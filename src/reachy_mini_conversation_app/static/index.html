@@ -166,25 +166,44 @@
             <p class="eyebrow">Accessories &amp; NFC</p>
             <h2>RFID Reader</h2>
           </div>
-          <span id="rfid-conn-chip" class="chip">Disconnected</span>
+          <div class="heading-actions">
+            <button id="rfid-help-btn" class="icon-btn" type="button" aria-expanded="false" aria-controls="rfid-help">?</button>
+            <span id="rfid-conn-chip" class="chip">Disconnected</span>
+          </div>
         </div>
-        <p class="muted">When a tag is placed on the reader, its associated personality is applied automatically.</p>
+        <!-- Kept outside #rfid-body so it stays readable and clickable while
+             the rest of the panel is greyed out — it is what explains why. -->
+        <div id="rfid-help" class="help-box hidden">
+          <p class="small" style="margin:0 0 6px"><strong>What is this?</strong></p>
+          <p class="muted small" style="margin:0">
+            The NFC reader is an optional accessory board for Reachy Mini. Place an
+            accessory on it and the personality linked to that accessory is applied
+            automatically; lift the accessory and the default personality comes back.
+          </p>
+          <p class="muted small" style="margin:6px 0 0">
+            This section stays inactive while the board is not detected. If the chip
+            above reads <em>Driver not installed</em>, the board is not the problem:
+            the robot is missing the <code>winnie_nfc</code> package.
+          </p>
+        </div>
+        <div id="rfid-body">
+        <p class="muted">When an accessory is placed on the reader, its associated personality is applied automatically.</p>
 
         <div id="rfid-tag-state" class="rfid-tag-state none" style="display:flex;align-items:center;gap:8px;margin:12px 0 4px">
           <span class="rfid-tag-dot" style="width:10px;height:10px;border-radius:50%;background:var(--muted,#888);flex-shrink:0"></span>
-          <span id="rfid-tag-label">No tag</span>
+          <span id="rfid-tag-label">No accessory detected (default personality)</span>
         </div>
         <p id="rfid-op-status" class="status small"></p>
 
         <hr style="margin:12px 0;border:none;border-top:1px solid rgba(255,255,255,.08)" />
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px">
-          <div>
-            <p class="label-sm" style="margin:0">Reset a tag</p>
-            <p class="muted small" style="margin:2px 0 0">Erases the tag content and makes it blank again</p>
-          </div>
-          <button id="rfid-clear-btn" class="ghost" type="button" disabled style="white-space:nowrap;padding:6px 12px">🗑 Erase</button>
+        <p class="label-sm" style="margin:0 0 2px">Anything to do with it?</p>
+        <p class="muted small" style="margin:0 0 10px">Both actions apply to the accessory on the reader.</p>
+        <div class="accessory-actions">
+          <button id="rfid-link-btn" type="button" disabled>🔗 Link to current personality</button>
+          <button id="rfid-clear-btn" class="ghost" type="button" disabled>🗑 Forget linked personality</button>
         </div>
         <p id="rfid-clear-status" class="status small"></p>
+        </div>
       </div>
       <!-- ── /RFID panel ─────────────────────────────────────────────────── -->
 
@@ -200,19 +219,24 @@
         <div class="section">
           <div class="section-heading">
             <h3>Select & launch</h3>
-            <p class="muted small">Pick a profile and choose what should launch on startup.</p>
+            <p class="muted small">Pick a profile, then act on it.</p>
           </div>
-          <div class="row row-top">
+          <div class="row row-select">
             <label for="personality-select">Select</label>
             <select id="personality-select"></select>
-            <button id="persist-personality" class="ghost">Use on startup</button>
-            <button id="apply-personality" class="ghost">Apply</button>
-            <button id="new-personality" class="ghost">New</button>
+            <button id="apply-personality">Apply</button>
           </div>
           <div class="row">
             <label></label>
-            <div class="link-tag-row">
-              <button id="link-tag-btn" class="ghost" disabled>🏷 Link to tag</button>
+            <div class="actions">
+              <button id="persist-personality" class="ghost">Use on startup</button>
+              <!-- A disabled button receives no mouse events in most browsers,
+                   so the tooltip explaining why it is greyed out has to live on
+                   this wrapper rather than on the button itself. -->
+              <span id="link-tag-wrap">
+                <button id="link-tag-btn" class="ghost" disabled>🏷 Link to accessory</button>
+              </span>
+              <button id="edit-personality" class="ghost">✎ Edit</button>
               <span id="link-tag-status" class="status small"></span>
             </div>
           </div>
@@ -222,11 +246,17 @@
               <span id="startup-label" class="chip">Built-in default</span>
             </div>
           </div>
+          <div class="row row-new">
+            <label></label>
+            <div class="actions">
+              <button id="new-personality">+ New personality</button>
+            </div>
+          </div>
         </div>
 
-        <div class="section">
+        <div id="personality-editor" class="section hidden">
           <div class="section-heading">
-            <h3>Create / edit</h3>
+            <h3 id="editor-heading">Create / edit</h3>
             <p class="muted small">Adjust instructions, tools, and voice, then save your profile.</p>
           </div>
           <div class="row">
@@ -254,6 +284,7 @@
             <label></label>
             <div class="actions">
               <button id="save-personality">Save</button>
+              <button id="cancel-edit" class="ghost">Cancel</button>
             </div>
           </div>
         </div>

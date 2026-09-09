@@ -60,7 +60,7 @@ class RFIDManagerUI:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _choices(self) -> list[str]:
-        """Personalities that can be written to a tag, in selection form."""
+        """Personalities that can be written to an accessory, in selection form."""
         return list_personalities()
 
     # ── Shared UI builder ─────────────────────────────────────────────────────
@@ -73,7 +73,7 @@ class RFIDManagerUI:
         # ── Write a personality onto a tag ────────────────────────────────────
         with gr.Row(equal_height=False):
             with gr.Column(scale=2, min_width=320):
-                gr.Markdown("**Écrire une personnalité sur un tag**")
+                gr.Markdown("**Écrire une personnalité sur un accessoire**")
                 personality_dd = gr.Dropdown(
                     label="Personnalité",
                     choices=self._choices(),
@@ -82,12 +82,12 @@ class RFIDManagerUI:
                 )
                 # Shown before writing: the tag carries this text verbatim, so
                 # there is no reason to keep it hidden from whoever writes it.
-                token_md = gr.Markdown("**Écrit sur le tag :** —")
-                write_btn = gr.Button("→ Écrire sur tag", variant="primary")
+                token_md = gr.Markdown("**Écrit sur l'accessoire :** —")
+                write_btn = gr.Button("→ Écrire sur l'accessoire", variant="primary")
 
         # ── Status bar ────────────────────────────────────────────────────────
         gr.Markdown("---")
-        last_tag_md = gr.Markdown("**Tag détecté :** —")
+        last_tag_md = gr.Markdown("**Accessoire :** aucun accessoire détecté (personnalité par défaut)")
         op_status_md = gr.Markdown("")
 
         # ── Hidden state + timer ──────────────────────────────────────────────
@@ -102,7 +102,6 @@ class RFIDManagerUI:
         def _refresh_status() -> str:
             status = self._nfc.get_status()
             connected = status.get("connected", False)
-            port = status.get("port") or "?"
             chip = status.get("chip_detected", False)
             # Checked before the link: without the driver the daemon disables
             # the reader outright, and the board being plugged in changes
@@ -116,21 +115,21 @@ class RFIDManagerUI:
             if not connected:
                 return "● **Daemon NFC : non connecté** (carte débranchée ou daemon non démarré)"
             if not chip:
-                return f"● **Port ouvert** ({port}) — CLRC663 non détecté"
-            return f"● **Connecté** ({port}) — lecteur NFC prêt"
+                return "● **Port ouvert** — CLRC663 non détecté"
+            return "● **Connecté** — lecteur NFC prêt"
 
         def _on_personality_select(personality: str | None) -> tuple[str | None, str]:
             token = to_tag_token(personality) if personality else None
             if token is None:
-                return personality, "**Écrit sur le tag :** —"
-            return personality, f"**Écrit sur le tag :** `{token}`"
+                return personality, "**Écrit sur l'accessoire :** —"
+            return personality, f"**Écrit sur l'accessoire :** `{token}`"
 
         def _write_tag(personality: str | None) -> str:
             if not personality:
                 return "Aucune personnalité sélectionnée."
             token = to_tag_token(personality)
             if token is None:
-                return "Cette personnalité ne peut pas être écrite sur un tag."
+                return "Cette personnalité ne peut pas être écrite sur un accessoire."
             return self._nfc.write_tag(token)
 
         def _poll() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -155,7 +154,7 @@ class RFIDManagerUI:
             # Write results
             for _success, result_msg in self._nfc.drain_write_results():
                 if _success:
-                    op_text = "✓ Tag écrit avec succès"
+                    op_text = "✓ Accessoire écrit avec succès"
                 else:
                     code = result_msg.split(":", 1)[-1] if ":" in result_msg else result_msg
                     op_text = f"⚠ Échec écriture : {describe_write_error(code)}"
@@ -163,7 +162,10 @@ class RFIDManagerUI:
             # Tag transitions
             if prev is not None:
                 if not tag.present and prev.present:
-                    last_tag_text = "**Tag détecté :** —"
+                    last_tag_text = (
+                        "**Accessoire :** aucun accessoire détecté "
+                        "(personnalité par défaut)"
+                    )
                     if self._handler is not None and self._loop is not None:
                         try:
                             fut = asyncio.run_coroutine_threadsafe(
@@ -175,7 +177,7 @@ class RFIDManagerUI:
                             logger.warning("RFID default revert failed: %s", exc)
                 elif tag.present and not prev.present:
                     if tag.blank:
-                        last_tag_text = "**Tag détecté :** (vide) — tag non initialisé"
+                        last_tag_text = "**Accessoire :** nouvel accessoire vierge"
                     elif tag.content:
                         personality = from_tag_token(tag.content)
                         if personality and personality not in list_personalities():
@@ -184,7 +186,7 @@ class RFIDManagerUI:
                             # since. Say which, rather than staying silent.
                             personality = None
                         if personality:
-                            last_tag_text = f"**Tag détecté :** `{tag.content}` — **{personality}**"
+                            last_tag_text = f"**Accessoire :** **{personality}**"
                             if self._handler is not None and self._loop is not None:
                                 try:
                                     profile = None if personality == "(built-in default)" else personality
@@ -197,8 +199,7 @@ class RFIDManagerUI:
                                     op_text = f"Erreur changement personnalité : {exc}"
                         else:
                             last_tag_text = (
-                                f"**Tag détecté :** `{tag.content}` — "
-                                f"personnalité inconnue sur ce robot"
+                                f"**Accessoire :** inconnu (`{tag.content}`)"
                             )
 
             return (

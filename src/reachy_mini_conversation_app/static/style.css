@@ -11,6 +11,7 @@
   --accent: #45c4ff;
   --accent-2: #5ef0c1;
   --shadow: 0 20px 70px rgba(0, 0, 0, 0.45);
+  --control-h: 44px;
 }
 
 * { box-sizing: border-box; }
@@ -313,6 +314,9 @@ label {
 }
 input[type="password"],
 input[type="text"],
+select {
+  min-height: var(--control-h);
+}
 select,
 textarea {
   width: 100%;
@@ -345,8 +349,11 @@ button {
   align-items: center;
   justify-content: center;
   margin-top: 12px;
+  min-height: var(--control-h);
   padding: 11px 16px;
-  border: none;
+  /* Transparent rather than absent, so a ghost button's 1px border does not
+     make it taller than a primary one beside it. */
+  border: 1px solid transparent;
   border-radius: 10px;
   background: linear-gradient(120deg, var(--accent), var(--accent-2));
   color: #031022;
@@ -415,9 +422,6 @@ button.ghost:hover { border-color: rgba(94, 240, 193, 0.4); }
 .row > button { margin: 0; }
 
 /* First row: controls inline */
-#personality-panel .row-top {
-  grid-template-columns: 160px 1fr auto auto auto;
-}
 #personality-panel .row-voice {
   grid-template-columns: 160px 1fr auto;
 }
@@ -443,10 +447,24 @@ button.ghost:hover { border-color: rgba(94, 240, 193, 0.4); }
   gap: 10px;
   flex-wrap: wrap;
 }
-.link-tag-row {
+/* Apply sits on the dropdown line: the selection and the act of using it are
+   one gesture, so they share one row. */
+#personality-panel .row-select {
+  grid-template-columns: 160px 1fr auto;
+}
+.accessory-actions {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
+}
+.accessory-actions button {
+  white-space: nowrap;
+}
+.row-new {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
 }
 .row-save .actions {
   justify-content: flex-start;
@@ -493,12 +511,12 @@ button.ghost:hover { border-color: rgba(94, 240, 193, 0.4); }
 }
 
 @media (max-width: 900px) {
-  #personality-panel .row-top,
+  #personality-panel .row-select,
   #personality-panel .row-voice {
     grid-template-columns: 1fr;
   }
 
-  #personality-panel .row-top button,
+  #personality-panel .row-select button,
   #personality-panel .row-voice button {
     width: 100%;
     justify-content: center;
@@ -544,3 +562,58 @@ button.ghost:hover { border-color: rgba(94, 240, 193, 0.4); }
 .rfid-tag-state.unknown #rfid-tag-label { color: var(--warn); }
 .rfid-tag-state.known .rfid-tag-dot  { background: var(--ok); box-shadow: 0 0 6px rgba(76,224,179,0.55); }
 .rfid-tag-state.known #rfid-tag-label { color: var(--ok); }
+
+/* ── Unavailable state ──────────────────────────────────────────────────── */
+
+/* No styling existed for disabled buttons, so a greyed-out action looked
+   exactly like a live one. */
+button:disabled,
+button:disabled:hover {
+  opacity: 0.4;
+  cursor: not-allowed;
+  filter: none;
+  transform: none;
+  box-shadow: none;
+}
+
+/* The whole accessory section reads as inactive when the reader is missing.
+   pointer-events is what makes it truthful: nothing inside can be clicked,
+   including the select and the text fields. */
+#rfid-status-panel.is-unavailable #rfid-body {
+  opacity: 0.4;
+  pointer-events: none;
+  user-select: none;
+}
+
+.heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.icon-btn {
+  min-height: 26px;
+  width: 26px;
+  height: 26px;
+  margin-top: 0;
+  padding: 0;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border);
+  color: var(--text);
+  box-shadow: none;
+}
+.icon-btn:hover { border-color: rgba(94, 240, 193, 0.4); }
+.help-box {
+  margin: 10px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+.help-box code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 5px;
+  border-radius: 5px;
+}

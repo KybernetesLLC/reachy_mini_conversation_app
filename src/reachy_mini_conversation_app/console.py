@@ -596,6 +596,24 @@ class LocalStream:
             logger.info("[RFID] Tag written with %r", code)
             return JSONResponse({"ok": True, "code": code, "personality": personality, "written": True})
 
+        def _accessory_view(t) -> dict:
+            """What the panel shows for the accessory on the reader.
+
+            Resolved server-side on purpose: the token scheme lives in
+            personality_tag, and a second copy of it in JavaScript would be
+            free to drift from this one.
+            """
+            if t is None or not t.present:
+                return {"state": "none", "personality": None, "content": None}
+            if t.blank or not t.content:
+                return {"state": "blank", "personality": None, "content": None}
+            personality = _from_tag_token(t.content)
+            if personality and personality in _list_personalities():
+                return {"state": "known", "personality": personality, "content": t.content}
+            # Carries something, but nothing this robot can act on: an old
+            # opaque code, a deleted profile, or a tag written elsewhere.
+            return {"state": "unknown", "personality": None, "content": t.content}
+
         @_app.get("/rfid/poll")
         def _rfid_poll() -> JSONResponse:
             status = _nfc_client.get_status()
@@ -604,7 +622,8 @@ class LocalStream:
             if not status.get("connected"):
                 _prev_tag[0] = None
                 return JSONResponse({"messages": [], "connected": False, "applied": None, "port": None,
-                                     "driver_available": _driver_ok})
+                                     "driver_available": _driver_ok,
+                                     "accessory": _accessory_view(None)})
 
             tag = _nfc_client.get_tag()
             prev = _prev_tag[0]
@@ -632,10 +651,12 @@ class LocalStream:
             applied = None
             if not msgs:
                 return JSONResponse({"messages": [], "connected": True, "applied": None, "port": port,
-                                     "driver_available": _driver_ok})
+                                     "driver_available": _driver_ok,
+                                     "accessory": _accessory_view(tag)})
             if not _apply_lock.acquire(blocking=False):
                 return JSONResponse({"messages": msgs, "connected": True, "applied": None, "port": port,
-                                     "driver_available": _driver_ok})
+                                     "driver_available": _driver_ok,
+                                     "accessory": _accessory_view(tag)})
             try:
                 handler = _get_handler()
                 logger.info("[RFID] events: %r", msgs)
@@ -870,7 +891,8 @@ class LocalStream:
             finally:
                 _apply_lock.release()
             return JSONResponse({"messages": msgs, "connected": True, "applied": applied, "port": port,
-                                 "driver_available": _driver_ok})
+                                 "driver_available": _driver_ok,
+                                 "accessory": _accessory_view(tag)})
 
         # ── Personality management (under /rfid/ to avoid runtime route conflicts) ──
 

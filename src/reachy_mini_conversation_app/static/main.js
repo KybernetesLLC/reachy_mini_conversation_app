@@ -359,7 +359,11 @@ async function init() {
   const pApply = document.getElementById("apply-personality");
   const pPersist = document.getElementById("persist-personality");
   const pNew = document.getElementById("new-personality");
+  const pEdit = document.getElementById("edit-personality");
   const pSave = document.getElementById("save-personality");
+  const pCancel = document.getElementById("cancel-edit");
+  const pEditor = document.getElementById("personality-editor");
+  const pEditorHeading = document.getElementById("editor-heading");
   const pStartupLabel = document.getElementById("startup-label");
   const pName = document.getElementById("personality-name");
   const pInstr = document.getElementById("instructions-ta");
@@ -909,7 +913,33 @@ async function init() {
       }
     });
 
+    function openEditor(heading) {
+      if (pEditorHeading) pEditorHeading.textContent = heading;
+      if (!pEditor) return;
+      show(pEditor, true);
+      pEditor.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    function closeEditor() {
+      if (pEditor) show(pEditor, false);
+    }
+
+    pEdit?.addEventListener("click", async () => {
+      // loadSelected() already mirrors the selection into the editor fields on
+      // every change, so Edit only has to reveal them.
+      const selected = pSelect.value || "";
+      await loadSelected();
+      openEditor(selected ? `Edit ${selected}` : "Edit personality");
+    });
+
+    pCancel?.addEventListener("click", async () => {
+      closeEditor();
+      // Drop any unsaved edits so reopening shows the profile as stored.
+      await loadSelected();
+    });
+
     pNew.addEventListener("click", () => {
+      openEditor("New personality");
       pName.value = "";
       pInstr.value = "# Write your instructions here\n# e.g., Keep responses concise and friendly.";
       pTools.value = "# tools enabled for this profile\n";
@@ -947,6 +977,7 @@ async function init() {
           pSelect.appendChild(opt);
         }
         setStatusMessage(pStatus, "Saved.", "ok");
+        closeEditor();
         // Auto-apply
         try { await applyPersonality(pSelect.value); } catch {}
       } catch (e) {
@@ -983,7 +1014,15 @@ async function rfidFetch(url, options = {}) {
 // reader is not something this page connects or disconnects: the chip in the
 // panel heading reports what the daemon found.
 let _rfidConnected = false;
-function rfidSetConnected(connected, port, driverAvailable) {
+function rfidSetConnected(connected, driverAvailable, accessory) {
+  // Acting on an accessory needs two things: the reader, and something on it.
+  // Both gate the same three buttons, so they are decided once here.
+  const hasAccessory = !!accessory && accessory.state !== "none";
+  const canAct = connected && hasAccessory;
+
+  const panel = document.getElementById("rfid-status-panel");
+  if (panel) panel.classList.toggle("is-unavailable", !connected);
+
   const chip     = document.getElementById("rfid-conn-chip");
   const clearBtn = document.getElementById("rfid-clear-btn");
   if (chip) {
@@ -992,17 +1031,47 @@ function rfidSetConnected(connected, port, driverAvailable) {
     if (driverAvailable === false) {
       chip.textContent = "Driver not installed";
     } else {
-      chip.textContent = connected ? (port ? `Connected — ${port}` : "Connected") : "Disconnected";
+      chip.textContent = connected ? "Connected" : "Disconnected";
     }
     chip.className = connected ? "chip chip-ok" : "chip";
   }
-  if (clearBtn) clearBtn.disabled = !connected;
+  if (clearBtn) clearBtn.disabled = !canAct;
+  const rfidLinkBtn = document.getElementById("rfid-link-btn");
+  if (rfidLinkBtn) rfidLinkBtn.disabled = !canAct;
+
+  // Greying a button out without saying why reads as a bug, and the three
+  // reasons call for three different actions from the user.
   const linkTagBtn = document.getElementById("link-tag-btn");
-  if (linkTagBtn) linkTagBtn.disabled = !connected;
+  const linkTagWrap = document.getElementById("link-tag-wrap");
+  if (linkTagBtn) linkTagBtn.disabled = !canAct;
+  const reason = connected
+    ? (hasAccessory ? "" : "Place an accessory on the reader first.")
+    : driverAvailable === false
+      ? "Requires the NFC reader accessory. Its driver is not installed on this robot."
+      : "Requires the NFC reader accessory — plug the reader board in to link one.";
+  if (linkTagWrap) linkTagWrap.title = reason;
+  const accessoryActions = document.querySelector(".accessory-actions");
+  if (accessoryActions) accessoryActions.title = reason;
   _rfidConnected = connected;
 }
 
 const _TAG_STATE_COLORS = { none: "#888", blank: "#f0a000", known: "#44c76a", unknown: "#f05050" };
+
+// What the accessory carries matters to the user as a personality, not as the
+// text stored on it. The raw content only earns a mention when nothing here can
+// make sense of it — then it is the one clue worth showing.
+function rfidRenderAccessory(acc) {
+  if (!acc) return;
+  if (acc.state === "known" && acc.personality) {
+    rfidSetTagState("known", acc.personality);
+  } else if (acc.state === "unknown") {
+    rfidSetTagState("unknown", `Unknown accessory (${acc.content || "?"})`);
+  } else if (acc.state === "blank") {
+    rfidSetTagState("blank", "New blank accessory");
+  } else {
+    rfidSetTagState("none", "No accessory detected (default personality)");
+  }
+}
 function rfidSetTagState(state, label) {
   const el      = document.getElementById("rfid-tag-state");
   const labelEl = document.getElementById("rfid-tag-label");
@@ -1031,29 +1100,18 @@ let _rfidLoadPersonality = null;
 async function rfidPoll() {
   const data = await rfidFetch("/rfid/poll");
   if (!data) return;
-  rfidSetConnected(data.connected, data.port, data.driver_available);
+  rfidSetConnected(data.connected, data.driver_available, data.accessory);
+  rfidRenderAccessory(data.accessory);
   if (!data.connected) return;
   for (const msg of data.messages || []) {
-    if (msg === "NO_TAG") {
-      rfidSetTagState("none", "No tag");
-    } else if (msg.startsWith("READ:")) {
-      const code = msg.slice(5).replace(/\x00/g, "").trim();
-      if (!code || code === "EMPTY") {
-        rfidSetTagState("blank", "Blank tag — not initialised");
-      } else {
-        rfidSetTagState("known", `Tag detected: ${code}`);
-        if (data.applied?.personality) {
-          rfidSetTagState("known", `${code} → ${data.applied.personality}`);
-        }
-      }
-    } else if (msg === "WRITE_MODE") {
-      rfidSetOpStatus("Waiting for a tag to write...");
+    if (msg === "WRITE_MODE") {
+      rfidSetOpStatus("Waiting for an accessory to write...");
     } else if (msg === "WRITE_OK") {
-      rfidSetOpStatus("✓ Tag written successfully", "ok");
+      rfidSetOpStatus("✓ Accessory written successfully", "ok");
     } else if (msg.startsWith("WRITE_FAIL:")) {
       rfidSetOpStatus(`⚠ ${msg.slice(11)}`, "warn");
     } else if (msg.startsWith("AUTH_FAIL:") || msg.startsWith("READ_FAIL:")) {
-      rfidSetOpStatus(`⚠ RFID error: ${msg}`, "warn");
+      rfidSetOpStatus(`⚠ Accessory error: ${msg}`, "warn");
     } else if (msg === "NFC_ERROR:NOT_FOUND") {
       rfidSetOpStatus("⚠ NFC reader not detected — check the board", "error");
     } else if (msg === "READY") {
@@ -1066,8 +1124,6 @@ async function rfidPoll() {
   if (data.applied) {
     const code = data.applied.code;
     const pers = data.applied.personality;
-    if (code && pers) rfidSetTagState("known", `${code} → ${pers}`);
-    else if (!code) rfidSetOpStatus("Reverted to default personality", "ok");
     // Auto-select the personality in Personality Studio
     if (_rfidSelectEl && _rfidLoadPersonality && pers) {
       const opts = Array.from(_rfidSelectEl.options);
@@ -1083,18 +1139,51 @@ function initRFID() {
   const panel = document.getElementById("rfid-status-panel");
   if (panel) panel.classList.remove("hidden");
 
+  document.getElementById("rfid-help-btn")?.addEventListener("click", () => {
+    const box = document.getElementById("rfid-help");
+    const btn = document.getElementById("rfid-help-btn");
+    if (!box) return;
+    // toggle() returns true when the class was added, i.e. now hidden.
+    const nowHidden = box.classList.toggle("hidden");
+    btn?.setAttribute("aria-expanded", String(!nowHidden));
+  });
+
   setInterval(rfidPoll, 500);
+
+  document.getElementById("rfid-link-btn")?.addEventListener("click", async () => {
+    const personality = _rfidSelectEl?.value;
+    if (!personality) {
+      rfidSetClearStatus("Pick a personality first.", "warn");
+      return;
+    }
+    const btn = document.getElementById("rfid-link-btn");
+    if (btn) btn.disabled = true;
+    rfidSetClearStatus(`Linking to ${personality}…`);
+    const res = await rfidFetch("/rfid/link_tag", {
+      method: "POST",
+      body: JSON.stringify({ personality }),
+    });
+    if (btn) btn.disabled = false;
+    if (res?.ok) {
+      rfidSetClearStatus(`✓ Accessory linked to ${res.personality}`, "ok");
+    } else {
+      const msg = res?.error === "no_tag" ? "No accessory on the reader"
+                : res?.error === "write_failed" ? (res.detail || "Write failed")
+                : res?.error || "Link failed";
+      rfidSetClearStatus(`⚠ ${msg}`, "warn");
+    }
+  });
 
   document.getElementById("rfid-clear-btn")?.addEventListener("click", async () => {
     const btn = document.getElementById("rfid-clear-btn");
     if (btn) btn.disabled = true;
-    rfidSetClearStatus("Erasing — keep the tag on the reader…");
+    rfidSetClearStatus("Forgetting — keep the accessory on the reader…");
     const data = await rfidFetch("/rfid/clear", { method: "POST", body: JSON.stringify({ full: false }) });
     if (btn) btn.disabled = false;
     if (data?.ok) {
-      rfidSetClearStatus("✓ Tag erased", "ok");
+      rfidSetClearStatus("✓ Accessory no longer linked to a personality", "ok");
     } else {
-      rfidSetClearStatus(`⚠ ${data?.message || "Erase failed"}`, "error");
+      rfidSetClearStatus(`⚠ ${data?.message || "Could not forget the link"}`, "error");
     }
   });
 
@@ -1113,11 +1202,11 @@ function initRFID() {
     if (!res) return;
     if (res.ok) {
       const msg = res.written
-        ? `✓ Code written & linked (${res.code})`
-        : `✓ Linked to ${res.code}`;
+        ? `✓ Accessory written (${res.code})`
+        : `✓ Accessory already linked`;
       if (statusEl) { statusEl.textContent = msg; statusEl.className = "status small ok"; }
     } else {
-      const msg = res.error === "no_tag" ? "No tag on reader"
+      const msg = res.error === "no_tag" ? "No accessory on the reader"
                 : res.error === "write_failed" ? `Write failed: ${res.detail || ""}`
                 : res.error || "Failed";
       if (statusEl) { statusEl.textContent = `⚠ ${msg}`; statusEl.className = "status small warn"; }
