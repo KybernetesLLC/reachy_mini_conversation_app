@@ -116,7 +116,6 @@ class LocalStream:
         # Re-inject RFID deps whenever the handler is replaced
         if getattr(self, "_rfid_serial", None) is not None:
             self.handler.deps.rfid_serial = self._rfid_serial
-            self.handler.deps.rfid_store = self._rfid_store
 
     # ---- Settings UI ----
     def _read_env_lines(self, env_path: Path) -> list[str]:
@@ -486,7 +485,10 @@ class LocalStream:
             NfcDaemonClient,
             describe_write_error,
         )
-        from external_content.rfid_manager.rfid_store import RFIDStore
+        from reachy_mini_conversation_app.personality_tag import (
+            from_tag_token as _from_tag_token,
+            to_tag_token as _to_tag_token,
+        )
 
         _TRANSITION_MOVES = None
         _MOVES = None
@@ -499,10 +501,8 @@ class LocalStream:
             pass
 
         _nfc_client = NfcDaemonClient()
-        _store = RFIDStore()
         # Store as instance attrs so _install_handler() can re-inject on backend restart
         self._rfid_serial = _nfc_client
-        self._rfid_store = _store
         _app = self._settings_app
         _get_handler = lambda: self.handler  # noqa: E731 — always returns the current handler
         _get_loop = lambda: self._asyncio_loop  # noqa: E731
@@ -515,14 +515,9 @@ class LocalStream:
 
         # Inject NFC deps into ToolDependencies so nfc_writer can use them
         self.handler.deps.rfid_serial = _nfc_client
-        self.handler.deps.rfid_store = _store
         _apply_lock = _threading.Lock()
 
         _DEFAULT_PROFILE = "(built-in default)"
-
-        class _MappingBody(BaseModel):
-            code: str
-            personality: str
 
         class _WriteBody(BaseModel):
             code: str
@@ -537,25 +532,6 @@ class LocalStream:
                 "driver_available": status.get("driver_available", False),
                 "chip_version": status.get("chip_version"),
             })
-
-        @_app.get("/rfid/mappings")
-        def _rfid_mappings() -> JSONResponse:
-            return JSONResponse({"mappings": _store.all()})
-
-        @_app.post("/rfid/mappings")
-        def _rfid_save_mapping(body: _MappingBody) -> JSONResponse:
-            _store.save(body.code, body.personality)
-            return JSONResponse({"ok": True})
-
-        @_app.delete("/rfid/mappings/{code}")
-        def _rfid_delete_mapping(code: str) -> JSONResponse:
-            _store.delete(code)
-            return JSONResponse({"ok": True})
-
-        @_app.post("/rfid/new_mapping")
-        def _rfid_new_mapping() -> JSONResponse:
-            code = _uuid.uuid4().hex[:8].upper()
-            return JSONResponse({"ok": True, "code": code})
 
         @_app.post("/rfid/write")
         def _rfid_write(body: _WriteBody) -> JSONResponse:
@@ -599,32 +575,26 @@ class LocalStream:
             tag = _nfc_client.get_tag()
             if not tag.present:
                 return JSONResponse({"ok": False, "error": "no_tag"})
-            if tag.blank or not tag.content:
-                # Generate a code not already in the store
-                existing_codes = set(_store.all().keys())
-                code = _uuid.uuid4().hex[:8].upper()
-                while code in existing_codes:
-                    code = _uuid.uuid4().hex[:8].upper()
-                # Persist mapping before writing so the poll loop can apply it immediately
-                _store.save(code, personality)
-                logger.info("[RFID] Writing new code %r to blank tag for personality %r", code, personality)
-                success, detail = _nfc_client.write_tag_sync(code)
-                if not success:
-                    _store.delete(code)
-                    logger.warning("[RFID] Write failed for code %r: %s", code, detail)
-                    return JSONResponse({
-                        "ok": False,
-                        "error": "write_failed",
-                        "detail": describe_write_error(detail),
-                        "code": detail,
-                    })
-                logger.info("[RFID] Tag %r written and linked to %r", code, personality)
-                return JSONResponse({"ok": True, "code": code, "personality": personality, "written": True})
-            else:
-                code = tag.content
-                _store.save(code, personality)
-                logger.info("[RFID] Linked existing tag %r to personality %r", code, personality)
+            code = _to_tag_token(personality)
+            if code is None:
+                return JSONResponse({"ok": False, "error": "not_writable"}, status_code=400)
+            # A tag already carrying this exact personality needs no write: the
+            # token is derived from the personality, so it cannot drift.
+            if tag.content == code:
+                logger.info("[RFID] Tag already carries %r", personality)
                 return JSONResponse({"ok": True, "code": code, "personality": personality, "written": False})
+            logger.info("[RFID] Writing %r to tag for personality %r", code, personality)
+            success, detail = _nfc_client.write_tag_sync(code)
+            if not success:
+                logger.warning("[RFID] Write failed for %r: %s", code, detail)
+                return JSONResponse({
+                    "ok": False,
+                    "error": "write_failed",
+                    "detail": describe_write_error(detail),
+                    "code": detail,
+                })
+            logger.info("[RFID] Tag written with %r", code)
+            return JSONResponse({"ok": True, "code": code, "personality": personality, "written": True})
 
         @_app.get("/rfid/poll")
         def _rfid_poll() -> JSONResponse:
@@ -750,7 +720,13 @@ class LocalStream:
                                         logger.warning("[RFID] >>> blank tag inject FAILED: %s", exc)
                         elif code:
                             handler.deps.blank_tag_present = False
-                            personality_name = _store.get(code)
+                            personality_name = _from_tag_token(code)
+                            if personality_name is not None and personality_name not in _list_personalities():
+                                # A token for a personality this robot does not
+                                # have: say so rather than silently ignoring a
+                                # tag the user just presented.
+                                logger.warning("[RFID] >>> unknown personality %r on tag", personality_name)
+                                personality_name = None
                             if personality_name is not None:
                                 if personality_name == _current_rfid_personality[0]:
                                     logger.debug("[RFID] >>> same personality %r, skipping", personality_name)
@@ -922,7 +898,9 @@ class LocalStream:
             choices = [_DEFAULT_OPTION, *_list_personalities()]
             from reachy_mini_conversation_app.config import config as _cfg
             current = getattr(_cfg, "REACHY_MINI_CUSTOM_PROFILE", None) or _DEFAULT_OPTION
-            personality_to_code = {p: c for c, p in _store.all().items()}
+            personality_to_code = {
+                p: t for p in _list_personalities() if (t := _to_tag_token(p)) is not None
+            }
             return JSONResponse({"choices": choices, "current": current, "personality_to_code": personality_to_code})
 
         @_app.get("/rfid/personalities/load")
@@ -962,13 +940,11 @@ class LocalStream:
             try:
                 _write_profile(name_s, body.instructions, body.tools_text, body.voice or "cedar")
                 value = f"user_personalities/{name_s}"
-                existing_code = next((c for c, p in _store.all().items() if p == value), None)
-                if existing_code is None:
-                    existing_code = _uuid.uuid4().hex[:8].upper()
-                    _store.save(existing_code, value)
                 choices = [_DEFAULT_OPTION, *_list_personalities()]
-                personality_to_code = {p: c for c, p in _store.all().items()}
-                return JSONResponse({"ok": True, "value": value, "code": existing_code, "choices": choices, "personality_to_code": personality_to_code})
+                personality_to_code = {
+                    p: t for p in _list_personalities() if (t := _to_tag_token(p)) is not None
+                }
+                return JSONResponse({"ok": True, "value": value, "code": _to_tag_token(value), "choices": choices, "personality_to_code": personality_to_code})
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -980,9 +956,6 @@ class LocalStream:
             import shutil as _shutil
             if body.name == _DEFAULT_OPTION:
                 return JSONResponse({"ok": False, "error": "cannot_delete_default"}, status_code=400)
-            for code, p in list(_store.all().items()):
-                if p == body.name:
-                    _store.delete(code)
             try:
                 pdir = _resolve_profile_dir(body.name)
                 if pdir.exists():
@@ -990,7 +963,9 @@ class LocalStream:
             except Exception:
                 pass
             choices = [_DEFAULT_OPTION, *_list_personalities()]
-            personality_to_code = {p: c for c, p in _store.all().items()}
+            personality_to_code = {
+                p: t for p in _list_personalities() if (t := _to_tag_token(p)) is not None
+            }
             return JSONResponse({"ok": True, "choices": choices, "personality_to_code": personality_to_code})
 
         @_app.post("/rfid/personalities/apply")

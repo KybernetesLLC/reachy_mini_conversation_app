@@ -1,4 +1,3 @@
-import uuid
 import logging
 from typing import Any, Dict
 
@@ -7,6 +6,7 @@ from reachy_mini_conversation_app.headless_personality import (
     _sanitize_name,
     _write_profile,
 )
+from reachy_mini_conversation_app.personality_tag import USER_DIR, to_tag_token
 
 logger = logging.getLogger(__name__)
 
@@ -95,23 +95,16 @@ class NfcWriter(Tool):
             logger.error("nfc_writer: failed to write profile: %s", exc)
             return {"error": f"Failed to write profile: {exc}"}
 
-        personality = f"user_personalities/{name_s}"
+        personality = f"{USER_DIR}/{name_s}"
 
-        # Reuse existing RFID code for this personality, or generate a new one
-        rfid_store = deps.rfid_store
-        code: str
-        if rfid_store is not None:
-            existing = next((c for c, p in rfid_store.all().items() if p == personality), None)
-            if existing:
-                code = existing
-                logger.info("nfc_writer: reusing existing code %r for %r", code, personality)
-            else:
-                code = uuid.uuid4().hex[:8].upper()
-                rfid_store.save(code, personality)
-                logger.info("nfc_writer: created new code %r for %r", code, personality)
-        else:
-            code = uuid.uuid4().hex[:8].upper()
-            logger.warning("nfc_writer: rfid_store not available — code %r not persisted", code)
+        # The tag carries the personality itself, so there is nothing to
+        # allocate or remember: the same personality always yields the same
+        # token, and the tag means the same thing on any robot.
+        code = to_tag_token(personality)
+        if code is None:
+            logger.error("nfc_writer: no tag token for personality %r", personality)
+            return {"error": f"Cannot write personality {personality!r} to a tag"}
+        logger.info("nfc_writer: tag token %r for %r", code, personality)
 
         # Check whether a blank tag is currently on the reader
         rfid_serial = deps.rfid_serial

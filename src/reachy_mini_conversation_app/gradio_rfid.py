@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +35,13 @@ from reachy_mini_conversation_app.nfc_daemon_client import (  # noqa: E402
     NfcDaemonClient,
     describe_write_error,
 )
-from external_content.rfid_manager.rfid_store import RFIDStore  # noqa: E402
+from reachy_mini_conversation_app.headless_personality import (  # noqa: E402
+    list_personalities,
+)
+from reachy_mini_conversation_app.personality_tag import (  # noqa: E402
+    from_tag_token,
+    to_tag_token,
+)
 
 
 class RFIDManagerUI:
@@ -49,22 +54,14 @@ class RFIDManagerUI:
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         self._nfc = NfcDaemonClient()
-        self._store = RFIDStore(data_dir=data_dir)
         self._handler = handler
         self._loop = loop
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _choices(self) -> list[str]:
-        return [
-            f"{code} — {personality}"
-            for code, personality in self._store.all().items()
-        ]
-
-    def _code_from_choice(self, choice: str) -> str | None:
-        if not choice:
-            return None
-        return choice.split(" — ")[0].strip()
+        """Personalities that can be written to a tag, in selection form."""
+        return list_personalities()
 
     # ── Shared UI builder ─────────────────────────────────────────────────────
 
@@ -73,35 +70,20 @@ class RFIDManagerUI:
         # ── Connection status ─────────────────────────────────────────────────
         conn_status = gr.Markdown("● Vérifie la connexion au daemon…")
 
-        # ── Tag list + editor ─────────────────────────────────────────────────
+        # ── Write a personality onto a tag ────────────────────────────────────
         with gr.Row(equal_height=False):
-
-            with gr.Column(scale=1, min_width=200):
-                gr.Markdown("**Tags enregistrés**")
-                with gr.Row():
-                    new_btn = gr.Button("+ Nouveau", size="sm")
-                    delete_btn = gr.Button("✕ Supprimer", size="sm")
-                tag_dd = gr.Dropdown(
-                    label="Sélectionner un tag",
+            with gr.Column(scale=2, min_width=320):
+                gr.Markdown("**Écrire une personnalité sur un tag**")
+                personality_dd = gr.Dropdown(
+                    label="Personnalité",
                     choices=self._choices(),
                     value=None,
                     allow_custom_value=False,
                 )
-
-            with gr.Column(scale=2, min_width=320):
-                gr.Markdown("**Éditeur**")
-                code_id_md = gr.Markdown("**Code ID :** —")
-                personality_tb = gr.Textbox(
-                    label="Personnalité",
-                    placeholder="Nom du profil (ex: user_personalities/my_bot)",
-                )
-                with gr.Row():
-                    save_btn = gr.Button("Sauvegarder", variant="primary")
-                    write_btn = gr.Button(
-                        "→ Écrire sur tag",
-                        interactive=True,
-                        variant="secondary",
-                    )
+                # Shown before writing: the tag carries this text verbatim, so
+                # there is no reason to keep it hidden from whoever writes it.
+                token_md = gr.Markdown("**Écrit sur le tag :** —")
+                write_btn = gr.Button("→ Écrire sur tag", variant="primary")
 
         # ── Status bar ────────────────────────────────────────────────────────
         gr.Markdown("---")
@@ -137,53 +119,19 @@ class RFIDManagerUI:
                 return f"● **Port ouvert** ({port}) — CLRC663 non détecté"
             return f"● **Connecté** ({port}) — lecteur NFC prêt"
 
-        def _on_tag_select(choice: str) -> tuple[str | None, str, str]:
-            code = self._code_from_choice(choice)
-            if not code:
-                return None, "**Code ID :** —", ""
-            personality = self._store.get(code) or ""
-            return (
-                code,
-                f"**Code ID :** `{code}`",
-                personality,
-            )
+        def _on_personality_select(personality: str | None) -> tuple[str | None, str]:
+            token = to_tag_token(personality) if personality else None
+            if token is None:
+                return personality, "**Écrit sur le tag :** —"
+            return personality, f"**Écrit sur le tag :** `{token}`"
 
-        def _new_tag() -> tuple[dict[str, Any], str, str, str]:
-            new_code = uuid.uuid4().hex[:8].upper()
-            self._store.save(new_code, "")
-            choices = self._choices()
-            new_choice = next((c for c in choices if c.startswith(new_code)), None)
-            return (
-                gr.update(choices=choices, value=new_choice),
-                new_code,
-                f"**Code ID :** `{new_code}`",
-                "",
-            )
-
-        def _delete_tag(code: str | None) -> tuple[dict[str, Any], None, str, str, str]:
-            if not code:
-                return gr.update(), None, "**Code ID :** —", "", "Aucun tag sélectionné."
-            self._store.delete(code)
-            return (
-                gr.update(choices=self._choices(), value=None),
-                None,
-                "**Code ID :** —",
-                "",
-                "Tag supprimé.",
-            )
-
-        def _save_tag(code: str | None, personality: str) -> tuple[dict[str, Any], str]:
-            if not code:
-                return gr.update(), "Aucun tag sélectionné."
-            self._store.save(code, personality.strip())
-            choices = self._choices()
-            matching = next((c for c in choices if c.startswith(code)), None)
-            return gr.update(choices=choices, value=matching), "✓ Sauvegardé."
-
-        def _write_tag(code: str | None) -> str:
-            if not code:
-                return "Aucun tag sélectionné."
-            return self._nfc.write_tag(code)
+        def _write_tag(personality: str | None) -> str:
+            if not personality:
+                return "Aucune personnalité sélectionnée."
+            token = to_tag_token(personality)
+            if token is None:
+                return "Cette personnalité ne peut pas être écrite sur un tag."
+            return self._nfc.write_tag(token)
 
         def _poll() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
             status = self._nfc.get_status()
@@ -229,7 +177,12 @@ class RFIDManagerUI:
                     if tag.blank:
                         last_tag_text = "**Tag détecté :** (vide) — tag non initialisé"
                     elif tag.content:
-                        personality = self._store.get(tag.content)
+                        personality = from_tag_token(tag.content)
+                        if personality and personality not in list_personalities():
+                            # The tag names a personality this robot does not
+                            # have — an old opaque code, or a profile deleted
+                            # since. Say which, rather than staying silent.
+                            personality = None
                         if personality:
                             last_tag_text = f"**Tag détecté :** `{tag.content}` — **{personality}**"
                             if self._handler is not None and self._loop is not None:
@@ -243,7 +196,10 @@ class RFIDManagerUI:
                                 except Exception as exc:
                                     op_text = f"Erreur changement personnalité : {exc}"
                         else:
-                            last_tag_text = f"**Tag détecté :** `{tag.content}` — code inconnu dans la base"
+                            last_tag_text = (
+                                f"**Tag détecté :** `{tag.content}` — "
+                                f"personnalité inconnue sur ce robot"
+                            )
 
             return (
                 gr.update(value=conn_text),
@@ -253,27 +209,10 @@ class RFIDManagerUI:
 
         # ── Event wiring ──────────────────────────────────────────────────────
 
-        tag_dd.change(
-            fn=_on_tag_select,
-            inputs=[tag_dd],
-            outputs=[code_state, code_id_md, personality_tb],
-        )
-
-        new_btn.click(
-            fn=_new_tag,
-            outputs=[tag_dd, code_state, code_id_md, personality_tb],
-        )
-
-        delete_btn.click(
-            fn=_delete_tag,
-            inputs=[code_state],
-            outputs=[tag_dd, code_state, code_id_md, personality_tb, op_status_md],
-        )
-
-        save_btn.click(
-            fn=_save_tag,
-            inputs=[code_state, personality_tb],
-            outputs=[tag_dd, op_status_md],
+        personality_dd.change(
+            fn=_on_personality_select,
+            inputs=[personality_dd],
+            outputs=[code_state, token_md],
         )
 
         write_btn.click(

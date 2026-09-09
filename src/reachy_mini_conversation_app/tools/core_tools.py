@@ -45,7 +45,6 @@ class ToolDependencies:
     vision_processor: Any | None = None
     motion_duration_s: float = 1.0
     rfid_serial: Any | None = None      # NfcDaemonClient (injected at runtime by console.py)
-    rfid_store: Any | None = None       # RFIDStore (injected at runtime by console.py)
     blank_tag_present: bool = False     # True while a blank NFC tag is on the reader
     pending_nfc_write: "dict | None" = None  # {"code": str, "personality": str} waiting for blank tag
     recently_written_codes: "set[str]" = field(default_factory=set)  # codes written but not yet welcomed
