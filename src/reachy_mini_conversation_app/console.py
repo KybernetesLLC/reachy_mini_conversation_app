@@ -482,7 +482,10 @@ class LocalStream:
         if str(_proj_root) not in _sys.path:
             _sys.path.insert(0, str(_proj_root))
 
-        from reachy_mini_conversation_app.nfc_daemon_client import NfcDaemonClient
+        from reachy_mini_conversation_app.nfc_daemon_client import (
+            NfcDaemonClient,
+            describe_write_error,
+        )
         from external_content.rfid_manager.rfid_store import RFIDStore
 
         _TRANSITION_MOVES = None
@@ -530,7 +533,9 @@ class LocalStream:
             return JSONResponse({
                 "connected": status.get("connected", False),
                 "port": status.get("port"),
-                "module_detected": status.get("module_detected", False),
+                "chip_detected": status.get("chip_detected", False),
+                "driver_available": status.get("driver_available", False),
+                "chip_version": status.get("chip_version"),
             })
 
         @_app.get("/rfid/mappings")
@@ -556,6 +561,28 @@ class LocalStream:
         def _rfid_write(body: _WriteBody) -> JSONResponse:
             msg = _nfc_client.write_tag(body.code)
             return JSONResponse({"ok": True, "message": msg})
+
+        class _ClearBody(BaseModel):
+            full: bool = False
+
+        @_app.post("/rfid/clear")
+        def _rfid_clear(body: _ClearBody | None = None) -> JSONResponse:
+            """Make the tag on the reader blank again.
+
+            ``full`` also zeroes the whole user memory — the only way to remove
+            a payload that is not NDEF. It writes one page at a time, so it
+            takes a few seconds on an NTAG215.
+            """
+            full = bool(body.full) if body is not None else False
+            success, result = _nfc_client.erase_tag_sync(full=full)
+            if not success:
+                logger.warning("[RFID] Erase failed: %s", result)
+                return JSONResponse({
+                    "ok": False,
+                    "message": describe_write_error(result),
+                    "code": result,
+                })
+            return JSONResponse({"ok": True, "message": "Tag erased"})
 
         class _LinkTagBody(BaseModel):
             personality: str
@@ -585,7 +612,12 @@ class LocalStream:
                 if not success:
                     _store.delete(code)
                     logger.warning("[RFID] Write failed for code %r: %s", code, detail)
-                    return JSONResponse({"ok": False, "error": "write_failed", "detail": detail})
+                    return JSONResponse({
+                        "ok": False,
+                        "error": "write_failed",
+                        "detail": describe_write_error(detail),
+                        "code": detail,
+                    })
                 logger.info("[RFID] Tag %r written and linked to %r", code, personality)
                 return JSONResponse({"ok": True, "code": code, "personality": personality, "written": True})
             else:
@@ -598,9 +630,11 @@ class LocalStream:
         def _rfid_poll() -> JSONResponse:
             status = _nfc_client.get_status()
             port = status.get("port")
+            _driver_ok = status.get("driver_available", False)
             if not status.get("connected"):
                 _prev_tag[0] = None
-                return JSONResponse({"messages": [], "connected": False, "applied": None, "port": None})
+                return JSONResponse({"messages": [], "connected": False, "applied": None, "port": None,
+                                     "driver_available": _driver_ok})
 
             tag = _nfc_client.get_tag()
             prev = _prev_tag[0]
@@ -627,9 +661,11 @@ class LocalStream:
 
             applied = None
             if not msgs:
-                return JSONResponse({"messages": [], "connected": True, "applied": None, "port": port})
+                return JSONResponse({"messages": [], "connected": True, "applied": None, "port": port,
+                                     "driver_available": _driver_ok})
             if not _apply_lock.acquire(blocking=False):
-                return JSONResponse({"messages": msgs, "connected": True, "applied": None, "port": port})
+                return JSONResponse({"messages": msgs, "connected": True, "applied": None, "port": port,
+                                     "driver_available": _driver_ok})
             try:
                 handler = _get_handler()
                 logger.info("[RFID] events: %r", msgs)
@@ -857,7 +893,8 @@ class LocalStream:
                         logger.debug("[RFID] >>> unhandled event: %r", msg)
             finally:
                 _apply_lock.release()
-            return JSONResponse({"messages": msgs, "connected": True, "applied": applied, "port": port})
+            return JSONResponse({"messages": msgs, "connected": True, "applied": applied, "port": port,
+                                 "driver_available": _driver_ok})
 
         # ── Personality management (under /rfid/ to avoid runtime route conflicts) ──
 

@@ -32,7 +32,10 @@ _PROJECT_ROOT = Path(__file__).parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from reachy_mini_conversation_app.nfc_daemon_client import NfcDaemonClient  # noqa: E402
+from reachy_mini_conversation_app.nfc_daemon_client import (  # noqa: E402
+    NfcDaemonClient,
+    describe_write_error,
+)
 from external_content.rfid_manager.rfid_store import RFIDStore  # noqa: E402
 
 
@@ -118,12 +121,21 @@ class RFIDManagerUI:
             status = self._nfc.get_status()
             connected = status.get("connected", False)
             port = status.get("port") or "?"
-            module = status.get("module_detected", False)
+            chip = status.get("chip_detected", False)
+            # Checked before the link: without the driver the daemon disables
+            # the reader outright, and the board being plugged in changes
+            # nothing — reporting "non connecté" there would send you hunting
+            # for a cable instead of an install.
+            if not status.get("driver_available", False):
+                return (
+                    "● **Driver NFC absent sur le robot** — "
+                    "installer le paquet `winnie_nfc` puis relancer le daemon"
+                )
             if not connected:
-                return "● **Daemon NFC : non connecté** (Arduino absent ou daemon non démarré)"
-            if not module:
-                return f"● **Port ouvert** ({port}) — module PN532 non détecté"
-            return f"● **Connecté** ({port}) — module NFC prêt"
+                return "● **Daemon NFC : non connecté** (carte débranchée ou daemon non démarré)"
+            if not chip:
+                return f"● **Port ouvert** ({port}) — CLRC663 non détecté"
+            return f"● **Connecté** ({port}) — lecteur NFC prêt"
 
         def _on_tag_select(choice: str) -> tuple[str | None, str, str]:
             code = self._code_from_choice(choice)
@@ -197,7 +209,8 @@ class RFIDManagerUI:
                 if _success:
                     op_text = "✓ Tag écrit avec succès"
                 else:
-                    op_text = f"⚠ Échec écriture : {result_msg}"
+                    code = result_msg.split(":", 1)[-1] if ":" in result_msg else result_msg
+                    op_text = f"⚠ Échec écriture : {describe_write_error(code)}"
 
             # Tag transitions
             if prev is not None:

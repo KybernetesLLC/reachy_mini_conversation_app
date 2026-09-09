@@ -979,43 +979,26 @@ async function rfidFetch(url, options = {}) {
   }
 }
 
-async function rfidLoadPorts() {
-  const data = await rfidFetch("/rfid/ports");
-  const sel = document.getElementById("rfid-port");
-  if (!sel) return;
-  const ports = data?.ports || [];
-  sel.innerHTML = ports.length
-    ? ports.map((p) => `<option value="${p}">${p}</option>`).join("")
-    : `<option value="">No port</option>`;
-}
-
+// The daemon owns the serial link and discovers the board by probing, so the
+// reader is not something this page connects or disconnects: the chip in the
+// panel heading reports what the daemon found.
 let _rfidConnected = false;
-function rfidSetConnected(connected, port) {
-  const chip       = document.getElementById("rfid-conn-chip");
-  const connectBtn = document.getElementById("rfid-connect-btn");
-  const clearBtn   = document.getElementById("rfid-clear-btn");
+function rfidSetConnected(connected, port, driverAvailable) {
+  const chip     = document.getElementById("rfid-conn-chip");
+  const clearBtn = document.getElementById("rfid-clear-btn");
   if (chip) {
-    chip.textContent = connected ? (port ? `Connected — ${port}` : "Connected") : "Disconnected";
+    // A missing driver is not a missing cable: say so, or the next hour goes
+    // into checking the wiring of a board that was never going to be used.
+    if (driverAvailable === false) {
+      chip.textContent = "Driver not installed";
+    } else {
+      chip.textContent = connected ? (port ? `Connected — ${port}` : "Connected") : "Disconnected";
+    }
     chip.className = connected ? "chip chip-ok" : "chip";
-  }
-  if (connectBtn) {
-    connectBtn.textContent = connected ? "Disconnect" : "Connect";
-    connectBtn.style.opacity = connected ? "0.75" : "";
   }
   if (clearBtn) clearBtn.disabled = !connected;
   const linkTagBtn = document.getElementById("link-tag-btn");
   if (linkTagBtn) linkTagBtn.disabled = !connected;
-  if (connected && port) {
-    const sel = document.getElementById("rfid-port");
-    if (sel && sel.value !== port) {
-      const hasOption = Array.from(sel.options).some((o) => o.value === port);
-      if (!hasOption) {
-        const opt = document.createElement("option");
-        opt.value = port; opt.textContent = port; sel.appendChild(opt);
-      }
-      sel.value = port;
-    }
-  }
   _rfidConnected = connected;
 }
 
@@ -1042,14 +1025,13 @@ function rfidSetClearStatus(msg, type) {
   el.className = `status small${type ? " " + type : ""}`;
 }
 
-let _rfidClearPending = false;
 let _rfidSelectEl = null;       // set by initPersonalityPanel, used by rfidPoll
 let _rfidLoadPersonality = null;
 
 async function rfidPoll() {
   const data = await rfidFetch("/rfid/poll");
   if (!data) return;
-  rfidSetConnected(data.connected, data.port);
+  rfidSetConnected(data.connected, data.port, data.driver_available);
   if (!data.connected) return;
   for (const msg of data.messages || []) {
     if (msg === "NO_TAG") {
@@ -1065,18 +1047,17 @@ async function rfidPoll() {
         }
       }
     } else if (msg === "WRITE_MODE") {
-      if (_rfidClearPending) rfidSetClearStatus("Place the tag to erase on the reader...");
-      else rfidSetOpStatus("Waiting for a tag to write...");
+      rfidSetOpStatus("Waiting for a tag to write...");
     } else if (msg === "WRITE_OK") {
-      if (_rfidClearPending) { rfidSetClearStatus("✓ Tag erased", "ok"); _rfidClearPending = false; }
-      else rfidSetOpStatus("✓ Tag written successfully", "ok");
-    } else if (msg.startsWith("AUTH_FAIL:") || msg.startsWith("WRITE_FAIL:") || msg.startsWith("READ_FAIL:")) {
-      if (_rfidClearPending) { rfidSetClearStatus(`⚠ Erase failed: ${msg}`, "warn"); _rfidClearPending = false; }
-      else rfidSetOpStatus(`⚠ RFID error: ${msg}`, "warn");
+      rfidSetOpStatus("✓ Tag written successfully", "ok");
+    } else if (msg.startsWith("WRITE_FAIL:")) {
+      rfidSetOpStatus(`⚠ ${msg.slice(11)}`, "warn");
+    } else if (msg.startsWith("AUTH_FAIL:") || msg.startsWith("READ_FAIL:")) {
+      rfidSetOpStatus(`⚠ RFID error: ${msg}`, "warn");
     } else if (msg === "NFC_ERROR:NOT_FOUND") {
-      rfidSetOpStatus("⚠ NFC module not detected — check wiring", "error");
+      rfidSetOpStatus("⚠ NFC reader not detected — check the board", "error");
     } else if (msg === "READY") {
-      rfidSetOpStatus("✓ NFC module ready", "ok");
+      rfidSetOpStatus("✓ NFC reader ready", "ok");
     } else if (msg.startsWith("SERIAL_ERROR:")) {
       rfidSetConnected(false);
       rfidSetOpStatus(`⚠ Connection lost: ${msg.slice(13)}`, "error");
@@ -1102,38 +1083,18 @@ function initRFID() {
   const panel = document.getElementById("rfid-status-panel");
   if (panel) panel.classList.remove("hidden");
 
-  rfidLoadPorts();
   setInterval(rfidPoll, 500);
 
-  document.getElementById("rfid-refresh-btn")?.addEventListener("click", rfidLoadPorts);
-
-  document.getElementById("rfid-connect-btn")?.addEventListener("click", async () => {
-    const isConnected = document.getElementById("rfid-conn-chip")?.classList.contains("chip-ok");
-    if (isConnected) {
-      await rfidFetch("/rfid/disconnect", { method: "POST" });
-      rfidSetConnected(false);
-    } else {
-      const port = document.getElementById("rfid-port")?.value || "";
-      rfidSetOpStatus("Connecting...");
-      const data = await rfidFetch("/rfid/connect", { method: "POST", body: JSON.stringify({ port }) });
-      if (data?.ok) {
-        rfidSetConnected(true, port);
-        rfidSetOpStatus(data.message || "Connected", "ok");
-      } else {
-        rfidSetOpStatus(data?.message || "Connection error", "error");
-      }
-    }
-  });
-
   document.getElementById("rfid-clear-btn")?.addEventListener("click", async () => {
-    _rfidClearPending = true;
-    rfidSetClearStatus("Sending command...");
-    const data = await rfidFetch("/rfid/clear", { method: "POST" });
+    const btn = document.getElementById("rfid-clear-btn");
+    if (btn) btn.disabled = true;
+    rfidSetClearStatus("Erasing — keep the tag on the reader…");
+    const data = await rfidFetch("/rfid/clear", { method: "POST", body: JSON.stringify({ full: false }) });
+    if (btn) btn.disabled = false;
     if (data?.ok) {
-      rfidSetClearStatus(data.message || "Place the tag to erase on the reader...");
+      rfidSetClearStatus("✓ Tag erased", "ok");
     } else {
-      _rfidClearPending = false;
-      rfidSetClearStatus(data?.message || "Erase command failed.", "error");
+      rfidSetClearStatus(`⚠ ${data?.message || "Erase failed"}`, "error");
     }
   });
 
