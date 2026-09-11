@@ -32,23 +32,21 @@ _import_warmup_thread: threading.Thread | None = None
 def start_import_warmup() -> threading.Thread:
     """Preload heavy modules in the background while the robot connects.
 
-    openai (~1.5s) and scipy (~1s on the robot) are needed by the realtime
-    handler and the movement manager, but not before the robot / media
-    pipelines are up. Importing them on a side thread overlaps that cost with
-    robot initialization instead of paying it serially. Idempotent; errors are
-    deferred to the real import site, which reports them with full context.
+    The openai realtime tree (~1.5s on the robot) is needed by the realtime
+    handler, but not before the robot / media pipelines are up. Importing it
+    on a side thread overlaps that cost with robot initialization instead of
+    paying it serially. Idempotent; errors are deferred to the real import
+    site, which reports them with full context.
     """
     global _import_warmup_thread
     if _import_warmup_thread is None:
 
         def _preload() -> None:
             try:
-                import scipy.spatial.transform  # noqa: F401
-
                 # AsyncOpenAI.realtime is a cached_property whose module tree
                 # (~1.6s on the CM4) otherwise loads lazily INSIDE the ws
                 # connect phase; same for the websockets client the SDK pulls
-                # in __aenter__. Importing openai above does NOT cover these.
+                # in __aenter__. Importing plain openai does NOT cover these.
                 import openai.resources.realtime  # noqa: F401
                 import websockets.asyncio.client  # noqa: F401
 
