@@ -17,7 +17,7 @@ from reachy_mini_conversation_app.config import config, list_tool_module_names
 from reachy_mini_conversation_app.mcp_client import McpToolTimeoutError, McpToolInvocationError
 from reachy_mini_conversation_app.tool_spaces import build_remote_client, read_installed_tool_spaces
 from reachy_mini_conversation_app.profile_store import DEFAULT_PROFILE_NAME
-from reachy_mini_conversation_app.profile_toolsets import read_profile_tool_names
+from reachy_mini_conversation_app.profile_toolsets import read_profile_tool_names, read_profile_tool_override
 from reachy_mini_conversation_app.tools.tool_constants import SystemTool
 
 
@@ -102,22 +102,27 @@ _REMOTE_TOOL_RETRY_DELAY_S = 0.25
 _TOOLS_LOCK = threading.RLock()
 _EXTERNAL_TOOL_MODULE_NAMESPACE = "reachy_mini_conversation_app._external_tools"
 
-# nfc_writer is a system-level tool: it belongs to every profile as soon as an NFC
-# reader is attached, and to none when there is no reader. console.py flips this when
-# it connects to (or loses) the NFC daemon; it takes part in the registry signature so
-# the next initialize_tools() rebuilds the registry accordingly.
-NFC_WRITER_TOOL_NAME = "nfc_writer"
-_NFC_WRITER_ENABLED = False
+# Writing a personality onto an accessory needs a reader, so the tool is offered only
+# while one is attached; rfid_routes flips this as the NFC daemon comes and goes. It
+# takes part in the registry signature, so the next initialize_tools() rebuilds
+# accordingly. Availability only: a profile that explicitly excludes the tool keeps
+# it excluded.
+ACCESSORY_PERSONALITY_TOOL_NAME = "create_accessory_personality"
+_ACCESSORY_PERSONALITY_TOOL_AVAILABLE = False
 
 
-def set_nfc_writer_enabled(enabled: bool) -> None:
-    """Enable or disable the profile-independent nfc_writer tool."""
-    global _NFC_WRITER_ENABLED
+def set_accessory_personality_tool_available(available: bool) -> None:
+    """Offer or withdraw the accessory-personality tool as the reader comes and goes."""
+    global _ACCESSORY_PERSONALITY_TOOL_AVAILABLE
     with _TOOLS_LOCK:
-        if _NFC_WRITER_ENABLED == enabled:
+        if _ACCESSORY_PERSONALITY_TOOL_AVAILABLE == available:
             return
-        _NFC_WRITER_ENABLED = enabled
-    logger.info("nfc_writer tool %s", "enabled (NFC reader attached)" if enabled else "disabled (no NFC reader)")
+        _ACCESSORY_PERSONALITY_TOOL_AVAILABLE = available
+    logger.info(
+        "%s tool %s",
+        ACCESSORY_PERSONALITY_TOOL_NAME,
+        "available (NFC reader attached)" if available else "withdrawn (no NFC reader)",
+    )
 
 
 class RemoteMcpTool(Tool):
@@ -313,7 +318,7 @@ def _tool_registry_signature(
         _normalize_signature_path(config.TOOLS_DIRECTORY),
         bool(config.AUTOLOAD_EXTERNAL_TOOLS),
         _normalize_signature_path(instance_path),
-        _NFC_WRITER_ENABLED,
+        _ACCESSORY_PERSONALITY_TOOL_AVAILABLE,
     )
 
 
@@ -330,12 +335,17 @@ def _read_profile_tool_names(instance_path: str | Path | None) -> list[str]:
 
     tool_names.extend(tool.value for tool in SystemTool if tool.value not in tool_names)
 
-    # Available to every profile while an NFC reader is attached, to none otherwise.
-    if _NFC_WRITER_ENABLED:
-        if NFC_WRITER_TOOL_NAME not in tool_names:
-            tool_names.append(NFC_WRITER_TOOL_NAME)
-    elif NFC_WRITER_TOOL_NAME in tool_names:
-        tool_names.remove(NFC_WRITER_TOOL_NAME)
+    # Offered by default to any profile while a reader is attached, so the flow works
+    # out of the box without listing the tool in thirteen shipped profile documents.
+    # A profile whose tools were set explicitly keeps exactly what was set: unticking
+    # the tool in the Tool access panel has to mean something.
+    if _ACCESSORY_PERSONALITY_TOOL_AVAILABLE:
+        has_explicit_toolset = read_profile_tool_override(profile, instance_path) is not None
+        if not has_explicit_toolset and ACCESSORY_PERSONALITY_TOOL_NAME not in tool_names:
+            tool_names.append(ACCESSORY_PERSONALITY_TOOL_NAME)
+    elif ACCESSORY_PERSONALITY_TOOL_NAME in tool_names:
+        # No reader: the tool cannot run, so never offer it even if a profile lists it.
+        tool_names.remove(ACCESSORY_PERSONALITY_TOOL_NAME)
 
     if config.AUTOLOAD_EXTERNAL_TOOLS:
         discovered_external_tools = list_tool_module_names(config.TOOLS_DIRECTORY)

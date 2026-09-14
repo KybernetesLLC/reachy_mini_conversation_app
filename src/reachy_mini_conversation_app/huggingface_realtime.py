@@ -44,6 +44,7 @@ from reachy_mini_conversation_app.prompts import (
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
 from reachy_mini_conversation_app.tools.core_tools import (
+    ACCESSORY_PERSONALITY_TOOL_NAME,
     ToolSpec,
     ToolDependencies,
     get_tool_specs,
@@ -164,7 +165,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
 
-        # NFC write retry task: started when nfc_writer returns "waiting_for_tag"
+        # NFC write retry task: started when the accessory tool returns "waiting_for_tag"
         self._nfc_retry_task: asyncio.Task[None] | None = None
         # NFC transition gate: True from WRITE_OK until apply_personality completes.
         # Blocks new _safe_response_create calls and cancels VAD auto-responses.
@@ -177,7 +178,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._nfc_speech_done_event: asyncio.Event = asyncio.Event()
         self._nfc_speech_done_event.set()  # starts in "not waiting" state
         # Counts down response.done events after blank-tag injection.
-        # While > 0, nfc_writer is excluded from session tools.
+        # While > 0, the accessory tool is excluded from session tools.
         self._nfc_collect_turns: int = 0
         # Tracks the welcome-speech audio so _delayed_switch can wait for playback.
         self._nfc_speech_start_time: float | None = None
@@ -375,11 +376,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             "STEP 1 (this turn): An unknown object is on your head. React with curiosity. "
             "Ask the user ONE question: would they like to give it a personality? Wait for their answer.\n"
             "STEP 2 (only if user says yes, next turn): Ask them to describe the personality they want. "
-            "Do NOT call nfc_writer yet. Wait for their description.\n"
+            "Do NOT call create_accessory_personality yet. Wait for their description.\n"
             "STEP 3 (only after user has described the personality): "
             "Express — spontaneously and joyfully — that you feel this new personality growing in this accessory.\n"
-            "THEN and only then call nfc_writer with name, instructions (must include a rule that responses stay short), and voice. "
-            "NEVER call nfc_writer before the user has answered yes AND described the personality in their own words.\n"
+            "THEN and only then call create_accessory_personality with name, instructions "
+            "(must include a rule that responses stay short), and voice. "
+            "NEVER call create_accessory_personality before the user has answered yes "
+            "AND described the personality in their own words.\n"
             "If user says no at any point: react naturally and drop the topic.]"
         )
         await self.connection.conversation.item.create(
@@ -415,7 +418,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     await self.connection.response.cancel()
                 except Exception:
                     pass
-            logger.info("abort_nfc_collection: restoring nfc_writer in session tools")
+            logger.info("abort_nfc_collection: restoring the accessory tool in session tools")
             if self.connection is not None:
                 try:
                     await self.connection.session.update(
@@ -555,7 +558,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         await self._safe_response_create(response={})
 
     async def _nfc_retry_loop(self) -> None:
-        """Wait up to 10 s for a blank tag after nfc_writer returned 'waiting_for_tag'.
+        """Wait up to 10 s for a blank tag after the accessory tool returned 'waiting_for_tag'.
 
         - After 5 s with no tag: ask the user again.
         - After another 5 s: cancel the pending write.
@@ -924,7 +927,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._in_flight_tool_calls.discard(completed_tool.id)
 
             if (
-                completed_tool.tool_name == "nfc_writer"
+                completed_tool.tool_name == ACCESSORY_PERSONALITY_TOOL_NAME
                 and isinstance(tool_result, dict)
                 and tool_result.get("status") == "waiting_for_tag"
             ):
@@ -936,7 +939,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # While the tag is being written the flow speaks from inject_nfc_write_result,
             # so suppress the generic spoken follow-up for that result.
             nfc_silent = (
-                completed_tool.tool_name == "nfc_writer"
+                completed_tool.tool_name == ACCESSORY_PERSONALITY_TOOL_NAME
                 and isinstance(tool_result, dict)
                 and tool_result.get("status") == "writing"
             )

@@ -310,11 +310,30 @@ function buildStatusSection() {
       if (payload.requires_restart) {
         list.appendChild(statusRow("Restart", "Required to apply changes", "warn"));
       }
+      list.appendChild(accessoryReaderRow(payload));
     },
     renderUnavailable(error) {
       list.replaceChildren(statusRow("Backend", `Unavailable: ${describeError(error)}`, "warn"));
     },
   };
+}
+
+/**
+ * The NFC accessory reader. Three distinct states, because "not connected" and
+ * "this robot has no reader" call for very different reactions from the user.
+ */
+function accessoryReaderRow(payload) {
+  if (!payload.nfc_supported) {
+    return statusRow("Accessory reader", "Not installed on this robot");
+  }
+  if (!payload.nfc_connected) {
+    return statusRow("Accessory reader", "Not responding", "warn");
+  }
+  return statusRow(
+    "Accessory reader",
+    payload.nfc_port ? `Connected (${payload.nfc_port})` : "Connected",
+    "ok"
+  );
 }
 
 function statusRow(label, value, tone) {

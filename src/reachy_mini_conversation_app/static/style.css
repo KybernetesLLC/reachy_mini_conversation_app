@@ -1653,3 +1653,60 @@ button {
 .view-footnote a:hover {
   color: var(--accent);
 }
+
+/* Accessory badge in the app shell: same shape as the personality badge, with an
+   icon instead of an avatar. */
+.app-shell__accessory-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+}
+
+.app-shell__accessory-icon svg {
+  width: 30px;
+  height: 30px;
+}
+
+/* An accessory this robot can act on is worth noticing across the room. */
+.app-shell__accessory[data-state="known"] .app-shell__accessory-icon {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-soft));
+}
+
+.app-shell__accessory[data-state="blank"] .app-shell__accessory-icon {
+  border-style: dashed;
+}
+
+.app-shell__accessory[hidden] {
+  display: none;
+}
+
+.accessory-card__details {
+  display: grid;
+  gap: 4px;
+  margin: 10px 0 0;
+}
+
+.accessory-card__detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 0.86rem;
+}
+
+.accessory-card__detail dt {
+  min-width: 150px;
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.accessory-card__detail dd {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}

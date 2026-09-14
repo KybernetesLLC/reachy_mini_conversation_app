@@ -7,6 +7,11 @@ import {
   mountPersonalityBadge,
   showPersonalityBadge,
 } from "./personality-badge.js";
+import {
+  hideAccessoryBadge,
+  mountAccessoryBadge,
+  showAccessoryBadge,
+} from "./accessory-badge.js";
 import { $ } from "./ui.js";
 import { mountHomeView } from "./views/home.js";
 import { mountTalkView } from "./views/talk.js";
@@ -102,6 +107,11 @@ function boot() {
     personalityBadge.addEventListener("click", () => router.navigate(ROUTES.PERSONALITIES));
   }
 
+  const accessoryBadge = $('[data-action="open-accessory"]');
+  if (accessoryBadge) {
+    accessoryBadge.addEventListener("click", () => router.navigate(ROUTES.ACCESSORY));
+  }
+
   const back = $('[data-action="go-back"]');
   if (back) {
     back.addEventListener("click", () => {
@@ -121,6 +131,7 @@ function boot() {
   }
 
   mountPersonalityBadge(document);
+  mountAccessoryBadge(document);
 
   function syncHeaderForRoute(route = router.currentRoute() || ROUTES.TALK) {
     const routeName = route.split("?")[0];
@@ -151,8 +162,13 @@ function boot() {
       }
       back.setAttribute("aria-label", backLabel);
     }
-    if (routeName === ROUTES.TALK) showPersonalityBadge();
-    else hidePersonalityBadge();
+    if (routeName === ROUTES.TALK) {
+      showPersonalityBadge();
+      showAccessoryBadge();
+    } else {
+      hidePersonalityBadge();
+      hideAccessoryBadge();
+    }
   }
   router.start();
 }

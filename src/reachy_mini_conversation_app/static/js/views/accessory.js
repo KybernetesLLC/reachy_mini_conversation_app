@@ -131,8 +131,30 @@ export async function mountAccessoryView({ outlet, signal }) {
         accessory.personality
           ? h("span", { class: "accessory-card__name" }, prettifyProfileName(accessory.personality))
           : null,
-        h("span", { class: "settings-hint" }, copy.hint)
+        h("span", { class: "settings-hint" }, copy.hint),
+        tagDetails(accessory)
       )
+    );
+  }
+
+  /** What the tag literally holds. Useful when a tag is not recognized. */
+  function tagDetails(accessory) {
+    if (accessory.state === "none" || accessory.state === "blank") return null;
+    return h(
+      "dl",
+      { class: "accessory-card__details" },
+      detailRow("Personality", accessory.personality ? prettifyProfileName(accessory.personality) : "—"),
+      detailRow("Profile", accessory.personality || "—"),
+      detailRow("Written on the tag", accessory.content || "—")
+    );
+  }
+
+  function detailRow(label, value) {
+    return h(
+      "div",
+      { class: "accessory-card__detail" },
+      h("dt", null, label),
+      h("dd", null, value)
     );
   }
 

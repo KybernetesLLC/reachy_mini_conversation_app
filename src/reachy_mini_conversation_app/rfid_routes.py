@@ -3,7 +3,7 @@
 Each accessory carries a personality token (see :mod:`personality_tag`); placing
 one on the reader applies that personality, removing it reverts to the default.
 A blank accessory starts the "give it a personality" conversation, at the end of
-which :mod:`tools.nfc_writer` writes the new token onto it.
+which :mod:`tools.create_accessory_personality` writes the new token onto it.
 
 The serial link is owned by the Reachy Mini daemon; this app is an HTTP client
 of the daemon's ``/api/nfc`` endpoints.
@@ -31,7 +31,7 @@ from reachy_mini_conversation_app.personality_tag import (
     to_tag_token,
     from_tag_token,
 )
-from reachy_mini_conversation_app.tools.core_tools import set_nfc_writer_enabled
+from reachy_mini_conversation_app.tools.core_tools import set_accessory_personality_tool_available
 from reachy_mini_conversation_app.nfc_daemon_client import (
     NfcTagSnapshot,
     NfcDaemonClient,
@@ -110,6 +110,7 @@ class RfidController:
         self._inject_move_future: Any = None
         self._previous_tag: NfcTagSnapshot | None = None
         self._last_broadcast: dict[str, Any] | None = None
+        self._last_status: dict[str, Any] | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -152,19 +153,31 @@ class RfidController:
     def connection_status(self) -> dict[str, Any]:
         """Return the reader's connection state as the UI shows it.
 
-        Also keeps the nfc_writer tool in step with the reader: a reader plugged
-        in (or unplugged) mid-session changes which tools the next realtime
-        session offers.
+        Also keeps the accessory-personality tool in step with the reader: one
+        plugged in (or unplugged) mid-session changes which tools the next
+        realtime session offers.
         """
         status = self._client.get_status()
-        set_nfc_writer_enabled(bool(status.get("driver_available", False)))
-        return {
+        set_accessory_personality_tool_available(bool(status.get("driver_available", False)))
+        summary = {
             "connected": status.get("connected", False),
             "port": status.get("port"),
             "chip_detected": status.get("chip_detected", False),
             "driver_available": status.get("driver_available", False),
             "chip_version": status.get("chip_version"),
         }
+        self._last_status = summary
+        return summary
+
+    def last_status(self) -> dict[str, Any]:
+        """Return the most recent reader status without contacting the daemon.
+
+        The polling thread refreshes it continuously; callers on the request
+        path (conversation.status) must not block on an HTTP round trip.
+        """
+        if self._last_status is not None:
+            return dict(self._last_status)
+        return self.connection_status()
 
     def accessory_view(self, tag: NfcTagSnapshot | None) -> dict[str, Any]:
         """Describe, for the panel, the accessory currently on the reader.

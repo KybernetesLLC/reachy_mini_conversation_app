@@ -4,11 +4,20 @@
  * Robot stays live, tapping the orb only mutes or unmutes the user's mic.
  */
 
-import { applyPersonality, getMicState, listPersonalities, setMicMuted, subscribe } from "../api.js";
+import {
+  applyPersonality,
+  describeError,
+  getMicState,
+  linkRfidTag,
+  listPersonalities,
+  setMicMuted,
+  subscribe,
+} from "../api.js";
 import { ORB_STATES } from "../constants.js";
 import { createOrb, mapActivityToState } from "../orb.js";
 import { consumePendingApply } from "../pending-apply.js";
 import { setPersonality } from "../personality-badge.js";
+import { onAccessoryChange } from "../accessory-badge.js";
 import { h, prettifyProfileName } from "../ui.js";
 
 const CAPTION_BY_STATE = Object.freeze({
@@ -42,6 +51,17 @@ export async function mountTalkView({ outlet, signal }) {
   if (defaultAction) {
     defaultAction.hidden = true;
     defaultAction.addEventListener("click", onSetDefault);
+  }
+  const linkAction = document.querySelector('[data-component="link-accessory-action"]');
+  let accessoryState = { state: "none", personality: null };
+  let stopWatchingAccessory = null;
+  if (linkAction) {
+    linkAction.hidden = true;
+    linkAction.addEventListener("click", onLinkAccessory);
+    stopWatchingAccessory = onAccessoryChange((accessory) => {
+      accessoryState = accessory;
+      syncLinkAction();
+    });
   }
   const orb = createOrb({
     initialState: ORB_STATES.CONNECTING,
@@ -119,6 +139,39 @@ export async function mountTalkView({ outlet, signal }) {
       defaultAction.hidden = true;
       defaultAction.removeEventListener("click", onSetDefault);
     }
+    stopWatchingAccessory?.();
+    if (linkAction) {
+      linkAction.hidden = true;
+      linkAction.removeEventListener("click", onLinkAccessory);
+    }
+  }
+
+  /** Offer the shortcut only when an accessory is there and not already linked here. */
+  function syncLinkAction() {
+    if (!linkAction) return;
+    const onReader = accessoryState.state === "blank" || accessoryState.state === "unknown";
+    const linkedElsewhere =
+      accessoryState.state === "known" && accessoryState.personality !== activePersonality;
+    linkAction.hidden = !activePersonality || !(onReader || linkedElsewhere);
+    linkAction.textContent = linkedElsewhere ? "Relink to current personality" : "Link current personality";
+  }
+
+  async function onLinkAccessory() {
+    if (!linkAction || !activePersonality) return;
+    linkAction.disabled = true;
+    const label = prettifyProfileName(activePersonality);
+    caption.textContent = `Linking the accessory to "${label}"...`;
+    try {
+      const result = await linkRfidTag(activePersonality);
+      if (signal.aborted) return;
+      caption.textContent = result?.written
+        ? `Accessory linked to "${label}".`
+        : `This accessory already carries "${label}".`;
+    } catch (error) {
+      if (!signal.aborted) caption.textContent = `Could not link the accessory: ${describeError(error)}`;
+    } finally {
+      linkAction.disabled = false;
+    }
   }
 
   function restingState() {
@@ -155,6 +208,7 @@ export async function mountTalkView({ outlet, signal }) {
     if (defaultAction) {
       defaultAction.hidden = shouldHide;
     }
+    syncLinkAction();
   }
 
   async function onSetDefault() {

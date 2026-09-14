@@ -82,6 +82,34 @@
       >
         Set as default
       </button>
+      <button
+        type="button"
+        class="app-shell__personality app-shell__accessory"
+        data-component="accessory-badge"
+        data-action="open-accessory"
+        aria-label="Manage accessories"
+        hidden
+      >
+        <span class="app-shell__personality-avatar app-shell__accessory-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 13a8 8 0 0 1 16 0"/>
+            <rect x="2" y="13" width="20" height="6" rx="2"/>
+            <path d="M9 16h6"/>
+          </svg>
+        </span>
+        <span class="app-shell__personality-text">
+          <span class="app-shell__personality-label">Accessory</span>
+          <span class="app-shell__personality-name" data-role="accessory-name" aria-live="polite"></span>
+        </span>
+      </button>
+      <button
+        type="button"
+        class="app-shell__default-personality"
+        data-component="link-accessory-action"
+        hidden
+      >
+        Link current personality
+      </button>
     </div>
     <main id="view-outlet" class="app-shell__outlet" role="main"></main>
   </body>

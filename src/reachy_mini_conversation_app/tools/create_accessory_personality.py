@@ -28,8 +28,8 @@ def _queue_write_move(deps: ToolDependencies) -> None:
         logger.warning("_queue_write_move: failed to queue movement: %s", exc)
 
 
-# Authored tool defaults for a personality the robot creates for itself. nfc_writer
-# is deliberately absent: core_tools adds it to every profile while a reader is
+# Authored tool defaults for a personality the robot creates for itself. This tool
+# is deliberately absent: core_tools offers it to every profile while a reader is
 # attached, so listing it here would only pin a stale copy into the profile document.
 _DEFAULT_TOOLS = (
     "camera",
@@ -48,10 +48,10 @@ def _sanitize_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "", sanitized)
 
 
-class NfcWriter(Tool):
+class CreateAccessoryPersonality(Tool):
     """Create a new personality profile and write its NFC code to the blank tag on the reader."""
 
-    name = "nfc_writer"
+    name = "create_accessory_personality"
     description = (
         "Create a new personality profile from a name and a system-prompt, "
         "then write its unique code onto the accessory currently placed on the head. "
@@ -99,7 +99,7 @@ class NfcWriter(Tool):
         if not name_s:
             return {"error": f"Invalid personality name: {name!r}"}
 
-        logger.info("nfc_writer: creating profile %r voice=%r", name_s, voice)
+        logger.info("create_accessory_personality: creating profile %r voice=%r", name_s, voice)
 
         try:
             personality = save_user_personality(
@@ -110,7 +110,7 @@ class NfcWriter(Tool):
                 default_tools=_DEFAULT_TOOLS,
             )
         except Exception as exc:
-            logger.error("nfc_writer: failed to write profile: %s", exc)
+            logger.error("create_accessory_personality: failed to write profile: %s", exc)
             return {"error": f"Failed to write profile: {exc}"}
 
         # The tag carries the personality itself, so there is nothing to
@@ -118,9 +118,9 @@ class NfcWriter(Tool):
         # token, and the tag means the same thing on any robot.
         code = to_tag_token(personality)
         if code is None:
-            logger.error("nfc_writer: no tag token for personality %r", personality)
+            logger.error("create_accessory_personality: no tag token for personality %r", personality)
             return {"error": f"Cannot write personality {personality!r} to a tag"}
-        logger.info("nfc_writer: tag token %r for %r", code, personality)
+        logger.info("create_accessory_personality: tag token %r for %r", code, personality)
 
         # Check whether a blank tag is currently on the reader
         rfid_serial = deps.rfid_serial
@@ -132,10 +132,10 @@ class NfcWriter(Tool):
             deps.recently_written_codes.add(code)
             if rfid_serial is not None and rfid_serial.is_connected():
                 write_status = rfid_serial.write_tag(code)
-                logger.info("nfc_writer: write_tag(%r) → %s", code, write_status)
+                logger.info("create_accessory_personality: write_tag(%r) → %s", code, write_status)
             else:
                 write_status = "RFID reader not connected"
-                logger.warning("nfc_writer: %s", write_status)
+                logger.warning("create_accessory_personality: %s", write_status)
             return {
                 "status": "writing",
                 "personality": personality,
@@ -145,7 +145,9 @@ class NfcWriter(Tool):
         else:
             # No blank tag on reader — store pending write so console.py writes on next detection
             deps.pending_nfc_write = {"code": code, "personality": personality}
-            logger.info("nfc_writer: no blank tag present — stored pending write for %r", personality)
+            logger.info(
+                "create_accessory_personality: no blank tag present — stored pending write for %r", personality
+            )
             return {
                 "status": "waiting_for_tag",
                 "personality": personality,

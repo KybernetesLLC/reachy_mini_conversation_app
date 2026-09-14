@@ -483,6 +483,22 @@ class LocalStream:
         await self.request_backend_restart("personality_changed")
         return "Applied personality and restarting backend."
 
+    def _nfc_status(self) -> dict[str, object]:
+        """Summarise the NFC accessory reader for the settings panel.
+
+        Kept cheap: the polling thread already holds a fresh reading, so this
+        never waits on the daemon.
+        """
+        controller = self._rfid_controller
+        if controller is None:
+            return {"nfc_supported": False, "nfc_connected": False, "nfc_port": None}
+        status = controller.last_status()
+        return {
+            "nfc_supported": bool(status.get("driver_available")),
+            "nfc_connected": bool(status.get("connected")),
+            "nfc_port": status.get("port"),
+        }
+
     def _clear_persisted_voice_override(self) -> None:
         """Forget the persisted startup voice so the startup profile's own voice wins."""
         if not self._instance_path:
@@ -612,6 +628,7 @@ class LocalStream:
                 "can_proceed_with_hf": has_hf_connection,
                 "requires_restart": not self._can_rebuild_handler(),
                 **backend_connection,
+                **self._nfc_status(),
             }
 
         # GET / -> index.html
