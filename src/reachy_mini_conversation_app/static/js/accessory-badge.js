@@ -16,8 +16,12 @@ const LABEL_BY_STATE = Object.freeze({
 });
 
 let rootEl = null;
+let groupEl = null;
 let nameEl = null;
 let supported = false;
+// The row only exists on Talk; elsewhere the whole row is hidden, so the badge
+// must not re-show itself when a tag notification lands on another view.
+let onTalkView = false;
 let lastAccessory = { state: "none", personality: null };
 const listeners = new Set();
 
@@ -26,6 +30,7 @@ export function mountAccessoryBadge(headerRoot = document) {
   const next = headerRoot.querySelector('[data-component="accessory-badge"]');
   if (!next || rootEl === next) return;
   rootEl = next;
+  groupEl = next.closest('[data-component="accessory-group"]') || next;
   nameEl = next.querySelector('[data-role="accessory-name"]');
 
   subscribe("rfid.tag", (payload) => render(payload?.accessory));
@@ -61,17 +66,7 @@ function render(accessory) {
 }
 
 function refreshVisibility() {
-  if (rootEl) rootEl.hidden = !supported;
-}
-
-/** Whether this robot has an accessory reader at all. */
-export function hasAccessoryReader() {
-  return supported;
-}
-
-/** The accessory currently on the reader, as the badge last saw it. */
-export function currentAccessory() {
-  return lastAccessory;
+  if (groupEl) groupEl.hidden = !(supported && onTalkView);
 }
 
 /** Observe accessory changes. Returns an unsubscribe function. */
@@ -82,9 +77,11 @@ export function onAccessoryChange(listener) {
 }
 
 export function showAccessoryBadge() {
+  onTalkView = true;
   refreshVisibility();
 }
 
 export function hideAccessoryBadge() {
-  if (rootEl) rootEl.hidden = true;
+  onTalkView = false;
+  refreshVisibility();
 }

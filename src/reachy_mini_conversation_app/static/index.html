@@ -59,57 +59,60 @@
       </div>
     </header>
     <div class="app-shell__personality-row" data-component="personality-row" hidden>
-      <button
-        type="button"
-        class="app-shell__personality"
-        data-component="personality-badge"
-        data-action="open-personalities"
-        aria-label="Change personality"
-      >
-        <span class="app-shell__personality-avatar" aria-hidden="true">
-          <img src="/static/avatars/default.svg" alt="" draggable="false" />
-        </span>
-        <span class="app-shell__personality-text">
-          <span class="app-shell__personality-label">Personality</span>
-          <span class="app-shell__personality-name" aria-live="polite"></span>
-        </span>
-      </button>
-      <button
-        type="button"
-        class="app-shell__default-personality"
-        data-component="default-personality-action"
-        hidden
-      >
-        Set as default
-      </button>
-      <button
-        type="button"
-        class="app-shell__personality app-shell__accessory"
-        data-component="accessory-badge"
-        data-action="open-accessory"
-        aria-label="Manage accessories"
-        hidden
-      >
-        <span class="app-shell__personality-avatar app-shell__accessory-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M4 13a8 8 0 0 1 16 0"/>
-            <rect x="2" y="13" width="20" height="6" rx="2"/>
-            <path d="M9 16h6"/>
-          </svg>
-        </span>
-        <span class="app-shell__personality-text">
-          <span class="app-shell__personality-label">Accessory</span>
-          <span class="app-shell__personality-name" data-role="accessory-name" aria-live="polite"></span>
-        </span>
-      </button>
-      <button
-        type="button"
-        class="app-shell__default-personality"
-        data-component="link-accessory-action"
-        hidden
-      >
-        Link current personality
-      </button>
+      <div class="app-shell__badge-group">
+        <button
+          type="button"
+          class="app-shell__personality"
+          data-component="personality-badge"
+          data-action="open-personalities"
+          aria-label="Change personality"
+        >
+          <span class="app-shell__personality-avatar" aria-hidden="true">
+            <img src="/static/avatars/default.svg" alt="" draggable="false" />
+          </span>
+          <span class="app-shell__personality-text">
+            <span class="app-shell__personality-label">Personality</span>
+            <span class="app-shell__personality-name" aria-live="polite"></span>
+          </span>
+        </button>
+        <button
+          type="button"
+          class="app-shell__default-personality"
+          data-component="default-personality-action"
+          hidden
+        >
+          Set as default
+        </button>
+      </div>
+      <div class="app-shell__badge-group" data-component="accessory-group" hidden>
+        <button
+          type="button"
+          class="app-shell__personality app-shell__accessory"
+          data-component="accessory-badge"
+          data-action="open-accessory"
+          aria-label="Manage accessories"
+        >
+          <span class="app-shell__personality-avatar app-shell__accessory-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 13a8 8 0 0 1 16 0"/>
+              <rect x="2" y="13" width="20" height="6" rx="2"/>
+              <path d="M9 16h6"/>
+            </svg>
+          </span>
+          <span class="app-shell__personality-text">
+            <span class="app-shell__personality-label">Accessory</span>
+            <span class="app-shell__personality-name" data-role="accessory-name" aria-live="polite"></span>
+          </span>
+        </button>
+        <button
+          type="button"
+          class="app-shell__default-personality"
+          data-component="link-accessory-action"
+          hidden
+        >
+          Link current personality
+        </button>
+      </div>
     </div>
     <main id="view-outlet" class="app-shell__outlet" role="main"></main>
   </body>

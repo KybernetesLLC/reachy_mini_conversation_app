@@ -40,7 +40,7 @@ export async function mountAccessoryView({ outlet, signal }) {
     disabled: "disabled",
   });
   const linkButton = h("button", { type: "button", class: "btn btn--primary", disabled: "disabled" }, "Link accessory");
-  const eraseButton = h("button", { type: "button", class: "btn btn--ghost", disabled: "disabled" }, "Erase accessory");
+  const eraseButton = h("button", { type: "button", class: "btn btn--ghost", disabled: "disabled" }, "Unlink accessory");
   const status = h("p", { class: "settings-status", role: "status", "aria-live": "polite" });
 
   const view = h(
@@ -53,7 +53,7 @@ export async function mountAccessoryView({ outlet, signal }) {
       h(
         "p",
         { class: "view-subtitle" },
-        "Link a personality to an accessory. Reachy Mini wears it as long as the accessory stays on its head."
+        "See what the accessory on Reachy Mini's head carries, and choose the personality it should apply."
       )
     ),
     h(
@@ -70,7 +70,8 @@ export async function mountAccessoryView({ outlet, signal }) {
       h(
         "p",
         { class: "settings-hint settings-section-intro" },
-        "The accessory carries the personality itself, so it means the same thing on any Reachy Mini."
+        "The accessory carries the personality itself, so it means the same thing on any Reachy Mini. "
+          + "Unlinking leaves it blank, and Reachy Mini stops changing personality for it."
       ),
       h(
         "label",
@@ -225,9 +226,9 @@ export async function mountAccessoryView({ outlet, signal }) {
   eraseButton.addEventListener("click", async () => {
     if (busy || !canErase()) return;
     const confirmed = await confirmDialog({
-      title: "Erase this accessory?",
+      title: "Unlink this accessory?",
       message: "It will carry nothing afterwards, and Reachy Mini will stop changing personality for it.",
-      confirmLabel: "Erase",
+      confirmLabel: "Unlink",
       danger: true,
       signal,
     });
@@ -237,7 +238,7 @@ export async function mountAccessoryView({ outlet, signal }) {
     setBusy(true, "Erasing…");
     try {
       await eraseRfidTag(false);
-      status.textContent = "Accessory erased.";
+      status.textContent = "Accessory unlinked.";
       render(await getRfidStatus());
     } catch (error) {
       status.textContent = describeError(error);

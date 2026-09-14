@@ -177,11 +177,25 @@ button {
 .app-shell__personality-row {
   position: fixed;
   top: 90px;
+  right: 32px;
   left: 32px;
   z-index: 9;
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 14px 20px;
+}
+
+/* A badge and its action stay together when the row wraps. */
+.app-shell__badge-group {
+  display: inline-flex;
+  align-items: center;
   gap: 14px;
+  min-width: 0;
+}
+
+.app-shell__badge-group[hidden] {
+  display: none;
 }
 
 .app-shell__personality-row[hidden] {
@@ -1119,8 +1133,7 @@ button {
   .app-shell__personality-row {
     right: 20px;
     left: 20px;
-    flex-wrap: wrap;
-    gap: 10px;
+    gap: 10px 16px;
   }
 
   .app-shell__personality-name {
@@ -1639,20 +1652,6 @@ button {
   margin: 0;
 }
 
-.view-footnote {
-  margin: 18px 0 0;
-  text-align: center;
-  color: var(--text-muted);
-}
-
-.view-footnote a {
-  color: inherit;
-  text-underline-offset: 3px;
-}
-
-.view-footnote a:hover {
-  color: var(--accent);
-}
 
 /* Accessory badge in the app shell: same shape as the personality badge, with an
    icon instead of an avatar. */

@@ -4,7 +4,6 @@ import {
   applyPersonality,
   deletePersonality,
   describeError,
-  getRfidStatus,
   listPersonalities,
   listVoices,
   loadPersonality,
@@ -90,37 +89,6 @@ export async function mountHomeView({ outlet, signal, navigate }) {
   function availableVoices() {
     if (voicesPromise === null) voicesPromise = listVoices().catch(() => []);
     return voicesPromise;
-  }
-
-  void offerAccessoryLink();
-
-  /** Show the accessory shortcut only on robots that actually have a reader. */
-  async function offerAccessoryLink() {
-    let reader;
-    try {
-      reader = await getRfidStatus();
-    } catch {
-      return; // no NFC reader on this robot, or rfid.* never registered
-    }
-    if (signal.aborted || !reader?.driver_available) return;
-    view.insertBefore(
-      h(
-        "p",
-        { class: "view-footnote" },
-        h(
-          "a",
-          {
-            href: ROUTES.ACCESSORY,
-            onclick: (event) => {
-              event.preventDefault();
-              navigate(ROUTES.ACCESSORY);
-            },
-          },
-          "Link a personality to an accessory"
-        )
-      ),
-      status
-    );
   }
 
   function handleSelection(name) {
