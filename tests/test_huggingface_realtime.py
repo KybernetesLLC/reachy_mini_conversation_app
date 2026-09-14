@@ -886,3 +886,35 @@ async def test_run_session_response_lifecycle_toggles_done_event(monkeypatch: An
     assert handler._response_done_event.is_set()
     handler.deps.movement_manager.set_speaking.assert_any_call(True)
     handler.deps.movement_manager.set_speaking.assert_any_call(False)
+
+
+@pytest.mark.asyncio
+async def test_applying_a_personality_drops_the_manual_voice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A voice picked from Settings must not follow you into the next personality."""
+    handler = _plain_handler()
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Serena")
+    monkeypatch.setattr(hf_mod.core_tools, "initialize_tools", lambda **_kwargs: None)
+    handler._voice_override = "Dylan"
+
+    await handler.apply_personality("sorry_bro")
+
+    assert handler._voice_override is None
+    assert handler.get_current_voice() == "Serena"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_personality_apply_keeps_the_manual_voice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing changed, so the voice the user picked is still in effect."""
+    handler = _plain_handler()
+
+    def _boom(_instance_path: Any = None) -> str:
+        raise RuntimeError("profile unreadable")
+
+    monkeypatch.setattr(hf_mod, "get_session_instructions", _boom)
+    handler._voice_override = "Dylan"
+
+    status = await handler.apply_personality("sorry_bro")
+
+    assert "Failed to apply personality" in status
+    assert handler._voice_override == "Dylan"

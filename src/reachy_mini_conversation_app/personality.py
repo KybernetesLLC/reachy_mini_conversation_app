@@ -22,6 +22,7 @@ from reachy_mini_conversation_app.profile_store import (
     read_profile_from_directory,
     read_packaged_default_profile,
 )
+from reachy_mini_conversation_app.profile_voices import clear_profile_voice_override
 from reachy_mini_conversation_app.profile_toolsets import (
     read_profile_toolsets,
     write_profile_toolsets,
@@ -142,7 +143,10 @@ def save_user_personality(
 
     profile_directory = config.user_personalities_root() / profile_name
     selection = f"{USER_PERSONALITIES_DIRNAME}/{profile_name}"
-    selected_voice = voice or get_default_voice()
+    # None means the caller said nothing about the voice, so a new profile gets
+    # the backend default of the moment. An explicit "" is the UI's "no voice of
+    # its own": author none, and fall back to the default at every session.
+    selected_voice = get_default_voice() if voice is None else (voice.strip() or None)
     authored_tools = tuple(default_tools) if default_tools is not None else None
     with profile_toolsets_transaction():
         if profile_directory.exists() and not overwrite:
@@ -163,6 +167,8 @@ def save_user_personality(
 
         if authored_tools is not None:
             clear_profile_tool_override(selection, config.INSTANCE_PATH)
+        # The authored voice is now the source of truth for this profile.
+        clear_profile_voice_override(selection, config.INSTANCE_PATH)
 
         try:
             write_profile(

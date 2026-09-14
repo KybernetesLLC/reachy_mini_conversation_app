@@ -27,6 +27,7 @@ from reachy_mini_conversation_app.profile_store import (
     normalize_tool_names,
     canonical_profile_name,
 )
+from reachy_mini_conversation_app.profile_voices import read_profile_voice_override
 from reachy_mini_conversation_app.profile_toolsets import (
     read_profile_tool_override,
 )
@@ -67,6 +68,7 @@ class PersonalityOps:
         apply_personality: Callable[[str | None], Awaitable[str]] | None = None,
         get_voices: Callable[[], Awaitable[list[str]]] | None = None,
         get_current_voice: Callable[[], str] | None = None,
+        get_voice_override: Callable[[], str | None] | None = None,
         change_voice: Callable[[str], Awaitable[str]] | None = None,
     ) -> None:
         """Initialize operations with runtime callbacks."""
@@ -77,6 +79,7 @@ class PersonalityOps:
         self._apply_personality = apply_personality
         self._get_voices = get_voices
         self._get_current_voice = get_current_voice
+        self._get_voice_override = get_voice_override
         self._change_voice = change_voice
         self._startup_choice = self._configured_startup_choice()
 
@@ -108,6 +111,18 @@ class PersonalityOps:
         return canonical_profile_name(config.REACHY_MINI_CUSTOM_PROFILE)
 
     def _voice_override(self) -> str | None:
+        """Return the ad-hoc voice to persist for startup, if one is in effect.
+
+        Deliberately not the *effective* voice: persisting that would pin the
+        personality's own voice as a startup override and freeze later edits
+        to it.
+        """
+        if self._get_voice_override is not None:
+            try:
+                return self._get_voice_override()
+            except Exception as exc:
+                logger.warning("Failed to read the current voice override: %s", exc)
+                return None
         try:
             callback = self._get_current_voice or self._handler.get_current_voice
             return callback()
@@ -149,12 +164,13 @@ class PersonalityOps:
             logger.warning("Failed to load tools for profile %r: %s", name, exc)
             raise RouteError("profile_tools_unavailable", message=str(exc)) from exc
         enabled_tools = list(override) if override is not None else list(profile.default_tools)
+        effective_voice = read_profile_voice_override(name, config.INSTANCE_PATH) or profile.voice
         return {
             "instructions": profile.instructions,
             "greeting": profile.greeting or "",
             "tools_text": "".join(f"{tool_name}\n" for tool_name in enabled_tools),
-            "voice": profile.voice or get_default_voice(),
-            "uses_default_voice": profile.voice is None,
+            "voice": effective_voice or get_default_voice(),
+            "uses_default_voice": effective_voice is None,
             "available_tools": available_tools,
             "enabled_tools": enabled_tools,
         }
@@ -197,6 +213,8 @@ class PersonalityOps:
         instructions = str(payload.get("instructions", ""))
         if not instructions.strip():
             raise RouteError("invalid_instructions")
+        # "" is meaningful here — it clears the profile's voice — so it is passed
+        # through rather than collapsed to None, which means "caller said nothing".
         voice = str(payload["voice"]) if payload.get("voice") is not None else None
         greeting = str(payload["greeting"]) if payload.get("greeting") is not None else None
         has_tools_text = "tools_text" in payload
@@ -336,6 +354,7 @@ def build_personality_ops(
     apply_personality: Callable[[str | None], Awaitable[str]] | None = None,
     get_voices: Callable[[], Awaitable[list[str]]] | None = None,
     get_current_voice: Callable[[], str] | None = None,
+    get_voice_override: Callable[[], str | None] | None = None,
     change_voice: Callable[[str], Awaitable[str]] | None = None,
 ) -> PersonalityOps:
     """Build personality operations for a control transport."""
@@ -347,6 +366,7 @@ def build_personality_ops(
         apply_personality=apply_personality,
         get_voices=get_voices,
         get_current_voice=get_current_voice,
+        get_voice_override=get_voice_override,
         change_voice=change_voice,
     )
 

@@ -6,6 +6,7 @@ import {
   describeError,
   getRfidStatus,
   listPersonalities,
+  listVoices,
   loadPersonality,
   savePersonality,
   untilReady,
@@ -83,6 +84,14 @@ export async function mountHomeView({ outlet, signal, navigate }) {
     status.classList.add("is-warning");
   }
 
+  // Fetched once and shared by the create and edit modals; an unreachable
+  // backend just means the modal omits the voice picker.
+  let voicesPromise = null;
+  function availableVoices() {
+    if (voicesPromise === null) voicesPromise = listVoices().catch(() => []);
+    return voicesPromise;
+  }
+
   void offerAccessoryLink();
 
   /** Show the accessory shortcut only on robots that actually have a reader. */
@@ -133,6 +142,7 @@ export async function mountHomeView({ outlet, signal, navigate }) {
   async function handleCustomClick() {
     const created = await openProfileModal({
       mode: "create",
+      voices: await availableVoices(),
       signal,
     });
     if (!created || signal.aborted) return;
@@ -144,7 +154,7 @@ export async function mountHomeView({ outlet, signal, navigate }) {
         name: created.name,
         instructions: created.instructions,
         greeting: created.greeting || null,
-        voice: "", // falls back to backend default; user can change in Settings
+        voice: created.voice,
       });
       if (signal.aborted) return;
       newName = saveResult?.value || created.name;
@@ -178,7 +188,10 @@ export async function mountHomeView({ outlet, signal, navigate }) {
         name: stripUserPrefix(name),
         instructions: data?.instructions || "",
         greeting: data?.greeting || "",
+        voice: data?.voice || "",
+        usesDefaultVoice: data?.uses_default_voice !== false,
       },
+      voices: await availableVoices(),
       signal,
     });
     if (!edited || signal.aborted) return;
@@ -190,7 +203,7 @@ export async function mountHomeView({ outlet, signal, navigate }) {
         name: stripUserPrefix(name),
         instructions: edited.instructions,
         greeting: edited.greeting,
-        voice: data?.voice || "", // keep the profile's existing voice
+        voice: edited.voice,
         overwrite: true,
       });
     } catch (error) {

@@ -316,13 +316,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def apply_personality(self, profile: str | None) -> str:
         """Apply a personality to the active or next realtime connection."""
         previous_profile = config.REACHY_MINI_CUSTOM_PROFILE
+        previous_voice_override = self._voice_override
         set_custom_profile(profile)
+        # A voice picked from Settings applies to the personality it was picked
+        # for, not to every personality that follows: each one speaks with its
+        # own voice again as soon as it is applied.
+        self._voice_override = None
         try:
             instructions = get_session_instructions(self.instance_path)
             voice = self.get_current_voice()
             core_tools.initialize_tools(force=True)
         except Exception as exc:
             set_custom_profile(previous_profile)
+            self._voice_override = previous_voice_override
             logger.error("Failed to resolve personality %r: %s", profile, exc)
             return f"Failed to apply personality: {exc}"
 

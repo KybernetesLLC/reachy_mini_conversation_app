@@ -465,17 +465,35 @@ class LocalStream:
     async def apply_personality(self, profile: Optional[str]) -> str:
         """Apply a personality by updating config and restarting the active backend."""
         previous_profile = config.REACHY_MINI_CUSTOM_PROFILE
+        previous_voice_override = self._voice_override
         set_custom_profile(profile)
+        # Drop the ad-hoc voice so the rebuilt handler starts from the new
+        # personality's own voice rather than inheriting the previous pick.
+        self._voice_override = None
         try:
             get_session_instructions()
             get_session_voice(default=get_default_voice())
             initialize_tools(force=True)
         except Exception:
             set_custom_profile(previous_profile)
+            self._voice_override = previous_voice_override
             raise
 
+        self._clear_persisted_voice_override()
         await self.request_backend_restart("personality_changed")
         return "Applied personality and restarting backend."
+
+    def _clear_persisted_voice_override(self) -> None:
+        """Forget the persisted startup voice so the startup profile's own voice wins."""
+        if not self._instance_path:
+            return
+        try:
+            existing = read_startup_settings(self._instance_path)
+            if existing.voice is None:
+                return
+            write_startup_settings(self._instance_path, profile=existing.profile, voice=None)
+        except Exception as e:
+            logger.warning("Failed to clear the persisted startup voice: %s", e)
 
     async def get_available_voices(self) -> list[str]:
         """Return the voices available for the Hugging Face backend."""
@@ -688,6 +706,7 @@ class LocalStream:
                 apply_personality=self.apply_personality,
                 get_voices=self.get_available_voices,
                 get_current_voice=self.get_current_voice,
+                get_voice_override=lambda: self._voice_override,
                 change_voice=self.change_voice,
             )
             # personalities.* / voices.* over JSON-RPC — the local UI and remote

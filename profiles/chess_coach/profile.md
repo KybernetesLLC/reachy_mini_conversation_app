@@ -1,5 +1,6 @@
 +++
 schema_version = 1
+voice = "Eric"
 default_tools = [
   "dance",
   "stop_dance",

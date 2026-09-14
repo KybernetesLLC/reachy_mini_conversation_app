@@ -12,6 +12,7 @@ from reachy_mini_conversation_app.profile_store import (
     read_profile,
     read_packaged_default_profile,
 )
+from reachy_mini_conversation_app.profile_voices import read_profile_voice
 
 
 logger = logging.getLogger(__name__)
@@ -53,11 +54,15 @@ def get_session_instructions(instance_path: str | Path | None = None) -> str:
 
 
 def get_session_voice(default: str | None = None) -> str:
-    """Return the active profile voice or the backend default."""
+    """Return the active profile's effective voice, or the backend default.
+
+    The instance-local override wins over the voice the profile document
+    authors; see :mod:`profile_voices`.
+    """
     fallback = get_default_voice() if default is None else default
     try:
-        return _active_profile().voice or fallback
-    except (FileNotFoundError, ProfileFormatError) as exc:
+        return read_profile_voice(config.REACHY_MINI_CUSTOM_PROFILE, config.INSTANCE_PATH) or fallback
+    except (FileNotFoundError, ProfileFormatError, OSError, RuntimeError) as exc:
         logger.warning("Failed to load the active profile voice: %s", exc)
         return fallback
 

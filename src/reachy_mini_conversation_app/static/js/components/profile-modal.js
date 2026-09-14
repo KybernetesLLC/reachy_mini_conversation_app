@@ -7,12 +7,18 @@ const NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 /**
  * @param {{
  *   mode?: "create" | "edit",
- *   initial?: { name?: string, instructions?: string, greeting?: string },
+ *   initial?: {
+ *     name?: string, instructions?: string, greeting?: string,
+ *     voice?: string, usesDefaultVoice?: boolean,
+ *   },
+ *   voices?: string[],
  *   signal?: AbortSignal,
  * }} [options]
- * @returns {Promise<{ name: string, instructions: string, greeting: string }|null>}
+ * @returns {Promise<{
+ *   name: string, instructions: string, greeting: string, voice: string,
+ * }|null>}
  */
-export function openProfileModal({ mode = "create", initial = {}, signal } = {}) {
+export function openProfileModal({ mode = "create", initial = {}, voices = [], signal } = {}) {
   const isEdit = mode === "edit";
 
   return new Promise((resolve) => {
@@ -23,7 +29,7 @@ export function openProfileModal({ mode = "create", initial = {}, signal } = {})
 
     const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const overlay = buildOverlay();
-    const dialog = buildDialog({ isEdit, initial });
+    const dialog = buildDialog({ isEdit, initial, voices });
     overlay.appendChild(dialog);
     document.body.appendChild(overlay);
 
@@ -88,7 +94,7 @@ export function openProfileModal({ mode = "create", initial = {}, signal } = {})
     dialog.querySelector("[data-action='cancel']").addEventListener("click", () => close(null));
 
     const errorBox = dialog.querySelector(".modal__error");
-    dialog.querySelectorAll("input, textarea").forEach((field) => {
+    dialog.querySelectorAll("input, textarea, select").forEach((field) => {
       field.addEventListener("input", () => errorBox.classList.remove("is-visible"));
     });
 
@@ -99,6 +105,8 @@ export function openProfileModal({ mode = "create", initial = {}, signal } = {})
       const name = isEdit ? String(initial.name || "") : String(formData.get("name") || "").trim();
       const instructions = String(formData.get("instructions") || "").trim();
       const greeting = String(formData.get("greeting") || "").trim();
+      // "" means "use the backend default" and clears any voice this profile had.
+      const voice = String(formData.get("voice") || "").trim();
 
       if (!isEdit) {
         if (!name) return showError(errorBox, "Please pick a name.");
@@ -108,7 +116,7 @@ export function openProfileModal({ mode = "create", initial = {}, signal } = {})
       }
       if (!instructions) return showError(errorBox, "Please write some instructions.");
 
-      close({ name, instructions, greeting });
+      close({ name, instructions, greeting, voice });
     });
   });
 }
@@ -120,7 +128,7 @@ function buildOverlay() {
   });
 }
 
-function buildDialog({ isEdit, initial }) {
+function buildDialog({ isEdit, initial, voices = [] }) {
   return h(
     "div",
     {
@@ -195,6 +203,7 @@ function buildDialog({ isEdit, initial }) {
           initial.greeting || ""
         )
       ),
+      buildVoiceField({ initial, voices }),
       h("p", { class: "modal__error", role: "alert", "aria-live": "polite" }),
       h(
         "div",
@@ -202,6 +211,30 @@ function buildDialog({ isEdit, initial }) {
         h("button", { type: "button", class: "btn btn--ghost", "data-action": "cancel" }, "Cancel"),
         h("button", { type: "submit", class: "btn btn--primary" }, isEdit ? "Save changes" : "Create & start")
       )
+    )
+  );
+}
+
+/** Voice picker. Omitted when the backend gave us no voices to choose from. */
+function buildVoiceField({ initial, voices }) {
+  if (!voices.length) return null;
+  const selected = initial.usesDefaultVoice ? "" : initial.voice || "";
+  return h(
+    "label",
+    { class: "modal__field" },
+    h("span", { class: "modal__label" }, "Voice"),
+    h(
+      "select",
+      { name: "voice", class: "modal__input" },
+      h("option", { value: "", selected: selected === "" ? "selected" : null }, "Default voice"),
+      ...voices.map((voice) =>
+        h("option", { value: voice, selected: voice === selected ? "selected" : null }, voice)
+      )
+    ),
+    h(
+      "span",
+      { class: "modal__hint" },
+      "Reachy Mini speaks with this voice whenever this personality is active."
     )
   );
 }

@@ -2,6 +2,7 @@ import re
 import logging
 from typing import Any, Dict
 
+from reachy_mini_conversation_app.config import get_default_voice, get_available_voices
 from reachy_mini_conversation_app.personality import save_user_personality
 from reachy_mini_conversation_app.personality_tag import to_tag_token
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
@@ -76,8 +77,10 @@ class NfcWriter(Tool):
             },
             "voice": {
                 "type": "string",
-                "description": "TTS voice to use for this personality. Default: cedar.",
-                "enum": ["cedar", "sage", "amber", "ash", "ballad", "coral", "echo", "shimmer", "verse"],
+                "description": "TTS voice to use for this personality.",
+                # Read from the backend rather than hardcoded: a stale list would
+                # be silently rejected and every new personality would sound alike.
+                "enum": get_available_voices(),
             },
         },
         "required": ["name", "instructions"],
@@ -87,7 +90,7 @@ class NfcWriter(Tool):
         """Save the personality, then write its token to the accessory on the reader."""
         name = (kwargs.get("name") or "").strip()
         instructions = (kwargs.get("instructions") or "").strip()
-        voice = (kwargs.get("voice") or "cedar").strip() or "cedar"
+        voice = (kwargs.get("voice") or "").strip() or get_default_voice()
 
         if not name or not instructions:
             return {"error": "name and instructions are required"}
