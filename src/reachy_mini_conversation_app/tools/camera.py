@@ -1,33 +1,42 @@
 import base64
-import asyncio
 import logging
 from typing import Any, Dict
 
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
-from reachy_mini_conversation_app.camera_frame_encoding import encode_bgr_frame_as_jpeg
 
 
 logger = logging.getLogger(__name__)
 
 
 class Camera(Tool):
-    """Take a picture with the camera and ask a question about it."""
+    """Take a picture with the camera to see what is in front of the robot."""
 
     name = "camera"
-    description = "Take a picture with the camera and ask a question about it."
+    description = (
+        "Take a picture with the camera to see what is in front of the robot. "
+        "Use this when the user asks you to look at something, see what they are holding, "
+        "check their appearance, describe the scene, or comment on how they look. "
+        "Also use it when the user asks what you can see or wants your visual opinion. "
+        "The camera is live, each call captures the current moment. "
+        "If the user asks you to look without saying at what, do not ask for clarification, call this tool and describe what you see. "
+    )
     parameters_schema = {
         "type": "object",
         "properties": {
             "question": {
                 "type": "string",
-                "description": "The question to ask about the picture",
+                "description": (
+                    "What to observe or ask about in the picture. "
+                    "Examples: what is the user holding, describe the user's outfit, "
+                    "what do you see around you, how does the user look today."
+                ),
             },
         },
         "required": ["question"],
     }
 
     async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> Dict[str, Any]:
-        """Take a picture with the camera and ask a question about it."""
+        """Take a picture with the camera and return the base64-encoded JPEG."""
         question = (kwargs.get("question") or "").strip()
         if not question:
             logger.warning("camera: empty question")
@@ -35,26 +44,13 @@ class Camera(Tool):
 
         logger.info("Tool call: camera question=%s", question[:120])
 
-        if deps.camera_worker is not None:
-            frame = deps.camera_worker.get_latest_frame()
-            if frame is None:
-                logger.error("No frame available from camera worker")
-                return {"error": "No frame available"}
-        else:
-            logger.error("Camera worker not available")
-            return {"error": "Camera worker not available"}
+        if not deps.camera_enabled:
+            logger.error("Camera is disabled")
+            return {"error": "Camera is disabled"}
 
-        if deps.vision_processor is not None:
-            vision_result = await asyncio.to_thread(
-                deps.vision_processor.process_image,
-                frame,
-                question,
-            )
-            return (
-                {"image_description": vision_result}
-                if isinstance(vision_result, str)
-                else {"error": "vision returned non-string"}
-            )
+        jpeg_bytes = deps.reachy_mini.media.get_frame_jpeg()
+        if jpeg_bytes is None:
+            logger.error("No frame available from camera")
+            return {"error": "No frame available"}
 
-        jpeg_bytes = encode_bgr_frame_as_jpeg(frame)
         return {"b64_im": base64.b64encode(jpeg_bytes).decode("utf-8")}

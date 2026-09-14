@@ -14,14 +14,14 @@ branch on them; :func:`describe_write_error` turns one into a line for a user.
 """
 
 from __future__ import annotations
-
-import logging
 import queue
+import logging
 import threading
+from typing import Any, Optional
 from dataclasses import dataclass
-from typing import Optional
 
 import requests
+
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +62,11 @@ class NfcTagSnapshot:
 
     present: bool
     uid: Optional[str]
-    content: Optional[str]   # text content; None if blank or no tag
-    blank: bool               # tag present but no content written
-    writable: bool = False    # identified, formatted and not locked
-    model: Optional[str] = None      # "NTAG215", ...
-    capacity: Optional[int] = None   # bytes of NDEF the tag declares
+    content: Optional[str]  # text content; None if blank or no tag
+    blank: bool  # tag present but no content written
+    writable: bool = False  # identified, formatted and not locked
+    model: Optional[str] = None  # "NTAG215", ...
+    capacity: Optional[int] = None  # bytes of NDEF the tag declares
 
 
 class NfcDaemonClient:
@@ -81,9 +81,8 @@ class NfcDaemonClient:
         client.write_tag("HELLO")           # non-blocking; result via drain_write_results()
     """
 
-    def __init__(
-        self, base_url: str = "http://localhost:8000", timeout: float = 5.0
-    ) -> None:
+    def __init__(self, base_url: str = "http://localhost:8000", timeout: float = 5.0) -> None:
+        """Build a client for the daemon's NFC endpoints."""
         self.base = base_url.rstrip("/")
         self.timeout = timeout
         self._write_queue: queue.SimpleQueue[tuple[bool, str]] = queue.SimpleQueue()
@@ -111,7 +110,7 @@ class NfcDaemonClient:
 
     # -- Reader status ------------------------------------------------------------
 
-    def get_status(self) -> dict:
+    def get_status(self) -> dict[str, Any]:
         """Return the daemon NFC reader status (never raises; returns disconnected on error).
 
         Mirrors the daemon's ``NfcStatus``: ``connected``, ``chip_detected``,
@@ -120,7 +119,8 @@ class NfcDaemonClient:
         try:
             r = requests.get(f"{self.base}/api/nfc/status", timeout=self.timeout)
             r.raise_for_status()
-            return r.json()
+            status: dict[str, Any] = r.json()
+            return status
         except Exception as exc:
             logger.debug("NFC get_status error: %s", exc)
             return {
@@ -186,9 +186,7 @@ class NfcDaemonClient:
 
         def _worker() -> None:
             success, result = self._post_write(text, max(self.timeout, 12.0))
-            self._write_queue.put(
-                (True, "WRITE_OK") if success else (False, f"WRITE_FAIL:{result}")
-            )
+            self._write_queue.put((True, "WRITE_OK") if success else (False, f"WRITE_FAIL:{result}"))
 
         threading.Thread(target=_worker, daemon=True).start()
         return f"Bring a tag close to write '{text}'…"

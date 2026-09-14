@@ -1,0 +1,155 @@
+name: Allure Report
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: allure-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  allure:
+    name: allure
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pages: write # Publishes the Pages artifact.
+      id-token: write # Attests the Pages deployment.
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      HF_HUB_ETAG_TIMEOUT: "120"
+      HF_HUB_DOWNLOAD_TIMEOUT: "120"
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libcairo2-dev \
+            libgirepository1.0-dev \
+            gir1.2-gst-plugins-base-1.0
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          lfs: true
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          python-version: 3.12
+          enable-cache: true
+
+      - name: Set HF_HOME
+        run: |
+          echo "HF_HOME=${RUNNER_TEMP}/.hf" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/.hf"
+
+      - name: Cache Hugging Face hub
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/.hf
+          key: hf-${{ runner.os }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+          restore-keys: hf-${{ runner.os }}-
+
+      - name: Install the project
+        run: uv sync --frozen --all-extras --group dev
+
+      - name: Create test .env
+        run: printf "OPENAI_API_KEY=test-dummy\n" > .env
+
+      - name: Prefetch HF dataset
+        run: |
+          .venv/bin/python -c "
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              repo_id='pollen-robotics/reachy-mini-emotions-library',
+              repo_type='dataset',
+              etag_timeout=120,
+              max_workers=4,
+          )
+          "
+
+      - name: Run tests (Allure results)
+        id: tests
+        continue-on-error: true
+        run: uv run --no-sync pytest --tb=short --alluredir=allure-results --cov=reachy_mini_conversation_app --cov-report=json:coverage.json --cov-report=html
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        if: always()
+        with:
+          node-version: 24
+
+      - name: Install pinned Allure Report 3
+        if: always()
+        # Keep the report tooling self-contained in this workflow; top-level versions remain exact.
+        run: npm install --no-save --package-lock=false --ignore-scripts --no-audit --no-fund allure@3.14.3 @allurereport/plugin-awesome@3.14.3 # zizmor: ignore[adhoc-packages]
+
+      - name: Get previous Allure history
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p history
+          curl --fail --silent --show-error --location \
+            --output history/history.jsonl \
+            https://pollen-robotics.github.io/reachy_mini_conversation_app/history/history.jsonl
+
+      # Allure Report 3 (the `allure` npm package + awesome plugin). Pure Node,
+      # no Java needed. Produces the modern "awesome" UI and a root summary.json.
+      - name: Generate Allure report
+        if: always()
+        run: npx --no-install allure generate allure-results
+
+      # Fold pytest-cov's total into the published summary.json so the status
+      # page can show a coverage % alongside the test donut (one URL to fetch).
+      - name: Add coverage to summary.json
+        if: always()
+        run: |
+          if [ -f coverage.json ] && [ -f allure-report/summary.json ]; then
+            cov=$(jq '.totals.percent_covered | round' coverage.json)
+            jq --argjson cov "$cov" '. + {coverage: $cov}' allure-report/summary.json > summary.tmp
+            mv summary.tmp allure-report/summary.json
+          fi
+
+      # Drop pytest-cov's HTML report into the published dir (browsable at
+      # <pages>/coverage/). After `allure generate` so it can't be clobbered.
+      - name: Bundle coverage HTML into report
+        if: always()
+        run: |
+          if [ -d htmlcov ]; then
+            mkdir -p allure-report/coverage
+            cp -r htmlcov/. allure-report/coverage/
+          fi
+
+      - name: Bundle history into report
+        if: always()
+        run: |
+          mkdir -p allure-report/history
+          if [ -f history/history.jsonl ]; then
+            cp history/history.jsonl allure-report/history/history.jsonl
+          fi
+
+      - name: Configure GitHub Pages
+        if: always()
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d  # v6.0.0
+
+      - name: Upload GitHub Pages artifact
+        if: always()
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
+        with:
+          path: allure-report
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        if: always()
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128  # v5.0.0
+
+      - name: Fail if tests failed
+        if: always() && steps.tests.outcome == 'failure'
+        run: exit 1

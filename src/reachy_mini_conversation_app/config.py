@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import logging
 from pathlib import Path
@@ -43,22 +44,8 @@ def _resolve_default_profiles_directory() -> Path:
 
 DEFAULT_PROFILES_DIRECTORY = _resolve_default_profiles_directory()
 
-# Full list of voices supported by the OpenAI Realtime / TTS API.
-# Source: https://developers.openai.com/api/docs/guides/text-to-speech/#voice-options
-# "marin" and "cedar" are recommended for gpt-realtime-2.
-AVAILABLE_VOICES: list[str] = [
-    "alloy",
-    "ash",
-    "ballad",
-    "cedar",
-    "coral",
-    "echo",
-    "marin",
-    "sage",
-    "shimmer",
-    "verse",
-]
-OPENAI_DEFAULT_VOICE = "cedar"
+USER_PERSONALITIES_DIRNAME = "user_personalities"
+TERMINAL_USER_PERSONALITIES_DIRECTORY = Path("external_content") / USER_PERSONALITIES_DIRNAME
 
 # Qwen3-TTS CustomVoice speaker catalog from the deployed Hugging Face backend.
 HF_AVAILABLE_VOICES: list[str] = [
@@ -73,22 +60,7 @@ HF_AVAILABLE_VOICES: list[str] = [
     "Vivian",
 ]
 
-# Voices supported by the Gemini Live API
-GEMINI_AVAILABLE_VOICES: list[str] = [
-    "Aoede",
-    "Charon",
-    "Fenrir",
-    "Kore",
-    "Leda",
-    "Orus",
-    "Puck",
-    "Zephyr",
-]
-
-OPENAI_BACKEND = "openai"
-GEMINI_BACKEND = "gemini"
 HF_BACKEND = "huggingface"
-DEFAULT_BACKEND_PROVIDER = HF_BACKEND
 HF_REALTIME_CONNECTION_MODE_ENV = "HF_REALTIME_CONNECTION_MODE"
 HF_REALTIME_WS_URL_ENV = "HF_REALTIME_WS_URL"
 REALTIME_TRANSCRIPTION_LANGUAGE_ENV = "REALTIME_TRANSCRIPTION_LANGUAGE"
@@ -108,72 +80,25 @@ class HFBackendDefaults:
     # with HF_REALTIME_WS_URL.
     session_url: str = HF_REALTIME_SESSION_PROXY_URL
     voice: str = "Aiden"
-    model_name: str = ""
     direct_port: int = 8765
 
 
 HF_DEFAULTS = HFBackendDefaults()
-DEFAULT_MODEL_NAME_BY_BACKEND = {
-    OPENAI_BACKEND: "gpt-realtime-2",
-    GEMINI_BACKEND: "gemini-3.1-flash-live-preview",
-    HF_BACKEND: HF_DEFAULTS.model_name,
-}
-BACKEND_LABEL_BY_PROVIDER = {
-    OPENAI_BACKEND: "OpenAI Realtime",
-    GEMINI_BACKEND: "Gemini Live",
-    HF_BACKEND: "Hugging Face",
-}
-DEFAULT_VOICE_BY_BACKEND = {
-    OPENAI_BACKEND: OPENAI_DEFAULT_VOICE,
-    GEMINI_BACKEND: "Kore",
-    HF_BACKEND: HF_DEFAULTS.voice,
-}
 
 logger = logging.getLogger(__name__)
 
-
-def _is_gemini_model_name(model_name: str | None) -> bool:
-    """Return True when the provided model name targets Gemini."""
-    candidate = (model_name or "").strip().lower()
-    return candidate.startswith("gemini")
+# Removed backend selectors kept in stale robot .env files: warn but ignore them.
+_OBSOLETE_BACKEND_ENV_NAMES = ("BACKEND_PROVIDER", "MODEL_NAME")
 
 
-def _normalize_backend_provider(
-    backend_provider: str | None = None,
-    model_name: str | None = None,
-) -> str:
-    """Normalize the configured backend provider."""
-    candidate = (backend_provider or "").strip().lower()
-    if candidate in DEFAULT_MODEL_NAME_BY_BACKEND:
-        return candidate
-    if candidate:
-        expected = ", ".join(sorted(DEFAULT_MODEL_NAME_BY_BACKEND))
-        raise ValueError(f"Invalid BACKEND_PROVIDER={backend_provider!r}. Expected one of: {expected}.")
-    return GEMINI_BACKEND if _is_gemini_model_name(model_name) else DEFAULT_BACKEND_PROVIDER
-
-
-def _resolve_model_name(
-    backend_provider: str | None = None,
-    model_name: str | None = None,
-) -> str:
-    """Return a model name that matches the selected backend provider."""
-    normalized_backend = _normalize_backend_provider(backend_provider, model_name)
-    if normalized_backend == HF_BACKEND:
-        return DEFAULT_MODEL_NAME_BY_BACKEND[HF_BACKEND]
-
-    candidate = (model_name or "").strip()
-    if candidate:
-        if normalized_backend == GEMINI_BACKEND and _is_gemini_model_name(candidate):
-            return candidate
-        if normalized_backend != GEMINI_BACKEND and not _is_gemini_model_name(candidate):
-            return candidate
+def _warn_on_obsolete_backend_env() -> None:
+    """Warn when removed multi-backend selectors are still set; Hugging Face is the only backend."""
+    present = [name for name in _OBSOLETE_BACKEND_ENV_NAMES if (os.getenv(name) or "").strip()]
+    if present:
         logger.warning(
-            "MODEL_NAME=%r does not match BACKEND_PROVIDER=%r, using default %r",
-            candidate,
-            normalized_backend,
-            DEFAULT_MODEL_NAME_BY_BACKEND[normalized_backend],
+            "Ignoring obsolete backend environment variable(s): %s. This app now uses the Hugging Face backend only.",
+            ", ".join(present),
         )
-    return DEFAULT_MODEL_NAME_BY_BACKEND[normalized_backend]
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -194,6 +119,23 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
     logger.warning("Invalid boolean value for %s=%r, using default=%s", name, raw, default)
     return default
+
+
+APP_TIMEOUT_MINUTES_ENV = "REACHY_MINI_APP_TIMEOUT_MINUTES"
+DEFAULT_APP_TIMEOUT_MINUTES = 1440.0
+
+
+def resolve_app_timeout_minutes() -> float | None:
+    """Read the app inactivity timeout (minutes) from the environment; None means disabled."""
+    raw_value = os.getenv(APP_TIMEOUT_MINUTES_ENV, "").strip()
+    if not raw_value:
+        return DEFAULT_APP_TIMEOUT_MINUTES
+    try:
+        timeout_minutes = float(raw_value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using default.", APP_TIMEOUT_MINUTES_ENV, raw_value)
+        return DEFAULT_APP_TIMEOUT_MINUTES
+    return timeout_minutes if timeout_minutes > 0 else None
 
 
 def _normalize_hf_connection_mode(value: str | None) -> str | None:
@@ -289,18 +231,30 @@ def build_hf_direct_ws_url(host: str, port: int) -> str:
 
 
 def _collect_profile_names(profiles_root: Path) -> set[str]:
-    """Return profile folder names from a profiles root directory."""
+    """Return declarative profile names from a profiles root directory."""
     if not profiles_root.exists() or not profiles_root.is_dir():
         return set()
-    return {p.name for p in profiles_root.iterdir() if p.is_dir()}
+    return {path.name for path in profiles_root.iterdir() if path.is_dir() and (path / "profile.md").is_file()}
 
 
-def _collect_tool_module_names(tools_root: Path) -> set[str]:
-    """Return tool module names from a tools directory."""
-    if not tools_root.exists() or not tools_root.is_dir():
-        return set()
+def list_tool_module_names(tools_root: Path | None) -> list[str]:
+    """Return valid importable tool module names from a directory."""
+    if tools_root is None or not tools_root.is_dir():
+        return []
+
     ignored = {"__init__", "core_tools"}
-    return {p.stem for p in tools_root.glob("*.py") if p.is_file() and p.stem not in ignored}
+    tool_names: list[str] = []
+    try:
+        for tool_file in tools_root.glob("*.py"):
+            if not tool_file.is_file() or tool_file.stem in ignored or tool_file.name.startswith("_"):
+                continue
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tool_file.stem) is None:
+                logger.warning("Skipping tool module with invalid name: %s", tool_file)
+                continue
+            tool_names.append(tool_file.stem)
+    except OSError as exc:
+        logger.warning("Failed to list tool modules in %s: %s", tools_root, exc)
+    return sorted(tool_names)
 
 
 def _raise_on_name_collisions(
@@ -327,12 +281,12 @@ def _raise_on_name_collisions(
 if LOCKED_PROFILE is not None:
     _profiles_dir = DEFAULT_PROFILES_DIRECTORY
     _profile_path = _profiles_dir / LOCKED_PROFILE
-    _instructions_file = _profile_path / "instructions.txt"
+    _profile_file = _profile_path / "profile.md"
     if not _profile_path.is_dir():
         logger.critical("LOCKED_PROFILE %r does not exist in %s", LOCKED_PROFILE, _profiles_dir)
         sys.exit(1)
-    if not _instructions_file.is_file():
-        logger.critical("LOCKED_PROFILE %r has no instructions.txt", LOCKED_PROFILE)
+    if not _profile_file.is_file():
+        logger.critical("LOCKED_PROFILE %r has no profile definition", LOCKED_PROFILE)
         sys.exit(1)
 
 _skip_dotenv = _env_flag("REACHY_MINI_SKIP_DOTENV", default=False)
@@ -350,20 +304,12 @@ else:
     else:
         logger.warning("No .env file found, using environment variables")
 
+_warn_on_obsolete_backend_env()
+
 
 class Config:
     """Configuration class for the conversation app."""
 
-    # Required (one of these depending on BACKEND_PROVIDER)
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # The key is downloaded in console.py if needed
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-
-    # Optional
-    BACKEND_PROVIDER = _normalize_backend_provider(
-        os.getenv("BACKEND_PROVIDER"),
-        os.getenv("MODEL_NAME"),
-    )
-    MODEL_NAME = _resolve_model_name(BACKEND_PROVIDER, os.getenv("MODEL_NAME"))
     HF_REALTIME_CONNECTION_MODE = (
         _normalize_hf_connection_mode(os.getenv(HF_REALTIME_CONNECTION_MODE_ENV)) or HF_DEFAULTS.connection_mode
     )
@@ -371,24 +317,19 @@ class Config:
     HF_REALTIME_SESSION_URL = HF_DEFAULTS.session_url
     HF_REALTIME_WS_URL = os.getenv(HF_REALTIME_WS_URL_ENV)
     REALTIME_TRANSCRIPTION_LANGUAGE = _normalize_transcription_language(os.getenv(REALTIME_TRANSCRIPTION_LANGUAGE_ENV))
-    HF_HOME = os.getenv("HF_HOME", "./cache")
-    LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
     HF_TOKEN = os.getenv("HF_TOKEN")  # Optional, falls back to hf auth login if not set
 
     logger.debug(
-        "Backend provider: %s, Model: %s, HF mode: %s, HF session URL set: %s, HF direct URL set: %s, HF_HOME: %s, Vision Model: %s",
-        BACKEND_PROVIDER,
-        MODEL_NAME,
+        "HF mode: %s, HF session URL set: %s, HF direct URL set: %s",
         HF_REALTIME_CONNECTION_MODE,
         bool(HF_REALTIME_SESSION_URL and HF_REALTIME_SESSION_URL.strip()),
         bool(HF_REALTIME_WS_URL and HF_REALTIME_WS_URL.strip()),
-        HF_HOME,
-        LOCAL_VISION_MODEL,
     )
 
     # Filesystem root containing profile directories, not a Python import path.
     _profiles_directory_env = os.getenv("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY")
     PROFILES_DIRECTORY = Path(_profiles_directory_env) if _profiles_directory_env else DEFAULT_PROFILES_DIRECTORY
+    INSTANCE_PATH: Path | None = None  # set at startup; writable home for UI-created profiles
     _tools_directory_env = os.getenv("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
     TOOLS_DIRECTORY = Path(_tools_directory_env) if _tools_directory_env else None
     AUTOLOAD_EXTERNAL_TOOLS = _env_flag("AUTOLOAD_EXTERNAL_TOOLS", default=False)
@@ -398,9 +339,13 @@ class Config:
 
     def __init__(self) -> None:
         """Initialize the configuration."""
-        if self.REACHY_MINI_CUSTOM_PROFILE and self.PROFILES_DIRECTORY != DEFAULT_PROFILES_DIRECTORY:
+        if (
+            self.REACHY_MINI_CUSTOM_PROFILE
+            and self.REACHY_MINI_CUSTOM_PROFILE != "default"
+            and self.PROFILES_DIRECTORY != DEFAULT_PROFILES_DIRECTORY
+        ):
             selected_profile_path = self.PROFILES_DIRECTORY / self.REACHY_MINI_CUSTOM_PROFILE
-            if not selected_profile_path.is_dir():
+            if not (selected_profile_path / "profile.md").is_file():
                 available_profiles = sorted(_collect_profile_names(self.PROFILES_DIRECTORY))
                 raise RuntimeError(
                     "Config.__init__(): Selected profile "
@@ -424,8 +369,8 @@ class Config:
 
         if self.TOOLS_DIRECTORY is not None:
             builtin_tools_root = Path(__file__).parent / "tools"
-            external_tools = _collect_tool_module_names(self.TOOLS_DIRECTORY)
-            internal_tools = _collect_tool_module_names(builtin_tools_root)
+            external_tools = set(list_tool_module_names(self.TOOLS_DIRECTORY))
+            internal_tools = set(list_tool_module_names(builtin_tools_root))
             _raise_on_name_collisions(
                 label="tool",
                 external_root=self.TOOLS_DIRECTORY,
@@ -437,7 +382,7 @@ class Config:
         if self.PROFILES_DIRECTORY != DEFAULT_PROFILES_DIRECTORY:
             logger.warning(
                 "Environment variable 'REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY' is set. "
-                "Profiles (instructions.txt, ...) will be loaded from %s.",
+                "Profiles will be loaded from %s.",
                 self.PROFILES_DIRECTORY,
             )
         else:
@@ -455,19 +400,26 @@ class Config:
         else:
             logger.info("'REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY' is not set. Using built-in shared tools only.")
 
+    def user_personalities_root(self) -> Path:
+        """Return the writable root for user-created profiles."""
+        if self.INSTANCE_PATH is None:
+            return TERMINAL_USER_PERSONALITIES_DIRECTORY
+        return self.INSTANCE_PATH / USER_PERSONALITIES_DIRNAME
+
+    def resolve_profile_dir(self, profile: str) -> Path:
+        """On-disk directory for a profile selection."""
+        head, _, tail = profile.partition("/")
+        if head == USER_PERSONALITIES_DIRNAME and tail:
+            return self.user_personalities_root() / tail
+        return self.PROFILES_DIRECTORY / profile
+
 
 config = Config()
 
 
 def refresh_runtime_config_from_env() -> None:
     """Refresh mutable runtime config fields from the current environment."""
-    config.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    config.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    config.BACKEND_PROVIDER = _normalize_backend_provider(
-        os.getenv("BACKEND_PROVIDER"),
-        os.getenv("MODEL_NAME"),
-    )
-    config.MODEL_NAME = _resolve_model_name(config.BACKEND_PROVIDER, os.getenv("MODEL_NAME"))
+    _warn_on_obsolete_backend_env()
     config.HF_REALTIME_CONNECTION_MODE = (
         _normalize_hf_connection_mode(os.getenv(HF_REALTIME_CONNECTION_MODE_ENV)) or HF_DEFAULTS.connection_mode
     )
@@ -477,44 +429,18 @@ def refresh_runtime_config_from_env() -> None:
     config.REALTIME_TRANSCRIPTION_LANGUAGE = _normalize_transcription_language(
         os.getenv(REALTIME_TRANSCRIPTION_LANGUAGE_ENV)
     )
-    config.HF_HOME = os.getenv("HF_HOME", "./cache")
-    config.LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
     config.HF_TOKEN = os.getenv("HF_TOKEN")
     config.REACHY_MINI_CUSTOM_PROFILE = LOCKED_PROFILE or os.getenv("REACHY_MINI_CUSTOM_PROFILE")
 
 
-def get_backend_choice(model_name: str | None = None) -> str:
-    """Return the configured backend family."""
-    if model_name is not None:
-        return _normalize_backend_provider(model_name=model_name)
-    return _normalize_backend_provider(config.BACKEND_PROVIDER, config.MODEL_NAME)
+def get_available_voices() -> list[str]:
+    """Return the curated Hugging Face voice list."""
+    return list(HF_AVAILABLE_VOICES)
 
 
-def get_model_name_for_backend(backend: str) -> str:
-    """Return the default model name for a backend selector value."""
-    return DEFAULT_MODEL_NAME_BY_BACKEND[_normalize_backend_provider(backend)]
-
-
-def get_backend_label(backend: str | None = None) -> str:
-    """Return a human-readable label for a backend selector value."""
-    normalized_backend = get_backend_choice() if backend is None else _normalize_backend_provider(backend)
-    return BACKEND_LABEL_BY_PROVIDER[normalized_backend]
-
-
-def get_available_voices_for_backend(backend: str | None = None) -> list[str]:
-    """Return the curated voice list for a backend selector value."""
-    normalized_backend = get_backend_choice() if backend is None else _normalize_backend_provider(backend)
-    if normalized_backend == GEMINI_BACKEND:
-        return list(GEMINI_AVAILABLE_VOICES)
-    if normalized_backend == HF_BACKEND:
-        return list(HF_AVAILABLE_VOICES)
-    return list(AVAILABLE_VOICES)
-
-
-def get_default_voice_for_backend(backend: str | None = None) -> str:
-    """Return the default voice for a backend selector value."""
-    normalized_backend = get_backend_choice() if backend is None else _normalize_backend_provider(backend)
-    return DEFAULT_VOICE_BY_BACKEND[normalized_backend]
+def get_default_voice() -> str:
+    """Return the default Hugging Face voice."""
+    return HF_DEFAULTS.voice
 
 
 def get_hf_session_url() -> str | None:
@@ -552,28 +478,17 @@ def has_hf_realtime_target() -> bool:
     return get_hf_connection_selection().has_target
 
 
-def is_gemini_model() -> bool:
-    """Return True if the configured MODEL_NAME is a Gemini Live model."""
-    return get_backend_choice() == GEMINI_BACKEND
+def set_instance_path(instance_path: str | Path | None) -> None:
+    """Record the app instance dir so UI-created profiles persist outside package data."""
+    config.INSTANCE_PATH = Path(instance_path) if instance_path else None
 
 
 def set_custom_profile(profile: str | None) -> None:
-    """Update the selected custom profile at runtime and expose it via env.
-
-    This ensures modules that read `config` and code that inspects the
-    environment see a consistent value.
-    """
+    """Update the selected profile in runtime config and the environment."""
     if LOCKED_PROFILE is not None:
         return
-    try:
-        config.REACHY_MINI_CUSTOM_PROFILE = profile
-    except Exception as e:
-        logger.warning("Failed to update config profile: %s", e)
-    try:
-        if profile:
-            os.environ["REACHY_MINI_CUSTOM_PROFILE"] = profile
-        else:
-            # Remove to reflect default
-            os.environ.pop("REACHY_MINI_CUSTOM_PROFILE", None)
-    except Exception as e:
-        logger.warning("Failed to sync profile to environment: %s", e)
+    if profile:
+        os.environ["REACHY_MINI_CUSTOM_PROFILE"] = profile
+    else:
+        os.environ.pop("REACHY_MINI_CUSTOM_PROFILE", None)
+    config.REACHY_MINI_CUSTOM_PROFILE = profile

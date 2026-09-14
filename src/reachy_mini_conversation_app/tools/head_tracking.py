@@ -8,24 +8,28 @@ logger = logging.getLogger(__name__)
 
 
 class HeadTracking(Tool):
-    """Toggle head tracking state."""
+    """Enable or disable following the user's face with the head."""
 
     name = "head_tracking"
-    description = "Toggle head tracking state."
+    description = (
+        "Enable or disable following the user's face with the head. "
+        "Use when asked to follow, keep looking at, or stop following the user."
+    )
+    needs_response = False
     parameters_schema = {
         "type": "object",
-        "properties": {"start": {"type": "boolean"}},
-        "required": ["start"],
+        "properties": {
+            "enabled": {
+                "type": "boolean",
+                "description": "True to start following the user's face, false to stop.",
+            },
+        },
+        "required": ["enabled"],
     }
 
     async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> Dict[str, Any]:
-        """Enable or disable head tracking."""
-        enable = bool(kwargs.get("start"))
-
-        # Update camera worker head tracking state
-        if deps.camera_worker is not None:
-            deps.camera_worker.set_head_tracking_enabled(enable)
-
-        status = "started" if enable else "stopped"
-        logger.info("Tool call: head_tracking %s", status)
-        return {"status": f"head tracking {status}"}
+        """Toggle head tracking."""
+        enabled = bool(kwargs.get("enabled", True))
+        logger.info("Tool call: head_tracking enabled=%s", enabled)
+        deps.movement_manager.set_head_tracking(enabled)
+        return {"status": "following" if enabled else "stopped following"}

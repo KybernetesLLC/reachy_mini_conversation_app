@@ -22,8 +22,8 @@ write rather than burning a tag on a no-op.
 """
 
 from __future__ import annotations
-
 from typing import Optional
+
 
 BUILTIN_PREFIX = "hf_"
 USER_PREFIX = "usr_"
@@ -43,7 +43,7 @@ def to_tag_token(selection: str) -> Optional[str]:
     if not s or s == DEFAULT_SELECTION:
         return None
     if s.startswith(USER_DIR + "/"):
-        name = s[len(USER_DIR) + 1:].strip("/")
+        name = s[len(USER_DIR) + 1 :].strip("/")
         return f"{USER_PREFIX}{name}" if name else None
     return f"{BUILTIN_PREFIX}{s}"
 
@@ -58,10 +58,10 @@ def from_tag_token(token: str) -> Optional[str]:
     """
     t = (token or "").strip()
     if t.startswith(USER_PREFIX):
-        name = t[len(USER_PREFIX):]
+        name = t[len(USER_PREFIX) :]
         return f"{USER_DIR}/{name}" if name else None
     if t.startswith(BUILTIN_PREFIX):
-        name = t[len(BUILTIN_PREFIX):]
+        name = t[len(BUILTIN_PREFIX) :]
         return name or None
     return None
 

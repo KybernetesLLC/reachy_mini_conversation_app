@@ -4,9 +4,9 @@ import pytest
 
 from reachy_mini_conversation_app.personality_tag import (
     DEFAULT_SELECTION,
+    to_tag_token,
     from_tag_token,
     is_personality_token,
-    to_tag_token,
 )
 
 
@@ -19,6 +19,7 @@ from reachy_mini_conversation_app.personality_tag import (
     ],
 )
 def test_round_trip(selection, token):
+    """A selection encodes to its token and decodes back unchanged."""
     assert to_tag_token(selection) == token
     assert from_tag_token(token) == selection
 
@@ -44,8 +45,11 @@ def test_a_user_may_reuse_a_built_in_name():
 
 
 def test_the_default_selection_has_no_token():
-    """Writing "revert to default" onto a tag would be a no-op: removing the
-    tag already does that. Callers must refuse rather than burn a tag."""
+    """The default selection refuses to be written to a tag.
+
+    Writing "revert to default" onto a tag would be a no-op: removing the tag
+    already does that. Callers must refuse rather than burn a tag.
+    """
     assert to_tag_token(DEFAULT_SELECTION) is None
     assert to_tag_token("") is None
     assert to_tag_token("   ") is None
@@ -54,7 +58,7 @@ def test_the_default_selection_has_no_token():
 @pytest.mark.parametrize(
     "token",
     [
-        "976F33E2",   # an opaque code from the old mapping scheme
+        "976F33E2",  # an opaque code from the old mapping scheme
         "",
         "hello winnie",
         "hf_",

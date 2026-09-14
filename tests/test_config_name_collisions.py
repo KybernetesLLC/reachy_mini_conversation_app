@@ -3,13 +3,13 @@ from pathlib import Path
 import pytest
 
 import reachy_mini_conversation_app.config as config_mod
+from reachy_mini_conversation_app.profile_store import write_profile
 
 
 def test_config_raises_on_external_profile_name_collision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Config should fail fast when external/built-in profile names collide."""
     external_profiles = tmp_path / "external_profiles"
-    external_profiles.mkdir(parents=True)
-    (external_profiles / "default").mkdir()
+    write_profile("default", external_profiles / "default", "External default.", [])
 
     monkeypatch.setattr(config_mod.Config, "PROFILES_DIRECTORY", external_profiles)
     monkeypatch.setattr(config_mod.Config, "TOOLS_DIRECTORY", None)
@@ -23,8 +23,12 @@ def test_config_raises_on_external_profile_name_collision_with_builtin_alias(
 ) -> None:
     """Config should treat compact built-in profile names as reserved."""
     external_profiles = tmp_path / "external_profiles"
-    external_profiles.mkdir(parents=True)
-    (external_profiles / "mad_scientist_assistant").mkdir()
+    write_profile(
+        "mad_scientist_assistant",
+        external_profiles / "mad_scientist_assistant",
+        "External scientist.",
+        [],
+    )
 
     monkeypatch.setattr(config_mod.Config, "PROFILES_DIRECTORY", external_profiles)
     monkeypatch.setattr(config_mod.Config, "TOOLS_DIRECTORY", None)
@@ -61,24 +65,37 @@ def test_config_raises_when_selected_external_profile_is_missing(
         config_mod.Config()
 
 
-def test_backend_provider_defaults_to_hf_when_unset() -> None:
-    """Non-Gemini models should default to the Hugging Face backend."""
-    assert config_mod._normalize_backend_provider(None, None) == config_mod.HF_BACKEND
-    assert config_mod._normalize_backend_provider("", None) == config_mod.HF_BACKEND
-    assert config_mod._normalize_backend_provider(None, "gpt-realtime-2") == config_mod.HF_BACKEND
-    assert config_mod._normalize_backend_provider(None, "gemini-3.1-flash-live-preview") == config_mod.GEMINI_BACKEND
+def test_config_allows_packaged_default_with_external_profiles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The canonical default should not require an external profile copy."""
+    external_profiles = tmp_path / "external_profiles"
+    external_profiles.mkdir()
+
+    monkeypatch.setattr(config_mod.Config, "REACHY_MINI_CUSTOM_PROFILE", "default")
+    monkeypatch.setattr(config_mod.Config, "PROFILES_DIRECTORY", external_profiles)
+    monkeypatch.setattr(config_mod.Config, "TOOLS_DIRECTORY", None)
+
+    configured = config_mod.Config()
+
+    assert configured.REACHY_MINI_CUSTOM_PROFILE == "default"
+    assert not (external_profiles / "default").exists()
 
 
-def test_backend_provider_rejects_explicit_unknown_backend() -> None:
-    """An explicit backend typo should fail instead of falling through to the default backend."""
-    with pytest.raises(ValueError, match="Invalid BACKEND_PROVIDER='openia'"):
-        config_mod._normalize_backend_provider("openia", None)
+def test_obsolete_backend_env_is_ignored_with_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Stale multi-backend selectors should be ignored with a warning, not change behaviour."""
+    monkeypatch.setenv("BACKEND_PROVIDER", "openai")
+    monkeypatch.setenv("MODEL_NAME", "gpt-realtime-2")
 
+    with caplog.at_level("WARNING"):
+        config_mod.refresh_runtime_config_from_env()
 
-def test_huggingface_backend_does_not_resolve_model_name() -> None:
-    """Hugging Face should rely on the server's model selection."""
-    assert config_mod._resolve_model_name(config_mod.HF_BACKEND, None) == ""
-    assert config_mod._resolve_model_name(config_mod.HF_BACKEND, "gpt-realtime-2") == ""
+    assert "BACKEND_PROVIDER" in caplog.text
+    assert "MODEL_NAME" in caplog.text
+    assert "Hugging Face backend only" in caplog.text
 
 
 def test_hf_default_session_url_uses_stable_space_proxy() -> None:
@@ -90,18 +107,12 @@ def test_hf_default_session_url_uses_stable_space_proxy() -> None:
 def test_refresh_runtime_config_reloads_hf_runtime_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     """Instance-local .env reloads should update every env-backed Hugging Face runtime field."""
     monkeypatch.setenv("HF_TOKEN", "hf-runtime-token")
-    monkeypatch.setenv("HF_HOME", "/tmp/reachy-hf-cache")
-    monkeypatch.setenv("LOCAL_VISION_MODEL", "test/local-vision-model")
 
     monkeypatch.setattr(config_mod.config, "HF_TOKEN", None)
-    monkeypatch.setattr(config_mod.config, "HF_HOME", "./old-cache")
-    monkeypatch.setattr(config_mod.config, "LOCAL_VISION_MODEL", "old/model")
 
     config_mod.refresh_runtime_config_from_env()
 
     assert config_mod.config.HF_TOKEN == "hf-runtime-token"
-    assert config_mod.config.HF_HOME == "/tmp/reachy-hf-cache"
-    assert config_mod.config.LOCAL_VISION_MODEL == "test/local-vision-model"
 
 
 @pytest.mark.parametrize(

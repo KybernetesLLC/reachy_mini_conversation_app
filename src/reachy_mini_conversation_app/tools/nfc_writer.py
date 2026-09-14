@@ -1,12 +1,11 @@
+import re
 import logging
 from typing import Any, Dict
 
+from reachy_mini_conversation_app.personality import save_user_personality
+from reachy_mini_conversation_app.personality_tag import to_tag_token
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
-from reachy_mini_conversation_app.headless_personality import (
-    _sanitize_name,
-    _write_profile,
-)
-from reachy_mini_conversation_app.personality_tag import USER_DIR, to_tag_token
+
 
 logger = logging.getLogger(__name__)
 
@@ -18,25 +17,34 @@ def _queue_write_move(deps: ToolDependencies) -> None:
     if deps.movement_manager is None:
         return
     try:
-        from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
         from reachy_mini.motion.recorded_move import RecordedMoves
+        from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
+
         if _WRITE_MOVES is None:
             _WRITE_MOVES = RecordedMoves("glannuzel/local-dataset")
         deps.movement_manager.queue_move(EmotionQueueMove("write-tag-6", _WRITE_MOVES))
     except Exception as exc:
         logger.warning("_queue_write_move: failed to queue movement: %s", exc)
 
-_DEFAULT_TOOLS_TXT = """\
-# tools enabled for this profile
-camera
-dance
-head_tracking
-move_head
-play_emotion
-stop_dance
-stop_emotion
-nfc_writer
-"""
+
+# Authored tool defaults for a personality the robot creates for itself. nfc_writer
+# is deliberately absent: core_tools adds it to every profile while a reader is
+# attached, so listing it here would only pin a stale copy into the profile document.
+_DEFAULT_TOOLS = (
+    "camera",
+    "dance",
+    "head_tracking",
+    "move_head",
+    "play_emotion",
+    "stop_dance",
+    "stop_emotion",
+)
+
+
+def _sanitize_name(name: str) -> str:
+    """Coerce a model-supplied name into a valid profile folder name."""
+    sanitized = re.sub(r"\s+", "_", name.strip())
+    return re.sub(r"[^a-zA-Z0-9_-]", "", sanitized)
 
 
 class NfcWriter(Tool):
@@ -76,6 +84,7 @@ class NfcWriter(Tool):
     }
 
     async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> Dict[str, Any]:
+        """Save the personality, then write its token to the accessory on the reader."""
         name = (kwargs.get("name") or "").strip()
         instructions = (kwargs.get("instructions") or "").strip()
         voice = (kwargs.get("voice") or "cedar").strip() or "cedar"
@@ -90,12 +99,16 @@ class NfcWriter(Tool):
         logger.info("nfc_writer: creating profile %r voice=%r", name_s, voice)
 
         try:
-            _write_profile(name_s, instructions, _DEFAULT_TOOLS_TXT, voice)
+            personality = save_user_personality(
+                name_s,
+                instructions,
+                voice=voice,
+                overwrite=True,
+                default_tools=_DEFAULT_TOOLS,
+            )
         except Exception as exc:
             logger.error("nfc_writer: failed to write profile: %s", exc)
             return {"error": f"Failed to write profile: {exc}"}
-
-        personality = f"{USER_DIR}/{name_s}"
 
         # The tag carries the personality itself, so there is nothing to
         # allocate or remember: the same personality always yields the same
