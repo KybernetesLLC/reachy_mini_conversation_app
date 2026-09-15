@@ -153,7 +153,7 @@ export async function mountTalkView({ outlet, signal }) {
     const linkedElsewhere =
       accessoryState.state === "known" && accessoryState.personality !== activePersonality;
     linkAction.hidden = !activePersonality || !(onReader || linkedElsewhere);
-    linkAction.textContent = linkedElsewhere ? "Relink to current personality" : "Link current personality";
+    linkAction.textContent = linkedElsewhere ? "Relink personality" : "Link personality";
   }
 
   async function onLinkAccessory() {

@@ -177,25 +177,35 @@ button {
 .app-shell__personality-row {
   position: fixed;
   top: 90px;
-  right: 32px;
+  right: 24px;
   left: 32px;
   z-index: 9;
   display: flex;
   align-items: flex-start;
-  flex-wrap: wrap;
-  gap: 14px 28px;
+  justify-content: space-between;
+  flex-wrap: nowrap;
+  gap: 20px;
 }
 
-/* Each badge keeps a slot of its own, so Personality and Accessory sit at the
-   same spot whatever a profile is called and whether its action is showing.
+/* Personality pinned left, Accessory pinned right, never wrapping: the two are
+   always in the same spot, and a long name is cut rather than moving them.
    The badge's -8px bottom margin cancels its own padding, so the gap reads true. */
 .app-shell__badge-group {
   display: inline-flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 10px;
-  width: 320px;
+  max-width: 320px;
   min-width: 0;
+}
+
+.app-shell__badge-group[data-component="accessory-group"] {
+  align-items: flex-end;
+  text-align: right;
+}
+
+.app-shell__badge-group[data-component="accessory-group"] .app-shell__personality-text {
+  align-items: flex-end;
 }
 
 .app-shell__badge-group[hidden] {
@@ -243,10 +253,14 @@ button {
 }
 
 .app-shell__personality-label {
+  max-width: 100%;
+  overflow: hidden;
   font-size: 0.78rem;
   font-weight: 600;
   letter-spacing: 0.12em;
   text-transform: uppercase;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   color: var(--text-muted);
 }
 
@@ -258,7 +272,7 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 260px;
+  max-width: 100%;
 }
 
 /* Larger than the brand mark for presence outside the topbar. */
@@ -288,7 +302,10 @@ button {
 
 .app-shell__default-personality {
   min-height: 36px;
+  max-width: 100%;
   padding: 8px 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent);
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--accent) 16%, var(--bg-elev));
@@ -807,14 +824,16 @@ button {
 /* 6. Settings and tools views */
 
 .view--settings,
-.view--tools {
+.view--tools,
+.view--accessory {
   display: flex;
   flex-direction: column;
   gap: 24px;
 }
 
 .view--settings > .view-header,
-.view--tools > .view-header {
+.view--tools > .view-header,
+.view--accessory > .view-header {
   margin-bottom: 0;
 }
 
@@ -896,6 +915,10 @@ button {
 
 .settings-section-intro {
   margin-bottom: 14px;
+}
+
+.view--accessory .settings-actions {
+  margin-top: 14px;
 }
 
 .settings-toolset-summary {
@@ -1137,16 +1160,10 @@ button {
   .app-shell__personality-row {
     right: 20px;
     left: 20px;
-    gap: 12px 20px;
-  }
-
-  /* Too narrow for two slots: let each group take the width it needs. */
-  .app-shell__badge-group {
-    width: auto;
+    gap: 14px;
   }
 
   .app-shell__personality-name {
-    max-width: calc(100vw - 140px);
     font-size: 1.12rem;
   }
 
