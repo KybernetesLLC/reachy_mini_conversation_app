@@ -6,7 +6,7 @@
  * badge that could never say anything but "no reader" is just noise.
  */
 
-import { getRfidStatus, subscribe } from "./api.js";
+import { getRfidStatus, subscribe, untilReady } from "./api.js";
 import { prettifyProfileName } from "./ui.js";
 
 const LABEL_BY_STATE = Object.freeze({
@@ -24,6 +24,8 @@ let supported = false;
 let onTalkView = false;
 let lastAccessory = { state: "none", personality: null };
 const listeners = new Set();
+// The badge lives as long as the page, unlike a view that unmounts.
+const neverAborts = new AbortController().signal;
 
 /** Bind to the static markup and start tracking the reader. Safe to call twice. */
 export function mountAccessoryBadge(headerRoot = document) {
@@ -33,14 +35,22 @@ export function mountAccessoryBadge(headerRoot = document) {
   groupEl = next.closest('[data-component="accessory-group"]') || next;
   nameEl = next.querySelector('[data-role="accessory-name"]');
 
-  subscribe("rfid.tag", (payload) => render(payload?.accessory));
+  // The reader only ever broadcasts while it is being polled, which needs a
+  // driver, so a notification is proof enough on its own.
+  subscribe("rfid.tag", (payload) => {
+    supported = true;
+    render(payload?.accessory);
+  });
+
   void (async () => {
     try {
-      const status = await getRfidStatus();
+      // The desktop panel loads this page as the app starts, well before /rpc
+      // answers; without the retry the badge would stay hidden for the session.
+      const status = await untilReady(getRfidStatus, neverAborts);
       supported = Boolean(status?.driver_available);
       render(status?.accessory);
-    } catch {
-      // No reader on this robot, or rfid.* never registered: stay hidden.
+    } catch (error) {
+      console.warn("Accessory reader unavailable; hiding the badge:", error);
       supported = false;
       refreshVisibility();
     }

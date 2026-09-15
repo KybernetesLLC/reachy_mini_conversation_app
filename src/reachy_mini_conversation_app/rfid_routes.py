@@ -14,16 +14,16 @@ browser attached. Clients learn about tag changes from the ``rfid.tag``
 notification and drive writes through the ``rfid.*`` methods.
 """
 
-from __future__ import annotations
 import time
 import asyncio
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 from collections.abc import Callable
 
 from reachy_mini.io.jsonrpc import JsonRpcError
 from reachy_mini.apps.jsonrpc_server import JsonRpcServer
+from reachy_mini.motion.recorded_move import RecordedMoves
 from reachy_mini_conversation_app.config import LOCKED_PROFILE
 from reachy_mini_conversation_app.personality import list_personalities
 from reachy_mini_conversation_app.personality_tag import (
@@ -37,6 +37,7 @@ from reachy_mini_conversation_app.nfc_daemon_client import (
     NfcDaemonClient,
     describe_write_error,
 )
+from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
 
 
 if TYPE_CHECKING:
@@ -50,34 +51,24 @@ POLL_INTERVAL_S = 0.4
 # A tag briefly reading NO_TAG (a hand moving it, a marginal antenna position)
 # must not re-trigger the blank-tag conversation as soon as it reads again.
 BLANK_TAG_COOLDOWN_S = 3.0
+TRANSITION_MOVE_DATASET = "cdeplanne/local-dataset"
 TRANSITION_MOVE_NAME = "switch-personnality-5"
+WRITE_MOVE_DATASET = "glannuzel/local-dataset"
 WRITE_MOVE_NAME = "write-tag-6"
 # The sound is started slightly before the movement is queued so the two line up.
 WRITE_SOUND_LEAD_S = 0.15
 
 HandlerGetter = Callable[[], "HuggingFaceRealtimeHandler"]
-LoopGetter = Callable[[], Optional[asyncio.AbstractEventLoop]]
+LoopGetter = Callable[[], asyncio.AbstractEventLoop | None]
 
 
-def _load_recorded_moves() -> tuple[Any, Any, Any]:
-    """Return (EmotionQueueMove, transition_moves, write_moves), any of them None."""
+def _load_move_dataset(repo_id: str) -> RecordedMoves | None:
+    """Load a recorded-move dataset, or None when it cannot be fetched."""
     try:
-        from reachy_mini.motion.recorded_move import RecordedMoves
-        from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
-    except Exception as exc:
-        logger.warning("[RFID] recorded moves unavailable: %s", exc)
-        return None, None, None
-    transition_moves = None
-    write_moves = None
-    try:
-        transition_moves = RecordedMoves("cdeplanne/local-dataset")
-    except Exception as exc:
-        logger.warning("[RFID] transition move dataset unavailable: %s", exc)
-    try:
-        write_moves = RecordedMoves("glannuzel/local-dataset")
-    except Exception as exc:
-        logger.warning("[RFID] write move dataset unavailable: %s", exc)
-    return EmotionQueueMove, transition_moves, write_moves
+        return RecordedMoves(repo_id)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.warning("[RFID] move dataset %s unavailable: %s", repo_id, exc)
+        return None
 
 
 class RfidController:
@@ -97,7 +88,8 @@ class RfidController:
         self._robot = robot
         self._rpc = rpc
 
-        self._emotion_move_cls, self._transition_moves, self._write_moves = _load_recorded_moves()
+        self._transition_moves = _load_move_dataset(TRANSITION_MOVE_DATASET)
+        self._write_moves = _load_move_dataset(WRITE_MOVE_DATASET)
 
         self._apply_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -348,17 +340,14 @@ class RfidController:
                 logger.debug("[RFID] >>> unhandled event: %r", message)
         return applied
 
-    def _queue_move(self, handler: "HuggingFaceRealtimeHandler", moves: Any, name: str) -> Any:
-        """Queue a recorded emotion move, returning it (or None when unavailable)."""
-        if self._emotion_move_cls is None or moves is None:
-            return None
+    def _queue_move(self, handler: "HuggingFaceRealtimeHandler", moves: RecordedMoves | None, name: str) -> None:
+        """Queue a recorded emotion move, doing nothing when its dataset is missing."""
+        if moves is None:
+            return
         try:
-            move = self._emotion_move_cls(name, moves)
-            handler.deps.movement_manager.queue_move(move)
-            return move
-        except Exception as exc:
+            handler.deps.movement_manager.queue_move(EmotionQueueMove(name, moves))
+        except (KeyError, ValueError, RuntimeError) as exc:
             logger.warning("[RFID] >>> move %r failed: %s", name, exc)
-            return None
 
     def _run_on_loop(self, coroutine: Any, description: str, timeout: float = 10.0) -> bool:
         """Run a handler coroutine on the conversation loop and wait for it."""
@@ -557,12 +546,10 @@ class RfidController:
 
     def _play_write_move(self, handler: "HuggingFaceRealtimeHandler") -> float:
         """Start the write-tag sound and movement; return the movement duration."""
-        if self._emotion_move_cls is None or self._write_moves is None:
-            return 0.0
-        if handler.deps.movement_manager is None:
+        if self._write_moves is None or handler.deps.movement_manager is None:
             return 0.0
         try:
-            move = self._emotion_move_cls(WRITE_MOVE_NAME, self._write_moves)
+            move = EmotionQueueMove(WRITE_MOVE_NAME, self._write_moves)
             sound_path = getattr(getattr(move, "emotion_move", None), "sound_path", None)
             if sound_path is not None:
                 self._robot.media.play_sound(str(sound_path))
@@ -579,7 +566,7 @@ class RfidController:
             duration = float(move.duration)
             logger.info("[RFID] >>> %s queued (%.2fs), speech delayed", WRITE_MOVE_NAME, duration)
             return duration
-        except Exception as exc:
+        except (KeyError, ValueError, RuntimeError, OSError) as exc:
             logger.warning("[RFID] >>> %s move failed: %s", WRITE_MOVE_NAME, exc)
             return 0.0
 

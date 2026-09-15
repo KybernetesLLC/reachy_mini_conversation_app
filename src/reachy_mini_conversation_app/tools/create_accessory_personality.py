@@ -10,24 +10,6 @@ from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
 
 logger = logging.getLogger(__name__)
 
-_WRITE_MOVES = None
-
-
-def _queue_write_move(deps: ToolDependencies) -> None:
-    global _WRITE_MOVES
-    if deps.movement_manager is None:
-        return
-    try:
-        from reachy_mini.motion.recorded_move import RecordedMoves
-        from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
-
-        if _WRITE_MOVES is None:
-            _WRITE_MOVES = RecordedMoves("glannuzel/local-dataset")
-        deps.movement_manager.queue_move(EmotionQueueMove("write-tag-6", _WRITE_MOVES))
-    except Exception as exc:
-        logger.warning("_queue_write_move: failed to queue movement: %s", exc)
-
-
 # Authored tool defaults for a personality the robot creates for itself. This tool
 # is deliberately absent: core_tools offers it to every profile while a reader is
 # attached, so listing it here would only pin a stale copy into the profile document.
