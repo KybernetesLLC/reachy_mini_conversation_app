@@ -181,16 +181,20 @@ button {
   left: 32px;
   z-index: 9;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   flex-wrap: wrap;
-  gap: 14px 20px;
+  gap: 14px 28px;
 }
 
-/* A badge and its action stay together when the row wraps. */
+/* Each badge keeps a slot of its own, so Personality and Accessory sit at the
+   same spot whatever a profile is called and whether its action is showing.
+   The badge's -8px bottom margin cancels its own padding, so the gap reads true. */
 .app-shell__badge-group {
   display: inline-flex;
-  align-items: center;
-  gap: 14px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  width: 320px;
   min-width: 0;
 }
 
@@ -1133,7 +1137,12 @@ button {
   .app-shell__personality-row {
     right: 20px;
     left: 20px;
-    gap: 10px 16px;
+    gap: 12px 20px;
+  }
+
+  /* Too narrow for two slots: let each group take the width it needs. */
+  .app-shell__badge-group {
+    width: auto;
   }
 
   .app-shell__personality-name {
