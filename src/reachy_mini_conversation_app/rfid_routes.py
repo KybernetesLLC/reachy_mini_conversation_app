@@ -60,6 +60,7 @@ WRITE_SOUND_LEAD_S = 0.15
 
 HandlerGetter = Callable[[], "HuggingFaceRealtimeHandler"]
 LoopGetter = Callable[[], asyncio.AbstractEventLoop | None]
+PersonalityObserver = Callable[[str | None], None]
 
 
 def _load_move_dataset(repo_id: str) -> RecordedMoves | None:
@@ -80,6 +81,7 @@ class RfidController:
         get_loop: LoopGetter,
         robot: "ReachyMini",
         rpc: JsonRpcServer | None = None,
+        on_personality_applied: PersonalityObserver | None = None,
     ) -> None:
         """Build a controller; call :meth:`start` to begin polling."""
         self._client = NfcDaemonClient()
@@ -87,6 +89,9 @@ class RfidController:
         self._get_loop = get_loop
         self._robot = robot
         self._rpc = rpc
+        # An accessory swaps the personality without any client asking, so the
+        # badges would otherwise keep showing the one it replaced.
+        self._on_personality_applied = on_personality_applied
 
         self._transition_moves = _load_move_dataset(TRANSITION_MOVE_DATASET)
         self._write_moves = _load_move_dataset(WRITE_MOVE_DATASET)
@@ -198,6 +203,15 @@ class RfidController:
             "accessory": self.accessory_view(tag),
             "current_personality": self._current_personality,
         }
+
+    def _announce_personality(self, profile: str | None) -> None:
+        """Tell the app a personality was applied by the reader, not by a client."""
+        if self._on_personality_applied is None:
+            return
+        try:
+            self._on_personality_applied(profile)
+        except Exception as exc:
+            logger.warning("[RFID] failed to announce the applied personality: %s", exc)
 
     def _broadcast(self, payload: dict[str, Any]) -> None:
         """Push an rfid.tag notification when the visible state changed.
@@ -390,6 +404,7 @@ class RfidController:
         if not self._run_on_loop(handler.apply_personality(None), "default revert"):
             return None
         self._current_personality = None
+        self._announce_personality(None)
         logger.info("[RFID] >>> default personality applied OK")
         return {"code": None, "personality": DEFAULT_SELECTION}
 
@@ -425,6 +440,7 @@ class RfidController:
         if not self._run_on_loop(handler.apply_personality(profile), "apply"):
             return None
         self._current_personality = personality
+        self._announce_personality(profile)
         logger.info("[RFID] >>> personality applied OK")
         return {"code": code, "personality": personality}
 
@@ -466,6 +482,7 @@ class RfidController:
                 await self._wait_for_welcome_speech(handler)
                 self._queue_move(handler, self._transition_moves, TRANSITION_MOVE_NAME)
                 await handler.apply_personality(profile)
+                self._announce_personality(profile)
                 logger.info("[RFID] >>> delayed personality switch to %r done", personality)
             except asyncio.CancelledError:
                 logger.info("[RFID] >>> delayed personality switch cancelled (tag removed)")

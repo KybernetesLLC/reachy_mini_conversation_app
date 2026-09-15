@@ -1059,3 +1059,23 @@ def test_rpc_settings_methods() -> None:
     assert isinstance(r2["result"], list)
     assert "spaces" in r3["result"]
     assert "enabled_tools" in r4["result"]
+
+
+@pytest.mark.asyncio
+async def test_a_personality_applied_by_the_reader_reaches_rpc_clients() -> None:
+    """An accessory swaps the personality with no client asking, so clients must be told."""
+
+    class FakeHandler:
+        pass
+
+    app = FastAPI()
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    stream = LocalStream(FakeHandler(), robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+
+    with TestClient(app).websocket_connect("/rpc") as ws:
+        stream.notify_personality("user_personalities/bard")
+        msg = ws.receive_json()
+
+    assert msg["method"] == "conversation.personality"
+    assert msg["params"] == {"profile": "user_personalities/bard"}

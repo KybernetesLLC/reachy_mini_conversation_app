@@ -184,7 +184,9 @@ button {
   align-items: flex-start;
   justify-content: space-between;
   flex-wrap: nowrap;
-  gap: 20px;
+  /* Each badge bleeds 12px past its group (its -12px side margin), so the gap
+     has to cover 24px of that before it separates anything. */
+  gap: 48px;
 }
 
 /* Personality pinned left, Accessory pinned right, never wrapping: the two are
@@ -1160,7 +1162,7 @@ button {
   .app-shell__personality-row {
     right: 20px;
     left: 20px;
-    gap: 14px;
+    gap: 32px;
   }
 
   .app-shell__personality-name {
@@ -1705,6 +1707,13 @@ button {
 
 .app-shell__accessory[data-state="blank"] .app-shell__accessory-icon {
   border-style: dashed;
+}
+
+/* Carries a personality other than the one running: worth noticing, not alarming. */
+.app-shell__accessory[data-mismatch] .app-shell__accessory-icon {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 50%, transparent);
+  background: color-mix(in srgb, var(--warn) 14%, var(--bg-soft));
 }
 
 .app-shell__accessory[hidden] {

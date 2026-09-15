@@ -12,12 +12,13 @@ import {
   listPersonalities,
   setMicMuted,
   subscribe,
+  untilReady,
 } from "../api.js";
 import { ORB_STATES } from "../constants.js";
 import { createOrb, mapActivityToState } from "../orb.js";
 import { consumePendingApply } from "../pending-apply.js";
 import { setPersonality } from "../personality-badge.js";
-import { onAccessoryChange } from "../accessory-badge.js";
+import { onAccessoryChange, setActivePersonality } from "../accessory-badge.js";
 import { h, prettifyProfileName } from "../ui.js";
 
 const CAPTION_BY_STATE = Object.freeze({
@@ -72,6 +73,10 @@ export async function mountTalkView({ outlet, signal }) {
   orb.root.disabled = true;
   orb.root.addEventListener("click", onMicTap);
   syncMicAria();
+
+  const stopWatchingPersonality = subscribe("conversation.personality", () => {
+    void refreshPersonalityState();
+  });
 
   signal.addEventListener("abort", cleanup, { once: true });
 
@@ -139,6 +144,7 @@ export async function mountTalkView({ outlet, signal }) {
       defaultAction.hidden = true;
       defaultAction.removeEventListener("click", onSetDefault);
     }
+    stopWatchingPersonality();
     stopWatchingAccessory?.();
     if (linkAction) {
       linkAction.hidden = true;
@@ -200,10 +206,11 @@ export async function mountTalkView({ outlet, signal }) {
   }
 
   async function refreshPersonalityState() {
-    const personalityState = await fetchPersonalityState();
+    const personalityState = await fetchPersonalityState(signal);
     if (signal.aborted || personalityState == null) return;
     activePersonality = personalityState.current;
     setPersonality(personalityState.current);
+    setActivePersonality(personalityState.current);
     const shouldHide = personalityState.locked || personalityState.current === personalityState.startup;
     if (defaultAction) {
       defaultAction.hidden = shouldHide;
@@ -240,9 +247,9 @@ export async function mountTalkView({ outlet, signal }) {
   }
 }
 
-async function fetchPersonalityState() {
+async function fetchPersonalityState(signal) {
   try {
-    const data = await listPersonalities();
+    const data = await untilReady(listPersonalities, signal);
     const current = data?.current;
     if (!current) return null;
     return {

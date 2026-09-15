@@ -12,6 +12,7 @@ import { prettifyProfileName } from "./ui.js";
 const LABEL_BY_STATE = Object.freeze({
   none: "None",
   blank: "Blank",
+  known: "Linked",
   unknown: "Unrecognized",
 });
 
@@ -23,6 +24,7 @@ let supported = false;
 // must not re-show itself when a tag notification lands on another view.
 let onTalkView = false;
 let lastAccessory = { state: "none", personality: null };
+let activeProfile = null;
 const listeners = new Set();
 // The badge lives as long as the page, unlike a view that unmounts.
 const neverAborts = new AbortController().signal;
@@ -57,14 +59,29 @@ export function mountAccessoryBadge(headerRoot = document) {
   })();
 }
 
+/**
+ * Naming the personality here would only repeat the badge next to it, which
+ * already says it. The name earns its place solely when the two disagree.
+ */
+function labelFor(accessory) {
+  if (accessory.state === "known" && accessory.personality !== activeProfile) {
+    return prettifyProfileName(accessory.personality);
+  }
+  return LABEL_BY_STATE[accessory.state] || LABEL_BY_STATE.none;
+}
+
 function render(accessory) {
   lastAccessory = accessory || { state: "none", personality: null };
-  if (nameEl) {
-    nameEl.textContent = lastAccessory.personality
-      ? prettifyProfileName(lastAccessory.personality)
-      : LABEL_BY_STATE[lastAccessory.state] || LABEL_BY_STATE.none;
+  if (nameEl) nameEl.textContent = labelFor(lastAccessory);
+  if (rootEl) {
+    rootEl.dataset.state = lastAccessory.state;
+    // "Linked" and another personality's name both read as a known tag; only the
+    // second one is something the user may want to act on.
+    rootEl.toggleAttribute(
+      "data-mismatch",
+      lastAccessory.state === "known" && lastAccessory.personality !== activeProfile
+    );
   }
-  if (rootEl) rootEl.dataset.state = lastAccessory.state;
   refreshVisibility();
   for (const listener of listeners) {
     try {
@@ -77,6 +94,13 @@ function render(accessory) {
 
 function refreshVisibility() {
   if (groupEl) groupEl.hidden = !(supported && onTalkView);
+}
+
+/** Tell the badge which personality is running, so it can stay out of its way. */
+export function setActivePersonality(profile) {
+  if (profile === activeProfile) return;
+  activeProfile = profile;
+  render(lastAccessory);
 }
 
 /** Observe accessory changes. Returns an unsubscribe function. */

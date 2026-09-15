@@ -40,6 +40,7 @@ from reachy_mini_conversation_app.config import (
 from reachy_mini_conversation_app.prompts import get_session_voice, get_session_instructions
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_float32
 from reachy_mini_conversation_app.rfid_routes import RfidController, register_rfid_methods
+from reachy_mini_conversation_app.profile_store import canonical_profile_name
 from reachy_mini_conversation_app.startup_settings import read_startup_settings, write_startup_settings
 from reachy_mini_conversation_app.tools.core_tools import initialize_tools
 from reachy_mini_conversation_app.tool_space_routes import register_tool_space_methods
@@ -226,6 +227,14 @@ class LocalStream:
             if state and state != self._last_turn_state:
                 self._last_turn_state = state
                 self._rpc.broadcast_threadsafe("conversation.turn", {"state": state})
+
+    def notify_personality(self, profile: Optional[str]) -> None:
+        """Push a conversation.personality notification to JSON-RPC clients."""
+        if self._rpc is not None:
+            self._rpc.broadcast_threadsafe(
+                "conversation.personality",
+                {"profile": canonical_profile_name(profile)},
+            )
 
     def _emit_phase(self, phase: str, reason: Optional[str] = None) -> None:
         """Push a conversation.phase notification to JSON-RPC clients."""
@@ -480,6 +489,7 @@ class LocalStream:
             raise
 
         self._clear_persisted_voice_override()
+        self.notify_personality(profile)
         await self.request_backend_restart("personality_changed")
         return "Applied personality and restarting backend."
 
@@ -568,6 +578,7 @@ class LocalStream:
             get_loop=lambda: self._asyncio_loop,
             robot=self._robot,
             rpc=rpc,
+            on_personality_applied=self.notify_personality,
         )
         register_rfid_methods(rpc, controller)
         self._rfid_controller = controller
