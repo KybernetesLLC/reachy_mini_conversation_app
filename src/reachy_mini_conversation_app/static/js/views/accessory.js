@@ -43,6 +43,26 @@ export async function mountAccessoryView({ outlet, signal }) {
   const eraseButton = h("button", { type: "button", class: "btn btn--ghost", disabled: "disabled" }, "Unlink accessory");
   const status = h("p", { class: "settings-status", role: "status", "aria-live": "polite" });
 
+  const linkSection = h(
+    "section",
+    { class: "settings-section" },
+    h("h2", { class: "settings-section-title" }, "Link a personality"),
+    h(
+      "p",
+      { class: "settings-hint settings-section-intro" },
+      "The accessory carries the personality itself, so it means the same thing on any Reachy Mini. "
+        + "Unlinking leaves it blank, and Reachy Mini stops changing personality for it."
+    ),
+    h(
+      "label",
+      { class: "settings-field" },
+      h("span", { class: "settings-label" }, "Personality"),
+      personalitySelect
+    ),
+    h("div", { class: "settings-actions" }, eraseButton, linkButton),
+    status
+  );
+
   const view = h(
     "section",
     { class: "view view--accessory" },
@@ -63,25 +83,7 @@ export async function mountAccessoryView({ outlet, signal }) {
       readerStatus,
       accessoryCard
     ),
-    h(
-      "section",
-      { class: "settings-section" },
-      h("h2", { class: "settings-section-title" }, "Link a personality"),
-      h(
-        "p",
-        { class: "settings-hint settings-section-intro" },
-        "The accessory carries the personality itself, so it means the same thing on any Reachy Mini. "
-          + "Unlinking leaves it blank, and Reachy Mini stops changing personality for it."
-      ),
-      h(
-        "label",
-        { class: "settings-field" },
-        h("span", { class: "settings-label" }, "Personality"),
-        personalitySelect
-      ),
-      h("div", { class: "settings-actions" }, eraseButton, linkButton),
-      status
-    )
+    linkSection
   );
   outlet.replaceChildren(view);
 
@@ -108,9 +110,20 @@ export async function mountAccessoryView({ outlet, signal }) {
 
   function renderReader(payload) {
     if (!payload?.driver_available) {
-      readerStatus.textContent = "No NFC reader on this Reachy Mini.";
+      readerStatus.replaceChildren(
+        h("strong", null, "This Reachy Mini has no accessory reader."),
+        h(
+          "span",
+          { class: "accessory-missing__body" },
+          "Accessories are read by the Reachy Mini NFC add-on. Fit it to give a "
+            + "personality to a hat or any other object, and have Reachy Mini take "
+            + "that personality on as soon as the object is placed on its head."
+        )
+      );
+      readerStatus.classList.add("accessory-missing");
       return;
     }
+    readerStatus.classList.remove("accessory-missing");
     if (!payload.connected) {
       readerStatus.textContent = "The NFC reader is not responding.";
       return;
@@ -161,8 +174,12 @@ export async function mountAccessoryView({ outlet, signal }) {
 
   function render(payload) {
     latest = payload;
+    const hasReader = Boolean(payload?.driver_available);
     renderReader(payload);
     renderAccessory(payload);
+    // Without a reader there is nothing on it to describe, and nothing to link.
+    accessoryCard.hidden = !hasReader;
+    linkSection.hidden = !hasReader;
     // A tag arriving or leaving changes what the buttons can do.
     setBusy(busy);
   }

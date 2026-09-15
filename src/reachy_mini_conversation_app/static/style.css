@@ -197,7 +197,7 @@ button {
   flex-direction: column;
   align-items: flex-start;
   gap: 10px;
-  max-width: 320px;
+  flex: 0 1 calc(50% - 24px);
   min-width: 0;
 }
 
@@ -1698,26 +1698,51 @@ button {
   height: 30px;
 }
 
-/* An accessory this robot can act on is worth noticing across the room. */
+/* Green reads "in agreement" at a glance, and keeps its distance from the amber
+   used when the accessory carries something else. */
 .app-shell__accessory[data-state="known"] .app-shell__accessory-icon {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  background: color-mix(in srgb, var(--accent) 14%, var(--bg-soft));
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 55%, transparent);
+  background: color-mix(in srgb, var(--success) 16%, var(--bg-soft));
 }
 
+/* An empty accessory waiting to be given a personality. */
 .app-shell__accessory[data-state="blank"] .app-shell__accessory-icon {
+  border-width: 2px;
   border-style: dashed;
+  border-color: var(--border-strong);
+  color: var(--text-soft);
 }
 
 /* Carries a personality other than the one running: worth noticing, not alarming. */
 .app-shell__accessory[data-mismatch] .app-shell__accessory-icon {
   color: var(--warn);
-  border-color: color-mix(in srgb, var(--warn) 50%, transparent);
-  background: color-mix(in srgb, var(--warn) 14%, var(--bg-soft));
+  border-color: color-mix(in srgb, var(--warn) 55%, transparent);
+  background: color-mix(in srgb, var(--warn) 16%, var(--bg-soft));
+}
+
+/* No add-on fitted: present, but plainly inert. */
+.app-shell__accessory[data-state="unavailable"] .app-shell__accessory-icon {
+  opacity: 0.55;
 }
 
 .app-shell__accessory[hidden] {
   display: none;
+}
+
+/* Explaining the missing add-on needs two lines, unlike the one-line statuses. */
+.accessory-missing {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.accessory-missing strong {
+  color: var(--text);
+}
+
+.accessory-missing__body {
+  max-width: 60ch;
 }
 
 .accessory-card__details {

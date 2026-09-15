@@ -2,8 +2,8 @@
  * Header accessory badge: what is on the NFC reader right now.
  *
  * Lives in the app shell (index.html) alongside the personality badge, so it
- * persists across view changes. Hidden entirely on robots with no reader — a
- * badge that could never say anything but "no reader" is just noise.
+ * persists across view changes. It stays visible without a reader, reading
+ * "Unavailable", so the feature is discoverable rather than silently absent.
  */
 
 import { getRfidStatus, subscribe, untilReady } from "./api.js";
@@ -15,6 +15,7 @@ const LABEL_BY_STATE = Object.freeze({
   known: "Linked",
   unknown: "Unrecognized",
 });
+const NO_READER_STATE = "unavailable";
 
 let rootEl = null;
 let groupEl = null;
@@ -47,14 +48,14 @@ export function mountAccessoryBadge(headerRoot = document) {
   void (async () => {
     try {
       // The desktop panel loads this page as the app starts, well before /rpc
-      // answers; without the retry the badge would stay hidden for the session.
+      // answers; without the retry the badge would read "Unavailable" all session.
       const status = await untilReady(getRfidStatus, neverAborts);
       supported = Boolean(status?.driver_available);
       render(status?.accessory);
     } catch (error) {
-      console.warn("Accessory reader unavailable; hiding the badge:", error);
+      console.warn("Accessory reader unavailable:", error);
       supported = false;
-      refreshVisibility();
+      render(lastAccessory);
     }
   })();
 }
@@ -64,6 +65,7 @@ export function mountAccessoryBadge(headerRoot = document) {
  * already says it. The name earns its place solely when the two disagree.
  */
 function labelFor(accessory) {
+  if (!supported) return "Unavailable";
   if (accessory.state === "known" && accessory.personality !== activeProfile) {
     return prettifyProfileName(accessory.personality);
   }
@@ -74,12 +76,12 @@ function render(accessory) {
   lastAccessory = accessory || { state: "none", personality: null };
   if (nameEl) nameEl.textContent = labelFor(lastAccessory);
   if (rootEl) {
-    rootEl.dataset.state = lastAccessory.state;
+    rootEl.dataset.state = supported ? lastAccessory.state : NO_READER_STATE;
     // "Linked" and another personality's name both read as a known tag; only the
     // second one is something the user may want to act on.
     rootEl.toggleAttribute(
       "data-mismatch",
-      lastAccessory.state === "known" && lastAccessory.personality !== activeProfile
+      supported && lastAccessory.state === "known" && lastAccessory.personality !== activeProfile
     );
   }
   refreshVisibility();
@@ -93,7 +95,7 @@ function render(accessory) {
 }
 
 function refreshVisibility() {
-  if (groupEl) groupEl.hidden = !(supported && onTalkView);
+  if (groupEl) groupEl.hidden = !onTalkView;
 }
 
 /** Tell the badge which personality is running, so it can stay out of its way. */
