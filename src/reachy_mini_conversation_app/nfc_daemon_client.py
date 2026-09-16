@@ -86,13 +86,19 @@ class NfcDaemonClient:
         self.base = base_url.rstrip("/")
         self.timeout = timeout
         self._write_queue: queue.SimpleQueue[tuple[bool, str]] = queue.SimpleQueue()
+        # The reader is polled a few times a second for as long as the app
+        # runs; without a session each poll opens and closes a TCP connection
+        # to the daemon. The session is used by the two read endpoints only —
+        # writes and erases run on their own threads, and requests.Session is
+        # not documented as thread-safe.
+        self._session = requests.Session()
 
     # -- Tag state ----------------------------------------------------------------
 
     def get_tag(self) -> NfcTagSnapshot:
         """Return the current tag state (never raises; returns absent on error)."""
         try:
-            r = requests.get(f"{self.base}/api/nfc/tag", timeout=self.timeout)
+            r = self._session.get(f"{self.base}/api/nfc/tag", timeout=self.timeout)
             r.raise_for_status()
             d = r.json()
             return NfcTagSnapshot(
@@ -117,7 +123,7 @@ class NfcDaemonClient:
         ``driver_available``, ``port``, ``chip_version``, ``error``.
         """
         try:
-            r = requests.get(f"{self.base}/api/nfc/status", timeout=self.timeout)
+            r = self._session.get(f"{self.base}/api/nfc/status", timeout=self.timeout)
             r.raise_for_status()
             status: dict[str, Any] = r.json()
             return status
@@ -226,6 +232,10 @@ class NfcDaemonClient:
         except Exception as exc:
             logger.warning("NFC erase error: %s", exc)
             return False, "LINK_LOST"
+
+    def close(self) -> None:
+        """Close the pooled connection used by the read endpoints."""
+        self._session.close()
 
     def drain_write_results(self) -> list[tuple[bool, str]]:
         """Drain and return all pending write results (non-blocking)."""

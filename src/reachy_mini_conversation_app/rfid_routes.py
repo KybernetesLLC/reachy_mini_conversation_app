@@ -48,6 +48,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 0.4
+# A board that is not plugged in will not answer any sooner for being asked
+# 2.5 times a second: while the reader reports itself disconnected, polling it
+# at the tag-detection rate only fills the daemon log. Hot-plug is still
+# picked up at this slower rate, just up to two seconds later.
+DISCONNECTED_POLL_INTERVAL_S = 2.0
 # A tag briefly reading NO_TAG (a hand moving it, a marginal antenna position)
 # must not re-trigger the blank-tag conversation as soon as it reads again.
 BLANK_TAG_COOLDOWN_S = 3.0
@@ -136,14 +141,18 @@ class RfidController:
         if thread is not None:
             thread.join(timeout=2.0)
         self._thread = None
+        self._client.close()
 
     def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
+            connected = False
             try:
-                self.poll_once()
+                connected = bool(self.poll_once().get("connected"))
             except Exception:
                 logger.exception("[RFID] polling iteration failed")
-            self._stop_event.wait(POLL_INTERVAL_S)
+            # A failed iteration backs off too: it means the daemon is not
+            # answering, which is no more urgent than a missing board.
+            self._stop_event.wait(POLL_INTERVAL_S if connected else DISCONNECTED_POLL_INTERVAL_S)
 
     # ── snapshot helpers ─────────────────────────────────────────────────────
 
