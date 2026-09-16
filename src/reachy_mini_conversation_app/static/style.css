@@ -206,10 +206,6 @@ button {
   text-align: right;
 }
 
-.app-shell__badge-group[data-component="accessory-group"] .app-shell__personality-text {
-  align-items: flex-end;
-}
-
 .app-shell__badge-group[hidden] {
   display: none;
 }
@@ -248,14 +244,13 @@ button {
 .app-shell__personality-text {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
+  align-items: stretch;
   justify-content: center;
   min-width: 0;
   line-height: 1.2;
 }
 
 .app-shell__personality-label {
-  max-width: 100%;
   overflow: hidden;
   font-size: 0.78rem;
   font-weight: 600;
@@ -274,7 +269,6 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 100%;
 }
 
 /* Larger than the brand mark for presence outside the topbar. */
