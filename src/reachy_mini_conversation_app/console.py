@@ -43,6 +43,7 @@ from reachy_mini_conversation_app.rfid_routes import RfidController, register_rf
 from reachy_mini_conversation_app.profile_store import canonical_profile_name
 from reachy_mini_conversation_app.startup_settings import read_startup_settings, write_startup_settings
 from reachy_mini_conversation_app.tools.core_tools import initialize_tools
+from reachy_mini_conversation_app.nfc_daemon_client import NO_BOARD_ERROR
 from reachy_mini_conversation_app.tool_space_routes import register_tool_space_methods
 from reachy_mini_conversation_app.personality_routes import (
     build_personality_ops,
@@ -501,13 +502,13 @@ class LocalStream:
         """
         controller = self._rfid_controller
         if controller is None:
-            return {"nfc_supported": False, "nfc_connected": False, "nfc_port": None, "nfc_error": None}
+            return {"nfc_supported": False, "nfc_connected": False, "nfc_error": None}
         status = controller.last_status()
+        error = status.get("error")
         return {
             "nfc_supported": bool(status.get("driver_available")),
             "nfc_connected": bool(status.get("connected")),
-            "nfc_port": status.get("port"),
-            "nfc_error": status.get("error"),
+            "nfc_error": None if error == NO_BOARD_ERROR else error,
         }
 
     def _clear_persisted_voice_override(self) -> None:

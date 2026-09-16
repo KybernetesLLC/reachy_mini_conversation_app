@@ -10,6 +10,7 @@ import {
   untilReady,
 } from "../api.js";
 import { h } from "../ui.js";
+import { ROUTES } from "../constants.js";
 
 const HF_CONNECTION_MODES = Object.freeze({
   DEPLOYED: "deployed",
@@ -24,7 +25,7 @@ const HF_MODE_HINTS = Object.freeze({
   [HF_CONNECTION_MODES.LOCAL]: "Connects directly to the host and port below.",
 });
 
-export async function mountSettingsView({ outlet, signal }) {
+export async function mountSettingsView({ outlet, signal, navigate }) {
   const connectionSection = buildConnectionSection({
     onSaved: () =>
       Promise.all([
@@ -33,7 +34,7 @@ export async function mountSettingsView({ outlet, signal }) {
       ]),
   });
   const voiceSection = buildVoiceSection();
-  const statusSection = buildStatusSection();
+  const statusSection = buildStatusSection({ navigate });
 
   const view = h(
     "section",
@@ -258,7 +259,7 @@ function buildVoiceSection() {
   };
 }
 
-function buildStatusSection() {
+function buildStatusSection({ navigate } = {}) {
   const list = h(
     "dl",
     { class: "settings-status-grid" },
@@ -310,7 +311,7 @@ function buildStatusSection() {
       if (payload.requires_restart) {
         list.appendChild(statusRow("Restart", "Required to apply changes", "warn"));
       }
-      list.append(...accessoryReaderRows(payload));
+      list.append(...accessoryReaderRows(payload, navigate));
     },
     renderUnavailable(error) {
       list.replaceChildren(statusRow("Backend", `Unavailable: ${describeError(error)}`, "warn"));
@@ -319,29 +320,40 @@ function buildStatusSection() {
 }
 
 /**
- * The NFC accessory reader. Three distinct states, because "not connected" and
- * "this robot has no reader" call for very different reactions from the user.
- * The daemon's own reason for a link being down follows on its own row, the way
- * the backend's error does: it is what turns "Not connected" into something the
- * reader can act on — no board found, port busy, driver missing.
+ * The NFC accessory reader. No add-on fitted is the ordinary state of a robot,
+ * not a warning, so it stays grey and offers the explanation instead. Only a
+ * genuine fault — port busy, link lost — is amber and says what went wrong.
  */
-function accessoryReaderRows(payload) {
+function accessoryReaderRows(payload, navigate) {
   const rows = [];
-  if (!payload.nfc_supported) {
-    rows.push(statusRow("Accessory reader", "Not installed on this robot"));
-  } else if (!payload.nfc_connected) {
-    rows.push(statusRow("Accessory reader", "Not connected", "warn"));
+  if (payload.nfc_connected) {
+    rows.push(statusRow("Accessory reader", "Connected", "ok"));
   } else {
-    rows.push(
-      statusRow("Accessory reader", payload.nfc_port ? `Connected (${payload.nfc_port})` : "Connected", "ok")
-    );
+    const label = payload.nfc_supported ? "Not connected" : "Not installed on this robot";
+    rows.push(statusRow("Accessory reader", [label, accessoryHelpButton(navigate)]));
   }
-  // The daemon clears it as soon as the chip answers, so it only ever shows
-  // alongside one of the two states above.
+  // The daemon clears it as soon as the chip answers, and console.py drops the
+  // one that only means "no add-on fitted", so this is a fault worth the amber.
   if (payload.nfc_error) {
     rows.push(statusRow("Accessory reader error", payload.nfc_error, "warn"));
   }
   return rows;
+}
+
+/** Sends the reader to the page that explains what the feature needs. */
+function accessoryHelpButton(navigate) {
+  if (!navigate) return null;
+  return h(
+    "button",
+    {
+      type: "button",
+      class: "settings-status-help",
+      "aria-label": "What does the accessory feature require?",
+      title: "What does the accessory feature require?",
+      onClick: () => navigate(ROUTES.ACCESSORY),
+    },
+    "?"
+  );
 }
 
 function statusRow(label, value, tone) {

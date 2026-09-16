@@ -64,7 +64,7 @@ function boot() {
     {
       [ROUTES.TALK]: (ctx) => mountTalkView(ctx),
       [ROUTES.PERSONALITIES]: (ctx) => mountHomeView({ ...ctx, navigate: router.navigate }),
-      [ROUTES.SETTINGS]: (ctx) => mountSettingsView(ctx),
+      [ROUTES.SETTINGS]: (ctx) => mountSettingsView({ ...ctx, navigate: router.navigate }),
       [ROUTES.TOOLS]: (ctx) => mountToolsView(ctx),
       [ROUTES.ACCESSORY]: (ctx) => mountAccessoryView(ctx),
     },

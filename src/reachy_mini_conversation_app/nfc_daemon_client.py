@@ -47,6 +47,9 @@ WRITE_ERROR_MESSAGES = {
 }
 
 
+NO_BOARD_ERROR = "no NFC reader board found"
+
+
 def describe_write_error(code: str) -> str:
     """Turn a write/erase error code into a line for a user.
 
