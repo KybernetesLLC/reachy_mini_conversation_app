@@ -333,6 +333,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             logger.error("Failed to resolve personality %r: %s", profile, exc)
             return f"Failed to apply personality: {exc}"
 
+        # A personality introduces itself when its session opens. Picking one in
+        # the panel rebuilds the whole backend, so it gets that for free; a live
+        # swap — an accessory placed on the reader — reuses this handler, whose
+        # gate is still closed from the session before.
+        self._startup_greeting_sent = False
+
         if self.connection is not None:
             try:
                 await self.connection.session.update(

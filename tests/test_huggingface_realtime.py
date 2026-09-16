@@ -485,6 +485,38 @@ async def test_apply_personality_uses_selected_voice_for_lb_allocated_sessions(m
 
 
 @pytest.mark.asyncio
+async def test_apply_personality_rearms_the_greeting_for_the_new_personality(monkeypatch: Any) -> None:
+    """An accessory swaps personality on a live handler, and the new one introduces itself."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "new instructions")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Serena")
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    monkeypatch.setattr(handler, "_restart_session", AsyncMock(return_value=None))
+    handler._startup_greeting_sent = True
+
+    await handler.apply_personality("mars_rover")
+
+    assert handler._startup_greeting_sent is False
+
+
+@pytest.mark.asyncio
+async def test_apply_personality_leaves_the_greeting_alone_when_it_fails(monkeypatch: Any) -> None:
+    """A personality that could not be resolved must not make the current one greet again."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "new instructions")
+
+    def fail_tool_reload(*, force: bool = False) -> None:
+        raise RuntimeError("tool reload failed")
+
+    monkeypatch.setattr(hf_mod.core_tools, "initialize_tools", fail_tool_reload)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._startup_greeting_sent = True
+
+    await handler.apply_personality("broken")
+
+    assert handler._startup_greeting_sent is True
+
+
+@pytest.mark.asyncio
 async def test_apply_personality_restores_profile_when_tools_fail(monkeypatch: Any) -> None:
     """A failed tool reload should leave the previous profile selected."""
     selected_profiles: list[str | None] = []
