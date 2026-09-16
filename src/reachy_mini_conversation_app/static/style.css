@@ -189,9 +189,7 @@ button {
   gap: 48px;
 }
 
-/* Personality pinned left, Accessory pinned right, never wrapping: the two are
-   always in the same spot, and a long name is cut rather than moving them.
-   The badge's -8px bottom margin cancels its own padding, so the gap reads true. */
+/* Personality pinned left, Accessory pinned right, never wrapping. */
 .app-shell__badge-group {
   display: inline-flex;
   flex-direction: column;
