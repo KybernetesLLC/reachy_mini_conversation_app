@@ -12,6 +12,8 @@ import {
 import { h, prettifyProfileName } from "../ui.js";
 import { confirmDialog } from "../components/confirm-dialog.js";
 
+const NO_READER_ACCESSORY = Object.freeze({ state: "unavailable", personality: null, content: null });
+
 const ACCESSORY_COPY = Object.freeze({
   none: {
     title: "No accessory",
@@ -99,13 +101,16 @@ export async function mountAccessoryView({ outlet, signal }) {
     linkButton.textContent = nextBusy && label ? label : "Link accessory";
   }
 
+  // Only a tag state means a tag is on a reader that answers, so neither action
+  // needs to check the connection on top.
   function canLink() {
-    return Boolean(latest?.connected) && latest?.accessory?.state !== "none" && personalitySelect.value !== "";
+    const state = latest?.accessory?.state;
+    return (state === "blank" || state === "known" || state === "unknown") && personalitySelect.value !== "";
   }
 
   function canErase() {
     const state = latest?.accessory?.state;
-    return Boolean(latest?.connected) && (state === "known" || state === "unknown");
+    return state === "known" || state === "unknown";
   }
 
   function renderReader(payload) {
@@ -133,8 +138,7 @@ export async function mountAccessoryView({ outlet, signal }) {
       : "Reader connected.";
   }
 
-  function renderAccessory(payload) {
-    const accessory = payload?.accessory || { state: "none" };
+  function renderAccessory(accessory) {
     const copy = ACCESSORY_COPY[accessory.state] || ACCESSORY_COPY.none;
     accessoryCard.dataset.state = accessory.state;
     accessoryCard.replaceChildren(
@@ -153,7 +157,7 @@ export async function mountAccessoryView({ outlet, signal }) {
 
   /** What the tag literally holds. Useful when a tag is not recognized. */
   function tagDetails(accessory) {
-    if (accessory.state === "none" || accessory.state === "blank") return null;
+    if (accessory.state !== "known" && accessory.state !== "unknown") return null;
     return h(
       "dl",
       { class: "accessory-card__details" },
@@ -174,12 +178,13 @@ export async function mountAccessoryView({ outlet, signal }) {
 
   function render(payload) {
     latest = payload;
-    const hasReader = Boolean(payload?.driver_available);
+    const accessory = payload?.accessory || NO_READER_ACCESSORY;
     renderReader(payload);
-    renderAccessory(payload);
-    // Without a reader there is nothing on it to describe, and nothing to link.
-    accessoryCard.hidden = !hasReader;
-    linkSection.hidden = !hasReader;
+    // A reader that cannot be read has nothing on it to describe: saying "no
+    // accessory" here would read as an empty reader. The line above says why.
+    accessoryCard.hidden = accessory.state === "unavailable";
+    if (!accessoryCard.hidden) renderAccessory(accessory);
+    linkSection.hidden = !payload?.driver_available;
     // A tag arriving or leaving changes what the buttons can do.
     setBusy(busy);
   }
@@ -214,7 +219,7 @@ export async function mountAccessoryView({ outlet, signal }) {
   }
 
   const unsubscribe = subscribe("rfid.tag", (payload) => {
-    if (!signal.aborted) render({ ...payload, accessory: payload.accessory || { state: "none" } });
+    if (!signal.aborted) render(payload);
   });
   signal.addEventListener("abort", unsubscribe, { once: true });
 

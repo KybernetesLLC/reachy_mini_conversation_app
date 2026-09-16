@@ -179,11 +179,16 @@ class RfidController:
     def accessory_view(self, tag: NfcTagSnapshot | None) -> dict[str, Any]:
         """Describe, for the panel, the accessory currently on the reader.
 
+        ``tag`` is None when there is no reader to read from, which the UI has
+        to tell apart from a working reader with nothing on it.
+
         Resolved server-side on purpose: the token scheme lives in
         personality_tag, and a second copy of it in JavaScript would be free to
         drift from this one.
         """
-        if tag is None or not tag.present:
+        if tag is None:
+            return {"state": "unavailable", "personality": None, "content": None}
+        if not tag.present:
             return {"state": "none", "personality": None, "content": None}
         if tag.blank or not tag.content:
             return {"state": "blank", "personality": None, "content": None}

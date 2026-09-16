@@ -10,21 +10,22 @@ import { getRfidStatus, subscribe, untilReady } from "./api.js";
 import { prettifyProfileName } from "./ui.js";
 
 const LABEL_BY_STATE = Object.freeze({
+  unavailable: "Unavailable",
   none: "None",
   blank: "Blank",
   known: "Linked",
   unknown: "Unrecognized",
 });
-const NO_READER_STATE = "unavailable";
+// What to show before the first answer, and whenever the reader cannot be read.
+const NO_READER = Object.freeze({ state: "unavailable", personality: null });
 
 let rootEl = null;
 let groupEl = null;
 let nameEl = null;
-let supported = false;
 // The row only exists on Talk; elsewhere the whole row is hidden, so the badge
 // must not re-show itself when a tag notification lands on another view.
 let onTalkView = false;
-let lastAccessory = { state: "none", personality: null };
+let lastAccessory = NO_READER;
 let activeProfile = null;
 const listeners = new Set();
 // The badge lives as long as the page, unlike a view that unmounts.
@@ -38,24 +39,19 @@ export function mountAccessoryBadge(headerRoot = document) {
   groupEl = next.closest('[data-component="accessory-group"]') || next;
   nameEl = next.querySelector('[data-role="accessory-name"]');
 
-  // The reader only ever broadcasts while it is being polled, which needs a
-  // driver, so a notification is proof enough on its own.
-  subscribe("rfid.tag", (payload) => {
-    supported = true;
-    render(payload?.accessory);
-  });
+  // The poller broadcasts whether or not there is a reader to read, so the
+  // state in the payload is what says which of the two this is.
+  subscribe("rfid.tag", (payload) => render(payload?.accessory));
 
   void (async () => {
     try {
       // The desktop panel loads this page as the app starts, well before /rpc
       // answers; without the retry the badge would read "Unavailable" all session.
       const status = await untilReady(getRfidStatus, neverAborts);
-      supported = Boolean(status?.driver_available);
       render(status?.accessory);
     } catch (error) {
       console.warn("Accessory reader unavailable:", error);
-      supported = false;
-      render(lastAccessory);
+      render(NO_READER);
     }
   })();
 }
@@ -65,23 +61,22 @@ export function mountAccessoryBadge(headerRoot = document) {
  * already says it. The name earns its place solely when the two disagree.
  */
 function labelFor(accessory) {
-  if (!supported) return "Unavailable";
   if (accessory.state === "known" && accessory.personality !== activeProfile) {
     return prettifyProfileName(accessory.personality);
   }
-  return LABEL_BY_STATE[accessory.state] || LABEL_BY_STATE.none;
+  return LABEL_BY_STATE[accessory.state] || LABEL_BY_STATE.unavailable;
 }
 
 function render(accessory) {
-  lastAccessory = accessory || { state: "none", personality: null };
+  lastAccessory = accessory || NO_READER;
   if (nameEl) nameEl.textContent = labelFor(lastAccessory);
   if (rootEl) {
-    rootEl.dataset.state = supported ? lastAccessory.state : NO_READER_STATE;
+    rootEl.dataset.state = lastAccessory.state;
     // "Linked" and another personality's name both read as a known tag; only the
     // second one is something the user may want to act on.
     rootEl.toggleAttribute(
       "data-mismatch",
-      supported && lastAccessory.state === "known" && lastAccessory.personality !== activeProfile
+      lastAccessory.state === "known" && lastAccessory.personality !== activeProfile
     );
   }
   refreshVisibility();

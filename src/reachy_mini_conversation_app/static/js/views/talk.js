@@ -54,7 +54,7 @@ export async function mountTalkView({ outlet, signal }) {
     defaultAction.addEventListener("click", onSetDefault);
   }
   const linkAction = document.querySelector('[data-component="link-accessory-action"]');
-  let accessoryState = { state: "none", personality: null };
+  let accessoryState = { state: "unavailable", personality: null };
   let stopWatchingAccessory = null;
   if (linkAction) {
     linkAction.hidden = true;
