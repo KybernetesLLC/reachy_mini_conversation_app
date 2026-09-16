@@ -51,18 +51,23 @@ export async function mountAccessoryView({ outlet, signal }) {
   // goes on screen so it stays reachable from any other device.
   addOnButton.addEventListener("click", async () => {
     let store = null;
+    let failure = null;
     try {
       store = await openAddOnStore();
     } catch (error) {
+      failure = describeError(error);
       console.warn("Could not open the add-on store:", error);
     }
     if (store?.opened) return;
     if (store?.url && window.open(store.url, "_blank", "noopener")) return;
-    if (store?.url) {
-      addOnAddress.replaceChildren("Open this address in a browser: ", h("code", null, store.url));
-    } else {
-      addOnAddress.replaceChildren("The store could not be opened from here.");
-    }
+    // Saying why matters here: an app still running the code it started with
+    // answers "method not found", which points straight at the restart it needs.
+    addOnAddress.replaceChildren(
+      store?.url
+        ? "Open this address in a browser: "
+        : `The store could not be opened: ${failure || "the app gave no address"}.`
+    );
+    if (store?.url) addOnAddress.appendChild(h("code", null, store.url));
     addOnAddress.hidden = false;
   });
   // Shown in the reader panel's place when there is no reader to report on.

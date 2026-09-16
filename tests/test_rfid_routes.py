@@ -65,7 +65,7 @@ def test_a_tag_on_a_connected_reader_is_described_by_what_it_carries(controller,
 
 
 def test_the_daemon_reason_for_a_down_link_reaches_the_panel(controller, monkeypatch):
-    """ "Not connected" alone leaves a user guessing; the daemon says which it is."""
+    """Not connected on its own leaves a user guessing; the daemon says which it is."""
     fake_reader(monkeypatch, connected=False, error="no NFC reader board found")
     assert controller.connection_status()["error"] == "no NFC reader board found"
     assert controller.last_status()["error"] == "no NFC reader board found"
