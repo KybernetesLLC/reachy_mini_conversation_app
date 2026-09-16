@@ -1740,7 +1740,6 @@ button {
 /* Sits under the paragraph explaining what the accessory feature needs. */
 .accessory-requirement__link {
   margin-top: 14px;
-  text-decoration: none;
 }
 
 /* The address itself, revealed when the host refuses to open a browser window. */

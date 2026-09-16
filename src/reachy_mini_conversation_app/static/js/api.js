@@ -159,6 +159,7 @@ export const linkRfidTag = (personality) =>
   rpcCall("rfid.link_tag", { personality }, { timeoutMs: TOOL_SPACE_TIMEOUT_MS });
 export const eraseRfidTag = (full = false) =>
   rpcCall("rfid.erase", { full }, { timeoutMs: TOOL_SPACE_TIMEOUT_MS });
+export const openAddOnStore = () => rpcCall("rfid.open_add_on_store");
 
 export const resetProfileTools = (profile) =>
   rpcCall("profile_tools.reset", { profile });

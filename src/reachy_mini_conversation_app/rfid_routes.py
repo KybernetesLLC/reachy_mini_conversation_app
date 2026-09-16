@@ -18,6 +18,7 @@ import time
 import asyncio
 import logging
 import threading
+import webbrowser
 from typing import TYPE_CHECKING, Any
 from collections.abc import Callable
 
@@ -62,6 +63,7 @@ WRITE_MOVE_DATASET = "glannuzel/local-dataset"
 WRITE_MOVE_NAME = "write-tag-6"
 # The sound is started slightly before the movement is queued so the two line up.
 WRITE_SOUND_LEAD_S = 0.15
+ADD_ON_STORE_URL = "https://store.pollen-robotics.com/collections/reachy-mini"
 
 HandlerGetter = Callable[[], "HuggingFaceRealtimeHandler"]
 LoopGetter = Callable[[], asyncio.AbstractEventLoop | None]
@@ -628,8 +630,21 @@ def register_rfid_methods(rpc: JsonRpcServer, controller: RfidController) -> Non
             raise JsonRpcError("A code is required.", reason="invalid_code")
         return await asyncio.to_thread(controller.write_tag, code)
 
+    async def _open_add_on_store(_params: dict[str, Any]) -> dict[str, Any]:
+        # The panel runs in the control app's webview, which drops target="_blank"
+        # and window.open, so the browser has to be raised by a process with a
+        # screen. This app's own is the only one it can ask; on a robot running
+        # headless there is none, and the caller falls back to showing the URL.
+        try:
+            opened = await asyncio.to_thread(webbrowser.open, ADD_ON_STORE_URL)
+        except webbrowser.Error as exc:
+            logger.info("No browser on this host to open the add-on store: %s", exc)
+            opened = False
+        return {"opened": opened, "url": ADD_ON_STORE_URL}
+
     rpc.register("rfid.status", _status)
     rpc.register("rfid.tokens", _tokens)
     rpc.register("rfid.link_tag", _link_tag)
     rpc.register("rfid.erase", _erase)
     rpc.register("rfid.write", _write)
+    rpc.register("rfid.open_add_on_store", _open_add_on_store)

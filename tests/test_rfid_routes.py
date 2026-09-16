@@ -1,5 +1,7 @@
 """What the reader reports for the UI: no reader is not the same as no accessory."""
 
+import webbrowser
+
 import pytest
 
 from reachy_mini_conversation_app import rfid_routes
@@ -59,3 +61,33 @@ def test_a_tag_on_a_connected_reader_is_described_by_what_it_carries(controller,
     """Each tag state stays distinct from both "none" and "unavailable"."""
     fake_reader(monkeypatch, connected=True, tag=tag)
     assert controller.snapshot()["accessory"]["state"] == state
+
+
+@pytest.fixture
+def add_on_store(controller):
+    """Register the rfid.* methods and return the one that opens the add-on store."""
+    methods = {}
+
+    class FakeRpc:
+        def register(self, name, handler):
+            methods[name] = handler
+
+    rfid_routes.register_rfid_methods(FakeRpc(), controller)
+    return methods["rfid.open_add_on_store"]
+
+
+@pytest.mark.asyncio
+async def test_the_store_opens_on_the_machine_running_the_app(monkeypatch, add_on_store):
+    """The panel cannot raise a browser window from its webview, so the app does it."""
+    asked = []
+    monkeypatch.setattr(webbrowser, "open", lambda url: bool(asked.append(url)) or True)
+    result = await add_on_store({})
+    assert asked == [rfid_routes.ADD_ON_STORE_URL]
+    assert result == {"opened": True, "url": rfid_routes.ADD_ON_STORE_URL}
+
+
+@pytest.mark.asyncio
+async def test_a_host_with_no_browser_still_hands_back_the_address(monkeypatch, add_on_store):
+    """A robot with no screen of its own: the panel shows the URL instead."""
+    monkeypatch.setattr(webbrowser, "open", lambda url: False)
+    assert await add_on_store({}) == {"opened": False, "url": rfid_routes.ADD_ON_STORE_URL}

@@ -6,6 +6,7 @@ import {
   getRfidStatus,
   linkRfidTag,
   listPersonalities,
+  openAddOnStore,
   subscribe,
   untilReady,
 } from "../api.js";
@@ -13,7 +14,6 @@ import { h, prettifyProfileName } from "../ui.js";
 import { confirmDialog } from "../components/confirm-dialog.js";
 
 const NO_READER_ACCESSORY = Object.freeze({ state: "unavailable", personality: null, content: null });
-const ADD_ON_STORE_URL = "https://store.pollen-robotics.com/collections/reachy-mini";
 
 const ACCESSORY_COPY = Object.freeze({
   none: {
@@ -38,34 +38,32 @@ export async function mountAccessoryView({ outlet, signal }) {
   const readerStatus = h("p", { class: "settings-hint", "data-role": "reader" }, "Checking the reader…");
   const accessoryCard = h("div", { class: "accessory-card", "aria-live": "polite" });
   const readerTitle = h("h2", { class: "settings-section-title" }, "On the reader");
-  const addOnLink = h(
-    "a",
-    {
-      class: "btn btn--ghost accessory-requirement__link",
-      href: ADD_ON_STORE_URL,
-      target: "_blank",
-      rel: "noreferrer",
-    },
+  const addOnButton = h(
+    "button",
+    { type: "button", class: "btn btn--ghost accessory-requirement__link" },
     "Get the NFC add-on"
   );
-  const addOnAddress = h(
-    "p",
-    { class: "settings-hint accessory-requirement__address", hidden: "hidden" },
-    "Open this address in a browser: ",
-    h("code", null, ADD_ON_STORE_URL)
-  );
-  // The control app shows this panel in a webview that drops both target="_blank"
-  // and window.open. A click there must still leave the address on screen rather
-  // than appear to do nothing.
-  addOnLink.addEventListener("click", (event) => {
-    event.preventDefault();
-    let opened = null;
+  const addOnAddress = h("p", { class: "settings-hint accessory-requirement__address", hidden: "hidden" });
+  // This panel runs in the control app's webview, which drops target="_blank"
+  // and window.open, so the app opens the store on the machine it runs on —
+  // the same one as the control app on a Lite, or when both sit on a desk. A
+  // robot with no screen of its own has no browser to raise, and the address
+  // goes on screen so it stays reachable from any other device.
+  addOnButton.addEventListener("click", async () => {
+    let store = null;
     try {
-      opened = window.open(ADD_ON_STORE_URL, "_blank", "noopener");
+      store = await openAddOnStore();
     } catch (error) {
-      console.warn("The host refused to open the store link:", error);
+      console.warn("Could not open the add-on store:", error);
     }
-    if (!opened) addOnAddress.hidden = false;
+    if (store?.opened) return;
+    if (store?.url && window.open(store.url, "_blank", "noopener")) return;
+    if (store?.url) {
+      addOnAddress.replaceChildren("Open this address in a browser: ", h("code", null, store.url));
+    } else {
+      addOnAddress.replaceChildren("The store could not be opened from here.");
+    }
+    addOnAddress.hidden = false;
   });
   // Shown in the reader panel's place when there is no reader to report on.
   const requirementPanel = [
@@ -77,7 +75,7 @@ export async function mountAccessoryView({ outlet, signal }) {
         + "any other object, and Reachy Mini takes that personality on as soon as the object is placed "
         + "on its head."
     ),
-    addOnLink,
+    addOnButton,
     addOnAddress,
   ];
   const readerSection = h("section", { class: "settings-section" }, readerTitle, readerStatus, accessoryCard);
