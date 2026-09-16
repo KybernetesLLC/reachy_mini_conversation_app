@@ -20,7 +20,7 @@ def controller(monkeypatch):
     )
 
 
-def fake_reader(monkeypatch, *, connected, tag=None):
+def fake_reader(monkeypatch, *, connected, tag=None, error=None):
     """Answer the daemon's status and tag endpoints without a reader."""
     monkeypatch.setattr(
         NfcDaemonClient,
@@ -30,6 +30,7 @@ def fake_reader(monkeypatch, *, connected, tag=None):
             "chip_detected": connected,
             "driver_available": True,
             "port": "/dev/nfc",
+            "error": error,
         },
     )
     absent = NfcTagSnapshot(present=False, uid=None, content=None, blank=False)
@@ -61,6 +62,13 @@ def test_a_tag_on_a_connected_reader_is_described_by_what_it_carries(controller,
     """Each tag state stays distinct from both "none" and "unavailable"."""
     fake_reader(monkeypatch, connected=True, tag=tag)
     assert controller.snapshot()["accessory"]["state"] == state
+
+
+def test_the_daemon_reason_for_a_down_link_reaches_the_panel(controller, monkeypatch):
+    """ "Not connected" alone leaves a user guessing; the daemon says which it is."""
+    fake_reader(monkeypatch, connected=False, error="no NFC reader board found")
+    assert controller.connection_status()["error"] == "no NFC reader board found"
+    assert controller.last_status()["error"] == "no NFC reader board found"
 
 
 @pytest.fixture

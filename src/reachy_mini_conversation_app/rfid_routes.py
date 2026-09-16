@@ -173,6 +173,9 @@ class RfidController:
             "chip_detected": status.get("chip_detected", False),
             "driver_available": status.get("driver_available", False),
             "chip_version": status.get("chip_version"),
+            # The daemon says why the link is down — no board found, port busy,
+            # driver missing. "Not connected" alone leaves the user guessing.
+            "error": status.get("error"),
         }
         self._last_status = summary
         return summary

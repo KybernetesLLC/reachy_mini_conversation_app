@@ -310,7 +310,7 @@ function buildStatusSection() {
       if (payload.requires_restart) {
         list.appendChild(statusRow("Restart", "Required to apply changes", "warn"));
       }
-      list.appendChild(accessoryReaderRow(payload));
+      list.append(...accessoryReaderRows(payload));
     },
     renderUnavailable(error) {
       list.replaceChildren(statusRow("Backend", `Unavailable: ${describeError(error)}`, "warn"));
@@ -321,19 +321,27 @@ function buildStatusSection() {
 /**
  * The NFC accessory reader. Three distinct states, because "not connected" and
  * "this robot has no reader" call for very different reactions from the user.
+ * The daemon's own reason for a link being down follows on its own row, the way
+ * the backend's error does: it is what turns "Not connected" into something the
+ * reader can act on — no board found, port busy, driver missing.
  */
-function accessoryReaderRow(payload) {
+function accessoryReaderRows(payload) {
+  const rows = [];
   if (!payload.nfc_supported) {
-    return statusRow("Accessory reader", "Not installed on this robot");
+    rows.push(statusRow("Accessory reader", "Not installed on this robot"));
+  } else if (!payload.nfc_connected) {
+    rows.push(statusRow("Accessory reader", "Not connected", "warn"));
+  } else {
+    rows.push(
+      statusRow("Accessory reader", payload.nfc_port ? `Connected (${payload.nfc_port})` : "Connected", "ok")
+    );
   }
-  if (!payload.nfc_connected) {
-    return statusRow("Accessory reader", "Not responding", "warn");
+  // The daemon clears it as soon as the chip answers, so it only ever shows
+  // alongside one of the two states above.
+  if (payload.nfc_error) {
+    rows.push(statusRow("Accessory reader error", payload.nfc_error, "warn"));
   }
-  return statusRow(
-    "Accessory reader",
-    payload.nfc_port ? `Connected (${payload.nfc_port})` : "Connected",
-    "ok"
-  );
+  return rows;
 }
 
 function statusRow(label, value, tone) {

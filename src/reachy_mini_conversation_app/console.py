@@ -501,12 +501,13 @@ class LocalStream:
         """
         controller = self._rfid_controller
         if controller is None:
-            return {"nfc_supported": False, "nfc_connected": False, "nfc_port": None}
+            return {"nfc_supported": False, "nfc_connected": False, "nfc_port": None, "nfc_error": None}
         status = controller.last_status()
         return {
             "nfc_supported": bool(status.get("driver_available")),
             "nfc_connected": bool(status.get("connected")),
             "nfc_port": status.get("port"),
+            "nfc_error": status.get("error"),
         }
 
     def _clear_persisted_voice_override(self) -> None:

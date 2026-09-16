@@ -120,7 +120,8 @@ class NfcDaemonClient:
         """Return the daemon NFC reader status (never raises; returns disconnected on error).
 
         Mirrors the daemon's ``NfcStatus``: ``connected``, ``chip_detected``,
-        ``driver_available``, ``port``, ``chip_version``, ``error``.
+        ``driver_available``, ``port``, ``chip_version``, ``error``,
+        ``last_seen_at``.
         """
         try:
             r = self._session.get(f"{self.base}/api/nfc/status", timeout=self.timeout)
