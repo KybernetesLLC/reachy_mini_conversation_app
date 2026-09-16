@@ -38,6 +38,35 @@ export async function mountAccessoryView({ outlet, signal }) {
   const readerStatus = h("p", { class: "settings-hint", "data-role": "reader" }, "Checking the reader…");
   const accessoryCard = h("div", { class: "accessory-card", "aria-live": "polite" });
   const readerTitle = h("h2", { class: "settings-section-title" }, "On the reader");
+  const addOnLink = h(
+    "a",
+    {
+      class: "btn btn--ghost accessory-requirement__link",
+      href: ADD_ON_STORE_URL,
+      target: "_blank",
+      rel: "noreferrer",
+    },
+    "Get the NFC add-on"
+  );
+  const addOnAddress = h(
+    "p",
+    { class: "settings-hint accessory-requirement__address", hidden: "hidden" },
+    "Open this address in a browser: ",
+    h("code", null, ADD_ON_STORE_URL)
+  );
+  // The control app shows this panel in a webview that drops both target="_blank"
+  // and window.open. A click there must still leave the address on screen rather
+  // than appear to do nothing.
+  addOnLink.addEventListener("click", (event) => {
+    event.preventDefault();
+    let opened = null;
+    try {
+      opened = window.open(ADD_ON_STORE_URL, "_blank", "noopener");
+    } catch (error) {
+      console.warn("The host refused to open the store link:", error);
+    }
+    if (!opened) addOnAddress.hidden = false;
+  });
   // Shown in the reader panel's place when there is no reader to report on.
   const requirementPanel = [
     h("h2", { class: "settings-section-title" }, "What does the accessory feature require?"),
@@ -48,16 +77,8 @@ export async function mountAccessoryView({ outlet, signal }) {
         + "any other object, and Reachy Mini takes that personality on as soon as the object is placed "
         + "on its head."
     ),
-    h(
-      "a",
-      {
-        class: "btn btn--ghost accessory-requirement__link",
-        href: ADD_ON_STORE_URL,
-        target: "_blank",
-        rel: "noreferrer",
-      },
-      "Get the NFC add-on"
-    ),
+    addOnLink,
+    addOnAddress,
   ];
   const readerSection = h("section", { class: "settings-section" }, readerTitle, readerStatus, accessoryCard);
   const personalitySelect = h("select", {

@@ -1743,6 +1743,16 @@ button {
   text-decoration: none;
 }
 
+/* The address itself, revealed when the host refuses to open a browser window. */
+.accessory-requirement__address {
+  margin-top: 10px;
+  word-break: break-all;
+}
+
+.accessory-requirement__address code {
+  color: var(--text-soft);
+}
+
 .accessory-card__details {
   display: grid;
   gap: 4px;
