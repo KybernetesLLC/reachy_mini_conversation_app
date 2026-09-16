@@ -13,6 +13,7 @@ import { h, prettifyProfileName } from "../ui.js";
 import { confirmDialog } from "../components/confirm-dialog.js";
 
 const NO_READER_ACCESSORY = Object.freeze({ state: "unavailable", personality: null, content: null });
+const ADD_ON_STORE_URL = "https://store.pollen-robotics.com/collections/reachy-mini";
 
 const ACCESSORY_COPY = Object.freeze({
   none: {
@@ -36,6 +37,29 @@ const ACCESSORY_COPY = Object.freeze({
 export async function mountAccessoryView({ outlet, signal }) {
   const readerStatus = h("p", { class: "settings-hint", "data-role": "reader" }, "Checking the reader…");
   const accessoryCard = h("div", { class: "accessory-card", "aria-live": "polite" });
+  const readerTitle = h("h2", { class: "settings-section-title" }, "On the reader");
+  // Shown in the reader panel's place when there is no reader to report on.
+  const requirementPanel = [
+    h("h2", { class: "settings-section-title" }, "What does the accessory feature require?"),
+    h(
+      "p",
+      { class: "settings-hint" },
+      "Accessories are read by the Reachy Mini NFC add-on. Fit it to give a personality to a hat or "
+        + "any other object, and Reachy Mini takes that personality on as soon as the object is placed "
+        + "on its head."
+    ),
+    h(
+      "a",
+      {
+        class: "btn btn--ghost accessory-requirement__link",
+        href: ADD_ON_STORE_URL,
+        target: "_blank",
+        rel: "noreferrer",
+      },
+      "Get the NFC add-on"
+    ),
+  ];
+  const readerSection = h("section", { class: "settings-section" }, readerTitle, readerStatus, accessoryCard);
   const personalitySelect = h("select", {
     class: "settings-select",
     "aria-label": "Personality to link",
@@ -78,13 +102,7 @@ export async function mountAccessoryView({ outlet, signal }) {
         "See what the accessory on Reachy Mini's head carries, and choose the personality it should apply."
       )
     ),
-    h(
-      "section",
-      { class: "settings-section" },
-      h("h2", { class: "settings-section-title" }, "On the reader"),
-      readerStatus,
-      accessoryCard
-    ),
+    readerSection,
     linkSection
   );
   outlet.replaceChildren(view);
@@ -111,31 +129,6 @@ export async function mountAccessoryView({ outlet, signal }) {
   function canErase() {
     const state = latest?.accessory?.state;
     return state === "known" || state === "unknown";
-  }
-
-  function renderReader(payload) {
-    if (!payload?.driver_available) {
-      readerStatus.replaceChildren(
-        h("strong", null, "This Reachy Mini has no accessory reader."),
-        h(
-          "span",
-          { class: "accessory-missing__body" },
-          "Accessories are read by the Reachy Mini NFC add-on. Fit it to give a "
-            + "personality to a hat or any other object, and have Reachy Mini take "
-            + "that personality on as soon as the object is placed on its head."
-        )
-      );
-      readerStatus.classList.add("accessory-missing");
-      return;
-    }
-    readerStatus.classList.remove("accessory-missing");
-    if (!payload.connected) {
-      readerStatus.textContent = "The NFC reader is not responding.";
-      return;
-    }
-    readerStatus.textContent = payload.port
-      ? `Reader connected on ${payload.port}.`
-      : "Reader connected.";
   }
 
   function renderAccessory(accessory) {
@@ -179,12 +172,17 @@ export async function mountAccessoryView({ outlet, signal }) {
   function render(payload) {
     latest = payload;
     const accessory = payload?.accessory || NO_READER_ACCESSORY;
-    renderReader(payload);
-    // A reader that cannot be read has nothing on it to describe: saying "no
-    // accessory" here would read as an empty reader. The line above says why.
-    accessoryCard.hidden = accessory.state === "unavailable";
-    if (!accessoryCard.hidden) renderAccessory(accessory);
-    linkSection.hidden = !payload?.driver_available;
+    const hasReader = accessory.state !== "unavailable";
+    // Reporting on a reader that is not there would read as an empty one, so
+    // the panel says what the feature needs instead.
+    if (hasReader) {
+      readerSection.replaceChildren(readerTitle, readerStatus, accessoryCard);
+      readerStatus.textContent = payload.port ? `Reader connected on ${payload.port}.` : "Reader connected.";
+      renderAccessory(accessory);
+    } else {
+      readerSection.replaceChildren(...requirementPanel);
+    }
+    linkSection.hidden = !hasReader;
     // A tag arriving or leaving changes what the buttons can do.
     setBusy(busy);
   }

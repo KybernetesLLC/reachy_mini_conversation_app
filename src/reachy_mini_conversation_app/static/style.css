@@ -1715,28 +1715,32 @@ button {
   background: color-mix(in srgb, var(--warn) 16%, var(--bg-soft));
 }
 
-/* No add-on fitted: present, but plainly inert. */
+/* No add-on fitted: present, but plainly inert — struck through and greyed out,
+   so it never reads as a reader that simply has nothing on it. */
 .app-shell__accessory[data-state="unavailable"] .app-shell__accessory-icon {
   opacity: 0.55;
+}
+
+.app-shell__accessory-slash {
+  display: none;
+}
+
+.app-shell__accessory[data-state="unavailable"] .app-shell__accessory-slash {
+  display: block;
+}
+
+.app-shell__accessory[data-state="unavailable"] .app-shell__personality-name {
+  color: var(--text-muted);
 }
 
 .app-shell__accessory[hidden] {
   display: none;
 }
 
-/* Explaining the missing add-on needs two lines, unlike the one-line statuses. */
-.accessory-missing {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.accessory-missing strong {
-  color: var(--text);
-}
-
-.accessory-missing__body {
-  max-width: 60ch;
+/* Sits under the paragraph explaining what the accessory feature needs. */
+.accessory-requirement__link {
+  margin-top: 14px;
+  text-decoration: none;
 }
 
 .accessory-card__details {
