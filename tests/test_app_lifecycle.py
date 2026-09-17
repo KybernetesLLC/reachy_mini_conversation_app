@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, call
 import numpy as np
 
 from reachy_mini.reachy_mini import SLEEP_HEAD_POSE
-from reachy_mini_conversation_app import app_lifecycle
+from reachy_mini_conversation_app import daemon_api, app_lifecycle
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 
 
@@ -27,7 +27,7 @@ def test_request_stop_current_app_posts_to_daemon(monkeypatch) -> None:
         assert timeout == 2.0
         return FakeResponse()
 
-    monkeypatch.setattr(app_lifecycle.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(daemon_api.urllib.request, "urlopen", fake_urlopen)
     robot = SimpleNamespace(client=SimpleNamespace(host="192.168.1.42", port=8000))
 
     assert app_lifecycle.request_stop_current_app(robot, MagicMock())
@@ -80,9 +80,9 @@ def test_request_stop_current_app_returns_false_on_urlerror(monkeypatch) -> None
     """A daemon that is unreachable is reported as a failed stop, not an exception."""
 
     def fake_urlopen(request, timeout):
-        raise app_lifecycle.urllib.error.URLError("connection refused")
+        raise daemon_api.urllib.error.URLError("connection refused")
 
-    monkeypatch.setattr(app_lifecycle.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(daemon_api.urllib.request, "urlopen", fake_urlopen)
     robot = SimpleNamespace(client=SimpleNamespace(host="192.168.1.42", port=8000))
 
     assert not app_lifecycle.request_stop_current_app(robot, MagicMock())
