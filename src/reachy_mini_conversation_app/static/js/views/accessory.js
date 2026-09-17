@@ -15,6 +15,50 @@ import { confirmDialog } from "../components/confirm-dialog.js";
 
 const NO_READER_ACCESSORY = Object.freeze({ state: "unavailable", personality: null, content: null });
 
+/** Kept in step with ADD_ON_STORE_URL in rfid_routes.py. */
+const ADD_ON_STORE_URL = "https://store.pollen-robotics.com/collections/reachy-mini";
+
+/** How long the embedding app gets to answer before we try the next way in. */
+const HOST_OPEN_TIMEOUT_MS = 500;
+
+/**
+ * Ask the page embedding this app to open a URL on the machine it runs on.
+ *
+ * The control app draws this panel in an iframe inside a Tauri webview, where
+ * window.open is dropped; its own "Open on Hugging Face" buttons work because
+ * they call the Tauri shell plugin, which an iframe on the robot's origin
+ * cannot reach. A message to the host is the one line out, and it only pays
+ * off once the control app answers it — until then this resolves false and the
+ * caller moves on.
+ */
+function askHostToOpen(url) {
+  const id = `open-url-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return new Promise((resolve) => {
+    let timer = 0;
+    const settle = (opened) => {
+      window.removeEventListener("message", onMessage);
+      window.clearTimeout(timer);
+      resolve(opened);
+    };
+    const onMessage = (event) => {
+      // The host's origin is its own business — a Tauri scheme, a dev server —
+      // so the answer is tied to the frame we asked rather than to an origin.
+      if (event.source !== window.parent) return;
+      const data = event.data;
+      if (data?.source !== "reachy-mini-host" || data.type !== "open-url:result" || data.id !== id) return;
+      settle(Boolean(data.opened));
+    };
+    window.addEventListener("message", onMessage);
+    timer = window.setTimeout(() => settle(false), HOST_OPEN_TIMEOUT_MS);
+    try {
+      window.parent.postMessage({ source: "reachy-mini-app", type: "open-url", id, url }, "*");
+    } catch (error) {
+      console.warn("Could not reach the embedding app:", error);
+      settle(false);
+    }
+  });
+}
+
 const ACCESSORY_COPY = Object.freeze({
   none: {
     title: "No accessory",
@@ -44,12 +88,23 @@ export async function mountAccessoryView({ outlet, signal }) {
     "Get the NFC add-on"
   );
   const addOnAddress = h("p", { class: "settings-hint accessory-requirement__address", hidden: "hidden" });
-  // This panel runs in the control app's webview, which drops target="_blank"
-  // and window.open, so the app opens the store on the machine it runs on —
-  // the same one as the control app on a Lite, or when both sit on a desk. A
-  // robot with no screen of its own has no browser to raise, and the address
-  // goes on screen so it stays reachable from any other device.
+  // Tried nearest screen first: the app embedding this panel, then the browser
+  // showing it, then the robot's own screen, then the address on the page.
+  // Embedded is asked first because a webview that drops window.open is free to
+  // answer it with a window that never navigates, and we would read that as a
+  // raised tab. Standalone, window.open stays ahead of every await, so a
+  // browser still counts it as user-driven and lets the tab through.
   addOnButton.addEventListener("click", async () => {
+    if (window.parent !== window && (await askHostToOpen(ADD_ON_STORE_URL))) return;
+    // Opened without the noopener feature, which would null the handle we read
+    // to tell a raised tab from a blocked one; the link is severed instead.
+    const tab = window.open(ADD_ON_STORE_URL, "_blank");
+    if (tab) {
+      tab.opener = null;
+      return;
+    }
+    // A robot with no screen of its own has no browser to raise, and the
+    // address goes on screen so it stays reachable from any other device.
     let store = null;
     let failure = null;
     try {
@@ -59,15 +114,15 @@ export async function mountAccessoryView({ outlet, signal }) {
       console.warn("Could not open the add-on store:", error);
     }
     if (store?.opened) return;
-    if (store?.url && window.open(store.url, "_blank", "noopener")) return;
     // Saying why matters here: an app still running the code it started with
     // answers "method not found", which points straight at the restart it needs.
+    const url = store?.url || ADD_ON_STORE_URL;
     addOnAddress.replaceChildren(
-      store?.url
-        ? "Open this address in a browser: "
-        : `The store could not be opened: ${failure || "the app gave no address"}.`
+      failure
+        ? `The store could not be opened here: ${failure}. Open this address in a browser: `
+        : "Open this address in a browser: "
     );
-    if (store?.url) addOnAddress.appendChild(h("code", null, store.url));
+    addOnAddress.appendChild(h("code", null, url));
     addOnAddress.hidden = false;
   });
   // Shown in the reader panel's place when there is no reader to report on.
