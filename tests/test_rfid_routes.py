@@ -151,39 +151,74 @@ class _StubHandler:
         return None
 
 
-def test_taking_off_the_accessory_the_app_started_with_reverts_to_the_default(monkeypatch):
-    """The controller applied nothing itself, so it has to be told what it started as."""
+def removal_controller(monkeypatch, *, initial_personality=None, default_personality=None):
+    """Build a controller whose revert is observable without a handler or a loop."""
     monkeypatch.setattr(rfid_routes, "_load_move_dataset", lambda repo_id: None)
     controller = rfid_routes.RfidController(
         get_handler=lambda: pytest.fail("the handler is passed in, not fetched"),
         get_loop=lambda: None,
         robot=None,
-        initial_personality="default",
+        get_default_personality=lambda: default_personality,
+        initial_personality=initial_personality,
     )
-    ran = []
-    monkeypatch.setattr(
-        controller, "_run_on_loop", lambda coro, description, **kw: bool(ran.append(description)) or True
-    )
+    applied_to = []
     monkeypatch.setattr(controller, "_queue_move", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        controller,
+        "_run_on_loop",
+        lambda coro, description, **kw: bool(applied_to.append(description)) or True,
+    )
+    return controller, applied_to
+
+
+def test_taking_off_the_accessory_the_app_started_with_reverts_to_the_default(monkeypatch):
+    """The controller applied nothing itself, so it has to be told what it started as."""
+    controller, applied_to = removal_controller(monkeypatch, initial_personality="pirate")
 
     applied = controller._on_tag_removed(_StubHandler())
 
     assert applied == {"code": None, "personality": rfid_routes.DEFAULT_SELECTION}
-    assert "default revert" in ran
+    assert "default revert" in applied_to
+
+
+def test_taking_off_an_accessory_goes_back_to_the_personality_set_as_default(monkeypatch):
+    """The fallback is whatever this instance was told to start as, not the built-in one."""
+    controller, applied_to = removal_controller(
+        monkeypatch, initial_personality="pirate", default_personality="king_reachy_maximus"
+    )
+    monkeypatch.setattr(rfid_routes, "list_personalities", lambda: ["default", "king_reachy_maximus", "pirate"])
+
+    applied = controller._on_tag_removed(_StubHandler())
+
+    assert applied == {"code": None, "personality": "king_reachy_maximus"}
+    assert "default revert" in applied_to
+
+
+def test_a_default_personality_since_deleted_falls_back_to_the_built_in_one(monkeypatch):
+    """Reverting to a personality this robot no longer has would fail and strand the accessory's."""
+    controller, applied_to = removal_controller(
+        monkeypatch, initial_personality="pirate", default_personality="deleted_since"
+    )
+    monkeypatch.setattr(rfid_routes, "list_personalities", lambda: ["default", "pirate"])
+
+    assert controller._on_tag_removed(_StubHandler()) == {"code": None, "personality": rfid_routes.DEFAULT_SELECTION}
+    assert "default revert" in applied_to
+
+
+def test_an_accessory_carrying_the_default_personality_changes_nothing_when_removed(monkeypatch):
+    """Restarting the backend to arrive at what is already running only costs a silence."""
+    controller, applied_to = removal_controller(
+        monkeypatch, initial_personality="king_reachy_maximus", default_personality="king_reachy_maximus"
+    )
+    monkeypatch.setattr(rfid_routes, "list_personalities", lambda: ["default", "king_reachy_maximus"])
+
+    assert controller._on_tag_removed(_StubHandler()) is None
+    assert "default revert" not in applied_to
 
 
 def test_a_controller_that_started_at_the_default_has_nothing_to_revert(monkeypatch):
     """No accessory at launch: taking nothing off must not restart the backend."""
-    monkeypatch.setattr(rfid_routes, "_load_move_dataset", lambda repo_id: None)
-    controller = rfid_routes.RfidController(
-        get_handler=lambda: pytest.fail("the handler is passed in, not fetched"),
-        get_loop=lambda: None,
-        robot=None,
-    )
-    ran = []
-    monkeypatch.setattr(
-        controller, "_run_on_loop", lambda coro, description, **kw: bool(ran.append(description)) or True
-    )
+    controller, applied_to = removal_controller(monkeypatch)
 
     assert controller._on_tag_removed(_StubHandler()) is None
-    assert "default revert" not in ran
+    assert "default revert" not in applied_to

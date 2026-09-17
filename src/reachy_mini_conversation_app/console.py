@@ -585,6 +585,7 @@ class LocalStream:
             robot=self._robot,
             rpc=rpc,
             on_personality_applied=self.notify_personality,
+            get_default_personality=self._read_persisted_personality,
             initial_personality=self._startup_accessory_personality,
         )
         register_rfid_methods(rpc, controller)

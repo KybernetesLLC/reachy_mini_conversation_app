@@ -68,6 +68,7 @@ ADD_ON_STORE_URL = "https://store.pollen-robotics.com/collections/reachy-mini"
 HandlerGetter = Callable[[], "HuggingFaceRealtimeHandler"]
 LoopGetter = Callable[[], asyncio.AbstractEventLoop | None]
 PersonalityObserver = Callable[[str | None], None]
+DefaultPersonalityGetter = Callable[[], str | None]
 
 
 def accessory_personality_on_reader(timeout: float = 2.0) -> str | None:
@@ -118,6 +119,7 @@ class RfidController:
         robot: "ReachyMini",
         rpc: JsonRpcServer | None = None,
         on_personality_applied: PersonalityObserver | None = None,
+        get_default_personality: DefaultPersonalityGetter | None = None,
         initial_personality: str | None = None,
     ) -> None:
         """Build a controller; call :meth:`start` to begin polling.
@@ -136,6 +138,7 @@ class RfidController:
         # An accessory swaps the personality without any client asking, so the
         # badges would otherwise keep showing the one it replaced.
         self._on_personality_applied = on_personality_applied
+        self._get_default_personality = get_default_personality
 
         self._transition_moves = _load_move_dataset(TRANSITION_MOVE_DATASET)
         self._write_moves = _load_move_dataset(WRITE_MOVE_DATASET)
@@ -455,14 +458,38 @@ class RfidController:
         if self._current_personality is None:
             return None
 
-        logger.info("[RFID] >>> NO_TAG received — reverting to default")
+        profile = self._default_personality()
+        if profile == self._current_personality:
+            logger.info("[RFID] >>> NO_TAG received — already on the default personality")
+            self._current_personality = None
+            return None
+
+        logger.info("[RFID] >>> NO_TAG received — reverting to %s", profile or DEFAULT_SELECTION)
         self._queue_move(handler, self._transition_moves, TRANSITION_MOVE_NAME)
-        if not self._run_on_loop(handler.apply_personality(None), "default revert"):
+        if not self._run_on_loop(handler.apply_personality(profile), "default revert"):
             return None
         self._current_personality = None
-        self._announce_personality(None)
+        self._announce_personality(profile)
         logger.info("[RFID] >>> default personality applied OK")
-        return {"code": None, "personality": DEFAULT_SELECTION}
+        return {"code": None, "personality": profile or DEFAULT_SELECTION}
+
+    def _default_personality(self) -> str | None:
+        """Return the personality to fall back to with no accessory on the reader.
+
+        None means the built-in default. A saved personality that has since been
+        deleted reads the same way: falling back to something this robot no
+        longer has would fail the revert and strand the accessory's personality.
+        """
+        if self._get_default_personality is None:
+            return None
+        try:
+            profile = self._get_default_personality()
+        except (OSError, ValueError) as exc:
+            logger.warning("[RFID] could not read the default personality: %s", exc)
+            return None
+        if profile is None or profile not in list_personalities():
+            return None
+        return profile
 
     def _on_tag_read(self, handler: "HuggingFaceRealtimeHandler", code: str) -> dict[str, Any] | None:
         if not code:
