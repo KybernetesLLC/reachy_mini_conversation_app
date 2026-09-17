@@ -99,3 +99,91 @@ async def test_a_host_with_no_browser_still_hands_back_the_address(monkeypatch, 
     """A robot with no screen of its own: the panel shows the URL instead."""
     monkeypatch.setattr(webbrowser, "open", lambda url: False)
     assert await add_on_store({}) == {"opened": False, "url": rfid_routes.ADD_ON_STORE_URL}
+
+
+def test_an_accessory_left_on_the_head_names_the_personality_to_start_as(monkeypatch):
+    """The app reads the reader before building its handler, so it starts as that one."""
+    fake_reader(
+        monkeypatch,
+        connected=True,
+        tag=NfcTagSnapshot(present=True, uid="04", content=to_tag_token("default"), blank=False),
+    )
+    assert rfid_routes.accessory_personality_on_reader() == "default"
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        None,
+        NfcTagSnapshot(present=True, uid="04", content=None, blank=True),
+        NfcTagSnapshot(present=True, uid="04", content="written-elsewhere", blank=False),
+        NfcTagSnapshot(present=True, uid="04", content=to_tag_token("gone_from_this_robot"), blank=False),
+    ],
+    ids=["no accessory", "blank", "written elsewhere", "personality this robot lacks"],
+)
+def test_nothing_to_start_from_leaves_the_saved_personality_alone(monkeypatch, tag):
+    """Anything the robot cannot act on reads the same way: the app starts as usual."""
+    fake_reader(monkeypatch, connected=True, tag=tag)
+    assert rfid_routes.accessory_personality_on_reader() is None
+
+
+def test_a_robot_without_the_nfc_driver_is_not_asked_for_a_tag(monkeypatch):
+    """No driver means no reader on this robot, so the launch never waits on one."""
+    monkeypatch.setattr(NfcDaemonClient, "get_status", lambda self: {"driver_available": False})
+    monkeypatch.setattr(NfcDaemonClient, "get_tag", lambda self: pytest.fail("the tag must not be read"))
+    assert rfid_routes.accessory_personality_on_reader() is None
+
+
+class _StubHandler:
+    """Just enough handler for the tag-removal path, which never reaches the loop."""
+
+    class _Deps:
+        blank_tag_present = False
+        pending_nfc_write = None
+
+    def __init__(self):
+        self.deps = self._Deps()
+
+    def abort_nfc_collection(self):
+        return None
+
+    def apply_personality(self, profile):
+        return None
+
+
+def test_taking_off_the_accessory_the_app_started_with_reverts_to_the_default(monkeypatch):
+    """The controller applied nothing itself, so it has to be told what it started as."""
+    monkeypatch.setattr(rfid_routes, "_load_move_dataset", lambda repo_id: None)
+    controller = rfid_routes.RfidController(
+        get_handler=lambda: pytest.fail("the handler is passed in, not fetched"),
+        get_loop=lambda: None,
+        robot=None,
+        initial_personality="default",
+    )
+    ran = []
+    monkeypatch.setattr(
+        controller, "_run_on_loop", lambda coro, description, **kw: bool(ran.append(description)) or True
+    )
+    monkeypatch.setattr(controller, "_queue_move", lambda *args, **kwargs: None)
+
+    applied = controller._on_tag_removed(_StubHandler())
+
+    assert applied == {"code": None, "personality": rfid_routes.DEFAULT_SELECTION}
+    assert "default revert" in ran
+
+
+def test_a_controller_that_started_at_the_default_has_nothing_to_revert(monkeypatch):
+    """No accessory at launch: taking nothing off must not restart the backend."""
+    monkeypatch.setattr(rfid_routes, "_load_move_dataset", lambda repo_id: None)
+    controller = rfid_routes.RfidController(
+        get_handler=lambda: pytest.fail("the handler is passed in, not fetched"),
+        get_loop=lambda: None,
+        robot=None,
+    )
+    ran = []
+    monkeypatch.setattr(
+        controller, "_run_on_loop", lambda coro, description, **kw: bool(ran.append(description)) or True
+    )
+
+    assert controller._on_tag_removed(_StubHandler()) is None
+    assert "default revert" not in ran

@@ -122,7 +122,9 @@ def run(
     from reachy_mini_conversation_app.moves import MovementManager
     from reachy_mini_conversation_app.config import (
         HF_LOCAL_CONNECTION_MODE,
+        config,
         set_instance_path,
+        set_custom_profile,
         get_hf_connection_selection,
         resolve_app_timeout_minutes,
         refresh_runtime_config_from_env,
@@ -160,6 +162,7 @@ def run(
     )
 
     from reachy_mini_conversation_app.console import LocalStream
+    from reachy_mini_conversation_app.rfid_routes import accessory_personality_on_reader
     from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
     from reachy_mini_conversation_app.conversation_handler import ConversationHandler
 
@@ -215,6 +218,24 @@ def run(
             startup_voice=startup_voice,
         )
 
+    # An accessory already on the head at launch names the personality to start
+    # as. Read here, before the first handler is built, so the app comes up as
+    # that personality: leaving it to the reader's poll loop would apply it as a
+    # change instead — transition move, backend restart — seconds after a robot
+    # that has only just finished starting.
+    accessory_personality = accessory_personality_on_reader()
+    if accessory_personality is not None:
+        set_custom_profile(accessory_personality)
+        if config.REACHY_MINI_CUSTOM_PROFILE != accessory_personality:
+            # A profile pinned for this instance outranks an accessory.
+            logger.info("Accessory on the reader ignored: a profile is pinned for this instance")
+            accessory_personality = None
+        else:
+            logger.info("Accessory on the reader selects personality %r", accessory_personality)
+            # The saved voice was picked for the saved personality; the one the
+            # accessory names speaks with its own, as it would on any swap.
+            startup_settings = StartupSettings(profile=accessory_personality, voice=None)
+
     handler = build_handler(startup_settings.voice)
 
     stream_manager: LocalStream | None = None
@@ -238,6 +259,7 @@ def run(
         instance_path=instance_path,
         handler_factory=build_handler,
         startup_voice=startup_settings.voice,
+        startup_accessory_personality=accessory_personality,
     )
 
     # The page is served immediately, so the API must be live before the slow startup work below.

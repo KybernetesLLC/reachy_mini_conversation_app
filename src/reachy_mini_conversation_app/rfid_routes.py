@@ -70,6 +70,35 @@ LoopGetter = Callable[[], asyncio.AbstractEventLoop | None]
 PersonalityObserver = Callable[[str | None], None]
 
 
+def accessory_personality_on_reader(timeout: float = 2.0) -> str | None:
+    """Return the personality named by an accessory already on the reader.
+
+    None when there is none. Read once before the handler is built, so an
+    accessory left on the head between two runs starts its personality
+    outright. Going through :meth:`RfidController._on_tag_read` instead would
+    apply it as a change — the transition move, a backend restart — on top of a
+    robot that has only just finished starting.
+
+    No driver, no daemon answering, no accessory, and an accessory naming a
+    personality this robot does not have all read the same way here: nothing to
+    start from. The daemon client reports its own failures as an absent tag, so
+    a reader that is down cannot hold up the launch.
+    """
+    client = NfcDaemonClient(timeout=timeout)
+    try:
+        if not client.get_status().get("driver_available"):
+            return None
+        tag = client.get_tag()
+        if not tag.present or tag.blank or not tag.content:
+            return None
+        personality = from_tag_token(tag.content)
+        if personality is None or personality not in list_personalities():
+            return None
+        return personality
+    finally:
+        client.close()
+
+
 def _load_move_dataset(repo_id: str) -> RecordedMoves | None:
     """Load a recorded-move dataset, or None when it cannot be fetched."""
     try:
@@ -89,8 +118,16 @@ class RfidController:
         robot: "ReachyMini",
         rpc: JsonRpcServer | None = None,
         on_personality_applied: PersonalityObserver | None = None,
+        initial_personality: str | None = None,
     ) -> None:
-        """Build a controller; call :meth:`start` to begin polling."""
+        """Build a controller; call :meth:`start` to begin polling.
+
+        ``initial_personality`` is the one the app already started as, read off
+        an accessory that was on the reader before the app came up. The
+        controller needs it to know that taking that accessory off is a change:
+        without it the removal reads as "nothing was applied" and the
+        personality stays on with no accessory to explain it.
+        """
         self._client = NfcDaemonClient()
         self._get_handler = get_handler
         self._get_loop = get_loop
@@ -107,7 +144,7 @@ class RfidController:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
-        self._current_personality: str | None = None
+        self._current_personality: str | None = initial_personality
         self._blank_tag_active = False
         self._blank_tag_cooldown_until = 0.0
         self._delayed_switch_future: Any = None

@@ -117,12 +117,15 @@ class LocalStream:
         instance_path: Optional[str] = None,
         handler_factory: HandlerFactory | None = None,
         startup_voice: Optional[str] = None,
+        startup_accessory_personality: Optional[str] = None,
     ):
         """Initialize the stream with a realtime handler and pipelines.
 
         - ``settings_app``: the Reachy Mini Apps FastAPI to attach settings endpoints.
         - ``instance_path``: directory where per-instance ``.env`` should be stored.
         - ``handler_factory``: builds a fresh handler for the currently selected backend.
+        - ``startup_accessory_personality``: the personality the app started as
+          because an accessory was already on the reader.
         """
         self._robot = robot
         self._stop_event = asyncio.Event()
@@ -149,6 +152,7 @@ class LocalStream:
         # _install_handler so the first install can inject it like any later one.
         self._rfid_controller: Optional[RfidController] = None
         self._rfid_serial: Any | None = None
+        self._startup_accessory_personality = startup_accessory_personality
         self._install_handler(handler)
 
     def _install_handler(self, handler: ConversationHandler) -> None:
@@ -581,6 +585,7 @@ class LocalStream:
             robot=self._robot,
             rpc=rpc,
             on_personality_applied=self.notify_personality,
+            initial_personality=self._startup_accessory_personality,
         )
         register_rfid_methods(rpc, controller)
         self._rfid_controller = controller
