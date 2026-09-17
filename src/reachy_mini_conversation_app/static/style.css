@@ -1677,10 +1677,12 @@ button {
   background: var(--bg);
 }
 
-/* The left edge carries the state, so it reads at a glance from across a desk. */
+/* The left edge carries the state, so it reads at a glance from across a desk.
+   Same reading as the accessory badge in the app shell: green in agreement,
+   amber for something to notice, a dashed grey edge for an empty accessory. */
 .accessory-card[data-state="known"] {
-  border-left-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, var(--bg));
+  border-left-color: var(--success);
+  background: color-mix(in srgb, var(--success) 8%, var(--bg));
 }
 
 .accessory-card[data-state="blank"] {
@@ -1689,7 +1691,8 @@ button {
 }
 
 .accessory-card[data-state="unknown"] {
-  border-left-color: color-mix(in srgb, var(--accent) 45%, var(--text-muted));
+  border-left-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 8%, var(--bg));
 }
 
 .accessory-card__copy {
@@ -1702,12 +1705,32 @@ button {
 .accessory-card__name {
   font-size: 1.05rem;
   font-weight: 600;
-  color: var(--accent);
+  color: var(--text);
   overflow-wrap: anywhere;
+}
+
+.accessory-card[data-state="known"] .accessory-card__name {
+  color: color-mix(in srgb, var(--success) 75%, var(--text));
+}
+
+.accessory-card[data-state="unknown"] .accessory-card__name {
+  color: color-mix(in srgb, var(--warn) 80%, var(--text));
 }
 
 .accessory-card .settings-hint {
   margin: 0;
+}
+
+/* Sits under the tag's details, so erasing reads as acting on what is above it. */
+.accessory-card__actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.accessory-card__actions .btn {
+  padding: 7px 13px;
+  font-size: 0.86rem;
 }
 
 
