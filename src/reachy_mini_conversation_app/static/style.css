@@ -191,14 +191,14 @@ button {
 .app-shell__badge-group {
   display: inline-flex;
   flex-direction: column;
-  align-items: flex-start;
+  align-items: stretch;
   gap: 10px;
   flex: 0 1 auto;
   min-width: 0;
+  max-width: 320px;
 }
 
 .app-shell__badge-group[data-component="accessory-group"] {
-  align-items: flex-end;
   text-align: right;
 }
 
@@ -220,12 +220,15 @@ button {
   border: 0;
   border-radius: 16px;
   min-width: 0;
-  max-width: min(320px, 100%);
   font: inherit;
   color: inherit;
   cursor: pointer;
   appearance: none;
   transition: background 0.15s ease;
+}
+
+.app-shell__accessory {
+  justify-content: flex-end;
 }
 
 .app-shell__personality:hover {
@@ -293,6 +296,7 @@ button {
 }
 
 .app-shell__default-personality {
+  align-self: flex-start;
   min-height: 36px;
   max-width: 100%;
   padding: 8px 14px;
@@ -309,6 +313,10 @@ button {
   white-space: nowrap;
   transition: background var(--transition-fast), border-color var(--transition-fast),
     color var(--transition-fast), opacity var(--transition-fast);
+}
+
+.app-shell__badge-group[data-component="accessory-group"] .app-shell__default-personality {
+  align-self: flex-end;
 }
 
 .app-shell__default-personality[hidden] {
