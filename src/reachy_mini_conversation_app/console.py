@@ -336,9 +336,7 @@ class LocalStream:
         try:
             while not self._stop_event.is_set() and not self._session_wanted.is_set():
                 try:
-                    await asyncio.wait_for(
-                        self._session_wanted.wait(), timeout=self._session_closed_keepalive
-                    )
+                    await asyncio.wait_for(self._session_wanted.wait(), timeout=self._session_closed_keepalive)
                 except asyncio.TimeoutError:
                     pass
                 # Not _mark_activity: that notifies the activity observer, and a keepalive
