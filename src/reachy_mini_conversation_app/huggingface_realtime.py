@@ -448,6 +448,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 "content": [{"type": "input_text", "text": text}],
             },
         )
+        # TEMPORARY (plan 5 task 4): brackets this send against the
+        # response-sender's own "sending response.create" line and the
+        # close-code line, so Step 3 can read which of the two was on the
+        # wire when the session died.
+        logger.info("say: conversation.item.create returned; queueing response.create")
         self._mark_activity("say")
         await self._safe_response_create()
 
@@ -525,6 +530,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
+                # TEMPORARY (plan 5 task 4): pairs with the "queueing
+                # response.create" line in say(); fires for every response,
+                # not just say's, which is deliberate -- filtering it would
+                # hide where the ordering breaks.
+                logger.info("response sender: sending response.create")
                 try:
                     await self.connection.response.create(**kwargs)
                 except Exception as e:
