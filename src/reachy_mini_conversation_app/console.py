@@ -691,15 +691,6 @@ class LocalStream:
 
         @rpc.method("conversation.say")  # type: ignore[untyped-decorator]
         async def _rpc_say(params: dict[str, object]) -> dict[str, object]:
-            # TEMPORARY (plan 5 task 4): what the app's own state looked like
-            # the moment a say landed, to correlate against the close-code line
-            # in huggingface_realtime.py._run_realtime_session.
-            logger.info(
-                "conversation.say: last_turn_state=%r response_done=%s pending_responses=%d",
-                self._last_turn_state,
-                self.handler._response_done_event.is_set(),
-                len(self.handler._pending_responses._queue),
-            )
             text = str(params.get("text", "")).strip()
             if not text:
                 raise JsonRpcError("say requires 'text'", reason="invalid_params", code=-32602)

@@ -448,11 +448,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 "content": [{"type": "input_text", "text": text}],
             },
         )
-        # TEMPORARY (plan 5 task 4): brackets this send against the
-        # response-sender's own "sending response.create" line and the
-        # close-code line, so Step 3 can read which of the two was on the
-        # wire when the session died.
-        logger.info("say: conversation.item.create returned; queueing response.create")
         self._mark_activity("say")
         await self._safe_response_create()
 
@@ -530,11 +525,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
-                # TEMPORARY (plan 5 task 4): pairs with the "queueing
-                # response.create" line in say(); fires for every response,
-                # not just say's, which is deliberate -- filtering it would
-                # hide where the ordering breaks.
-                logger.info("response sender: sending response.create")
                 try:
                     await self.connection.response.create(**kwargs)
                 except Exception as e:
@@ -941,18 +931,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             await self.output_queue.put(
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
-
-                # TEMPORARY (plan 5 task 4): this only runs on the loop's normal
-                # exit -- the async-for over self.connection ends without raising
-                # only when AsyncRealtimeConnection.__aiter__ catches
-                # ConnectionClosedOK, i.e. close_code in {1000, 1001, 1005}. Any
-                # other close code raises ConnectionClosedError instead, which
-                # skips this line and is handled by start_up()'s retry branch.
-                logger.info(
-                    "Realtime event stream ended (close_code=%r reason=%r)",
-                    getattr(getattr(self.connection, "_connection", None), "close_code", None),
-                    getattr(getattr(self.connection, "_connection", None), "close_reason", None),
-                )
             finally:
                 # Stop the response sender worker.
                 if response_sender_task is not None:
