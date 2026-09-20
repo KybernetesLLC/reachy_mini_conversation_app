@@ -112,6 +112,172 @@ def test_mic_reports_and_toggles_mute_state_over_rpc() -> None:
     assert LocalStream(MagicMock(), robot)._mic_muted is False
 
 
+def _must_not_be_called(*_args: Any, **_kwargs: Any) -> Any:
+    raise AssertionError("the session gate must not rebuild the handler")
+
+
+def _gate_stream(last_activity: float | None = None) -> LocalStream:
+    """A headless LocalStream whose handler has a real activity clock.
+
+    MagicMock's attributes are mocks, and seconds_since_activity() subtracts
+    last_activity_time from time.monotonic(), so a bare MagicMock errors on the
+    arithmetic instead of measuring anything.
+    """
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = MagicMock()
+    handler.last_activity_time = time.monotonic() if last_activity is None else last_activity
+    return LocalStream(handler, robot)
+
+
+@pytest.mark.asyncio
+async def test_session_gate_parks_the_startup_loop_when_the_session_is_closed(
+    monkeypatch: Any,
+) -> None:
+    """A cleared gate stops the loop before start_up(), and never rebuilds the handler."""
+    stream = _gate_stream()
+    started: list[str] = []
+
+    async def _start_up() -> None:
+        started.append("start_up")
+
+    stream.handler.start_up = _start_up
+    monkeypatch.setattr(
+        type(stream), "_build_handler_for_current_backend", _must_not_be_called
+    )
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+
+    stream._session_wanted.clear()
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    await asyncio.sleep(0.05)
+    assert started == []          # parked: no session was opened
+
+    stream._session_wanted.set()
+    await _wait_until(lambda: started == ["start_up"])  # woken by the gate alone
+
+    stream._stop_event.set()
+    loop_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_closing_the_session_does_not_request_a_restart() -> None:
+    """The open path must not touch _restart_requested: that rebuilds the handler,
+    and a fresh handler greets again — the defect this whole change closes."""
+    stream = _gate_stream()
+    stream.handler.shutdown = AsyncMock()
+
+    await stream.close_session()
+    assert stream._session_wanted.is_set() is False
+    assert stream._restart_requested.is_set() is False
+
+    await stream.open_session()
+    assert stream._session_wanted.is_set() is True
+    assert stream._restart_requested.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_a_closed_session_does_not_age_the_app_toward_sleep(monkeypatch: Any) -> None:
+    """seconds_since_activity is session-scoped; a deliberate close must not
+    look like idleness, or the inactivity timeout stops the app."""
+    stream = _gate_stream(last_activity=time.monotonic() - 10_000.0)
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    stream._session_closed_keepalive = 0.01
+    assert stream.seconds_since_activity() > 9_000.0
+
+    stream._session_wanted.clear()
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    await _wait_until(lambda: stream.seconds_since_activity() < 5.0)
+
+    stream._stop_event.set()
+    stream._session_wanted.set()
+    loop_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_closing_drops_responses_queued_for_the_next_session() -> None:
+    """A close mid-turn must not leave a response.create() for the next session.
+
+    shutdown() drains output_queue and not _pending_responses, and the sender loop
+    runs `while self.connection:`, so a queued item survives the close and the next
+    session's sender fires it at once — the robot speaking unprompted after the
+    microphone was switched off and on again.
+    """
+    stream = _gate_stream()
+    stream.handler.shutdown = AsyncMock()
+    stream.handler._pending_responses = asyncio.Queue()
+    stream.handler._pending_responses.put_nowait({"response": {}})
+    stream.handler._pending_responses.put_nowait({"response": {}})
+
+    await stream.close_session()
+
+    assert stream.handler._pending_responses.empty()
+
+
+def test_status_payload_distinguishes_closed_on_purpose_from_broken() -> None:
+    """R-11 needs a signal that cannot lie, which means readback, not just a verb."""
+    stream = _gate_stream()
+    stream.handler.connection = None
+
+    stream._session_wanted.clear()
+    payload = stream._backend_connection_status()
+    assert payload["session_wanted"] is False
+    assert payload["backend_connected"] is False
+    assert payload["backend_connection_state"] == "session_closed"
+
+    stream._session_wanted.set()
+    stream._backend_connection_state = "disconnected"
+    payload = stream._backend_connection_status()
+    assert payload["session_wanted"] is True
+    assert payload["backend_connection_state"] == "disconnected"
+
+
+def test_conversation_session_opens_closes_and_reads_back() -> None:
+    """conversation.session mirrors conversation.mic: optional param, state returned."""
+    app = FastAPI()
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = MagicMock()
+    handler.connection = None
+    handler.last_activity_time = time.monotonic()
+    handler.shutdown = AsyncMock()
+    stream = LocalStream(handler, robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+
+    assert _rpc_call(app, "conversation.session")["result"] == {
+        "wanted": True,
+        "connected": False,
+    }
+    assert _rpc_call(app, "conversation.session", {"open": False})["result"] == {
+        "wanted": False,
+        "connected": False,
+    }
+    assert stream._session_wanted.is_set() is False
+    assert stream._restart_requested.is_set() is False
+
+    assert _rpc_call(app, "conversation.session", {"open": True})["result"] == {
+        "wanted": True,
+        "connected": False,
+    }
+    assert stream._session_wanted.is_set() is True
+
+
+def test_status_over_rpc_carries_session_wanted() -> None:
+    """The supervisor reads the off state from conversation.status, not only from
+    the verb's return; R-11 needs it observable without changing anything."""
+    app = FastAPI()
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = MagicMock()
+    handler.connection = None
+    handler.last_activity_time = time.monotonic()
+    handler.shutdown = AsyncMock()
+    stream = LocalStream(handler, robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+
+    assert _rpc_call(app, "conversation.status")["result"]["session_wanted"] is True
+    _rpc_call(app, "conversation.session", {"open": False})
+    status = _rpc_call(app, "conversation.status")["result"]
+    assert status["session_wanted"] is False
+    assert status["backend_connection_state"] == "session_closed"
+
+
 def test_rest_api_is_removed_in_favor_of_rpc() -> None:
     """The /api/v1 REST + SSE surface is gone; control is JSON-RPC over /rpc."""
     app = FastAPI()

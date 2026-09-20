@@ -120,6 +120,15 @@ class LocalStream:
         self._robot = robot
         self._stop_event = asyncio.Event()
         self._restart_requested = asyncio.Event()
+        # Session control. The gate decides whether the supervising loop below may
+        # open a realtime session at all. It starts set, so an untouched start is
+        # upstream's behaviour exactly.
+        self._session_wanted = asyncio.Event()
+        self._session_wanted.set()
+        # While the session is closed on purpose, bump the activity clock this often
+        # so the inactivity timeout does not read a deliberate close as idleness and
+        # stop the app. seconds_since_activity() is session-scoped.
+        self._session_closed_keepalive = 60.0
         self._tasks: List[asyncio.Task[None]] = []
         self._handler_factory = handler_factory
         self._voice_override = startup_voice
@@ -308,6 +317,71 @@ class LocalStream:
         except asyncio.TimeoutError:
             pass
 
+    async def _await_session_wanted(self) -> None:
+        """Park the startup loop while the realtime session is closed on request.
+
+        Deliberately does not touch _restart_requested. That path rebuilds the
+        handler, and a fresh handler has _startup_greeting_sent False, so it greets
+        again — which is the defect session control exists to close.
+        """
+        if self._session_wanted.is_set():
+            return
+        self._set_backend_connection_state("session_closed")
+        logger.info("Realtime session closed on request; waiting for conversation.session.")
+        while not self._stop_event.is_set() and not self._session_wanted.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._session_wanted.wait(), timeout=self._session_closed_keepalive
+                )
+            except asyncio.TimeoutError:
+                pass
+            # Not _mark_activity: that notifies the activity observer, and a keepalive
+            # arriving as conversation.activity would read as the app being busy.
+            self.handler.last_activity_time = time.monotonic()
+
+    async def open_session(self) -> None:
+        """Let the startup loop open a realtime session, and wake it now."""
+        if self._session_wanted.is_set():
+            return
+        logger.info("Realtime session open requested.")
+        self._session_wanted.set()
+
+    async def close_session(self) -> None:
+        """Close the realtime session and keep it closed until asked to reopen."""
+        if not self._session_wanted.is_set():
+            return
+        logger.info("Realtime session close requested.")
+        self._session_wanted.clear()
+        await self._close_live_session()
+
+    async def _close_live_session(self) -> None:
+        """Drop the live realtime connection so start_up() returns.
+
+        Also drops anything still queued for the response sender. The handler's
+        shutdown() drains output_queue but not _pending_responses, and the sender
+        loop runs `while self.connection:` — so a close in the middle of a turn
+        leaves a response.create() sitting in the queue for the *next* session's
+        sender to fire the moment it starts. The robot would speak unprompted
+        after the microphone had been switched off and on again.
+        """
+        try:
+            await self.handler.shutdown()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("Handler shutdown ignored while closing the session: %s", e)
+        pending = getattr(self.handler, "_pending_responses", None)
+        if pending is not None:
+            dropped = 0
+            while not pending.empty():
+                try:
+                    pending.get_nowait()
+                    dropped += 1
+                except asyncio.QueueEmpty:
+                    break
+            if dropped:
+                logger.info("Dropped %d queued response(s) on session close.", dropped)
+
     @staticmethod
     def _format_backend_error(error: BaseException | str) -> str:
         """Return a compact user-facing backend error string."""
@@ -329,11 +403,18 @@ class LocalStream:
     def _backend_connection_status(self) -> dict[str, object]:
         """Return the backend connection state exposed in the settings API."""
         connected = self._backend_connected()
-        state = "connected" if connected else self._backend_connection_state
+        wanted = self._session_wanted.is_set()
+        if connected:
+            state = "connected"
+        elif not wanted:
+            state = "session_closed"
+        else:
+            state = self._backend_connection_state
         return {
             "backend_connected": connected,
             "backend_connection_state": state,
             "backend_error": None if connected else self._backend_error,
+            "session_wanted": wanted,
         }
 
     def _persist_env_values(self, updates: dict[str, str]) -> None:
@@ -601,6 +682,18 @@ class LocalStream:
                 logger.info("Microphone %s via /rpc", "muted" if self._mic_muted else "unmuted")
             return {"muted": self._mic_muted}
 
+        @rpc.method("conversation.session")  # type: ignore[untyped-decorator]
+        async def _rpc_session(params: dict[str, object]) -> dict[str, object]:
+            if "open" in params:
+                if bool(params["open"]):
+                    await self.open_session()
+                else:
+                    await self.close_session()
+            return {
+                "wanted": self._session_wanted.is_set(),
+                "connected": self._backend_connected(),
+            }
+
         @rpc.method("backend.config")  # type: ignore[untyped-decorator]
         def _rpc_backend_config(params: dict[str, object]) -> dict[str, object]:
             hf_selection = get_hf_connection_selection()
@@ -678,6 +771,9 @@ class LocalStream:
     async def _run_handler_startup_loop(self) -> None:
         """Start the realtime handler and keep settings UI alive after backend failures."""
         while not self._stop_event.is_set():
+            await self._await_session_wanted()
+            if self._stop_event.is_set():
+                return
             if self._restart_requested.is_set():
                 await self._shutdown_active_handler()
                 if not self._can_rebuild_handler():
