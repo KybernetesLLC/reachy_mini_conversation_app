@@ -141,9 +141,6 @@ async def test_session_gate_parks_the_startup_loop_when_the_session_is_closed(
         started.append("start_up")
 
     stream.handler.start_up = _start_up
-    monkeypatch.setattr(
-        type(stream), "_build_handler_for_current_backend", _must_not_be_called
-    )
     monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
 
     stream._session_wanted.clear()
@@ -164,6 +161,9 @@ async def test_closing_the_session_does_not_request_a_restart() -> None:
     and a fresh handler greets again — the defect this whole change closes."""
     stream = _gate_stream()
     stream.handler.shutdown = AsyncMock()
+    # No startup loop is running here, so nothing will ever mark the gate parked;
+    # mark it directly so close_session's retry-until-parked wait resolves at once.
+    stream._session_parked.set()
 
     await stream.close_session()
     assert stream._session_wanted.is_set() is False
@@ -206,6 +206,9 @@ async def test_closing_drops_responses_queued_for_the_next_session() -> None:
     stream.handler._pending_responses = asyncio.Queue()
     stream.handler._pending_responses.put_nowait({"response": {}})
     stream.handler._pending_responses.put_nowait({"response": {}})
+    # No startup loop is running here; mark the gate parked directly (see the
+    # identical comment in test_closing_the_session_does_not_request_a_restart).
+    stream._session_parked.set()
 
     await stream.close_session()
 
@@ -213,7 +216,7 @@ async def test_closing_drops_responses_queued_for_the_next_session() -> None:
 
 
 def test_status_payload_distinguishes_closed_on_purpose_from_broken() -> None:
-    """R-11 needs a signal that cannot lie, which means readback, not just a verb."""
+    """Closed on purpose must be distinguishable from merely disconnected."""
     stream = _gate_stream()
     stream.handler.connection = None
 
@@ -240,6 +243,9 @@ def test_conversation_session_opens_closes_and_reads_back() -> None:
     handler.shutdown = AsyncMock()
     stream = LocalStream(handler, robot, settings_app=app)
     stream._init_settings_ui_if_needed()
+    # No startup loop is running here; mark the gate parked directly (see the
+    # identical comment in test_closing_the_session_does_not_request_a_restart).
+    stream._session_parked.set()
 
     assert _rpc_call(app, "conversation.session")["result"] == {
         "wanted": True,
@@ -261,7 +267,7 @@ def test_conversation_session_opens_closes_and_reads_back() -> None:
 
 def test_status_over_rpc_carries_session_wanted() -> None:
     """The supervisor reads the off state from conversation.status, not only from
-    the verb's return; R-11 needs it observable without changing anything."""
+    the verb's own return value."""
     app = FastAPI()
     robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
     handler = MagicMock()
@@ -270,12 +276,104 @@ def test_status_over_rpc_carries_session_wanted() -> None:
     handler.shutdown = AsyncMock()
     stream = LocalStream(handler, robot, settings_app=app)
     stream._init_settings_ui_if_needed()
+    # No startup loop is running here; mark the gate parked directly (see the
+    # identical comment in test_closing_the_session_does_not_request_a_restart).
+    stream._session_parked.set()
 
     assert _rpc_call(app, "conversation.status")["result"]["session_wanted"] is True
     _rpc_call(app, "conversation.session", {"open": False})
     status = _rpc_call(app, "conversation.status")["result"]
     assert status["session_wanted"] is False
     assert status["backend_connection_state"] == "session_closed"
+
+
+@pytest.mark.asyncio
+async def test_close_session_keeps_closing_until_the_loop_actually_parks(
+    monkeypatch: Any,
+) -> None:
+    """A close landing while a session is being established must not be satisfied
+    by a single shutdown() call that has nothing yet to close.
+
+    _run_realtime_session assigns handler.connection only after the websocket
+    handshake and the first session.update; start_up() spends real time with
+    connection still None before that, including retry backoff sleeps. A close
+    arriving in that window finds shutdown()'s `if self.connection:` guard is a
+    no-op, so clearing the gate and calling shutdown() exactly once would let
+    that session finish establishing anyway, with the gate already reporting
+    closed -- audio would keep reaching the provider while the readback claims
+    otherwise. close_session must keep closing until the loop is actually
+    parked with nothing connected.
+    """
+    stream = _gate_stream()
+    stream.handler.connection = None  # unset until the fake start_up "connects"
+    stream._backend_retry_delay = 0.05  # keep the loop's own retry sleep short
+    monkeypatch.setattr(
+        type(stream), "_build_handler_for_current_backend", _must_not_be_called
+    )
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+
+    close_live_calls: list[str] = []
+    original_close_live_session = type(stream)._close_live_session
+
+    async def _counting_close_live_session(self: Any) -> None:
+        close_live_calls.append("close")
+        await original_close_live_session(self)
+
+    monkeypatch.setattr(type(stream), "_close_live_session", _counting_close_live_session)
+
+    entered_connecting = asyncio.Event()
+    session_ended = asyncio.Event()
+
+    async def _start_up() -> None:
+        entered_connecting.set()
+        # Simulate the handshake + session.update delay, during which the real
+        # handler's connection attribute is still None.
+        await asyncio.sleep(0.1)
+        stream.handler.connection = object()  # assigned only once "connected"
+        await session_ended.wait()
+        stream.handler.connection = None  # mirrors the real start_up's own `finally`
+
+    async def _shutdown() -> None:
+        # Mirrors handler.shutdown()'s own `if self.connection:` guard: nothing
+        # to close while still connecting.
+        if stream.handler.connection is not None:
+            stream.handler.connection = None
+            session_ended.set()
+
+    stream.handler.start_up = _start_up
+    stream.handler.shutdown = _shutdown
+
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    await entered_connecting.wait()
+
+    # Land the close while the fake handshake is still in flight: connection is
+    # still None at this instant, so a single close attempt has nothing to close.
+    assert stream.handler.connection is None
+    result = await stream.close_session(timeout=2.0)
+
+    assert result is True
+    assert stream._session_wanted.is_set() is False
+    assert stream._session_parked.is_set() is True
+    assert stream._backend_connected() is False
+    assert len(close_live_calls) > 1  # the no-op attempt, and the one that closed
+
+    stream._stop_event.set()
+    stream._session_wanted.set()
+    loop_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_close_session_returns_false_when_it_cannot_settle() -> None:
+    """A close that cannot get the connection down and the loop parked within its
+    budget reports failure rather than claiming success it did not achieve."""
+    stream = _gate_stream()
+    stream.handler.connection = object()  # never actually closes
+    stream.handler.shutdown = AsyncMock()  # does not touch handler.connection
+
+    result = await stream.close_session(timeout=0.1)
+
+    assert result is False
+    assert stream._session_wanted.is_set() is False  # the intent to close still recorded
 
 
 def test_rest_api_is_removed_in_favor_of_rpc() -> None:

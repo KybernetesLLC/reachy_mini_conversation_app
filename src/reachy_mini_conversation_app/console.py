@@ -129,6 +129,10 @@ class LocalStream:
         # so the inactivity timeout does not read a deliberate close as idleness and
         # stop the app. seconds_since_activity() is session-scoped.
         self._session_closed_keepalive = 60.0
+        # Set while the startup loop is parked at the gate with no session open.
+        # close_session waits for it, because clearing the gate alone does not
+        # close a session that is still being established.
+        self._session_parked = asyncio.Event()
         self._tasks: List[asyncio.Task[None]] = []
         self._handler_factory = handler_factory
         self._voice_override = startup_voice
@@ -327,17 +331,21 @@ class LocalStream:
         if self._session_wanted.is_set():
             return
         self._set_backend_connection_state("session_closed")
+        self._session_parked.set()
         logger.info("Realtime session closed on request; waiting for conversation.session.")
-        while not self._stop_event.is_set() and not self._session_wanted.is_set():
-            try:
-                await asyncio.wait_for(
-                    self._session_wanted.wait(), timeout=self._session_closed_keepalive
-                )
-            except asyncio.TimeoutError:
-                pass
-            # Not _mark_activity: that notifies the activity observer, and a keepalive
-            # arriving as conversation.activity would read as the app being busy.
-            self.handler.last_activity_time = time.monotonic()
+        try:
+            while not self._stop_event.is_set() and not self._session_wanted.is_set():
+                try:
+                    await asyncio.wait_for(
+                        self._session_wanted.wait(), timeout=self._session_closed_keepalive
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                # Not _mark_activity: that notifies the activity observer, and a keepalive
+                # arriving as conversation.activity would read as the app being busy.
+                self.handler.last_activity_time = time.monotonic()
+        finally:
+            self._session_parked.clear()
 
     async def open_session(self) -> None:
         """Let the startup loop open a realtime session, and wake it now."""
@@ -346,13 +354,39 @@ class LocalStream:
         logger.info("Realtime session open requested.")
         self._session_wanted.set()
 
-    async def close_session(self) -> None:
-        """Close the realtime session and keep it closed until asked to reopen."""
-        if not self._session_wanted.is_set():
-            return
+    async def close_session(self, timeout: float = 15.0) -> bool:
+        """Close the realtime session and keep it closed until asked to reopen.
+
+        Returns True once the startup loop is parked at the gate with no
+        connection open. Clearing the gate is not enough on its own: the loop
+        checks it once per iteration, and _run_realtime_session assigns
+        self.connection only after the websocket handshake and the first
+        session.update, so a close arriving while a session is being established
+        has nothing to close and the loop would go on to run that session with
+        the gate clear. Keep closing until the loop has actually parked.
+        """
         logger.info("Realtime session close requested.")
         self._session_wanted.clear()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         await self._close_live_session()
+        while True:
+            if self._session_parked.is_set() and not self._backend_connected():
+                return True
+            if loop.time() >= deadline:
+                logger.warning(
+                    "Session close did not settle within %.0f s; connected=%s parked=%s",
+                    timeout,
+                    self._backend_connected(),
+                    self._session_parked.is_set(),
+                )
+                return False
+            try:
+                await asyncio.wait_for(self._session_parked.wait(), 0.2)
+            except asyncio.TimeoutError:
+                pass
+            if self._backend_connected():
+                await self._close_live_session()
 
     async def _close_live_session(self) -> None:
         """Drop the live realtime connection so start_up() returns.
