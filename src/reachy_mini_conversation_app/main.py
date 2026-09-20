@@ -382,6 +382,12 @@ def run(
 
 class ReachyMiniConversationApp(ReachyMiniApp):  # type: ignore[misc]
     """Reachy Mini Apps entry point for the conversation app."""
+    # PLAN2 TEST 2026-09-16: open audio in-process (MediaBackend.LOCAL) even though the
+    # daemon runs --no-media. Needs the matching SDK change in reachy_mini.py so an
+    # explicit 'local' beats the daemon's no_media flag. See reachy-companion
+    # docs/verify-runtime.md, Question 3.
+    request_media_backend = "local"
+
 
     custom_app_url = "http://0.0.0.0:7860/"
     dont_start_webserver = False
