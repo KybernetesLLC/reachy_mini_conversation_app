@@ -931,6 +931,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             await self.output_queue.put(
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
+
+                # TEMPORARY (plan 5 task 4): this only runs on the loop's normal
+                # exit -- the async-for over self.connection ends without raising
+                # only when AsyncRealtimeConnection.__aiter__ catches
+                # ConnectionClosedOK, i.e. close_code in {1000, 1001, 1005}. Any
+                # other close code raises ConnectionClosedError instead, which
+                # skips this line and is handled by start_up()'s retry branch.
+                logger.info(
+                    "Realtime event stream ended (close_code=%r reason=%r)",
+                    getattr(getattr(self.connection, "_connection", None), "close_code", None),
+                    getattr(getattr(self.connection, "_connection", None), "close_reason", None),
+                )
             finally:
                 # Stop the response sender worker.
                 if response_sender_task is not None:
