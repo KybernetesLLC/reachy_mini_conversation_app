@@ -886,3 +886,57 @@ async def test_run_session_response_lifecycle_toggles_done_event(monkeypatch: An
     assert handler._response_done_event.is_set()
     handler.deps.movement_manager.set_speaking.assert_any_call(True)
     handler.deps.movement_manager.set_speaking.assert_any_call(False)
+
+
+@pytest.mark.asyncio
+async def test_handler_reopens_a_session_after_shutdown(monkeypatch: Any) -> None:
+    """A handler that has been shut down can run a second session on the same object.
+
+    Session control closes the realtime session and later reopens it without
+    rebuilding the handler, because a rebuilt handler greets again. Nothing
+    upstream exercises shutdown() followed by start_up() on one instance:
+    _shutdown_active_handler's callers always rebuild. This pins it down.
+    """
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "hello there")
+
+    handler = _plain_handler()
+    greetings: list[str] = []
+
+    # Capture the original BEFORE patching. Reaching for it through type(handler)
+    # inside the wrapper would find the wrapper, and recurse forever.
+    original_greeting = type(handler)._send_startup_greeting_prompt
+
+    async def _count_greeting(self: Any) -> None:
+        before = self._startup_greeting_sent
+        await original_greeting(self)
+        if not before and self._startup_greeting_sent:
+            greetings.append("greeted")
+
+    monkeypatch.setattr(type(handler), "_send_startup_greeting_prompt", _count_greeting)
+
+    def _fresh_client() -> Any:
+        return _make_fake_realtime_client(events=(_FakeEvent("response.created"),))
+
+    async def _build(self: Any) -> Any:
+        return _fresh_client()
+
+    monkeypatch.setattr(type(handler), "_build_realtime_client", _build)
+
+    # First session: opens, greets, and ends when the fake connection runs dry.
+    await handler.start_up()
+    assert greetings == ["greeted"]
+    assert handler.connection is None
+
+    # Close it the way the close verb will.
+    await handler.shutdown()
+
+    # Second session on the same object.
+    await handler.start_up()
+
+    # It ran: the tool manager was restarted and torn down again cleanly.
+    assert handler.tool_manager._lifecycle_tasks == []
+    # And it did not greet, which is what closes the plan 3 defect.
+    assert greetings == ["greeted"]
