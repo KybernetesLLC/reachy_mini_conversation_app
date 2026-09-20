@@ -936,7 +936,118 @@ async def test_handler_reopens_a_session_after_shutdown(monkeypatch: Any) -> Non
     # Second session on the same object.
     await handler.start_up()
 
-    # It ran: the tool manager was restarted and torn down again cleanly.
+    # It tore down cleanly a second time.
+    assert handler.tool_manager._lifecycle_tasks == []
+    # And it did not greet, which is what closes the plan 3 defect.
+    assert greetings == ["greeted"]
+
+
+class _LiveFakeConn:
+    """A fake realtime connection that stays open until `close()` is called.
+
+    `_make_fake_realtime_client`'s FakeConn ends the session itself once its
+    `events` run out -- by the time `start_up()` returns, `handler.connection`
+    is already `None` (its own `finally` guarantees that), so a `shutdown()`
+    called afterward never reaches its `connection.close()` branch. This fake
+    keeps the connection idle-but-open so `shutdown()` is the thing that ends
+    the session, while `_run_realtime_session` is still parked in `async for`.
+    """
+
+    def __init__(self) -> None:
+        """Build a connection with no queued events and an open `close()` gate."""
+        self.session = SimpleNamespace(update=AsyncMock())
+        self.input_audio_buffer = SimpleNamespace(append=AsyncMock())
+        self.conversation = SimpleNamespace(item=SimpleNamespace(create=AsyncMock(), cancel=AsyncMock()))
+        self.response = SimpleNamespace(create=AsyncMock())
+        self._closed = asyncio.Event()
+
+    async def __aenter__(self) -> "_LiveFakeConn":
+        """Support use as an async context manager."""
+        return self
+
+    async def __aexit__(self, *_args: Any) -> bool:
+        """Propagate any exception raised inside the `async with` block."""
+        return False
+
+    async def close(self) -> None:
+        """Signal the pending `__anext__` to end the session, like a real close."""
+        self._closed.set()
+
+    def __aiter__(self) -> "_LiveFakeConn":
+        """Return self as the async iterator."""
+        return self
+
+    async def __anext__(self) -> _FakeEvent:
+        """Block until closed, the way an idle live websocket would."""
+        await self._closed.wait()
+        raise StopAsyncIteration
+
+
+@pytest.mark.asyncio
+async def test_handler_reopens_a_session_after_closing_a_live_connection(monkeypatch: Any) -> None:
+    """shutdown() must close a session that is still open, not just a finished one.
+
+    test_handler_reopens_a_session_after_shutdown proves reuse in the natural-end
+    case, where the fake connection has already run dry and start_up()'s own
+    `finally` has set `self.connection = None` before shutdown() is ever called --
+    shutdown()'s `if self.connection: await self.connection.close()` branch never
+    runs there. This test keeps the connection open so shutdown() is the thing
+    that ends it, concurrently with _run_realtime_session() still awaiting the
+    next event -- the situation Task 3's close verb actually faces.
+    """
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "hello there")
+
+    handler = _plain_handler()
+    greetings: list[str] = []
+    original_greeting = type(handler)._send_startup_greeting_prompt
+
+    async def _count_greeting(self: Any) -> None:
+        before = self._startup_greeting_sent
+        await original_greeting(self)
+        if not before and self._startup_greeting_sent:
+            greetings.append("greeted")
+
+    monkeypatch.setattr(type(handler), "_send_startup_greeting_prompt", _count_greeting)
+
+    live_conns: list[_LiveFakeConn] = []
+    build_calls = {"n": 0}
+
+    async def _build(self: Any) -> Any:
+        build_calls["n"] += 1
+        if build_calls["n"] == 1:
+            conn = _LiveFakeConn()
+            live_conns.append(conn)
+
+            class _LiveClient:
+                realtime = SimpleNamespace(connect=lambda **_kw: conn)
+
+            return _LiveClient()
+        # Second session: a session that ends on its own, like the other test.
+        return _make_fake_realtime_client(events=(_FakeEvent("response.created"),))
+
+    monkeypatch.setattr(type(handler), "_build_realtime_client", _build)
+
+    # First session: starts in the background and stays open (no queued events).
+    task = asyncio.create_task(handler.start_up())
+    await asyncio.wait_for(handler._connected_event.wait(), timeout=1.0)
+    assert handler.connection is not None
+    assert greetings == ["greeted"]
+
+    # Close it the way the close verb will, while the session is still live.
+    await asyncio.wait_for(handler.shutdown(), timeout=1.0)
+
+    # The concurrent _run_realtime_session() must actually unwind and return --
+    # start_up() cannot be called again on the same object while it is still running.
+    await asyncio.wait_for(task, timeout=1.0)
+    assert handler.connection is None
+
+    # Second session on the same object.
+    await handler.start_up()
+
+    # It tore down cleanly a second time.
     assert handler.tool_manager._lifecycle_tasks == []
     # And it did not greet, which is what closes the plan 3 defect.
     assert greetings == ["greeted"]
