@@ -383,12 +383,6 @@ def run(
 class ReachyMiniConversationApp(ReachyMiniApp):  # type: ignore[misc]
     """Reachy Mini Apps entry point for the conversation app."""
 
-    # The daemon on this host runs with --no-media, and the SDK picks NO_MEDIA from
-    # the daemon's advertisement before honouring any caller-side backend. Without
-    # this override, the app's capture loop spins on get_audio_sample() returning
-    # None. Requires a matching SDK change so an explicit 'local' request wins.
-    request_media_backend = "local"
-
     custom_app_url = "http://0.0.0.0:7860/"
     dont_start_webserver = False
 
