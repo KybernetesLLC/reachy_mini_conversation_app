@@ -433,7 +433,6 @@ async def test_close_session_returns_false_when_it_cannot_settle() -> None:
 async def test_the_retry_sleep_wakes_when_the_session_gate_is_cleared() -> None:
     """A voice-operated off switch cannot wait out a five-second retry delay."""
     stream = _bare_stream()
-    stream._backend_retry_delay = 5.0
     stream._session_wanted.set()
 
     task = asyncio.ensure_future(stream._sleep_or_restart_requested(5.0))
@@ -452,6 +451,40 @@ async def test_the_retry_sleep_still_wakes_on_a_restart_request() -> None:
     await asyncio.sleep(0.05)
     stream._restart_requested.set()
     await asyncio.wait_for(task, timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_close_session_settles_quickly_during_a_real_retry_sleep(
+    monkeypatch: Any,
+) -> None:
+    """The end-to-end promise: a close must not wait out a real retry delay.
+
+    Runs the real _run_handler_startup_loop(), with a start_up() that fails,
+    so the loop is genuinely parked inside its retry sleep at the real
+    BACKEND_RETRY_DELAY_SECONDS -- not a hand-set gate event and not a
+    shortened delay -- when close_session() is called.
+    """
+    stream = _gate_stream()
+    stream.handler.connection = None
+    stream.handler.shutdown = AsyncMock()
+    stream._backend_retry_delay = 5.0
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+
+    async def _failing_start_up() -> None:
+        raise RuntimeError("simulated connect failure")
+
+    stream.handler.start_up = _failing_start_up
+
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    await asyncio.sleep(0.1)  # let the loop fail start_up() and enter the retry sleep
+
+    result = await asyncio.wait_for(stream.close_session(), timeout=1.0)
+
+    assert result is True
+
+    stream._stop_event.set()
+    stream._session_wanted.set()
+    loop_task.cancel()
 
 
 def test_rest_api_is_removed_in_favor_of_rpc() -> None:
