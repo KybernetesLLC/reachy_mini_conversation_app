@@ -633,7 +633,17 @@ class MovementManager:
         self._manage_breathing(current_time)
 
     def _calculate_blended_antennas(self, target_antennas: Tuple[float, float]) -> Tuple[float, float]:
-        """Blend target antennas with listening freeze state and update blending."""
+        """Blend target antennas with listening freeze state and update blending.
+
+        A held pose's own antennas are commanded directly, bypassing the
+        listening freeze/blend entirely: nothing here is read or mutated while
+        holding, so `_is_listening` and the listening snapshot stay truthful
+        for whatever else reads them, both during the hold and once it
+        releases.
+        """
+        if isinstance(self.state.current_move, HoldPoseMove):
+            return (float(target_antennas[0]), float(target_antennas[1]))
+
         now = self._now()
         listening = self._is_listening
         listening_antennas = self._listening_antennas

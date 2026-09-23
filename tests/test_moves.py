@@ -234,6 +234,46 @@ def test_hold_blocks_breathing_and_release_lets_it_resume() -> None:
     assert isinstance(manager.move_queue[0], BreathingMove)
 
 
+def test_hold_pose_antennas_bypass_the_listening_freeze() -> None:
+    """A held pose's own antennas win over a stuck listening freeze.
+
+    _calculate_blended_antennas normally commands the frozen listening
+    snapshot while _is_listening is True (see the positive control below).
+    That freeze can outlive the session that set it -- nothing clears it on
+    shutdown between speech_started and speech_stopped, and a same-window
+    set_listening(False) is dropped by its own debounce -- so a hold must
+    win over it directly rather than by depending on the flag ever clearing.
+    """
+    manager = MovementManager(MagicMock())
+    manager._is_listening = True
+    manager._listening_antennas = (0.05, -0.05)
+
+    # Positive control: without a hold, listening still freezes antennas at
+    # the snapshot, regardless of what the current move is commanding.
+    frozen = manager._calculate_blended_antennas((0.3, -0.3))
+    assert frozen == (0.05, -0.05)
+
+    now = manager._now()
+    target_head_pose = create_head_pose(0, 0, 0, 0, 10, 0, degrees=True)
+    manager._handle_command("hold_pose", (target_head_pose, (0.2, -0.2), 1.0), now)
+    manager._manage_move_queue(now)  # promote the queued hold to the current move
+    assert isinstance(manager.state.current_move, HoldPoseMove)
+
+    # Drive a tick well past the hold's own interpolation, with the listening
+    # freeze still set: the commanded antennas must be the hold's target, not
+    # the frozen snapshot.
+    t_holding = now + 5.0
+    manager._update_primary_motion(t_holding)
+    _, antennas, _ = manager._get_primary_pose(t_holding)
+    antennas_cmd = manager._calculate_blended_antennas((float(antennas[0]), float(antennas[1])))
+    assert antennas_cmd == (0.2, -0.2)
+
+    # Bypassing the freeze must not mutate listening state itself: it stays
+    # truthful for whatever else reads it once the hold releases.
+    assert manager._is_listening is True
+    assert manager._listening_antennas == (0.05, -0.05)
+
+
 def test_release_hold_is_a_no_op_when_nothing_is_held() -> None:
     """Releasing with no hold current leaves any other current move untouched."""
     manager = MovementManager(MagicMock())
