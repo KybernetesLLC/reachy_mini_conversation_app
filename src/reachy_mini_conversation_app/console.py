@@ -9,8 +9,10 @@ import math
 import time
 import asyncio
 import logging
+import contextlib
 from typing import Any, List, Optional
 from pathlib import Path
+from collections import deque
 from collections.abc import Callable
 
 import numpy as np
@@ -109,6 +111,12 @@ LEGACY_STARTUP_ENV_NAMES = (
     "REACHY_MINI_VOICE_OVERRIDE",
 )
 BACKEND_RETRY_DELAY_SECONDS = 5.0
+# At most this many seconds of recent mic frames are kept while no realtime
+# connection is up, so a wake word and the command spoken in the same breath
+# are not lost during the moment it takes a session to connect. See
+# LocalStream's pre-roll buffer, below.
+PREROLL_SECONDS = 2.0
+_PREROLL_POLL_INTERVAL_S = 0.01
 
 
 class LocalStream:
@@ -151,6 +159,15 @@ class LocalStream:
         # off rather than merely disconnected. Starts True because launch()
         # starts the pipelines.
         self._capture_on = True
+        # Pre-roll buffer. record_loop keeps the most recent PREROLL_SECONDS of
+        # mic frames here while no realtime connection is up, and never writes
+        # them to disk. The buffer is flushed into the handler only when the
+        # connection it is waiting for was explicitly marked for it (see
+        # open_session); every other new connection -- and a capture-off, and
+        # a close -- discards it instead.
+        self._preroll: "deque[tuple[int, Any]]" = deque()
+        self._preroll_duration = 0.0
+        self._preroll_flush_pending = False
         # Set whenever _session_wanted changes, so the retry sleep can wake on a
         # close the way it already wakes on a restart request. Separate from
         # _session_wanted itself because the sleep must wake on *clearing* it, and
@@ -387,8 +404,18 @@ class LocalStream:
         finally:
             self._session_parked.clear()
 
-    async def open_session(self) -> None:
-        """Let the startup loop open a realtime session, and wake it now."""
+    async def open_session(self, *, preroll: bool = False) -> None:
+        """Let the startup loop open a realtime session, and wake it now.
+
+        ``preroll=True`` marks the connection this opens as one a wake word
+        authorised: the pre-roll buffer's couple of seconds of audio, spoken
+        before the session finished connecting, are fed into the handler the
+        moment it does, so a name and the command that follows it in the same
+        breath are not lost. Any other open leaves that audio to be discarded,
+        unflushed, at that same moment.
+        """
+        if preroll:
+            self._preroll_flush_pending = True
         if self._session_wanted.is_set():
             return
         logger.info("Realtime session open requested.")
@@ -409,6 +436,7 @@ class LocalStream:
         logger.info("Realtime session close requested.")
         self._session_wanted.clear()
         self._session_gate_changed.set()
+        self._reset_preroll()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         await self._close_live_session()
@@ -763,7 +791,7 @@ class LocalStream:
         async def _rpc_session(params: dict[str, object]) -> dict[str, object]:
             if "open" in params:
                 if bool(params["open"]):
-                    await self.open_session()
+                    await self.open_session(preroll=bool(params.get("preroll", False)))
                 else:
                     await self.close_session()
             return {
@@ -792,6 +820,9 @@ class LocalStream:
                     else:
                         media.stop_recording()
                         media.stop_playing()
+                        # No audio from before a capture-off may survive into
+                        # a later session.
+                        self._clear_preroll()
                     self._capture_on = wanted
                     logger.info("Audio capture %s via /rpc", "started" if wanted else "stopped")
             return {"on": self._capture_on}
@@ -919,6 +950,28 @@ class LocalStream:
 
         self._settings_initialized = True
 
+    async def _settle_preroll_on_connect(self) -> None:
+        """Wait for the next connection, then flush or discard the pre-roll buffer.
+
+        Runs alongside one handler.start_up() attempt. Once a connection comes
+        up, the buffer is fed into the handler, in order, if open_session()
+        marked this connection for it; otherwise it is discarded unflushed.
+        Either way, the flag is consumed here, so a later reconnect on the
+        same gate does not reuse it.
+        """
+        while not self._backend_connected():
+            if self._stop_event.is_set():
+                return
+            await asyncio.sleep(_PREROLL_POLL_INTERVAL_S)
+
+        frames = list(self._preroll)
+        flush = self._preroll_flush_pending
+        self._reset_preroll()
+        if not flush:
+            return
+        for frame in frames:
+            await self.handler.receive(frame)
+
     async def _run_handler_startup_loop(self) -> None:
         """Start the realtime handler and keep settings UI alive after backend failures."""
         while not self._stop_event.is_set():
@@ -954,6 +1007,7 @@ class LocalStream:
                 continue
 
             self._set_backend_connection_state("connecting")
+            preroll_watch = asyncio.ensure_future(self._settle_preroll_on_connect())
             try:
                 await self.handler.start_up()
             except asyncio.CancelledError:
@@ -977,6 +1031,10 @@ class LocalStream:
                     "Backend session ended. Settings UI remains available; retrying in %.1f seconds.",
                     self._backend_retry_delay,
                 )
+            finally:
+                preroll_watch.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await preroll_watch
 
             await self._sleep_or_restart_requested(self._backend_retry_delay)
 
@@ -1118,13 +1176,42 @@ class LocalStream:
             except asyncio.QueueEmpty:
                 break
 
+    def _append_preroll(self, frame: Any) -> None:
+        """Add one frame to the pre-roll buffer, trimming to PREROLL_SECONDS from the front."""
+        sample_rate, samples = frame
+        self._preroll.append(frame)
+        self._preroll_duration += len(samples) / sample_rate
+        while self._preroll and self._preroll_duration > PREROLL_SECONDS:
+            oldest_rate, oldest_samples = self._preroll.popleft()
+            self._preroll_duration -= len(oldest_samples) / oldest_rate
+
+    def _clear_preroll(self) -> None:
+        """Discard the pre-roll buffer's contents, leaving any pending flush flag alone."""
+        self._preroll.clear()
+        self._preroll_duration = 0.0
+
+    def _reset_preroll(self) -> None:
+        """Discard the pre-roll buffer and cancel any pending flush."""
+        self._clear_preroll()
+        self._preroll_flush_pending = False
+
     async def record_loop(self) -> None:
-        """Read mic frames from the recorder and forward them to the handler."""
+        """Read mic frames from the recorder and forward them to the handler.
+
+        While capture is on and no realtime connection is up, recent frames
+        are also kept in a short pre-roll buffer (see PREROLL_SECONDS) instead
+        of being lost, so a spoken name and the command that follows it in the
+        same breath are not lost during the moment it takes a session to
+        connect.
+        """
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
 
         while not self._stop_event.is_set():
             if not self._capture_on:
+                # No audio from before a capture-off may survive into a later
+                # session.
+                self._clear_preroll()
                 # conversation.capture {"on": false} sets the pipeline to NULL, so
                 # get_audio_sample() would return None on every call from here on;
                 # polling it with only asyncio.sleep(0) to yield would busy-loop and
@@ -1134,7 +1221,10 @@ class LocalStream:
                 continue
             audio_frame = self._robot.media.get_audio_sample()
             if audio_frame is not None and not self._mic_muted:
-                await self.handler.receive((input_sample_rate, audio_frame))
+                frame = (input_sample_rate, audio_frame)
+                await self.handler.receive(frame)
+                if not self._backend_connected():
+                    self._append_preroll(frame)
                 self._emit_level("user", audio_frame)
             await asyncio.sleep(0)  # avoid busy loop
 

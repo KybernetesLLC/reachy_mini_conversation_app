@@ -1447,6 +1447,246 @@ async def test_record_loop_backs_off_instead_of_polling_while_capture_is_off(
     assert all(delay == 0.1 for delay in fake_asyncio.sleep_delays)
 
 
+class _FakeSessionHandler:
+    """A minimal handler standing in for ConversationHandler in pre-roll tests.
+
+    ``connection`` flips to a real object as soon as start_up() begins --
+    mirroring huggingface_realtime.py setting self.connection right after the
+    handshake -- and back to None once the session ends: either because the
+    test calls shutdown(), or because it sets `stopped` directly to stand in
+    for the realtime side closing the connection on its own.
+    """
+
+    def __init__(self) -> None:
+        self.connection: object | None = None
+        self.received: list[tuple[int, Any]] = []
+        self.last_activity_time = time.monotonic()
+        self.started = asyncio.Event()
+        self.stopped = asyncio.Event()
+
+    async def start_up(self) -> None:
+        self.connection = object()
+        self.started.set()
+        await self.stopped.wait()
+        self.connection = None
+
+    async def shutdown(self) -> None:
+        self.stopped.set()
+        self.connection = None
+
+    async def receive(self, frame: tuple[int, Any]) -> None:
+        self.received.append(frame)
+
+
+async def _stop_fake_session_loop(stream: LocalStream, handler: _FakeSessionHandler, loop_task: Any) -> None:
+    """Tear down a startup loop driven by a _FakeSessionHandler."""
+    stream._stop_event.set()
+    handler.stopped.set()
+    loop_task.cancel()
+    try:
+        await loop_task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_the_preroll_buffer_holds_at_most_two_seconds() -> None:
+    """Feed 5 s of audio through record_loop.
+
+    At most PREROLL_SECONDS ends up buffered, and what remains is the most
+    recent slice -- not whatever happened to arrive first.
+    """
+    sample_rate = 16000
+    frame_seconds = 0.1
+    frame_len = int(sample_rate * frame_seconds)
+    total_frames = 50  # 5.0 s at 0.1 s/frame
+
+    robot = _audio_robot(get_input_audio_samplerate=MagicMock(return_value=sample_rate), get_audio_sample=MagicMock())
+    handler = MagicMock()
+    handler.connection = None  # no realtime connection up -- the buffering path
+    handler.receive = AsyncMock()
+    stream = LocalStream(handler, robot)
+
+    remaining = [np.full(frame_len, i, dtype=np.int16) for i in range(total_frames)]
+
+    def _next_frame() -> np.ndarray:
+        frame = remaining.pop(0)
+        if not remaining:
+            stream._stop_event.set()
+        return frame
+
+    robot.media.get_audio_sample.side_effect = _next_frame
+
+    await stream.record_loop()
+
+    total_duration = sum(len(samples) / rate for rate, samples in stream._preroll)
+    assert total_duration <= console_mod.PREROLL_SECONDS + 1e-9
+    assert total_duration > console_mod.PREROLL_SECONDS - (2 * frame_seconds)
+
+    kept_indices = [int(samples[0]) for _, samples in stream._preroll]
+    assert kept_indices == list(range(total_frames - len(kept_indices), total_frames))
+
+
+@pytest.mark.asyncio
+async def test_open_with_preroll_flushes_the_buffer_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Open with preroll and expect the buffer flushed in order, then emptied.
+
+    conversation.session {"open": true, "preroll": true} feeds the buffered
+    frames into the handler, in order, right after the connection comes up.
+    """
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = _FakeSessionHandler()
+    stream = LocalStream(handler, robot)
+    stream._session_wanted.clear()
+    stream._backend_retry_delay = 0.01
+
+    frame_a = (16000, np.full(4, 1, dtype=np.int16))
+    frame_b = (16000, np.full(4, 2, dtype=np.int16))
+    stream._append_preroll(frame_a)
+    stream._append_preroll(frame_b)
+
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    try:
+        await stream.open_session(preroll=True)
+        await _wait_until(lambda: len(handler.received) >= 2)
+
+        assert [r for r, _ in handler.received] == [16000, 16000]
+        assert [s.tolist() for _, s in handler.received] == [frame_a[1].tolist(), frame_b[1].tolist()]
+        assert len(stream._preroll) == 0
+        assert stream._preroll_flush_pending is False
+    finally:
+        await _stop_fake_session_loop(stream, handler, loop_task)
+
+
+@pytest.mark.asyncio
+async def test_open_without_preroll_discards_the_buffer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Open a session without preroll and expect the buffer discarded, not flushed.
+
+    A session opened for any other reason has no authorisation for the two
+    seconds already buffered.
+    """
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = _FakeSessionHandler()
+    stream = LocalStream(handler, robot)
+    stream._session_wanted.clear()
+    stream._backend_retry_delay = 0.01
+    stream._append_preroll((16000, np.full(4, 9, dtype=np.int16)))
+
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    try:
+        await stream.open_session()  # preroll defaults to False
+        await _wait_until(lambda: handler.started.is_set())
+        await _wait_until(lambda: len(stream._preroll) == 0)
+
+        assert handler.received == []
+    finally:
+        await _stop_fake_session_loop(stream, handler, loop_task)
+
+
+@pytest.mark.asyncio
+async def test_the_apps_own_reconnect_does_not_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Expect no flush when the session ends on its own and the app reconnects.
+
+    The gate stays set through that reconnect -- it is not the wake word
+    opening a new session, so whatever has accumulated since must be
+    discarded, not flushed.
+    """
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = _FakeSessionHandler()
+    stream = LocalStream(handler, robot)
+    stream._session_wanted.clear()
+    stream._backend_retry_delay = 0.01
+    stream._append_preroll((16000, np.full(4, 1, dtype=np.int16)))
+
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    try:
+        await stream.open_session(preroll=True)
+        await _wait_until(lambda: len(handler.received) >= 1)
+        assert stream._preroll_flush_pending is False  # consumed by the first connect
+
+        # The realtime side ends the session on its own -- not a
+        # close_session() call, so the gate (_session_wanted) is never
+        # touched, unlike a deliberate close/reopen.
+        handler.started.clear()
+        handler.stopped.set()
+        await _wait_until(lambda: handler.connection is None)
+        handler.stopped.clear()
+        assert stream._session_wanted.is_set() is True  # gate untouched
+
+        stream._append_preroll((16000, np.full(4, 2, dtype=np.int16)))
+        await _wait_until(lambda: handler.started.is_set())
+        await _wait_until(lambda: len(stream._preroll) == 0)
+
+        assert len(handler.received) == 1  # the second frame was never flushed
+    finally:
+        await _stop_fake_session_loop(stream, handler, loop_task)
+
+
+def test_capture_off_clears_and_keeps_the_preroll_buffer_empty() -> None:
+    """Expect the pre-roll buffer empty and staying empty while capture is off.
+
+    No audio from before a capture-off may survive into a later session.
+    """
+    app = FastAPI()
+    robot = _audio_robot(
+        stop_recording=MagicMock(),
+        start_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        start_playing=MagicMock(),
+    )
+    stream = LocalStream(MagicMock(), robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    stream._preroll.append((16000, np.zeros(4, dtype=np.int16)))
+    stream._preroll_duration = 4 / 16000
+
+    assert _rpc_call(app, "conversation.capture", {"on": False})["result"] == {"on": False}
+
+    assert len(stream._preroll) == 0
+    assert stream._preroll_duration == 0.0
+
+
+@pytest.mark.asyncio
+async def test_closing_the_session_clears_the_preroll_buffer() -> None:
+    """Closing the session clears the buffer -- and cancels any pending flush."""
+    stream = _gate_stream()
+    stream.handler.shutdown = AsyncMock()
+    stream._session_parked.set()
+    stream._preroll.append((16000, np.zeros(4, dtype=np.int16)))
+    stream._preroll_duration = 4 / 16000
+    stream._preroll_flush_pending = True
+
+    await stream.close_session()
+
+    assert len(stream._preroll) == 0
+    assert stream._preroll_duration == 0.0
+    assert stream._preroll_flush_pending is False
+
+
+def test_conversation_session_open_without_preroll_is_unchanged() -> None:
+    """Expect a caller that omits 'preroll' to get the prior behaviour byte for byte.
+
+    Omitting the parameter must also never arm the pre-roll flush.
+    """
+    app = FastAPI()
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = MagicMock()
+    handler.connection = None
+    handler.last_activity_time = time.monotonic()
+    handler.shutdown = AsyncMock()
+    stream = LocalStream(handler, robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    stream._session_parked.set()
+    stream._session_wanted.clear()
+
+    result = _rpc_call(app, "conversation.session", {"open": True})["result"]
+
+    assert result == {"wanted": True, "connected": False}
+    assert stream._preroll_flush_pending is False
+
+
 @pytest.mark.asyncio
 async def test_play_loop_logs_text_outputs() -> None:
     """Text outputs are logged, not pushed to the speaker."""
