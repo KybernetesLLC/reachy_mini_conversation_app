@@ -413,11 +413,17 @@ class LocalStream:
         moment it does, so a name and the command that follows it in the same
         breath are not lost. Any other open leaves that audio to be discarded,
         unflushed, at that same moment.
+
+        Only a call that actually opens a closed gate can arm this. A session
+        that is already open or connecting has no "before it connected" left
+        to authorise, so ``preroll=True`` on one is a no-op -- not a promise
+        to flush whatever accumulates next, which could otherwise leak into
+        an unrelated later reconnect.
         """
-        if preroll:
-            self._preroll_flush_pending = True
         if self._session_wanted.is_set():
             return
+        if preroll:
+            self._preroll_flush_pending = True
         logger.info("Realtime session open requested.")
         self._session_wanted.set()
         self._session_gate_changed.set()
@@ -958,19 +964,35 @@ class LocalStream:
         marked this connection for it; otherwise it is discarded unflushed.
         Either way, the flag is consumed here, so a later reconnect on the
         same gate does not reuse it.
+
+        Drains left-to-right until the buffer is genuinely empty, not just
+        however many frames were there when the connection came up: while a
+        flush is in flight, record_loop queues live frames behind it (see
+        record_loop) instead of sending them directly, so whatever arrives
+        during the drain is caught here too, in order, rather than racing the
+        drain's own handler.receive() calls to the handler.
         """
         while not self._backend_connected():
             if self._stop_event.is_set():
                 return
             await asyncio.sleep(_PREROLL_POLL_INTERVAL_S)
 
-        frames = list(self._preroll)
-        flush = self._preroll_flush_pending
-        self._reset_preroll()
-        if not flush:
+        if not self._preroll_flush_pending:
+            self._reset_preroll()
             return
-        for frame in frames:
-            await self.handler.receive(frame)
+
+        try:
+            while self._preroll:
+                frame = self._preroll.popleft()
+                try:
+                    await self.handler.receive(frame)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Pre-roll flush aborted: handler.receive() failed")
+                    break
+        finally:
+            self._reset_preroll()
 
     async def _run_handler_startup_loop(self) -> None:
         """Start the realtime handler and keep settings UI alive after backend failures."""
@@ -1202,7 +1224,9 @@ class LocalStream:
         are also kept in a short pre-roll buffer (see PREROLL_SECONDS) instead
         of being lost, so a spoken name and the command that follows it in the
         same breath are not lost during the moment it takes a session to
-        connect.
+        connect. While a pre-roll flush is in flight, live frames are queued
+        behind it rather than sent directly, so they cannot overtake the
+        frames the flush hasn't sent yet.
         """
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
@@ -1222,9 +1246,17 @@ class LocalStream:
             audio_frame = self._robot.media.get_audio_sample()
             if audio_frame is not None and not self._mic_muted:
                 frame = (input_sample_rate, audio_frame)
-                await self.handler.receive(frame)
-                if not self._backend_connected():
-                    self._append_preroll(frame)
+                connected = self._backend_connected()
+                if connected and self._preroll_flush_pending:
+                    # A flush is in flight: queue behind whatever it hasn't
+                    # sent yet instead of sending this frame directly, so a
+                    # live frame can never overtake -- or land between --
+                    # the still-unflushed pre-roll frames ahead of it.
+                    self._preroll.append(frame)
+                else:
+                    await self.handler.receive(frame)
+                    if not connected:
+                        self._append_preroll(frame)
                 self._emit_level("user", audio_frame)
             await asyncio.sleep(0)  # avoid busy loop
 
