@@ -133,6 +133,16 @@ class LocalStream:
         # close_session waits for it, because clearing the gate alone does not
         # close a session that is still being established.
         self._session_parked = asyncio.Event()
+        # Capture control. The session gate above closes the connection; this
+        # stops the microphone itself, for callers that need the mic provably
+        # off rather than merely disconnected. Starts True because launch()
+        # starts the pipelines.
+        self._capture_on = True
+        # Set whenever _session_wanted changes, so the retry sleep can wake on a
+        # close the way it already wakes on a restart request. Separate from
+        # _session_wanted itself because the sleep must wake on *clearing* it, and
+        # an asyncio.Event cannot be waited on for the cleared state.
+        self._session_gate_changed = asyncio.Event()
         self._tasks: List[asyncio.Task[None]] = []
         self._handler_factory = handler_factory
         self._voice_override = startup_voice
@@ -313,13 +323,28 @@ class LocalStream:
         await self._shutdown_active_handler()
 
     async def _sleep_or_restart_requested(self, delay: float) -> None:
-        """Sleep for a retry interval, waking early if a restart is requested."""
-        if self._restart_requested.is_set():
+        """Sleep for a retry interval, waking early on a restart or a session close.
+
+        Waking on the session gate cuts a deliberate close from about 5.3 s to
+        about the 0.65 s the connection actually takes, which is what a
+        voice-operated microphone switch needs. It deliberately does NOT set
+        _restart_requested to get there: that path rebuilds the handler, and
+        _startup_greeting_sent is per-instance and never reset, so a rebuilt
+        handler greets again.
+        """
+        if self._restart_requested.is_set() or not self._session_wanted.is_set():
             return
+        self._session_gate_changed.clear()
+        waiters = [
+            asyncio.ensure_future(self._restart_requested.wait()),
+            asyncio.ensure_future(self._session_gate_changed.wait()),
+        ]
         try:
-            await asyncio.wait_for(self._restart_requested.wait(), timeout=delay)
-        except asyncio.TimeoutError:
-            pass
+            done, pending = await asyncio.wait(waiters, timeout=delay, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
 
     async def _await_session_wanted(self) -> None:
         """Park the startup loop while the realtime session is closed on request.
@@ -351,6 +376,7 @@ class LocalStream:
             return
         logger.info("Realtime session open requested.")
         self._session_wanted.set()
+        self._session_gate_changed.set()
 
     async def close_session(self, timeout: float = 15.0) -> bool:
         """Close the realtime session and keep it closed until asked to reopen.
@@ -365,6 +391,7 @@ class LocalStream:
         """
         logger.info("Realtime session close requested.")
         self._session_wanted.clear()
+        self._session_gate_changed.set()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         await self._close_live_session()
@@ -663,6 +690,7 @@ class LocalStream:
                 "can_proceed": has_hf_connection,
                 "can_proceed_with_hf": has_hf_connection,
                 "requires_restart": not self._can_rebuild_handler(),
+                "capture": self._capture_on,
                 **backend_connection,
             }
 
@@ -725,6 +753,31 @@ class LocalStream:
                 "wanted": self._session_wanted.is_set(),
                 "connected": self._backend_connected(),
             }
+
+        @rpc.method("conversation.capture")  # type: ignore[untyped-decorator]
+        def _rpc_capture(params: dict[str, object]) -> dict[str, object]:
+            """Stop or start audio capture outright, not merely the connection.
+
+            The SDK's GStreamerAudio holds ONE pipeline carrying both the record
+            and the playback chains: stop_recording() sets it to NULL and
+            start_playing() sets it to PLAYING. So capture and playback move
+            together whether we like it or not, and pretending otherwise would
+            let the robot speak while reporting a stopped microphone. Both are
+            moved here, deliberately.
+            """
+            if "on" in params:
+                wanted = bool(params["on"])
+                if wanted != self._capture_on:
+                    media = self._robot.media
+                    if wanted:
+                        media.start_recording()
+                        media.start_playing()
+                    else:
+                        media.stop_recording()
+                        media.stop_playing()
+                    self._capture_on = wanted
+                    logger.info("Audio capture %s via /rpc", "started" if wanted else "stopped")
+            return {"on": self._capture_on}
 
         @rpc.method("backend.config")  # type: ignore[untyped-decorator]
         def _rpc_backend_config(params: dict[str, object]) -> dict[str, object]:
@@ -1005,6 +1058,14 @@ class LocalStream:
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
 
         while not self._stop_event.is_set():
+            if not self._capture_on:
+                # conversation.capture {"on": false} sets the pipeline to NULL, so
+                # get_audio_sample() would return None on every call from here on;
+                # polling it with only asyncio.sleep(0) to yield would busy-loop and
+                # pin a CPU core -- measured on the robot to drag the motor control
+                # loop from 49.5 Hz to 45.9 Hz. Back off instead of polling.
+                await asyncio.sleep(0.1)
+                continue
             audio_frame = self._robot.media.get_audio_sample()
             if audio_frame is not None and not self._mic_muted:
                 await self.handler.receive((input_sample_rate, audio_frame))

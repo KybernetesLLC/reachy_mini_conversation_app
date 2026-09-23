@@ -287,6 +287,62 @@ def test_status_over_rpc_carries_session_wanted() -> None:
     assert status["backend_connection_state"] == "session_closed"
 
 
+def _capture_robot() -> SimpleNamespace:
+    """Return a robot mock whose media pipeline can be stopped and started."""
+    media = SimpleNamespace(
+        audio=None,
+        backend=None,
+        stop_recording=MagicMock(),
+        start_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        start_playing=MagicMock(),
+    )
+    return SimpleNamespace(media=media)
+
+
+def test_capture_verb_stops_and_starts_both_pipelines() -> None:
+    """One GStreamer pipeline carries record and playback, so the verb moves both.
+
+    Stopping only the recorder would leave the app able to speak while claiming
+    the microphone is off -- a readback that lies about the hardware state.
+    """
+    app = FastAPI()
+    robot = _capture_robot()
+    stream = LocalStream(MagicMock(), robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+
+    assert _rpc_call(app, "conversation.capture", {"on": False})["result"] == {"on": False}
+    assert robot.media.stop_recording.called
+    assert robot.media.stop_playing.called
+
+    assert _rpc_call(app, "conversation.capture", {"on": True})["result"] == {"on": True}
+    assert robot.media.start_recording.called
+    assert robot.media.start_playing.called
+
+
+def test_capture_verb_without_a_parameter_only_reports() -> None:
+    """Reading conversation.capture back must not itself change the state."""
+    app = FastAPI()
+    robot = _capture_robot()
+    stream = LocalStream(MagicMock(), robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    stream._capture_on = False
+
+    assert _rpc_call(app, "conversation.capture", {})["result"] == {"on": False}
+    assert not robot.media.start_recording.called
+
+
+def test_capture_state_appears_in_status() -> None:
+    """The supervisor reads this back; a verb with no readback can lie."""
+    app = FastAPI()
+    robot = _capture_robot()
+    stream = LocalStream(MagicMock(), robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+
+    _rpc_call(app, "conversation.capture", {"on": False})
+    assert _rpc_call(app, "conversation.status")["result"]["capture"] is False
+
+
 @pytest.mark.asyncio
 async def test_close_session_keeps_closing_until_the_loop_actually_parks(
     monkeypatch: Any,
@@ -374,6 +430,31 @@ async def test_close_session_returns_false_when_it_cannot_settle() -> None:
 
     assert result is False
     assert stream._session_wanted.is_set() is False  # the intent to close still recorded
+
+
+@pytest.mark.asyncio
+async def test_the_retry_sleep_wakes_when_the_session_gate_is_cleared() -> None:
+    """A voice-operated off switch cannot wait out a five-second retry delay."""
+    stream = _bare_stream()
+    stream._backend_retry_delay = 5.0
+    stream._session_wanted.set()
+
+    task = asyncio.ensure_future(stream._sleep_or_restart_requested(5.0))
+    await asyncio.sleep(0.05)
+    stream._session_wanted.clear()
+    stream._session_gate_changed.set()
+    await asyncio.wait_for(task, timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_the_retry_sleep_still_wakes_on_a_restart_request() -> None:
+    """Change B must not cost the behaviour that was already there."""
+    stream = _bare_stream()
+
+    task = asyncio.ensure_future(stream._sleep_or_restart_requested(5.0))
+    await asyncio.sleep(0.05)
+    stream._restart_requested.set()
+    await asyncio.wait_for(task, timeout=0.5)
 
 
 def test_rest_api_is_removed_in_favor_of_rpc() -> None:
@@ -1142,6 +1223,51 @@ async def test_record_loop_skips_missing_frames() -> None:
     await stream.record_loop()
 
     handler.receive.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_record_loop_backs_off_instead_of_polling_while_capture_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While capture is off, record_loop must not poll get_audio_sample() or spin.
+
+    A None frame from a NULL pipeline plus asyncio.sleep(0) to yield is a busy
+    loop: measured on the robot, it dragged the motor control loop from 49.5 Hz
+    to 45.9 Hz.
+    """
+
+    class _RecordingAsyncio:
+        """Proxies the real asyncio module but records record_loop's sleep calls."""
+
+        def __init__(self, real: Any) -> None:
+            self._real = real
+            self.sleep_delays: list[float] = []
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real, name)
+
+        async def sleep(self, delay: float) -> None:
+            self.sleep_delays.append(delay)
+            await self._real.sleep(delay)
+
+    robot = _audio_robot(get_input_audio_samplerate=MagicMock(return_value=16000), get_audio_sample=MagicMock())
+    handler = MagicMock()
+    handler.receive = AsyncMock()
+    stream = LocalStream(handler, robot)
+    stream._capture_on = False
+
+    fake_asyncio = _RecordingAsyncio(asyncio)
+    monkeypatch.setattr(console_mod, "asyncio", fake_asyncio)
+
+    task = asyncio.ensure_future(stream.record_loop())
+    await asyncio.sleep(0.35)
+    stream._stop_event.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    robot.media.get_audio_sample.assert_not_called()
+    handler.receive.assert_not_awaited()
+    assert 1 <= len(fake_asyncio.sleep_delays) <= 20
+    assert all(delay == 0.1 for delay in fake_asyncio.sleep_delays)
 
 
 @pytest.mark.asyncio
