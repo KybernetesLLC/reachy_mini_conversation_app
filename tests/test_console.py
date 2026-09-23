@@ -2035,17 +2035,18 @@ async def test_mute_then_reopen_with_preroll_flushes_only_post_unmute_audio(
     """
     monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
     sample_rate = 16000
+    app = FastAPI()
     robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
     handler = _FakeSessionHandler()
-    stream = LocalStream(handler, robot)
+    stream = LocalStream(handler, robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
     stream._session_wanted.clear()
     stream._backend_retry_delay = 0.01
 
     # Pre-mute audio buffers while disconnected (AMBIENT); then the mic is
-    # muted, which clears it (what conversation.mic {"muted": true} does).
+    # muted over the real /rpc verb, which clears it.
     stream._append_preroll((sample_rate, np.full(4, 1, dtype=np.int16)))
-    stream._mic_muted = True
-    stream._clear_preroll()
+    assert _rpc_call(app, "conversation.mic", {"muted": True})["result"] == {"muted": True}
 
     loop_task = asyncio.create_task(stream._run_handler_startup_loop())
     try:
@@ -2054,9 +2055,10 @@ async def test_mute_then_reopen_with_preroll_flushes_only_post_unmute_audio(
         await _wait_until(lambda: stream._preroll_flush_pending is False)
         assert handler.received == []  # nothing pre-mute was ever flushed
 
-        # Back to AMBIENT, unmute, fresh audio buffers, wake word again.
+        # Back to AMBIENT, unmute over the real /rpc verb, fresh audio
+        # buffers, wake word again.
         assert await stream.close_session() is True
-        stream._mic_muted = False
+        assert _rpc_call(app, "conversation.mic", {"muted": False})["result"] == {"muted": False}
         stream._append_preroll((sample_rate, np.full(4, 2, dtype=np.int16)))
         handler.stopped.clear()
         await stream.open_session(preroll=True)
