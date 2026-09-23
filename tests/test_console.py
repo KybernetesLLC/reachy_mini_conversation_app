@@ -287,19 +287,6 @@ def test_status_over_rpc_carries_session_wanted() -> None:
     assert status["backend_connection_state"] == "session_closed"
 
 
-def _capture_robot() -> SimpleNamespace:
-    """Return a robot mock whose media pipeline can be stopped and started."""
-    media = SimpleNamespace(
-        audio=None,
-        backend=None,
-        stop_recording=MagicMock(),
-        start_recording=MagicMock(),
-        stop_playing=MagicMock(),
-        start_playing=MagicMock(),
-    )
-    return SimpleNamespace(media=media)
-
-
 def test_capture_verb_stops_and_starts_both_pipelines() -> None:
     """One GStreamer pipeline carries record and playback, so the verb moves both.
 
@@ -307,7 +294,12 @@ def test_capture_verb_stops_and_starts_both_pipelines() -> None:
     the microphone is off -- a readback that lies about the hardware state.
     """
     app = FastAPI()
-    robot = _capture_robot()
+    robot = _audio_robot(
+        stop_recording=MagicMock(),
+        start_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        start_playing=MagicMock(),
+    )
     stream = LocalStream(MagicMock(), robot, settings_app=app)
     stream._init_settings_ui_if_needed()
 
@@ -323,7 +315,7 @@ def test_capture_verb_stops_and_starts_both_pipelines() -> None:
 def test_capture_verb_without_a_parameter_only_reports() -> None:
     """Reading conversation.capture back must not itself change the state."""
     app = FastAPI()
-    robot = _capture_robot()
+    robot = _audio_robot(start_recording=MagicMock())
     stream = LocalStream(MagicMock(), robot, settings_app=app)
     stream._init_settings_ui_if_needed()
     stream._capture_on = False
@@ -335,7 +327,12 @@ def test_capture_verb_without_a_parameter_only_reports() -> None:
 def test_capture_state_appears_in_status() -> None:
     """The supervisor reads this back; a verb with no readback can lie."""
     app = FastAPI()
-    robot = _capture_robot()
+    robot = _audio_robot(
+        stop_recording=MagicMock(),
+        start_recording=MagicMock(),
+        stop_playing=MagicMock(),
+        start_playing=MagicMock(),
+    )
     stream = LocalStream(MagicMock(), robot, settings_app=app)
     stream._init_settings_ui_if_needed()
 
@@ -448,7 +445,7 @@ async def test_the_retry_sleep_wakes_when_the_session_gate_is_cleared() -> None:
 
 @pytest.mark.asyncio
 async def test_the_retry_sleep_still_wakes_on_a_restart_request() -> None:
-    """Change B must not cost the behaviour that was already there."""
+    """Waking on the session gate must not cost the existing wake on a restart."""
     stream = _bare_stream()
 
     task = asyncio.ensure_future(stream._sleep_or_restart_requested(5.0))
