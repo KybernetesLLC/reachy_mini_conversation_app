@@ -1603,7 +1603,7 @@ async def test_record_loop_holds_live_frames_behind_an_armed_flush() -> None:
     handler.receive = AsyncMock()
     stream = LocalStream(handler, robot)
     stream._preroll_flush_pending = True
-    stream._preroll.append((16000, np.full(4, 1, dtype=np.int16)))  # already queued for the flush
+    stream._append_preroll((16000, np.full(4, 1, dtype=np.int16)))  # already queued for the flush
     robot.media.get_audio_sample.side_effect = _stop_after(stream, frame)
 
     await stream.record_loop()
@@ -1611,6 +1611,44 @@ async def test_record_loop_holds_live_frames_behind_an_armed_flush() -> None:
     handler.receive.assert_not_awaited()  # not sent directly
     queued = [samples.tolist() for _, samples in stream._preroll]
     assert queued == [[1, 1, 1, 1], [9, 9, 9, 9]]  # queued behind the existing frame, in order
+
+
+@pytest.mark.asyncio
+async def test_frames_queued_behind_a_flush_stay_within_the_two_second_bound() -> None:
+    """Route frames queued behind an in-flight flush through the same bounded append.
+
+    If the drain does not keep up (here it never runs at all -- the worst
+    case), the frames record_loop queues behind it must still be trimmed the
+    same way everything else in the buffer is, so the 2 s bound holds
+    regardless of which path added a frame.
+    """
+    sample_rate = 16000
+    frame_seconds = 0.1
+    frame_len = int(sample_rate * frame_seconds)
+    total_frames = 50  # 5.0 s worth, well over the 2.0 s bound
+
+    robot = _audio_robot(get_input_audio_samplerate=MagicMock(return_value=sample_rate), get_audio_sample=MagicMock())
+    handler = MagicMock()
+    handler.connection = object()  # already connected
+    handler.receive = AsyncMock()
+    stream = LocalStream(handler, robot)
+    stream._preroll_flush_pending = True  # a flush is (nominally) in flight; nothing drains it here
+
+    remaining = [np.full(frame_len, i, dtype=np.int16) for i in range(total_frames)]
+
+    def _next_frame() -> np.ndarray:
+        frame = remaining.pop(0)
+        if not remaining:
+            stream._stop_event.set()
+        return frame
+
+    robot.media.get_audio_sample.side_effect = _next_frame
+
+    await stream.record_loop()
+
+    handler.receive.assert_not_awaited()  # nothing sent directly while the flush is pending
+    total_duration = sum(len(samples) / rate for rate, samples in stream._preroll)
+    assert total_duration <= console_mod.PREROLL_SECONDS + 1e-9
 
 
 @pytest.mark.asyncio
@@ -1632,15 +1670,17 @@ async def test_the_flush_drains_frames_queued_during_the_drain_in_order() -> Non
             received.append(frame)
             if not appended:
                 appended = True
-                # Stand in for record_loop queuing a live frame mid-drain.
-                stream._preroll.append((16000, np.full(4, 3, dtype=np.int16)))
+                # Stand in for record_loop queuing a live frame mid-drain --
+                # via the same helper record_loop itself now uses, so the
+                # timestamp bookkeeping stays consistent.
+                stream._append_preroll((16000, np.full(4, 3, dtype=np.int16)))
 
     handler = _DrainProbeHandler()
     robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
     stream = LocalStream(handler, robot)
     stream._preroll_flush_pending = True
-    stream._preroll.append((16000, np.full(4, 1, dtype=np.int16)))
-    stream._preroll.append((16000, np.full(4, 2, dtype=np.int16)))
+    stream._append_preroll((16000, np.full(4, 1, dtype=np.int16)))
+    stream._append_preroll((16000, np.full(4, 2, dtype=np.int16)))
 
     await stream._settle_preroll_on_connect()
 
@@ -1809,6 +1849,87 @@ async def test_preroll_on_an_already_open_session_arms_nothing(monkeypatch: pyte
         await _stop_fake_session_loop(stream, handler, loop_task)
 
 
+class _FlakySessionHandler(_FakeSessionHandler):
+    """Fails the first start_up() attempt before ever connecting, then behaves normally."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def start_up(self) -> None:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RuntimeError("transient connect failure")
+        await super().start_up()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_connect_does_not_leave_the_flush_flag_armed_for_the_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The authorisation covers the attempt open_session(preroll=True) caused.
+
+    If that attempt fails before handler.connection is ever set, a later
+    retry must not inherit the flag and flush whatever has accumulated by
+    the time it connects -- that connection was never actually asked for.
+    """
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = _FlakySessionHandler()
+    stream = LocalStream(handler, robot)
+    stream._session_wanted.clear()
+    stream._backend_retry_delay = 0.01
+    stream._append_preroll((16000, np.full(4, 4, dtype=np.int16)))
+
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    try:
+        await stream.open_session(preroll=True)
+        await _wait_until(lambda: handler.attempts >= 1)
+        await _wait_until(lambda: stream._preroll_flush_pending is False)  # cleared despite the failure
+
+        await _wait_until(lambda: handler.started.is_set())  # the retry connects
+        await _wait_until(lambda: len(stream._preroll) == 0)  # discarded, not flushed
+
+        assert handler.received == []
+        assert handler.attempts >= 2
+    finally:
+        await _stop_fake_session_loop(stream, handler, loop_task)
+
+
+@pytest.mark.asyncio
+async def test_a_hard_age_limit_drops_stale_buffered_frames_at_flush_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expect a frame older than PREROLL_SECONDS by flush time to be dropped, not sent.
+
+    The duration bound only limits how much audio accumulates; it does not
+    expire with wall-clock time on its own. With no new frames arriving to
+    trim it, a buffered frame can sit well past PREROLL_SECONDS in real time
+    while still reading as "within budget" by duration alone -- the flush
+    must catch this with each frame's own arrival timestamp instead.
+    """
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    fake_now = [0.0]
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = _FakeSessionHandler()
+    stream = LocalStream(handler, robot, preroll_clock=lambda: fake_now[0])
+    stream._session_wanted.clear()
+    stream._backend_retry_delay = 0.01
+    stream._append_preroll((16000, np.full(4, 1, dtype=np.int16)))
+
+    fake_now[0] += console_mod.PREROLL_SECONDS + 1.0  # 3.0 s later, nothing new arrived
+
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    try:
+        await stream.open_session(preroll=True)
+        await _wait_until(lambda: handler.started.is_set())
+        await _wait_until(lambda: stream._preroll_flush_pending is False)
+
+        assert handler.received == []  # too old by the time it would have flushed
+    finally:
+        await _stop_fake_session_loop(stream, handler, loop_task)
+
+
 def test_capture_off_clears_the_preroll_buffer_immediately() -> None:
     """No audio from before a capture-off may survive into a later session."""
     app = FastAPI()
@@ -1857,6 +1978,94 @@ async def test_the_preroll_buffer_stays_empty_while_capture_is_off() -> None:
     robot.media.get_audio_sample.assert_not_called()  # off means off -- no polling either
     assert len(stream._preroll) == 0
     assert stream._preroll_duration == 0.0
+
+
+def test_muting_clears_the_preroll_buffer_immediately() -> None:
+    """No audio from before a mute may sit in the buffer and later flush as if it were fresh."""
+    app = FastAPI()
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    stream = LocalStream(MagicMock(), robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    stream._append_preroll((16000, np.zeros(4, dtype=np.int16)))
+
+    assert _rpc_call(app, "conversation.mic", {"muted": True})["result"] == {"muted": True}
+
+    assert len(stream._preroll) == 0
+    assert stream._preroll_duration == 0.0
+
+
+@pytest.mark.asyncio
+async def test_the_preroll_buffer_stays_empty_while_muted() -> None:
+    """Drive record_loop muted, with a pre-existing buffer and frames available.
+
+    Confirms record_loop's own mute branch actively empties the buffer (and
+    keeps it empty), mirroring the capture-off branch above -- duration is
+    tracked in audio time, not wall time, so nothing would otherwise age a
+    frozen buffer out on its own for as long as the mute lasts.
+    """
+    robot = _audio_robot(
+        get_input_audio_samplerate=MagicMock(return_value=16000),
+        get_audio_sample=MagicMock(return_value=np.zeros(4, dtype=np.int16)),
+    )
+    handler = MagicMock()
+    handler.connection = None
+    handler.receive = AsyncMock()
+    stream = LocalStream(handler, robot)
+    stream._mic_muted = True
+    stream._append_preroll((16000, np.full(4, 5, dtype=np.int16)))  # left over from before the mute
+
+    task = asyncio.ensure_future(stream.record_loop())
+    await asyncio.sleep(0.05)
+    stream._stop_event.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    handler.receive.assert_not_awaited()
+    assert len(stream._preroll) == 0
+    assert stream._preroll_duration == 0.0
+
+
+@pytest.mark.asyncio
+async def test_mute_then_reopen_with_preroll_flushes_only_post_unmute_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: audio buffered before a mute must never reach the handler.
+
+    Not directly, and not through a later preroll flush either -- only audio
+    buffered after the unmute may.
+    """
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    sample_rate = 16000
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = _FakeSessionHandler()
+    stream = LocalStream(handler, robot)
+    stream._session_wanted.clear()
+    stream._backend_retry_delay = 0.01
+
+    # Pre-mute audio buffers while disconnected (AMBIENT); then the mic is
+    # muted, which clears it (what conversation.mic {"muted": true} does).
+    stream._append_preroll((sample_rate, np.full(4, 1, dtype=np.int16)))
+    stream._mic_muted = True
+    stream._clear_preroll()
+
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    try:
+        await stream.open_session(preroll=True)  # the wake word, still muted
+        await _wait_until(lambda: handler.started.is_set())
+        await _wait_until(lambda: stream._preroll_flush_pending is False)
+        assert handler.received == []  # nothing pre-mute was ever flushed
+
+        # Back to AMBIENT, unmute, fresh audio buffers, wake word again.
+        assert await stream.close_session() is True
+        stream._mic_muted = False
+        stream._append_preroll((sample_rate, np.full(4, 2, dtype=np.int16)))
+        handler.stopped.clear()
+        await stream.open_session(preroll=True)
+        await _wait_until(lambda: len(handler.received) >= 1)
+
+        tags = [int(s[0]) for _, s in handler.received]
+        assert tags == [2]  # only the post-unmute frame, never the pre-mute one
+    finally:
+        await _stop_fake_session_loop(stream, handler, loop_task)
 
 
 @pytest.mark.asyncio

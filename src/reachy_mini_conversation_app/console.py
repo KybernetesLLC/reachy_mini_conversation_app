@@ -131,12 +131,15 @@ class LocalStream:
         instance_path: Optional[str] = None,
         handler_factory: HandlerFactory | None = None,
         startup_voice: Optional[str] = None,
+        preroll_clock: Callable[[], float] = time.monotonic,
     ):
         """Initialize the stream with a realtime handler and pipelines.
 
         - ``settings_app``: the Reachy Mini Apps FastAPI to attach settings endpoints.
         - ``instance_path``: directory where per-instance ``.env`` should be stored.
         - ``handler_factory``: builds a fresh handler for the currently selected backend.
+        - ``preroll_clock``: monotonic clock used to timestamp the pre-roll buffer's frames
+          (see ``_append_preroll``); injectable so tests can advance time without a real sleep.
         """
         self._robot = robot
         self._stop_event = asyncio.Event()
@@ -160,14 +163,21 @@ class LocalStream:
         # starts the pipelines.
         self._capture_on = True
         # Pre-roll buffer. record_loop keeps the most recent PREROLL_SECONDS of
-        # mic frames here while no realtime connection is up, and never writes
-        # them to disk. The buffer is flushed into the handler only when the
-        # connection it is waiting for was explicitly marked for it (see
-        # open_session); every other new connection -- and a capture-off, and
-        # a close -- discards it instead.
+        # mic frames here while no realtime connection is up (or muted, or
+        # queued behind an in-flight flush), and never writes them to disk.
+        # The buffer is flushed into the handler only when the connection it
+        # is waiting for was explicitly marked for it (see open_session);
+        # every other new connection -- and a mute, a capture-off, and a
+        # close -- discards it instead. _preroll_times mirrors _preroll's
+        # length exactly, one arrival timestamp per frame, so a flush can
+        # drop anything that aged past PREROLL_SECONDS while sitting there
+        # (see _settle_preroll_on_connect) -- duration alone only bounds how
+        # much audio is buffered, not how long it has been waiting.
         self._preroll: "deque[tuple[int, Any]]" = deque()
+        self._preroll_times: "deque[float]" = deque()
         self._preroll_duration = 0.0
         self._preroll_flush_pending = False
+        self._preroll_clock = preroll_clock
         # Set whenever _session_wanted changes, so the retry sleep can wake on a
         # close the way it already wakes on a restart request. Separate from
         # _session_wanted itself because the sleep must wake on *clearing* it, and
@@ -419,6 +429,13 @@ class LocalStream:
         to authorise, so ``preroll=True`` on one is a no-op -- not a promise
         to flush whatever accumulates next, which could otherwise leak into
         an unrelated later reconnect.
+
+        The authorisation covers exactly one connection attempt: the one this
+        call causes. If that attempt fails before ever connecting, it is
+        consumed anyway rather than carried over -- a later retry, or a
+        handler rebuilt for an unrelated reason, connects with the flag
+        already cleared, and needs a fresh ``preroll=True`` call of its own
+        to flush anything.
         """
         if self._session_wanted.is_set():
             return
@@ -790,6 +807,12 @@ class LocalStream:
         def _rpc_mic(params: dict[str, object]) -> dict[str, object]:
             if "muted" in params:
                 self._mic_muted = bool(params["muted"])
+                if self._mic_muted:
+                    # Nothing from before the mute may sit in the buffer and
+                    # later be flushed as if it were fresh -- record_loop
+                    # stops buffering while muted, but does not itself
+                    # discard whatever was already there.
+                    self._clear_preroll()
                 logger.info("Microphone %s via /rpc", "muted" if self._mic_muted else "unmuted")
             return {"muted": self._mic_muted}
 
@@ -962,28 +985,44 @@ class LocalStream:
         Runs alongside one handler.start_up() attempt. Once a connection comes
         up, the buffer is fed into the handler, in order, if open_session()
         marked this connection for it; otherwise it is discarded unflushed.
-        Either way, the flag is consumed here, so a later reconnect on the
-        same gate does not reuse it.
+
+        Wrapped in one try/finally covering the whole method, so the buffer
+        and the flag are reset on every exit -- not just a successful flush
+        or discard, but also a stop, or this task being cancelled while still
+        waiting for a connection that never came (start_up() failed before
+        handler.connection was ever set). Without that, an attempt that never
+        connects would leave the flag armed for whichever later retry, or
+        handler rebuilt for an unrelated reason, happens to connect next --
+        authorising a flush that connection was never actually asked for.
 
         Drains left-to-right until the buffer is genuinely empty, not just
         however many frames were there when the connection came up: while a
         flush is in flight, record_loop queues live frames behind it (see
         record_loop) instead of sending them directly, so whatever arrives
         during the drain is caught here too, in order, rather than racing the
-        drain's own handler.receive() calls to the handler.
+        drain's own handler.receive() calls to the handler. Each frame is
+        also checked against its own arrival time and dropped, unsent, if it
+        has sat in the buffer longer than PREROLL_SECONDS -- the duration
+        bound only limits how much audio accumulates, not how long any of it
+        has been waiting, so a long gap with nothing new to trim the buffer
+        (a mute, a stretch of silence) would otherwise let stale audio ride
+        along into a much later flush.
         """
-        while not self._backend_connected():
-            if self._stop_event.is_set():
-                return
-            await asyncio.sleep(_PREROLL_POLL_INTERVAL_S)
-
-        if not self._preroll_flush_pending:
-            self._reset_preroll()
-            return
-
         try:
+            while not self._backend_connected():
+                if self._stop_event.is_set():
+                    return
+                await asyncio.sleep(_PREROLL_POLL_INTERVAL_S)
+
+            if not self._preroll_flush_pending:
+                return
+
+            now = self._preroll_clock()
             while self._preroll:
                 frame = self._preroll.popleft()
+                timestamp = self._preroll_times.popleft()
+                if now - timestamp > PREROLL_SECONDS:
+                    continue
                 try:
                     await self.handler.receive(frame)
                 except asyncio.CancelledError:
@@ -1057,6 +1096,17 @@ class LocalStream:
                 preroll_watch.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await preroll_watch
+                if not self._backend_connected():
+                    # Safety net alongside _settle_preroll_on_connect's own
+                    # try/finally: if start_up() fails (or is cancelled)
+                    # before ever yielding control -- a purely synchronous
+                    # failure -- preroll_watch can be cancelled before it has
+                    # run a single line of its own body, including its
+                    # finally, so it never gets the chance to consume the
+                    # flag itself. Idempotent with that reset when the
+                    # watcher did run (this attempt's flag is already False
+                    # by then); the fix only when it did not.
+                    self._preroll_flush_pending = False
 
             await self._sleep_or_restart_requested(self._backend_retry_delay)
 
@@ -1199,17 +1249,26 @@ class LocalStream:
                 break
 
     def _append_preroll(self, frame: Any) -> None:
-        """Add one frame to the pre-roll buffer, trimming to PREROLL_SECONDS from the front."""
+        """Add one frame to the pre-roll buffer, trimming to PREROLL_SECONDS from the front.
+
+        The single path every buffered frame goes through -- captured while
+        disconnected or muted, or queued behind an in-flight flush -- so the
+        duration bound and each frame's arrival timestamp are always kept
+        consistent, regardless of which caller added it.
+        """
         sample_rate, samples = frame
         self._preroll.append(frame)
+        self._preroll_times.append(self._preroll_clock())
         self._preroll_duration += len(samples) / sample_rate
         while self._preroll and self._preroll_duration > PREROLL_SECONDS:
             oldest_rate, oldest_samples = self._preroll.popleft()
+            self._preroll_times.popleft()
             self._preroll_duration -= len(oldest_samples) / oldest_rate
 
     def _clear_preroll(self) -> None:
         """Discard the pre-roll buffer's contents, leaving any pending flush flag alone."""
         self._preroll.clear()
+        self._preroll_times.clear()
         self._preroll_duration = 0.0
 
     def _reset_preroll(self) -> None:
@@ -1220,13 +1279,15 @@ class LocalStream:
     async def record_loop(self) -> None:
         """Read mic frames from the recorder and forward them to the handler.
 
-        While capture is on and no realtime connection is up, recent frames
-        are also kept in a short pre-roll buffer (see PREROLL_SECONDS) instead
-        of being lost, so a spoken name and the command that follows it in the
-        same breath are not lost during the moment it takes a session to
-        connect. While a pre-roll flush is in flight, live frames are queued
-        behind it rather than sent directly, so they cannot overtake the
-        frames the flush hasn't sent yet.
+        While capture is on, not muted, and no realtime connection is up,
+        recent frames are also kept in a short pre-roll buffer (see
+        PREROLL_SECONDS) instead of being lost, so a spoken name and the
+        command that follows it in the same breath are not lost during the
+        moment it takes a session to connect. While a pre-roll flush is in
+        flight, live frames are queued behind it rather than sent directly,
+        so they cannot overtake the frames the flush hasn't sent yet. While
+        muted, the buffer is actively cleared rather than merely not grown,
+        so audio from before the mute cannot sit there and outlast it.
         """
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
@@ -1244,15 +1305,23 @@ class LocalStream:
                 await asyncio.sleep(0.1)
                 continue
             audio_frame = self._robot.media.get_audio_sample()
-            if audio_frame is not None and not self._mic_muted:
+            if self._mic_muted:
+                # No audio from while the mic is muted may sit in the buffer
+                # and grow stale -- duration is tracked in audio time, not
+                # wall time, so nothing would otherwise age it out for as
+                # long as the mute lasts.
+                self._clear_preroll()
+            elif audio_frame is not None:
                 frame = (input_sample_rate, audio_frame)
                 connected = self._backend_connected()
                 if connected and self._preroll_flush_pending:
                     # A flush is in flight: queue behind whatever it hasn't
                     # sent yet instead of sending this frame directly, so a
                     # live frame can never overtake -- or land between --
-                    # the still-unflushed pre-roll frames ahead of it.
-                    self._preroll.append(frame)
+                    # the still-unflushed pre-roll frames ahead of it. Routed
+                    # through the same bounded, timestamped append as every
+                    # other path into the buffer.
+                    self._append_preroll(frame)
                 else:
                     await self.handler.receive(frame)
                     if not connected:
