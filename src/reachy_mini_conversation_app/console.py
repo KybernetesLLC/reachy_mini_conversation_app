@@ -15,6 +15,7 @@ from collections.abc import Callable
 import numpy as np
 
 from reachy_mini import ReachyMini
+from reachy_mini.utils import create_head_pose
 from reachy_mini.io.jsonrpc import JsonRpcError
 from reachy_mini.apps.jsonrpc_server import JsonRpcServer
 from reachy_mini.media.media_manager import MediaBackend
@@ -284,6 +285,10 @@ class LocalStream:
         except TypeError:
             handler_state = {}
         return handler_state.get("connection") is not None
+
+    def _movement_manager(self) -> Any:
+        """Return the active handler's movement manager, if any."""
+        return getattr(getattr(self.handler, "deps", None), "movement_manager", None)
 
     def _can_rebuild_handler(self) -> bool:
         """Return whether LocalStream can construct handlers for backend changes."""
@@ -778,6 +783,60 @@ class LocalStream:
                     self._capture_on = wanted
                     logger.info("Audio capture %s via /rpc", "started" if wanted else "stopped")
             return {"on": self._capture_on}
+
+        @rpc.method("conversation.pose")  # type: ignore[untyped-decorator]
+        def _rpc_pose(params: dict[str, object]) -> dict[str, object]:
+            """Hold the body in a target pose until released, or report the current state.
+
+            Holding queues an infinite move as the movement manager's current
+            move, which blocks its own idle breathing: moves.py's
+            _manage_breathing only starts breathing when there is no current
+            move, and an infinite move never ends on its own.
+            """
+            manager = self._movement_manager()
+            if manager is None:
+                raise JsonRpcError("movement manager unavailable", reason="not_running")
+
+            if params.get("release"):
+                manager.release_hold()
+                return {"holding": False}
+
+            if not params:
+                return {"holding": manager.is_holding()}
+
+            antennas_raw = params.get("antennas")
+            if not isinstance(antennas_raw, (list, tuple)) or len(antennas_raw) != 2:
+                raise JsonRpcError(
+                    "pose requires 'antennas' as [right, left]", reason="invalid_params", code=-32602
+                )
+            try:
+                target_antennas = (float(antennas_raw[0]), float(antennas_raw[1]))
+            except (TypeError, ValueError):
+                raise JsonRpcError("pose antennas must be numeric", reason="invalid_params", code=-32602)
+
+            head_pose_params = params.get("head_pose") or {}
+            if not isinstance(head_pose_params, dict):
+                raise JsonRpcError("pose head_pose must be an object", reason="invalid_params", code=-32602)
+            try:
+                x = float(head_pose_params.get("x", 0.0))
+                y = float(head_pose_params.get("y", 0.0))
+                z = float(head_pose_params.get("z", 0.0))
+                roll = float(head_pose_params.get("roll", 0.0))
+                pitch = float(head_pose_params.get("pitch", 0.0))
+                yaw = float(head_pose_params.get("yaw", 0.0))
+            except (TypeError, ValueError):
+                raise JsonRpcError("pose head_pose fields must be numeric", reason="invalid_params", code=-32602)
+
+            try:
+                duration = float(params.get("duration", 1.0))
+            except (TypeError, ValueError):
+                raise JsonRpcError("pose duration must be numeric", reason="invalid_params", code=-32602)
+            if duration <= 0:
+                raise JsonRpcError("pose duration must be > 0", reason="invalid_params", code=-32602)
+
+            target_head_pose = create_head_pose(x, y, z, roll, pitch, yaw, degrees=False)
+            manager.hold_pose(target_head_pose, target_antennas, duration)
+            return {"holding": True}
 
         @rpc.method("backend.config")  # type: ignore[untyped-decorator]
         def _rpc_backend_config(params: dict[str, object]) -> dict[str, object]:

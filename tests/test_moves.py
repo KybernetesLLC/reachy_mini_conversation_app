@@ -9,6 +9,7 @@ import pytest
 from reachy_mini.utils import create_head_pose
 from reachy_mini.utils.interpolation import compose_world_offset
 from reachy_mini_conversation_app.moves import (
+    HoldPoseMove,
     BreathingMove,
     MovementManager,
     LoopFrequencyStats,
@@ -155,6 +156,133 @@ def test_breathing_move_interpolates_then_breathes() -> None:
     assert head_breathe is not None
     assert antennas_breathe is not None and antennas_breathe.shape == (2,)
     assert body_yaw_breathe == 0.0
+
+
+def test_hold_pose_move_interpolates_then_holds_exactly() -> None:
+    """Hold reaches the target at `duration` and stays there indefinitely after, sway-free."""
+    start_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+    target_pose = create_head_pose(0, 0, 0.02, 0, 10, 0, degrees=True)
+    move = HoldPoseMove(
+        target_head_pose=target_pose,
+        target_antennas=(0.2, -0.2),
+        interpolation_start_pose=start_pose,
+        interpolation_start_antennas=(0.0, 0.0),
+        interpolation_duration=2.0,
+    )
+    assert move.duration == float("inf")
+
+    head_start, antennas_start, body_yaw_start = move.evaluate(0.0)
+    np.testing.assert_array_equal(head_start, start_pose)
+    np.testing.assert_array_equal(antennas_start, [0.0, 0.0])
+    assert body_yaw_start == 0.0
+
+    head_end, antennas_end, _ = move.evaluate(2.0)
+    np.testing.assert_array_equal(head_end, target_pose)
+    np.testing.assert_array_equal(antennas_end, [0.2, -0.2])
+
+    head_later, antennas_later, _ = move.evaluate(62.0)
+    np.testing.assert_array_equal(head_later, target_pose)
+    np.testing.assert_array_equal(antennas_later, [0.2, -0.2])
+
+
+def test_hold_blocks_breathing_and_release_lets_it_resume() -> None:
+    """A held pose blocks idle breathing; releasing it lets breathing resume after the delay.
+
+    Drives the manager's own decision functions (_manage_move_queue /
+    _manage_breathing) with a controllable clock rather than the worker
+    thread, per the brief's fallback for a manager that only runs on its
+    own thread.
+    """
+    robot = MagicMock()
+    robot.get_current_joint_positions.return_value = ([0.0] * 6, [0.0, 0.0])
+    robot.get_current_head_pose.return_value = np.eye(4)
+    manager = MovementManager(robot)
+
+    target_head_pose = create_head_pose(0, 0, 0, 0, 10, 0, degrees=True)
+    t0 = manager._now()
+    manager._handle_command("hold_pose", (target_head_pose, (0.2, -0.2), 1.0), t0)
+    manager._manage_move_queue(t0)  # promote the queued hold to the current move
+    assert isinstance(manager.state.current_move, HoldPoseMove)
+
+    # Well past both the hold's own interpolation and the idle-inactivity delay:
+    # breathing must not start while the hold is current.
+    t_holding = t0 + manager.idle_inactivity_delay + 5.0
+    manager._update_primary_motion(t_holding)
+    assert isinstance(manager.state.current_move, HoldPoseMove)
+    assert len(manager.move_queue) == 0
+    _, antennas, _ = manager.state.current_move.evaluate(t_holding - t0)
+    np.testing.assert_array_equal(antennas, [0.2, -0.2])
+
+    # Positive control: releasing hands control back to idle behaviour, and
+    # breathing starts once its own inactivity delay elapses from the release.
+    manager._handle_command("release_hold", None, t_holding)
+    assert manager.state.current_move is None
+    assert len(manager.move_queue) == 0
+
+    t_after_release = manager._now() + manager.idle_inactivity_delay + 1.0
+    manager._update_primary_motion(t_after_release)
+    assert len(manager.move_queue) == 1
+    assert isinstance(manager.move_queue[0], BreathingMove)
+
+
+def test_release_hold_is_a_no_op_when_nothing_is_held() -> None:
+    """Releasing with no hold current leaves any other current move untouched."""
+    manager = MovementManager(MagicMock())
+    now = manager._now()
+    breathing_move = BreathingMove(
+        interpolation_start_pose=create_head_pose(0, 0, 0, 0, 0, 0, degrees=True),
+        interpolation_start_antennas=(0.0, 0.0),
+    )
+    manager.state.current_move = breathing_move
+    manager.state.move_start_time = now
+    manager._breathing_active = True
+
+    manager._handle_command("release_hold", None, now)
+
+    assert manager.state.current_move is breathing_move
+    assert manager._breathing_active is True
+
+
+def test_hold_pose_seeds_from_last_commanded_pose_and_replaces_a_previous_hold() -> None:
+    """A second hold interpolates from wherever the manager last commanded, not the first target."""
+    manager = MovementManager(MagicMock())
+    now = manager._now()
+
+    first_target = create_head_pose(0, 0, 0, 0, 10, 0, degrees=True)
+    manager._handle_command("hold_pose", (first_target, (0.2, -0.2), 1.0), now)
+    manager._manage_move_queue(now)  # promote the queued hold to the current move
+    first_hold = manager.state.current_move
+    assert isinstance(first_hold, HoldPoseMove)
+
+    # Simulate the control loop having commanded the pose partway through the hold.
+    commanded_head = create_head_pose(0, 0, 0, 0, 4, 0, degrees=True)
+    manager._last_commanded_pose = (commanded_head, (0.08, -0.08), 0.0)
+
+    second_target = create_head_pose(0, 0, 0, 0, -5, 0, degrees=True)
+    manager._handle_command("hold_pose", (second_target, (-0.1, 0.1), 1.0), now + 0.5)
+    manager._manage_move_queue(now + 0.5)
+
+    assert manager.state.current_move is not first_hold
+    second_hold = manager.state.current_move
+    assert isinstance(second_hold, HoldPoseMove)
+    assert len(manager.move_queue) == 0
+    np.testing.assert_array_equal(second_hold.interpolation_start_pose, commanded_head)
+    np.testing.assert_array_equal(second_hold.interpolation_start_antennas, [0.08, -0.08])
+    np.testing.assert_array_equal(second_hold.target_head_pose, second_target)
+
+
+def test_is_holding_reports_current_or_queued_hold() -> None:
+    """is_holding is true for a current hold, false once released, with no other move disturbed."""
+    manager = MovementManager(MagicMock())
+    assert manager.is_holding() is False
+
+    now = manager._now()
+    target = create_head_pose(0, 0, 0, 0, 10, 0, degrees=True)
+    manager._handle_command("hold_pose", (target, (0.2, -0.2), 1.0), now)
+    assert manager.is_holding() is True
+
+    manager._handle_command("release_hold", None, now)
+    assert manager.is_holding() is False
 
 
 def test_is_idle_reflects_listening_and_activity() -> None:

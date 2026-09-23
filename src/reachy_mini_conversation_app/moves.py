@@ -122,6 +122,59 @@ class BreathingMove(Move):  # type: ignore
         return (head_pose, antennas, 0.0)
 
 
+class HoldPoseMove(Move):  # type: ignore
+    """Static hold: interpolate to a target pose, then hold it exactly, forever."""
+
+    def __init__(
+        self,
+        target_head_pose: NDArray[np.float32],
+        target_antennas: Tuple[float, float],
+        interpolation_start_pose: NDArray[np.float32],
+        interpolation_start_antennas: Tuple[float, float],
+        interpolation_duration: float = 1.0,
+    ):
+        """Initialize a pose hold.
+
+        Args:
+            target_head_pose: 4x4 matrix of the pose to hold.
+            target_antennas: Antenna positions to hold, [right, left].
+            interpolation_start_pose: 4x4 matrix of the pose to interpolate from.
+            interpolation_start_antennas: Antenna positions to interpolate from.
+            interpolation_duration: Time to reach the target pose (seconds).
+
+        """
+        self.target_head_pose = target_head_pose
+        self.target_antennas = np.array(target_antennas, dtype=np.float64)
+        self.interpolation_start_pose = interpolation_start_pose
+        self.interpolation_start_antennas = np.array(interpolation_start_antennas, dtype=np.float64)
+        self.interpolation_duration = interpolation_duration
+
+    @property
+    def duration(self) -> float:
+        """Duration property required by official Move interface."""
+        return float("inf")  # Holds the target pose forever, until released
+
+    def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
+        """Evaluate the hold at time t: interpolating, then exactly the target pose."""
+        if t < self.interpolation_duration:
+            interpolation_t = t / self.interpolation_duration
+
+            head_pose = linear_pose_interpolation(
+                self.interpolation_start_pose,
+                self.target_head_pose,
+                interpolation_t,
+            )
+            antennas = (
+                1 - interpolation_t
+            ) * self.interpolation_start_antennas + interpolation_t * self.target_antennas
+        else:
+            # Past the interpolation window: hold exactly, no drift, no sway.
+            head_pose = self.target_head_pose
+            antennas = self.target_antennas
+
+        return (head_pose, antennas, 0.0)
+
+
 def clone_full_body_pose(pose: FullBodyPose) -> FullBodyPose:
     """Create a deep copy of a full body pose tuple."""
     head, antennas, body_yaw = pose
@@ -252,6 +305,34 @@ class MovementManager:
         """
         self._command_queue.put(("clear_queue", None))
 
+    def hold_pose(
+        self,
+        target_head_pose: NDArray[np.float32],
+        target_antennas: Tuple[float, float],
+        duration: float,
+    ) -> None:
+        """Hold the body in a target pose, replacing any current or queued move.
+
+        Thread-safe: executed by the worker thread via the command queue, which
+        also seeds the interpolation start from the last commanded pose, so a
+        hold that replaces a previous hold picks up from wherever it had got to.
+        """
+        self._command_queue.put(("hold_pose", (target_head_pose, target_antennas, duration)))
+
+    def release_hold(self) -> None:
+        """Release a held pose, if any, and let normal idle behaviour resume.
+
+        A no-op when nothing is held: any other current or queued move is left
+        untouched. Thread-safe via the command queue.
+        """
+        self._command_queue.put(("release_hold", None))
+
+    def is_holding(self) -> bool:
+        """Return True while a HoldPoseMove is the current or a queued move."""
+        if isinstance(self.state.current_move, HoldPoseMove):
+            return True
+        return any(isinstance(move, HoldPoseMove) for move in tuple(self.move_queue))
+
     def set_moving_state(self, duration: float) -> None:
         """Mark the robot as actively moving for the provided duration.
 
@@ -335,6 +416,35 @@ class MovementManager:
             self.state.move_start_time = None
             self._breathing_active = False
             logger.info("Cleared move queue and stopped current move")
+        elif command == "hold_pose":
+            try:
+                target_head_pose, target_antennas, duration = payload
+            except (TypeError, ValueError):
+                logger.warning("Ignored hold_pose command with invalid payload: %s", payload)
+                return
+            start_head_pose, start_antennas, _ = self._last_commanded_pose
+            hold_move = HoldPoseMove(
+                target_head_pose=target_head_pose,
+                target_antennas=target_antennas,
+                interpolation_start_pose=start_head_pose.copy(),
+                interpolation_start_antennas=start_antennas,
+                interpolation_duration=duration,
+            )
+            self.move_queue.clear()
+            self.state.current_move = None
+            self.state.move_start_time = None
+            self.move_queue.append(hold_move)
+            self._breathing_active = False
+            self.state.update_activity()
+            logger.info("Holding pose, interpolating over %.2fs", duration)
+        elif command == "release_hold":
+            if self.is_holding():
+                self.move_queue.clear()
+                self.state.current_move = None
+                self.state.move_start_time = None
+                self._breathing_active = False
+                self.state.update_activity()
+                logger.info("Released held pose")
         elif command == "set_moving_state":
             try:
                 duration = float(payload)

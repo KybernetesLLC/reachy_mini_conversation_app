@@ -14,7 +14,9 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from reachy_mini.utils import create_head_pose
 import reachy_mini_conversation_app.console as console_mod
+from reachy_mini_conversation_app.moves import HoldPoseMove, BreathingMove, MovementManager
 from reachy_mini_conversation_app.config import HF_AVAILABLE_VOICES, config
 from reachy_mini_conversation_app.console import LocalStream
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
@@ -338,6 +340,148 @@ def test_capture_state_appears_in_status() -> None:
 
     _rpc_call(app, "conversation.capture", {"on": False})
     assert _rpc_call(app, "conversation.status")["result"]["capture"] is False
+
+
+def _pose_stream() -> tuple[LocalStream, MovementManager, FastAPI]:
+    """Return a LocalStream wired to a real, unstarted MovementManager for conversation.pose tests."""
+    app = FastAPI()
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    manager = MovementManager(MagicMock())
+    handler = MagicMock()
+    handler.deps = SimpleNamespace(movement_manager=manager)
+    stream = LocalStream(handler, robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    return stream, manager, app
+
+
+def _drive_manager(manager: MovementManager, t: float | None = None) -> None:
+    """Run one worker-thread tick's worth of command handling, without a live thread."""
+    now = manager._now() if t is None else t
+    manager._poll_signals(now)
+    manager._update_primary_motion(now)
+
+
+def test_pose_hold_over_rpc_queues_a_hold_move() -> None:
+    """A hold request returns {"holding": True} and leaves a HoldPoseMove current or queued."""
+    _stream, manager, app = _pose_stream()
+
+    resp = _rpc_call(
+        app,
+        "conversation.pose",
+        {"head_pose": {"pitch": 0.15}, "antennas": [0.2, -0.2], "duration": 0.5},
+    )
+
+    assert resp["result"] == {"holding": True}
+    _drive_manager(manager)
+    assert isinstance(manager.state.current_move, HoldPoseMove)
+    assert manager.is_holding() is True
+
+
+def test_pose_hold_replaces_a_previous_hold() -> None:
+    """A second hold leaves exactly one HoldPoseMove current, targeting the new pose."""
+    _stream, manager, app = _pose_stream()
+
+    _rpc_call(app, "conversation.pose", {"antennas": [0.2, -0.2], "duration": 0.5})
+    _drive_manager(manager)
+    first_hold = manager.state.current_move
+    assert isinstance(first_hold, HoldPoseMove)
+
+    _rpc_call(app, "conversation.pose", {"antennas": [-0.15, 0.15], "duration": 0.5})
+    _drive_manager(manager)
+
+    assert manager.state.current_move is not first_hold
+    second_hold = manager.state.current_move
+    assert isinstance(second_hold, HoldPoseMove)
+    assert len(manager.move_queue) == 0
+    np.testing.assert_array_equal(second_hold.target_antennas, [-0.15, 0.15])
+
+
+def test_pose_release_over_rpc_clears_the_hold() -> None:
+    """Release reports {"holding": False} and leaves no HoldPoseMove current or queued."""
+    _stream, manager, app = _pose_stream()
+    _rpc_call(app, "conversation.pose", {"antennas": [0.1, -0.1], "duration": 0.5})
+    _drive_manager(manager)
+    assert manager.is_holding() is True
+
+    resp = _rpc_call(app, "conversation.pose", {"release": True})
+
+    assert resp["result"] == {"holding": False}
+    _drive_manager(manager)
+    assert manager.is_holding() is False
+    assert manager.state.current_move is None
+    assert len(manager.move_queue) == 0
+
+
+def test_pose_release_over_rpc_is_a_no_op_when_nothing_is_held() -> None:
+    """Releasing with no hold in play does not disturb another current move."""
+    _stream, manager, app = _pose_stream()
+    breathing_move = BreathingMove(
+        interpolation_start_pose=create_head_pose(0, 0, 0, 0, 0, 0, degrees=True),
+        interpolation_start_antennas=(0.0, 0.0),
+    )
+    manager.state.current_move = breathing_move
+    manager.state.move_start_time = manager._now()
+
+    resp = _rpc_call(app, "conversation.pose", {"release": True})
+
+    assert resp["result"] == {"holding": False}
+    _drive_manager(manager)
+    assert manager.state.current_move is breathing_move
+
+
+def test_pose_read_only_reports_without_changing_anything() -> None:
+    """An empty-params read reports current state and queues no command."""
+    _stream, manager, app = _pose_stream()
+
+    resp = _rpc_call(app, "conversation.pose", {})
+    assert resp["result"] == {"holding": False}
+    assert manager._command_queue.empty()
+
+    _rpc_call(app, "conversation.pose", {"antennas": [0.1, -0.1], "duration": 0.5})
+    _drive_manager(manager)
+    assert manager.is_holding() is True
+
+    resp = _rpc_call(app, "conversation.pose", {})
+    assert resp["result"] == {"holding": True}
+    assert manager._command_queue.empty()
+    assert manager.is_holding() is True
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"duration": 1.0},  # missing antennas
+        {"antennas": [0.1]},  # wrong antenna count
+        {"antennas": [0.1, "nope"]},  # non-numeric antenna
+        {"antennas": [0.1, -0.1], "head_pose": {"pitch": "nope"}},  # non-numeric head_pose field
+        {"antennas": [0.1, -0.1], "duration": "nope"},  # non-numeric duration
+        {"antennas": [0.1, -0.1], "duration": 0.0},  # duration must be > 0
+        {"antennas": [0.1, -0.1], "duration": -1.0},  # duration must be > 0
+    ],
+)
+def test_pose_invalid_params_are_rejected(params: dict[str, Any]) -> None:
+    """Malformed hold params raise the file's invalid_params convention and queue nothing."""
+    _stream, manager, app = _pose_stream()
+
+    resp = _rpc_call(app, "conversation.pose", params)
+
+    assert resp["error"]["data"]["reason"] == "invalid_params"
+    assert resp["error"]["code"] == -32602
+    assert manager._command_queue.empty()
+
+
+def test_pose_without_a_movement_manager_reports_not_running() -> None:
+    """A handler with no wired movement manager fails predictably, not silently."""
+    app = FastAPI()
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = MagicMock()
+    handler.deps = SimpleNamespace(movement_manager=None)
+    stream = LocalStream(handler, robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+
+    resp = _rpc_call(app, "conversation.pose", {"antennas": [0.1, -0.1]})
+
+    assert resp["error"]["data"]["reason"] == "not_running"
 
 
 @pytest.mark.asyncio
