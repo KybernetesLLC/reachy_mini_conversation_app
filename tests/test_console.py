@@ -268,7 +268,7 @@ def test_conversation_session_opens_closes_and_reads_back() -> None:
 
 
 def test_status_over_rpc_carries_session_wanted() -> None:
-    """The supervisor reads the off state from conversation.status, not only from
+    """A caller reads the off state from conversation.status, not only from
     the verb's own return value."""
     app = FastAPI()
     robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
@@ -327,7 +327,7 @@ def test_capture_verb_without_a_parameter_only_reports() -> None:
 
 
 def test_capture_state_appears_in_status() -> None:
-    """The supervisor reads this back; a verb with no readback can lie."""
+    """A caller reads this back; a verb with no readback can lie."""
     app = FastAPI()
     robot = _audio_robot(
         stop_recording=MagicMock(),
