@@ -450,6 +450,15 @@ class MovementManager:
             logger.info("Holding pose, interpolating over %.2fs", duration)
         elif command == "release_hold":
             if self.is_holding():
+                if self._is_listening:
+                    # The freeze's own snapshot predates the hold and was never
+                    # updated during it (the hold bypasses this freeze entirely
+                    # -- see _calculate_blended_antennas), so falling through to
+                    # it unchanged on the very next tick would jump the
+                    # antennas straight back to a stale, pre-hold position.
+                    # Re-seed it from wherever the hold actually left them.
+                    _, last_antennas, _ = self._last_commanded_pose
+                    self._listening_antennas = (float(last_antennas[0]), float(last_antennas[1]))
                 self.move_queue.clear()
                 self.state.current_move = None
                 self.state.move_start_time = None

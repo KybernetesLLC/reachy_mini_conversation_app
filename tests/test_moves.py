@@ -274,6 +274,64 @@ def test_hold_pose_antennas_bypass_the_listening_freeze() -> None:
     assert manager._listening_antennas == (0.05, -0.05)
 
 
+def test_release_hold_reseeds_the_listening_freeze_to_avoid_a_jump() -> None:
+    """Releasing a hold while still listening re-freezes at the hold's antennas, not a stale snapshot.
+
+    Without the reseed, the freeze's own snapshot predates the hold (the hold
+    bypasses it entirely -- see test_hold_pose_antennas_bypass_the_listening_freeze
+    above) and falling through to it unchanged would snap the antennas back
+    to a stale pre-hold position in one tick, violating moves.py's own
+    "avoid jumps at all times" invariant.
+    """
+    manager = MovementManager(MagicMock())
+    manager._is_listening = True
+    manager._listening_antennas = (0.05, -0.05)  # stale, pre-hold snapshot
+
+    now = manager._now()
+    target_head_pose = create_head_pose(0, 0, 0, 0, 10, 0, degrees=True)
+    manager._handle_command("hold_pose", (target_head_pose, (0.2, -0.2), 1.0), now)
+    manager._manage_move_queue(now)  # promote the queued hold to the current move
+    assert isinstance(manager.state.current_move, HoldPoseMove)
+
+    # Tick past the hold's own interpolation: the bypass (see the test above)
+    # commands the hold's target, and _issue_control_command records it as
+    # the last-commanded pose, exactly as working_loop's real per-tick order
+    # would.
+    t_holding = now + 5.0
+    manager._update_primary_motion(t_holding)
+    head, antennas, body_yaw = manager._get_primary_pose(t_holding)
+    antennas_cmd = manager._calculate_blended_antennas((float(antennas[0]), float(antennas[1])))
+    assert antennas_cmd == (0.2, -0.2)
+    manager._issue_control_command(head, antennas_cmd, body_yaw)
+
+    # Release while still listening.
+    manager._handle_command("release_hold", None, t_holding)
+    assert manager.state.current_move is None
+    assert manager._is_listening is True  # release does not clear the flag itself
+
+    # One more tick, still listening: no jump -- the freeze now holds the
+    # hold's own last-commanded antennas, not the stale (0.05, -0.05)
+    # snapshot from before the hold. Whatever the next move/idle target
+    # would be (here a plausible neutral) is irrelevant while listening.
+    next_target = (-0.1745, 0.1745)
+    antennas_after_release = manager._calculate_blended_antennas(next_target)
+    assert antennas_after_release == (0.2, -0.2)
+
+    # Clearing listening lets the existing blend run, gradually, from the
+    # true (re-seeded) position toward the next target -- not a further jump
+    # in either direction. _last_listening_blend_time/_antenna_unfreeze_blend
+    # are set directly (bypassing set_listening's own real-time debounce) so
+    # the elapsed blend time is deterministic rather than dependent on how
+    # fast this test happens to run.
+    manager._is_listening = False
+    manager._last_listening_blend_time = manager._now() - (manager._antenna_blend_duration / 2)
+    antennas_mid_blend = manager._calculate_blended_antennas(next_target)
+    assert antennas_mid_blend != antennas_after_release
+    assert antennas_mid_blend != next_target
+    assert -0.1745 < antennas_mid_blend[0] < 0.2
+    assert -0.2 < antennas_mid_blend[1] < 0.1745
+
+
 def test_release_hold_is_a_no_op_when_nothing_is_held() -> None:
     """Releasing with no hold current leaves any other current move untouched."""
     manager = MovementManager(MagicMock())
