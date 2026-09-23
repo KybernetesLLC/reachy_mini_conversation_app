@@ -132,6 +132,8 @@ class HoldPoseMove(Move):  # type: ignore
         interpolation_start_pose: NDArray[np.float32],
         interpolation_start_antennas: Tuple[float, float],
         interpolation_duration: float = 1.0,
+        target_body_yaw: float = 0.0,
+        interpolation_start_body_yaw: float = 0.0,
     ):
         """Initialize a pose hold.
 
@@ -141,6 +143,8 @@ class HoldPoseMove(Move):  # type: ignore
             interpolation_start_pose: 4x4 matrix of the pose to interpolate from.
             interpolation_start_antennas: Antenna positions to interpolate from.
             interpolation_duration: Time to reach the target pose (seconds).
+            target_body_yaw: Body yaw to hold (radians).
+            interpolation_start_body_yaw: Body yaw to interpolate from (radians).
 
         """
         self.target_head_pose = target_head_pose
@@ -148,6 +152,8 @@ class HoldPoseMove(Move):  # type: ignore
         self.interpolation_start_pose = interpolation_start_pose
         self.interpolation_start_antennas = np.array(interpolation_start_antennas, dtype=np.float64)
         self.interpolation_duration = interpolation_duration
+        self.target_body_yaw = target_body_yaw
+        self.interpolation_start_body_yaw = interpolation_start_body_yaw
 
     @property
     def duration(self) -> float:
@@ -167,12 +173,16 @@ class HoldPoseMove(Move):  # type: ignore
             antennas = (
                 1 - interpolation_t
             ) * self.interpolation_start_antennas + interpolation_t * self.target_antennas
+            body_yaw = (
+                1 - interpolation_t
+            ) * self.interpolation_start_body_yaw + interpolation_t * self.target_body_yaw
         else:
             # Past the interpolation window: hold exactly, no drift, no sway.
             head_pose = self.target_head_pose
             antennas = self.target_antennas
+            body_yaw = self.target_body_yaw
 
-        return (head_pose, antennas, 0.0)
+        return (head_pose, antennas, body_yaw)
 
 
 def clone_full_body_pose(pose: FullBodyPose) -> FullBodyPose:
@@ -422,13 +432,14 @@ class MovementManager:
             except (TypeError, ValueError):
                 logger.warning("Ignored hold_pose command with invalid payload: %s", payload)
                 return
-            start_head_pose, start_antennas, _ = self._last_commanded_pose
+            start_head_pose, start_antennas, start_body_yaw = self._last_commanded_pose
             hold_move = HoldPoseMove(
                 target_head_pose=target_head_pose,
                 target_antennas=target_antennas,
                 interpolation_start_pose=start_head_pose.copy(),
                 interpolation_start_antennas=start_antennas,
                 interpolation_duration=duration,
+                interpolation_start_body_yaw=start_body_yaw,
             )
             self.move_queue.clear()
             self.state.current_move = None

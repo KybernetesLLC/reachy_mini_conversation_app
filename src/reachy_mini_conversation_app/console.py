@@ -5,6 +5,7 @@ served via the Reachy Mini Apps settings server so users can configure it.
 """
 
 import os
+import math
 import time
 import asyncio
 import logging
@@ -82,6 +83,17 @@ def _detach_framework_root_routes(app: "FastAPI") -> None:
             continue
         survivors.append(route)
     routes[:] = survivors
+
+
+def _finite_float(value: object, message: str) -> float:
+    """Parse a JSON-RPC parameter as a finite float, or raise invalid_params."""
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise JsonRpcError(message, reason="invalid_params", code=-32602)
+    if not math.isfinite(parsed):
+        raise JsonRpcError(message, reason="invalid_params", code=-32602)
+    return parsed
 
 
 LOCAL_PLAYER_BACKEND = (
@@ -809,28 +821,23 @@ class LocalStream:
                 raise JsonRpcError(
                     "pose requires 'antennas' as [right, left]", reason="invalid_params", code=-32602
                 )
-            try:
-                target_antennas = (float(antennas_raw[0]), float(antennas_raw[1]))
-            except (TypeError, ValueError):
-                raise JsonRpcError("pose antennas must be numeric", reason="invalid_params", code=-32602)
+            target_antennas = (
+                _finite_float(antennas_raw[0], "pose antennas must be numeric"),
+                _finite_float(antennas_raw[1], "pose antennas must be numeric"),
+            )
 
             head_pose_params = params.get("head_pose") or {}
             if not isinstance(head_pose_params, dict):
                 raise JsonRpcError("pose head_pose must be an object", reason="invalid_params", code=-32602)
-            try:
-                x = float(head_pose_params.get("x", 0.0))
-                y = float(head_pose_params.get("y", 0.0))
-                z = float(head_pose_params.get("z", 0.0))
-                roll = float(head_pose_params.get("roll", 0.0))
-                pitch = float(head_pose_params.get("pitch", 0.0))
-                yaw = float(head_pose_params.get("yaw", 0.0))
-            except (TypeError, ValueError):
-                raise JsonRpcError("pose head_pose fields must be numeric", reason="invalid_params", code=-32602)
+            head_pose_error = "pose head_pose fields must be numeric"
+            x = _finite_float(head_pose_params.get("x", 0.0), head_pose_error)
+            y = _finite_float(head_pose_params.get("y", 0.0), head_pose_error)
+            z = _finite_float(head_pose_params.get("z", 0.0), head_pose_error)
+            roll = _finite_float(head_pose_params.get("roll", 0.0), head_pose_error)
+            pitch = _finite_float(head_pose_params.get("pitch", 0.0), head_pose_error)
+            yaw = _finite_float(head_pose_params.get("yaw", 0.0), head_pose_error)
 
-            try:
-                duration = float(params.get("duration", 1.0))
-            except (TypeError, ValueError):
-                raise JsonRpcError("pose duration must be numeric", reason="invalid_params", code=-32602)
+            duration = _finite_float(params.get("duration", 1.0), "pose duration must be numeric")
             if duration <= 0:
                 raise JsonRpcError("pose duration must be > 0", reason="invalid_params", code=-32602)
 

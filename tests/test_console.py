@@ -457,6 +457,9 @@ def test_pose_read_only_reports_without_changing_anything() -> None:
         {"antennas": [0.1, -0.1], "duration": "nope"},  # non-numeric duration
         {"antennas": [0.1, -0.1], "duration": 0.0},  # duration must be > 0
         {"antennas": [0.1, -0.1], "duration": -1.0},  # duration must be > 0
+        {"antennas": [float("nan"), -0.1]},  # NaN antenna
+        {"antennas": [0.1, -0.1], "duration": float("inf")},  # infinite duration
+        {"antennas": [0.1, -0.1], "head_pose": {"pitch": float("nan")}},  # NaN head_pose field
     ],
 )
 def test_pose_invalid_params_are_rejected(params: dict[str, Any]) -> None:

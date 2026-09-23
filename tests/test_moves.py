@@ -168,21 +168,30 @@ def test_hold_pose_move_interpolates_then_holds_exactly() -> None:
         interpolation_start_pose=start_pose,
         interpolation_start_antennas=(0.0, 0.0),
         interpolation_duration=2.0,
+        interpolation_start_body_yaw=0.3,
     )
     assert move.duration == float("inf")
 
     head_start, antennas_start, body_yaw_start = move.evaluate(0.0)
     np.testing.assert_array_equal(head_start, start_pose)
     np.testing.assert_array_equal(antennas_start, [0.0, 0.0])
-    assert body_yaw_start == 0.0
+    assert body_yaw_start == 0.3
 
-    head_end, antennas_end, _ = move.evaluate(2.0)
+    # Body yaw is not part of the RPC target, but it still interpolates
+    # smoothly to neutral rather than snapping -- avoiding a jump if a hold
+    # is commanded while the manager's last commanded pose had some body yaw.
+    _, _, body_yaw_mid = move.evaluate(1.0)
+    assert body_yaw_mid == pytest.approx(0.15)
+
+    head_end, antennas_end, body_yaw_end = move.evaluate(2.0)
     np.testing.assert_array_equal(head_end, target_pose)
     np.testing.assert_array_equal(antennas_end, [0.2, -0.2])
+    assert body_yaw_end == 0.0
 
-    head_later, antennas_later, _ = move.evaluate(62.0)
+    head_later, antennas_later, body_yaw_later = move.evaluate(62.0)
     np.testing.assert_array_equal(head_later, target_pose)
     np.testing.assert_array_equal(antennas_later, [0.2, -0.2])
+    assert body_yaw_later == 0.0
 
 
 def test_hold_blocks_breathing_and_release_lets_it_resume() -> None:
@@ -254,9 +263,10 @@ def test_hold_pose_seeds_from_last_commanded_pose_and_replaces_a_previous_hold()
     first_hold = manager.state.current_move
     assert isinstance(first_hold, HoldPoseMove)
 
-    # Simulate the control loop having commanded the pose partway through the hold.
+    # Simulate the control loop having commanded the pose partway through the hold,
+    # including a non-zero body yaw (e.g. left over from a dance move).
     commanded_head = create_head_pose(0, 0, 0, 0, 4, 0, degrees=True)
-    manager._last_commanded_pose = (commanded_head, (0.08, -0.08), 0.0)
+    manager._last_commanded_pose = (commanded_head, (0.08, -0.08), 0.3)
 
     second_target = create_head_pose(0, 0, 0, 0, -5, 0, degrees=True)
     manager._handle_command("hold_pose", (second_target, (-0.1, 0.1), 1.0), now + 0.5)
@@ -268,6 +278,8 @@ def test_hold_pose_seeds_from_last_commanded_pose_and_replaces_a_previous_hold()
     assert len(manager.move_queue) == 0
     np.testing.assert_array_equal(second_hold.interpolation_start_pose, commanded_head)
     np.testing.assert_array_equal(second_hold.interpolation_start_antennas, [0.08, -0.08])
+    assert second_hold.interpolation_start_body_yaw == 0.3
+    assert second_hold.target_body_yaw == 0.0
     np.testing.assert_array_equal(second_hold.target_head_pose, second_target)
 
 
