@@ -24,6 +24,8 @@ Safety
 """
 
 from __future__ import annotations
+import os
+import math
 import time
 import logging
 import threading
@@ -49,6 +51,21 @@ CONTROL_LOOP_FREQUENCY_HZ = 60.0  # Hz - Target frequency for the movement contr
 
 # Type definitions
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
+
+
+def _idle_setting(name: str, default: float) -> float:
+    """Read a non-negative number from the environment, or return the default (with one warning)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if value < 0 or not math.isfinite(value) or raw.strip() == "":
+        logger.warning("%s=%r is not a non-negative number; using %s", name, raw, default)
+        return default
+    return value
 
 
 class BreathingMove(Move):  # type: ignore
@@ -77,10 +94,12 @@ class BreathingMove(Move):  # type: ignore
         self.neutral_antennas = np.array([-0.1745, 0.1745])  # ~10° offset to reduce shaking
 
         # Breathing parameters
-        self.breathing_z_amplitude = 0.005  # 5mm gentle breathing
+        # The owner, 2026-09-30: a calmer idle, so the motor loop's brief stalls
+        # (one per presence check) do not show as a stutter in a wide, fast sway.
+        self.breathing_z_amplitude = _idle_setting("REACHY_BREATHING_Z_MM", 3.0) / 1000.0
+        self.antenna_sway_amplitude = np.deg2rad(_idle_setting("REACHY_BREATHING_ANTENNA_DEG", 5.0))
+        self.antenna_frequency = _idle_setting("REACHY_BREATHING_ANTENNA_HZ", 0.25)
         self.breathing_frequency = 0.1  # Hz (6 breaths per minute)
-        self.antenna_sway_amplitude = np.deg2rad(15)  # 15 degrees
-        self.antenna_frequency = 0.5  # Hz (faster antenna sway)
 
     @property
     def duration(self) -> float:

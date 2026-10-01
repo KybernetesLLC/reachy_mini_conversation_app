@@ -1,3 +1,4 @@
+import math
 import time
 import threading
 from unittest.mock import MagicMock, call
@@ -425,3 +426,39 @@ def test_handle_command_queue_and_clear() -> None:
     manager._handle_command("clear_queue", None, now)
     assert len(manager.move_queue) == 0
     assert manager.state.current_move is None
+
+
+def _move() -> BreathingMove:
+    return BreathingMove(
+        interpolation_start_pose=np.eye(4),
+        interpolation_start_antennas=[-0.1745, 0.1745],
+        interpolation_duration=1.0,
+    )
+
+
+def test_the_idle_sway_is_calm_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Breathing move uses calm defaults when environment variables are unset."""
+    for name in ("REACHY_BREATHING_ANTENNA_DEG", "REACHY_BREATHING_ANTENNA_HZ", "REACHY_BREATHING_Z_MM"):
+        monkeypatch.delenv(name, raising=False)
+    move = _move()
+    assert move.antenna_sway_amplitude == pytest.approx(math.radians(5.0))
+    assert move.antenna_frequency == pytest.approx(0.25)
+    assert move.breathing_z_amplitude == pytest.approx(0.003)
+
+
+def test_the_sway_can_be_tuned_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Breathing move reads tuning parameters from environment variables."""
+    monkeypatch.setenv("REACHY_BREATHING_ANTENNA_DEG", "8")
+    monkeypatch.setenv("REACHY_BREATHING_ANTENNA_HZ", "0.2")
+    monkeypatch.setenv("REACHY_BREATHING_Z_MM", "0")
+    move = _move()
+    assert move.antenna_sway_amplitude == pytest.approx(math.radians(8.0))
+    assert move.antenna_frequency == pytest.approx(0.2)
+    assert move.breathing_z_amplitude == 0.0
+
+
+@pytest.mark.parametrize("bad", ["", "lots", "-3", "nan", "inf"])
+def test_a_bad_value_falls_back_to_the_default(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    """Invalid environment values (empty, non-numeric, negative, non-finite) fall back to defaults."""
+    monkeypatch.setenv("REACHY_BREATHING_ANTENNA_DEG", bad)
+    assert _move().antenna_sway_amplitude == pytest.approx(math.radians(5.0))
