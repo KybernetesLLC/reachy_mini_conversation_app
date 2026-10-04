@@ -83,6 +83,40 @@ def _turned(pose: NDArray[np.float64], yaw: float) -> NDArray[np.float64]:
     return create_head_pose(0, 0, 0, 0, 0, yaw, degrees=False) @ pose
 
 
+# The companion: how fast the ease into breathing may move each part, on
+# average. The owner, 2026-10-04, woken from the fold: "He POPPED UP like
+# spring-loaded snake-in-a-can." A fixed 1.0 s ease had swept the antennas
+# about 2.9 rad. A min-jerk ease peaks near 1.9 times these averages.
+EASE_ANTENNA_SPEED = 1.2  # rad/s
+EASE_HEAD_SPEED = 0.03  # m/s
+EASE_HEAD_TURN_SPEED = 0.4  # rad/s
+EASE_MIN_SECONDS = 1.0
+# The supervisor ignores antenna readings for 3 s after it hands the body to
+# breathing (AntennaWatch's settle), and breathing begins about 0.3 s after
+# that; a longer ease would still be moving when it starts to judge presses.
+EASE_MAX_SECONDS = 2.5
+
+
+def ease_seconds(
+    start_pose: NDArray[np.float64],
+    start_antennas: NDArray[np.float64],
+    end_pose: NDArray[np.float64],
+    end_antennas: NDArray[np.float64],
+) -> float:
+    """Return how long an ease from one pose to another should take, by distance."""
+    antennas = float(np.max(np.abs(np.asarray(end_antennas) - np.asarray(start_antennas))))
+    shift = float(np.linalg.norm(end_pose[:3, 3] - start_pose[:3, 3]))
+    relative = start_pose[:3, :3].T @ end_pose[:3, :3]
+    turn = float(np.arccos(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0)))
+    seconds = max(
+        EASE_MIN_SECONDS,
+        antennas / EASE_ANTENNA_SPEED,
+        shift / EASE_HEAD_SPEED,
+        turn / EASE_HEAD_TURN_SPEED,
+    )
+    return min(seconds, EASE_MAX_SECONDS)
+
+
 class BreathingMove(Move):  # type: ignore
     """Breathing move with interpolation to neutral and then continuous breathing patterns."""
 
@@ -90,7 +124,7 @@ class BreathingMove(Move):  # type: ignore
         self,
         interpolation_start_pose: NDArray[np.float32],
         interpolation_start_antennas: Tuple[float, float],
-        interpolation_duration: float = 1.0,
+        interpolation_duration: float | None = None,
         body_yaw: float = 0.0,
     ):
         """Initialize breathing move.
@@ -98,17 +132,28 @@ class BreathingMove(Move):  # type: ignore
         Args:
             interpolation_start_pose: 4x4 matrix of current head pose to interpolate from
             interpolation_start_antennas: Current antenna positions to interpolate from
-            interpolation_duration: Duration of interpolation to neutral (seconds)
+            interpolation_duration: Duration of interpolation to neutral (seconds);
+                by default, from the distance to travel (`ease_seconds`).
             body_yaw: Body yaw the breathing holds, radians; the body's yaw when breathing begins.
 
         """
         self.interpolation_start_pose = interpolation_start_pose
         self.interpolation_start_antennas = np.array(interpolation_start_antennas)
-        self.interpolation_duration = interpolation_duration
 
-        # Neutral positions for breathing base
+        # Neutral positions for breathing base. The companion: the antennas
+        # ease to where the sway begins (0), not to upstream's 10 degree
+        # offset, which the sway dropped at once -- a 0.17 rad jump.
         self.neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
-        self.neutral_antennas = np.array([-0.1745, 0.1745])  # ~10° offset to reduce shaking
+        self.neutral_antennas = np.array([0.0, 0.0])
+        self.start_body_yaw = float(body_yaw)
+        if interpolation_duration is None:
+            interpolation_duration = ease_seconds(
+                _turned(np.asarray(interpolation_start_pose, dtype=np.float64), -self.start_body_yaw),
+                self.interpolation_start_antennas,
+                self.neutral_head_pose,
+                self.neutral_antennas,
+            )
+        self.interpolation_duration = interpolation_duration
 
         # Breathing parameters
         # The owner, 2026-09-30: a calmer idle, so the motor loop's brief stalls
@@ -122,7 +167,6 @@ class BreathingMove(Move):  # type: ignore
         # when breathing began, instead of returning body yaw 0 -- that was a
         # snap to straight ahead -- and the head breathes facing the body's way.
         # A turn while breathing is a min-jerk trajectory (`turn_body`).
-        self.start_body_yaw = float(body_yaw)
         self._yaw_from = float(body_yaw)
         self._yaw_to = float(body_yaw)
         self._yaw_t0 = 0.0
@@ -138,9 +182,7 @@ class BreathingMove(Move):  # type: ignore
         if t <= self._yaw_t0:
             return self._yaw_from
         s = min(1.0, (t - self._yaw_t0) / self._yaw_duration)
-        return self._yaw_from + (self._yaw_to - self._yaw_from) * time_trajectory(
-            s, InterpolationTechnique.MIN_JERK
-        )
+        return self._yaw_from + (self._yaw_to - self._yaw_from) * time_trajectory(s, InterpolationTechnique.MIN_JERK)
 
     def turn_body(self, yaw: float, duration: float, t: float) -> None:
         """Turn the body and the breathing head to `yaw`, starting at move time `t`.
@@ -159,7 +201,8 @@ class BreathingMove(Move):  # type: ignore
             # Phase 1: interpolate to the neutral base. The start pose is in the
             # world frame, turned with the body as it was when breathing began:
             # take that turn out, interpolate, and put the present turn back.
-            interpolation_t = t / self.interpolation_duration
+            # Min-jerk, so the ease starts and ends at rest (the companion).
+            interpolation_t = time_trajectory(t / self.interpolation_duration, InterpolationTechnique.MIN_JERK)
             start = _turned(self.interpolation_start_pose, -self.start_body_yaw)
             head_pose = _turned(linear_pose_interpolation(start, self.neutral_head_pose, interpolation_t), yaw)
 
@@ -678,7 +721,6 @@ class MovementManager:
                     breathing_move = BreathingMove(
                         interpolation_start_pose=current_head_pose,
                         interpolation_start_antennas=current_antennas,
-                        interpolation_duration=1.0,
                         body_yaw=float(head_joints[0]),  # joint 0 is the body yaw
                     )
                     self.move_queue.append(breathing_move)

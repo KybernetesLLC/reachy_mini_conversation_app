@@ -605,3 +605,58 @@ def test_start_commands_the_robots_present_pose_not_neutral() -> None:
         assert first["antennas"] == pytest.approx((-0.1745, 0.1745))
     finally:
         manager.stop(reset_to_neutral=False)
+
+
+# --- the companion's wake from the fold ---------------------------------------
+
+# The supervisor's folded pose (reachy-companion body.py, Pose.FOLDED).
+_FOLD_HEAD = create_head_pose(x=-0.021, y=0, z=-0.044, roll=0, pitch=0.426, yaw=0, degrees=False, mm=False)
+_FOLD_ANTENNAS = (-3.05, 3.05)
+
+
+def test_the_ease_out_of_the_fold_is_slow_and_ends_inside_the_settle() -> None:
+    """The ease out of the fold takes its time from the distance.
+
+    The owner, 2026-10-04: woken from the fold he "POPPED UP like a
+    spring-loaded snake-in-a-can". A fixed 1.0 s ease moved the antennas
+    about 2.9 rad. The ease is capped below the supervisor's 3 s
+    press-settle window.
+    """
+    move = BreathingMove(interpolation_start_pose=_FOLD_HEAD, interpolation_start_antennas=_FOLD_ANTENNAS)
+    assert 2.0 <= move.interpolation_duration <= 2.5
+
+
+def test_a_short_ease_keeps_the_old_one_second() -> None:
+    """From near neutral (after a dance, a hold) the ease is still about 1 s."""
+    move = BreathingMove(
+        interpolation_start_pose=create_head_pose(0, 0, 0, 0, 0, 0, degrees=True),
+        interpolation_start_antennas=(-0.3, 0.3),
+    )
+    assert move.interpolation_duration == pytest.approx(1.0)
+
+
+def test_the_ease_starts_and_ends_at_rest() -> None:
+    """Min-jerk, not a straight line: no jump in speed when it begins or ends."""
+    move = BreathingMove(interpolation_start_pose=_FOLD_HEAD, interpolation_start_antennas=_FOLD_ANTENNAS)
+    d = move.interpolation_duration
+    step = d / 100
+    start = move.evaluate(0.0)[1]
+    early = move.evaluate(step)[1]
+    # A straight line would have covered 1% of the way; min-jerk covers ~0.001%.
+    assert abs(early[1] - start[1]) < 0.001 * abs(start[1] - 0.1745)
+    late = move.evaluate(d - step)[1]
+    end = move.evaluate(d)[1]
+    assert abs(end[1] - late[1]) < 0.001
+    np.testing.assert_allclose(move.evaluate(d)[1], move.evaluate(d + 1e-9)[1], atol=1e-6)
+
+
+def test_idle_breathing_out_of_the_fold_takes_its_time() -> None:
+    """The manager no longer forces 1.0 s on the breathing it starts."""
+    robot = MagicMock()
+    robot.get_current_joint_positions.return_value = ([0.0] * 7, list(_FOLD_ANTENNAS))
+    robot.get_current_head_pose.return_value = _FOLD_HEAD
+    manager = MovementManager(robot)
+    t = manager._now() + manager.idle_inactivity_delay + 1.0
+    manager._update_primary_motion(t)
+    (move,) = manager.move_queue
+    assert move.interpolation_duration > 2.0
