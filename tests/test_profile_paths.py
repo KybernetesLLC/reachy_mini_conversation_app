@@ -171,6 +171,24 @@ def test_session_greeting_prompt_loads_from_selected_profile(
     assert prompts_mod.get_session_greeting_prompt() == "Greet me like a tiny stage host."
 
 
+def test_session_greeting_prompt_says_a_listed_line_never_twice_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A startup_greetings.txt beside profile.md wins over the greeting prompt."""
+    profile_dir = tmp_path / "friendly"
+    write_profile("friendly", profile_dir, "test instructions", [], greeting="Greet me.")
+    (profile_dir / prompts_mod.STARTUP_GREETINGS_FILENAME).write_text("# a comment\n\nHello.\nHi there.\n")
+    monkeypatch.setattr(config, "PROFILES_DIRECTORY", tmp_path)
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "friendly")
+
+    said = [prompts_mod.get_session_greeting_prompt() for _ in range(6)]
+
+    assert all(p.startswith("Start the conversation by saying exactly this") for p in said)
+    assert {p.split('"')[1] for p in said} == {"Hello.", "Hi there."}
+    assert all(a != b for a, b in zip(said, said[1:]))
+
+
 def test_session_greeting_prompt_uses_builtin_default_without_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
