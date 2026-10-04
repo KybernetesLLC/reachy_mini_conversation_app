@@ -98,6 +98,18 @@ def _finite_float(value: object, message: str) -> float:
     return parsed
 
 
+# reachy_mini 1.10.0: yaw_body is capped at 160 degrees (URDF, max_body_yaw).
+_BODY_YAW_LIMIT = math.radians(160.0)
+
+
+def _body_yaw(value: object) -> float:
+    """Parse a body yaw in radians within the SDK's limit, or raise invalid_params."""
+    yaw = _finite_float(value, "pose body_yaw must be numeric")
+    if abs(yaw) > _BODY_YAW_LIMIT:
+        raise JsonRpcError("pose body_yaw is past the body's limit", reason="invalid_params", code=-32602)
+    return yaw
+
+
 LOCAL_PLAYER_BACKEND = (
     getattr(MediaBackend, "LOCAL", None)
     or getattr(MediaBackend, "GSTREAMER", None)
@@ -870,8 +882,18 @@ class LocalStream:
                 raise JsonRpcError("movement manager unavailable", reason="not_running")
 
             if params.get("release"):
+                if "body_yaw" not in params:
+                    manager.release_hold()
+                    return {"holding": False}
+                # The companion (decision 026): released to idle breathing,
+                # turned to face this way, min-jerk over `duration`.
+                turn_yaw = _body_yaw(params["body_yaw"])
+                turn_seconds = _finite_float(params.get("duration", 1.0), "pose duration must be numeric")
+                if turn_seconds <= 0:
+                    raise JsonRpcError("pose duration must be > 0", reason="invalid_params", code=-32602)
                 manager.release_hold()
-                return {"holding": False}
+                manager.turn_idle_body(turn_yaw, turn_seconds)
+                return {"holding": False, "body_yaw": turn_yaw}
 
             if not params:
                 return {"holding": manager.is_holding()}
@@ -901,9 +923,12 @@ class LocalStream:
             if duration <= 0:
                 raise JsonRpcError("pose duration must be > 0", reason="invalid_params", code=-32602)
 
+            body_yaw = _body_yaw(params["body_yaw"]) if "body_yaw" in params else None
             target_head_pose = create_head_pose(x, y, z, roll, pitch, yaw, degrees=False)
-            manager.hold_pose(target_head_pose, target_antennas, duration)
-            return {"holding": True}
+            manager.hold_pose(target_head_pose, target_antennas, duration, body_yaw=body_yaw)
+            if body_yaw is None:
+                return {"holding": True}
+            return {"holding": True, "body_yaw": body_yaw}
 
         @rpc.method("backend.config")  # type: ignore[untyped-decorator]
         def _rpc_backend_config(params: dict[str, object]) -> dict[str, object]:

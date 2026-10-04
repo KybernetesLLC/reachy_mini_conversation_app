@@ -40,7 +40,12 @@ from numpy.typing import NDArray
 from reachy_mini import ReachyMini
 from reachy_mini.utils import create_head_pose
 from reachy_mini.motion.move import Move
-from reachy_mini.utils.interpolation import compose_world_offset, linear_pose_interpolation
+from reachy_mini.utils.interpolation import (
+    InterpolationTechnique,
+    time_trajectory,
+    compose_world_offset,
+    linear_pose_interpolation,
+)
 from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
 
 
@@ -68,6 +73,16 @@ def _idle_setting(name: str, default: float) -> float:
     return value
 
 
+def _turned(pose: NDArray[np.float64], yaw: float) -> NDArray[np.float64]:
+    """Turn `pose` by `yaw` about the vertical axis.
+
+    The SDK's head pose is in the world frame (t_world_platform in its
+    kinematics), so a head that keeps its place on a body turned to `yaw`
+    carries the body's yaw. The companion (decision 026).
+    """
+    return create_head_pose(0, 0, 0, 0, 0, yaw, degrees=False) @ pose
+
+
 class BreathingMove(Move):  # type: ignore
     """Breathing move with interpolation to neutral and then continuous breathing patterns."""
 
@@ -76,6 +91,7 @@ class BreathingMove(Move):  # type: ignore
         interpolation_start_pose: NDArray[np.float32],
         interpolation_start_antennas: Tuple[float, float],
         interpolation_duration: float = 1.0,
+        body_yaw: float = 0.0,
     ):
         """Initialize breathing move.
 
@@ -83,6 +99,7 @@ class BreathingMove(Move):  # type: ignore
             interpolation_start_pose: 4x4 matrix of current head pose to interpolate from
             interpolation_start_antennas: Current antenna positions to interpolate from
             interpolation_duration: Duration of interpolation to neutral (seconds)
+            body_yaw: Body yaw the breathing holds, radians; the body's yaw when breathing begins.
 
         """
         self.interpolation_start_pose = interpolation_start_pose
@@ -101,23 +118,50 @@ class BreathingMove(Move):  # type: ignore
         self.antenna_frequency = _idle_setting("REACHY_BREATHING_ANTENNA_HZ", 0.25)
         self.breathing_frequency = 0.1  # Hz (6 breaths per minute)
 
+        # The companion (decision 026): breathing holds the body where it was
+        # when breathing began, instead of returning body yaw 0 -- that was a
+        # snap to straight ahead -- and the head breathes facing the body's way.
+        # A turn while breathing is a min-jerk trajectory (`turn_body`).
+        self.start_body_yaw = float(body_yaw)
+        self._yaw_from = float(body_yaw)
+        self._yaw_to = float(body_yaw)
+        self._yaw_t0 = 0.0
+        self._yaw_duration = 1.0
+
     @property
     def duration(self) -> float:
         """Duration property required by official Move interface."""
         return float("inf")  # Continuous breathing (never ends naturally)
 
+    def body_yaw_at(self, t: float) -> float:
+        """Return the body yaw at move time `t`: held, or on a min-jerk turn."""
+        if t <= self._yaw_t0:
+            return self._yaw_from
+        s = min(1.0, (t - self._yaw_t0) / self._yaw_duration)
+        return self._yaw_from + (self._yaw_to - self._yaw_from) * time_trajectory(
+            s, InterpolationTechnique.MIN_JERK
+        )
+
+    def turn_body(self, yaw: float, duration: float, t: float) -> None:
+        """Turn the body and the breathing head to `yaw`, starting at move time `t`.
+
+        Min-jerk over `duration` seconds, from wherever the body is at `t`.
+        """
+        self._yaw_from = self.body_yaw_at(t)
+        self._yaw_to = float(yaw)
+        self._yaw_t0 = float(t)
+        self._yaw_duration = max(float(duration), 1e-3)
+
     def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
         """Evaluate breathing move at time t."""
+        yaw = self.body_yaw_at(t)
         if t < self.interpolation_duration:
-            # Phase 1: Interpolate to neutral base position
+            # Phase 1: interpolate to the neutral base. The start pose is in the
+            # world frame, turned with the body as it was when breathing began:
+            # take that turn out, interpolate, and put the present turn back.
             interpolation_t = t / self.interpolation_duration
-
-            # Interpolate head pose
-            head_pose = linear_pose_interpolation(
-                self.interpolation_start_pose,
-                self.neutral_head_pose,
-                interpolation_t,
-            )
+            start = _turned(self.interpolation_start_pose, -self.start_body_yaw)
+            head_pose = _turned(linear_pose_interpolation(start, self.neutral_head_pose, interpolation_t), yaw)
 
             # Interpolate antennas
             antennas_interp = (
@@ -126,19 +170,21 @@ class BreathingMove(Move):  # type: ignore
             antennas = antennas_interp.astype(np.float64)
 
         else:
-            # Phase 2: Breathing patterns from neutral base
+            # Phase 2: breathing patterns from the neutral base, facing the body's way.
             breathing_time = t - self.interpolation_duration
 
             # Gentle z-axis breathing
             z_offset = self.breathing_z_amplitude * np.sin(2 * np.pi * self.breathing_frequency * breathing_time)
-            head_pose = create_head_pose(x=0, y=0, z=z_offset, roll=0, pitch=0, yaw=0, degrees=True, mm=False)
+            head_pose = _turned(
+                create_head_pose(x=0, y=0, z=z_offset, roll=0, pitch=0, yaw=0, degrees=True, mm=False), yaw
+            )
 
             # Antenna sway (opposite directions)
             antenna_sway = self.antenna_sway_amplitude * np.sin(2 * np.pi * self.antenna_frequency * breathing_time)
             antennas = np.array([antenna_sway, -antenna_sway], dtype=np.float64)
 
         # Return in official Move interface format: (head_pose, antennas_array, body_yaw)
-        return (head_pose, antennas, 0.0)
+        return (head_pose, antennas, yaw)
 
 
 class HoldPoseMove(Move):  # type: ignore
@@ -303,6 +349,9 @@ class MovementManager:
         self._antenna_blend_duration = 0.4  # seconds to blend back after listening
         self._last_listening_blend_time = self._now()
         self._breathing_active = False  # true when breathing move is running or queued
+        # The companion (decision 026): a turn asked for while no breathing is
+        # current, as (yaw, duration); applied when breathing next becomes current.
+        self._pending_turn: Tuple[float, float] | None = None
         self._listening_debounce_s = 0.15
         self._last_listening_toggle_time = self._now()
         self._last_set_target_err = 0.0
@@ -339,14 +388,27 @@ class MovementManager:
         target_head_pose: NDArray[np.float32],
         target_antennas: Tuple[float, float],
         duration: float,
+        body_yaw: float | None = None,
     ) -> None:
         """Hold the body in a target pose, replacing any current or queued move.
+
+        `body_yaw` None keeps the last commanded body yaw: a hold used to turn
+        the body back to 0 (HoldPoseMove's default), which the companion's
+        facing (decision 026) must not have undone by every hold.
 
         Thread-safe: executed by the worker thread via the command queue, which
         also seeds the interpolation start from the last commanded pose, so a
         hold that replaces a previous hold picks up from wherever it had got to.
         """
-        self._command_queue.put(("hold_pose", (target_head_pose, target_antennas, duration)))
+        self._command_queue.put(("hold_pose", (target_head_pose, target_antennas, duration, body_yaw)))
+
+    def turn_idle_body(self, yaw: float, duration: float) -> None:
+        """Turn the body, with the breathing head, to `yaw` over `duration` s.
+
+        The companion (decision 026). Applied to the current breathing at once,
+        or to the next breathing if none is current. Thread-safe.
+        """
+        self._command_queue.put(("turn_idle_body", (yaw, duration)))
 
     def release_hold(self) -> None:
         """Release a held pose, if any, and let normal idle behaviour resume.
@@ -447,10 +509,11 @@ class MovementManager:
             logger.info("Cleared move queue and stopped current move")
         elif command == "hold_pose":
             try:
-                target_head_pose, target_antennas, duration = payload
+                target_head_pose, target_antennas, duration, *rest = payload
             except (TypeError, ValueError):
                 logger.warning("Ignored hold_pose command with invalid payload: %s", payload)
                 return
+            body_yaw = rest[0] if rest else None
             start_head_pose, start_antennas, start_body_yaw = self._last_commanded_pose
             hold_move = HoldPoseMove(
                 target_head_pose=target_head_pose,
@@ -458,8 +521,10 @@ class MovementManager:
                 interpolation_start_pose=start_head_pose.copy(),
                 interpolation_start_antennas=start_antennas,
                 interpolation_duration=duration,
+                target_body_yaw=start_body_yaw if body_yaw is None else float(body_yaw),
                 interpolation_start_body_yaw=start_body_yaw,
             )
+            self._pending_turn = None  # the hold's own body yaw wins
             self.move_queue.clear()
             self.state.current_move = None
             self.state.move_start_time = None
@@ -484,6 +549,21 @@ class MovementManager:
                 self._breathing_active = False
                 self.state.update_activity()
                 logger.info("Released held pose")
+        elif command == "turn_idle_body":
+            try:
+                yaw, duration = float(payload[0]), float(payload[1])
+            except (TypeError, ValueError, IndexError):
+                logger.warning("Ignored turn_idle_body command with invalid payload: %s", payload)
+                return
+            move = self.state.current_move
+            if isinstance(move, BreathingMove) and self.state.move_start_time is not None:
+                move.turn_body(yaw, duration, current_time - self.state.move_start_time)
+                self._pending_turn = None
+            else:
+                # Not breathing yet (a hold just released, or the idle delay):
+                # the turn starts with the next breathing.
+                self._pending_turn = (yaw, duration)
+            logger.info("Turning the idle body to %.2f rad over %.1fs", yaw, duration)
         elif command == "set_moving_state":
             try:
                 duration = float(payload)
@@ -571,6 +651,9 @@ class MovementManager:
                 self.state.move_start_time = current_time
                 # Any real move cancels breathing mode flag
                 self._breathing_active = isinstance(self.state.current_move, BreathingMove)
+                if self._breathing_active and self._pending_turn is not None:
+                    self.state.current_move.turn_body(*self._pending_turn, 0.0)
+                    self._pending_turn = None
                 logger.debug(f"Starting new move, duration: {self.state.current_move.duration}s")
 
     def _manage_breathing(self, current_time: float) -> None:
@@ -586,7 +669,7 @@ class MovementManager:
                 try:
                     # These 2 functions return the latest available sensor data from the robot, but don't perform I/O synchronously.
                     # Therefore, we accept calling them inside the control loop.
-                    _, current_antennas = self.current_robot.get_current_joint_positions()
+                    head_joints, current_antennas = self.current_robot.get_current_joint_positions()
                     current_head_pose = self.current_robot.get_current_head_pose()
 
                     self._breathing_active = True
@@ -596,6 +679,7 @@ class MovementManager:
                         interpolation_start_pose=current_head_pose,
                         interpolation_start_antennas=current_antennas,
                         interpolation_duration=1.0,
+                        body_yaw=float(head_joints[0]),  # joint 0 is the body yaw
                     )
                     self.move_queue.append(breathing_move)
                     logger.debug("Started breathing after %.1fs of inactivity", idle_for)
@@ -624,7 +708,10 @@ class MovementManager:
             if antennas is None:
                 antennas = np.array([-0.1745, 0.1745])  # ~10° offset
             if body_yaw is None:
-                body_yaw = 0.0
+                # Keep the body where it is: 0.0 here was a snap to straight
+                # ahead for any move that leaves the body alone (decision 026).
+                last = self.state.last_primary_pose
+                body_yaw = last[2] if last is not None else 0.0
 
             antennas_tuple = (float(antennas[0]), float(antennas[1]))
             head_copy = head.copy()
@@ -786,10 +873,37 @@ class MovementManager:
         if self._thread is not None and self._thread.is_alive():
             logger.warning("Move worker already running; start() ignored")
             return
+        self._seed_from_robot()
         self._stop_event.clear()
         self._thread = threading.Thread(target=self.working_loop, daemon=True)
         self._thread.start()
         logger.debug("Move worker started")
+
+    def _seed_from_robot(self) -> None:
+        """Start from the robot's present pose, not a neutral one.
+
+        The loop commands the last pose every tick until breathing begins
+        (0.3 s), and that used to be neutral with body yaw 0 and antennas
+        (0, 0): a snap to straight ahead whenever the app started on a turned
+        robot (the companion, decision 026). A read that fails keeps neutral.
+        """
+        try:
+            head = np.asarray(self.current_robot.get_current_head_pose(), dtype=np.float64)
+            head_joints, antennas = self.current_robot.get_current_joint_positions()
+            if head.shape != (4, 4):
+                raise ValueError(f"head pose shape {head.shape}")
+            pose: FullBodyPose = (
+                head.copy(),
+                (float(antennas[0]), float(antennas[1])),
+                float(head_joints[0]),
+            )
+        except Exception as e:
+            logger.warning("Could not read the robot's pose at start; starting from neutral: %s", e)
+            return
+        self.state.last_primary_pose = clone_full_body_pose(pose)
+        with self._status_lock:
+            self._last_commanded_pose = clone_full_body_pose(pose)
+        self._listening_antennas = pose[1]
 
     def stop(self, reset_to_neutral: bool = True) -> None:
         """Request the worker thread to stop and wait for it to exit.

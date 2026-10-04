@@ -460,6 +460,10 @@ def test_pose_read_only_reports_without_changing_anything() -> None:
         {"antennas": [float("nan"), -0.1]},  # NaN antenna
         {"antennas": [0.1, -0.1], "duration": float("inf")},  # infinite duration
         {"antennas": [0.1, -0.1], "head_pose": {"pitch": float("nan")}},  # NaN head_pose field
+        {"release": True, "body_yaw": "left"},  # non-numeric body yaw
+        {"release": True, "body_yaw": 3.0},  # past the SDK's 160 degrees
+        {"release": True, "body_yaw": 0.2, "duration": 0},  # turn duration must be > 0
+        {"antennas": [0.1, -0.1], "body_yaw": "left"},  # non-numeric body yaw on a hold
     ],
 )
 def test_pose_invalid_params_are_rejected(params: dict[str, Any]) -> None:
@@ -471,6 +475,41 @@ def test_pose_invalid_params_are_rejected(params: dict[str, Any]) -> None:
     assert resp["error"]["data"]["reason"] == "invalid_params"
     assert resp["error"]["code"] == -32602
     assert manager._command_queue.empty()
+
+
+def test_pose_hold_with_a_body_yaw_holds_it_and_says_so() -> None:
+    """A hold with body_yaw holds that yaw and echoes it."""
+    _stream, manager, app = _pose_stream()
+    resp = _rpc_call(
+        app,
+        "conversation.pose",
+        {"head_pose": {"yaw": 0.3}, "antennas": [0.2, -0.2], "duration": 0.5, "body_yaw": 0.3},
+    )
+    assert resp["result"] == {"holding": True, "body_yaw": 0.3}
+    _drive_manager(manager)
+    assert isinstance(manager.state.current_move, HoldPoseMove)
+    assert manager.state.current_move.target_body_yaw == pytest.approx(0.3)
+
+
+def test_pose_release_with_a_body_yaw_turns_the_idle_body() -> None:
+    """A release with body_yaw releases and turns the idle breathing."""
+    _stream, manager, app = _pose_stream()
+    _rpc_call(app, "conversation.pose", {"antennas": [0.1, -0.1], "duration": 0.5})
+    _drive_manager(manager)
+    resp = _rpc_call(app, "conversation.pose", {"release": True, "body_yaw": 0.4, "duration": 2.0})
+    assert resp["result"] == {"holding": False, "body_yaw": 0.4}
+    _drive_manager(manager)
+    assert manager.is_holding() is False
+    assert manager._pending_turn == (0.4, 2.0)
+
+
+def test_pose_release_without_a_body_yaw_turns_nothing() -> None:
+    """A plain release turns nothing and answers as before."""
+    _stream, manager, app = _pose_stream()
+    resp = _rpc_call(app, "conversation.pose", {"release": True})
+    assert resp["result"] == {"holding": False}
+    _drive_manager(manager)
+    assert manager._pending_turn is None
 
 
 def test_pose_without_a_movement_manager_reports_not_running() -> None:

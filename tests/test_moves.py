@@ -378,7 +378,8 @@ def test_hold_pose_seeds_from_last_commanded_pose_and_replaces_a_previous_hold()
     np.testing.assert_array_equal(second_hold.interpolation_start_pose, commanded_head)
     np.testing.assert_array_equal(second_hold.interpolation_start_antennas, [0.08, -0.08])
     assert second_hold.interpolation_start_body_yaw == 0.3
-    assert second_hold.target_body_yaw == 0.0
+    # The companion (decision 026): a hold given no body yaw keeps the last one.
+    assert second_hold.target_body_yaw == 0.3
     np.testing.assert_array_equal(second_hold.target_head_pose, second_target)
 
 
@@ -462,3 +463,145 @@ def test_a_bad_value_falls_back_to_the_default(monkeypatch: pytest.MonkeyPatch, 
     """Invalid environment values (empty, non-numeric, negative, non-finite) fall back to defaults."""
     monkeypatch.setenv("REACHY_BREATHING_ANTENNA_DEG", bad)
     assert _move().antenna_sway_amplitude == pytest.approx(math.radians(5.0))
+
+
+# --- the companion's facing (decision 026) ------------------------------------
+
+from scipy.spatial.transform import Rotation as R  # noqa: E402
+
+
+def _yaw_of(pose: np.ndarray) -> float:
+    return float(R.from_matrix(pose[:3, :3]).as_euler("xyz")[2])
+
+
+def test_breathing_holds_the_body_where_it_began() -> None:
+    """Breathing keeps the body yaw it began with, and the head faces that way.
+
+    The companion (decision 026): breathing used to return body yaw 0, a
+    snap back to straight ahead.
+    """
+    move = BreathingMove(
+        interpolation_start_pose=create_head_pose(0, 0, 0, 0, 0, 0.4, degrees=False),
+        interpolation_start_antennas=(-0.1745, 0.1745),
+        body_yaw=0.4,
+    )
+    head0, _, yaw0 = move.evaluate(0.0)
+    np.testing.assert_allclose(head0, create_head_pose(0, 0, 0, 0, 0, 0.4, degrees=False), atol=1e-9)
+    assert yaw0 == pytest.approx(0.4)
+    head5, _, yaw5 = move.evaluate(5.0)
+    assert yaw5 == pytest.approx(0.4)
+    assert _yaw_of(head5) == pytest.approx(0.4)
+
+
+def test_a_turn_while_breathing_is_min_jerk_and_ends_on_target() -> None:
+    """A turn eases in and out, and the body stays at the target afterwards."""
+    move = BreathingMove(
+        interpolation_start_pose=create_head_pose(0, 0, 0, 0, 0, 0, degrees=True),
+        interpolation_start_antennas=(-0.1745, 0.1745),
+    )
+    move.turn_body(0.6, 2.0, 3.0)
+    assert move.evaluate(3.0)[2] == pytest.approx(0.0)
+    assert move.evaluate(3.2)[2] < 0.6 * 0.1  # slower than a straight line at the start
+    assert move.evaluate(4.0)[2] == pytest.approx(0.3)  # min-jerk is half way at half time
+    assert move.evaluate(5.0)[2] == pytest.approx(0.6)
+    head, _, yaw = move.evaluate(60.0)
+    assert yaw == pytest.approx(0.6) and _yaw_of(head) == pytest.approx(0.6)
+
+
+def test_a_new_turn_starts_from_where_the_body_is() -> None:
+    """A turn asked for mid-turn starts from the body's yaw at that moment."""
+    move = BreathingMove(
+        interpolation_start_pose=create_head_pose(0, 0, 0, 0, 0, 0, degrees=True),
+        interpolation_start_antennas=(-0.1745, 0.1745),
+    )
+    move.turn_body(0.6, 2.0, 0.0)
+    move.turn_body(-0.2, 2.0, 1.0)
+    assert move.evaluate(1.0)[2] == pytest.approx(0.3)
+    assert move.evaluate(3.0)[2] == pytest.approx(-0.2)
+
+
+def _robot(body_yaw: float = 0.0) -> MagicMock:
+    robot = MagicMock()
+    robot.get_current_joint_positions.return_value = ([body_yaw] + [0.0] * 6, [-0.1745, 0.1745])
+    robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 0, body_yaw, degrees=False)
+    return robot
+
+
+def test_breathing_starts_from_the_robots_present_body_yaw() -> None:
+    """Idle breathing reads the body yaw from joint 0 when it begins."""
+    manager = MovementManager(_robot(0.5))
+    t = manager._now() + manager.idle_inactivity_delay + 1.0
+    manager._update_primary_motion(t)
+    (move,) = manager.move_queue
+    assert isinstance(move, BreathingMove) and move.start_body_yaw == pytest.approx(0.5)
+
+
+def test_an_idle_turn_turns_the_breathing_body() -> None:
+    """turn_idle_body applies to the current breathing move at once."""
+    manager = MovementManager(_robot())
+    t = manager._now() + manager.idle_inactivity_delay + 1.0
+    manager._update_primary_motion(t)
+    manager._manage_move_queue(t)
+    assert isinstance(manager.state.current_move, BreathingMove)
+    manager._handle_command("turn_idle_body", (0.6, 2.0), t + 1.0)
+    assert manager.state.current_move.evaluate(3.0)[2] == pytest.approx(0.6)
+
+
+def test_a_turn_before_breathing_starts_waits_for_it() -> None:
+    """A turn asked for before breathing begins starts with the next breathing."""
+    manager = MovementManager(_robot())
+    t0 = manager._now()
+    manager._handle_command("turn_idle_body", (0.6, 2.0), t0)
+    assert manager._pending_turn == (0.6, 2.0)
+    t = t0 + manager.idle_inactivity_delay + 1.0
+    manager._update_primary_motion(t)
+    manager._manage_move_queue(t)
+    move = manager.state.current_move
+    assert isinstance(move, BreathingMove) and manager._pending_turn is None
+    assert move.evaluate(2.0)[2] == pytest.approx(0.6)
+
+
+def test_a_hold_keeps_the_body_yaw_unless_given_one() -> None:
+    """A hold without a body yaw keeps the last commanded one."""
+    manager = MovementManager(_robot())
+    manager._last_commanded_pose = (np.eye(4), (0.0, 0.0), 0.4)
+    t = manager._now()
+    manager._handle_command("hold_pose", (np.eye(4), (0.2, -0.2), 1.0), t)
+    assert manager.move_queue[-1].target_body_yaw == pytest.approx(0.4)
+    manager._handle_command("hold_pose", (np.eye(4), (0.2, -0.2), 1.0, 0.1), t)
+    assert manager.move_queue[-1].target_body_yaw == pytest.approx(0.1)
+
+
+def test_a_move_without_a_body_yaw_keeps_the_last_one() -> None:
+    """A move that returns no body yaw leaves the body where it is."""
+
+    class _NoYaw:
+        duration = 10.0
+
+        def evaluate(self, t: float):
+            return (np.eye(4), np.array([0.0, 0.0]), None)
+
+    manager = MovementManager(_robot())
+    manager.state.last_primary_pose = (np.eye(4), (0.0, 0.0), 0.4)
+    t = manager._now()
+    manager.state.current_move = _NoYaw()
+    manager.state.move_start_time = t
+    assert manager._get_primary_pose(t)[2] == pytest.approx(0.4)
+
+
+def test_start_commands_the_robots_present_pose_not_neutral() -> None:
+    """The first command is the robot's present pose.
+
+    The startup snap: the loop used to command neutral, body yaw 0 and
+    antennas (0, 0), for the 0.3 s before breathing began.
+    """
+    robot = _robot(0.5)
+    manager = MovementManager(robot)
+    manager.start()
+    try:
+        assert _wait_for(lambda: robot.set_target.called)
+        first = robot.set_target.call_args_list[0].kwargs
+        assert first["body_yaw"] == pytest.approx(0.5)
+        assert first["antennas"] == pytest.approx((-0.1745, 0.1745))
+    finally:
+        manager.stop(reset_to_neutral=False)
