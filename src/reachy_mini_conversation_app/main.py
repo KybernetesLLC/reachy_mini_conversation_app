@@ -14,7 +14,7 @@ from collections.abc import Callable, Awaitable
 from fastapi import FastAPI, Request, Response
 
 from reachy_mini import ReachyMini, ReachyMiniApp
-from reachy_mini_conversation_app import app_lifecycle
+from reachy_mini_conversation_app import startup, app_lifecycle
 from reachy_mini_conversation_app.utils import (
     parse_args,
     setup_logger,
@@ -187,7 +187,11 @@ def run(
             logger.error("Please check your configuration and try again.")
             sys.exit(1)
 
-    app_lifecycle.wake_up_if_sleeping(robot, logger)
+    # The companion (R-36): an app the supervisor starts on its own moves nothing
+    # until the supervisor says so -- no wake-up from the fold, no breathing.
+    still = not startup.motion_on_start()
+    if not still:
+        app_lifecycle.wake_up_if_sleeping(robot, logger)
 
     movement_manager = MovementManager(current_robot=robot)
 
@@ -318,7 +322,7 @@ def run(
         sys.exit(1)
 
     # Each async service → its own thread/loop
-    movement_manager.start()
+    movement_manager.start(hold_still=still)
     # Audio-reactive head motion is driven by the daemon's wobbler, which
     # taps the media pipeline at push_audio_sample. The console stream pushes
     # assistant audio through that pipeline directly.

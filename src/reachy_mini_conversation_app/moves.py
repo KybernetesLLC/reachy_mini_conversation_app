@@ -910,16 +910,29 @@ class MovementManager:
         )
         stats.reset()
 
-    def start(self) -> None:
-        """Start the worker thread that drives the 100 Hz control loop."""
+    def start(self, hold_still: bool = False) -> None:
+        """Start the worker thread that drives the 100 Hz control loop.
+
+        `hold_still` (the companion, R-36): hold the robot's present pose from the
+        first tick, so no idle breathing begins until a pose command or a release
+        arrives -- an app started while the robot is folded must not lift it.
+        """
         if self._thread is not None and self._thread.is_alive():
             logger.warning("Move worker already running; start() ignored")
             return
         self._seed_from_robot()
+        if hold_still:
+            self._queue_hold_still()
         self._stop_event.clear()
         self._thread = threading.Thread(target=self.working_loop, daemon=True)
         self._thread.start()
         logger.debug("Move worker started")
+
+    def _queue_hold_still(self) -> None:
+        """Hold the pose `_seed_from_robot` read, before the worker's first tick."""
+        head, antennas, body_yaw = clone_full_body_pose(self._last_commanded_pose)
+        self.hold_pose(head, antennas, 0.1, body_yaw=body_yaw)
+        logger.info("Holding still until the supervisor moves the robot")
 
     def _seed_from_robot(self) -> None:
         """Start from the robot's present pose, not a neutral one.

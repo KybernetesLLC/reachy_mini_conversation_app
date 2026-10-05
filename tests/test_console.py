@@ -148,7 +148,7 @@ async def test_session_gate_parks_the_startup_loop_when_the_session_is_closed(
     stream._session_wanted.clear()
     loop_task = asyncio.create_task(stream._run_handler_startup_loop())
     await asyncio.sleep(0.05)
-    assert started == []          # parked: no session was opened
+    assert started == []  # parked: no session was opened
 
     stream._session_wanted.set()
     await _wait_until(lambda: started == ["start_up"])  # woken by the gate alone
@@ -160,7 +160,8 @@ async def test_session_gate_parks_the_startup_loop_when_the_session_is_closed(
 @pytest.mark.asyncio
 async def test_closing_the_session_does_not_request_a_restart() -> None:
     """The open path must not touch _restart_requested: that rebuilds the handler,
-    and a fresh handler greets again — the defect this whole change closes."""
+    and a fresh handler greets again — the defect this whole change closes.
+    """
     stream = _gate_stream()
     stream.handler.shutdown = AsyncMock()
     # No startup loop is running here, so nothing will ever mark the gate parked;
@@ -179,7 +180,8 @@ async def test_closing_the_session_does_not_request_a_restart() -> None:
 @pytest.mark.asyncio
 async def test_a_closed_session_does_not_age_the_app_toward_sleep(monkeypatch: Any) -> None:
     """seconds_since_activity is session-scoped; a deliberate close must not
-    look like idleness, or the inactivity timeout stops the app."""
+    look like idleness, or the inactivity timeout stops the app.
+    """
     stream = _gate_stream(last_activity=time.monotonic() - 10_000.0)
     monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
     stream._session_closed_keepalive = 0.01
@@ -269,7 +271,8 @@ def test_conversation_session_opens_closes_and_reads_back() -> None:
 
 def test_status_over_rpc_carries_session_wanted() -> None:
     """A caller reads the off state from conversation.status, not only from
-    the verb's own return value."""
+    the verb's own return value.
+    """
     app = FastAPI()
     robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
     handler = MagicMock()
@@ -546,9 +549,7 @@ async def test_close_session_keeps_closing_until_the_loop_actually_parks(
     stream = _gate_stream()
     stream.handler.connection = None  # unset until the fake start_up "connects"
     stream._backend_retry_delay = 0.05  # keep the loop's own retry sleep short
-    monkeypatch.setattr(
-        type(stream), "_build_handler_for_current_backend", _must_not_be_called
-    )
+    monkeypatch.setattr(type(stream), "_build_handler_for_current_backend", _must_not_be_called)
     monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
 
     close_live_calls: list[str] = []
@@ -604,7 +605,8 @@ async def test_close_session_keeps_closing_until_the_loop_actually_parks(
 @pytest.mark.asyncio
 async def test_close_session_returns_false_when_it_cannot_settle() -> None:
     """A close that cannot get the connection down and the loop parked within its
-    budget reports failure rather than claiming success it did not achieve."""
+    budget reports failure rather than claiming success it did not achieve.
+    """
     stream = _gate_stream()
     stream.handler.connection = object()  # never actually closes
     stream.handler.shutdown = AsyncMock()  # does not touch handler.connection
@@ -2327,3 +2329,40 @@ def test_rpc_settings_methods() -> None:
     assert isinstance(r2["result"], list)
     assert "spaces" in r3["result"]
     assert "enabled_tools" in r4["result"]
+
+
+def test_a_parked_start_has_no_session_wanted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R-36: started by the supervisor, the app opens nothing until asked."""
+    monkeypatch.setenv("REACHY_MINI_SESSION_ON_START", "closed")
+    app = FastAPI()
+    stream = LocalStream(MagicMock(), _audio_robot(), settings_app=app)
+    stream._init_settings_ui_if_needed()
+    assert not stream._session_wanted.is_set()
+    assert _rpc_call(app, "conversation.session")["result"]["wanted"] is False
+
+
+def test_a_deaf_start_starts_no_pipeline_until_capture_is_asked_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R-36: an app started while the robot is asleep must not capture."""
+    monkeypatch.setenv("REACHY_MINI_CAPTURE_ON_START", "off")
+    app = FastAPI()
+    robot = _audio_robot(start_recording=MagicMock(), start_playing=MagicMock())
+    stream = LocalStream(MagicMock(), robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+
+    stream._start_media_if_wanted()
+
+    assert not robot.media.start_recording.called and not robot.media.start_playing.called
+    assert _rpc_call(app, "conversation.capture", {})["result"] == {"on": False}
+    assert _rpc_call(app, "conversation.capture", {"on": True})["result"] == {"on": True}
+    assert robot.media.start_recording.called and robot.media.start_playing.called
+
+
+def test_an_ordinary_start_starts_both_pipelines(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset, the app starts both pipelines, as upstream does."""
+    monkeypatch.delenv("REACHY_MINI_CAPTURE_ON_START", raising=False)
+    robot = _audio_robot(start_recording=MagicMock(), start_playing=MagicMock())
+    stream = LocalStream(MagicMock(), robot)
+    stream._start_media_if_wanted()
+    assert robot.media.start_recording.called and robot.media.start_playing.called

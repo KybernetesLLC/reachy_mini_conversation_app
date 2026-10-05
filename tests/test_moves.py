@@ -660,3 +660,26 @@ def test_idle_breathing_out_of_the_fold_takes_its_time() -> None:
     manager._update_primary_motion(t)
     (move,) = manager.move_queue
     assert move.interpolation_duration > 2.0
+
+
+# --- the companion's still start (R-36) ---------------------------------------
+
+
+def test_a_still_start_holds_the_robots_present_pose_before_anything_moves() -> None:
+    """A still start holds the robot where it is.
+
+    Started by the supervisor while folded, the app must not lift the robot:
+    breathing waits for a pose command.
+    """
+    manager = MovementManager(_robot(0.4))
+    manager._seed_from_robot()
+    manager._queue_hold_still()
+    name, (head, antennas, duration, body_yaw) = manager._command_queue.get_nowait()
+    assert name == "hold_pose"
+    np.testing.assert_allclose(head, create_head_pose(0, 0, 0, 0, 0, 0.4, degrees=False))
+    assert antennas == (-0.1745, 0.1745) and body_yaw == pytest.approx(0.4)
+    t = manager._now()
+    manager._handle_command(name, (head, antennas, duration, body_yaw), t)
+    manager._update_primary_motion(t + 5.0)  # well past the 0.3 s breathing delay
+    assert manager.is_holding()
+    assert not any(isinstance(m, BreathingMove) for m in manager.move_queue)

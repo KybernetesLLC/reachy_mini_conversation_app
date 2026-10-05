@@ -22,6 +22,7 @@ from reachy_mini.utils import create_head_pose
 from reachy_mini.io.jsonrpc import JsonRpcError
 from reachy_mini.apps.jsonrpc_server import JsonRpcServer
 from reachy_mini.media.media_manager import MediaBackend
+from reachy_mini_conversation_app import startup
 from reachy_mini_conversation_app.config import (
     HF_BACKEND,
     LOCKED_PROFILE,
@@ -161,6 +162,10 @@ class LocalStream:
         # upstream's behaviour exactly.
         self._session_wanted = asyncio.Event()
         self._session_wanted.set()
+        # The companion (R-36): an app the supervisor starts on its own starts
+        # parked, so it opens no session and says nothing until asked.
+        if not startup.session_on_start():
+            self._session_wanted.clear()
         # While the session is closed on purpose, bump the activity clock this often
         # so the inactivity timeout does not read a deliberate close as idleness and
         # stop the app. seconds_since_activity() is session-scoped.
@@ -172,8 +177,8 @@ class LocalStream:
         # Capture control. The session gate above closes the connection; this
         # stops the microphone itself, for callers that need the mic provably
         # off rather than merely disconnected. Starts True because launch()
-        # starts the pipelines.
-        self._capture_on = True
+        # starts the pipelines -- unless the app was started deaf (R-36).
+        self._capture_on = startup.capture_on_start()
         # Pre-roll buffer. record_loop keeps the most recent PREROLL_SECONDS of
         # mic frames here while no realtime connection is up (or muted, or
         # queued behind an in-flight flush), and never writes them to disk.
@@ -725,6 +730,18 @@ class LocalStream:
         except Exception as e:
             logger.warning("Failed to persist startup voice: %s", e)
 
+    def _start_media_if_wanted(self) -> None:
+        """Start the pipelines, unless the app was started deaf.
+
+        The companion (R-36): then conversation.capture starts them when the
+        supervisor asks.
+        """
+        if not self._capture_on:
+            logger.info("Starting with capture off; conversation.capture turns it on")
+            return
+        self._robot.media.start_recording()
+        self._robot.media.start_playing()
+
     def _init_settings_ui_if_needed(self) -> None:
         """Attach minimal settings UI to the settings app.
 
@@ -900,9 +917,7 @@ class LocalStream:
 
             antennas_raw = params.get("antennas")
             if not isinstance(antennas_raw, (list, tuple)) or len(antennas_raw) != 2:
-                raise JsonRpcError(
-                    "pose requires 'antennas' as [right, left]", reason="invalid_params", code=-32602
-                )
+                raise JsonRpcError("pose requires 'antennas' as [right, left]", reason="invalid_params", code=-32602)
             target_antennas = (
                 _finite_float(antennas_raw[0], "pose antennas must be numeric"),
                 _finite_float(antennas_raw[1], "pose antennas must be numeric"),
@@ -1182,8 +1197,7 @@ class LocalStream:
             self._set_backend_connection_state("not_started")
 
         # Start media after key is set/available
-        self._robot.media.start_recording()
-        self._robot.media.start_playing()
+        self._start_media_if_wanted()
 
         async def runner() -> None:
             # Capture loop for cross-thread personality actions
