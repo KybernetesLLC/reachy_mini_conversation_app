@@ -127,8 +127,10 @@ BACKEND_RETRY_DELAY_SECONDS = 5.0
 # At most this many seconds of recent mic frames are kept while no realtime
 # connection is up, so a wake word and the command spoken in the same breath
 # are not lost during the moment it takes a session to connect. See
-# LocalStream's pre-roll buffer, below.
-PREROLL_SECONDS = 2.0
+# LocalStream's pre-roll buffer, below. 4 s (the companion's audit D27): 2 s
+# counted back from connect left about 0.7 s, and a wake decided with the
+# camera (its decision 030) spends most of that before the session opens.
+PREROLL_SECONDS = 4.0
 _PREROLL_POLL_INTERVAL_S = 0.01
 
 

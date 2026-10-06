@@ -1589,12 +1589,13 @@ def test_append_preroll_bounds_stereo_channels_last_frames_by_sample_count() -> 
     sample_rate = 16000
 
     frame = (sample_rate, np.zeros((1600, 2), dtype=np.float32))  # 0.1 s of stereo audio
-    for _ in range(25):  # 2.5 s worth, well over the 2.0 s bound
+    bound = round(console_mod.PREROLL_SECONDS * 10)  # frames of 0.1 s in the bound
+    for _ in range(bound + 5):  # well over the bound
         stream._append_preroll(frame)
 
     total_duration = sum(len(samples) / rate for rate, samples in stream._preroll)
     assert total_duration <= console_mod.PREROLL_SECONDS + 1e-9
-    assert 19 <= len(stream._preroll) <= 20  # ~2.0 s / 0.1 s per frame, float-rounding tolerant
+    assert bound - 1 <= len(stream._preroll) <= bound  # float-rounding tolerant
 
 
 @pytest.mark.asyncio
@@ -2403,3 +2404,9 @@ def test_an_unknown_cue_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert resp["error"]["data"]["reason"] == "unknown_cue"
     assert len(manager.move_queue) == 0
+
+
+def test_the_preroll_keeps_four_seconds() -> None:
+    """The companion's audit, D27: 2 s counted back from connect left about 0.7 s of
+    margin, and decision 030's camera check after a quiet name spends most of it."""
+    assert console_mod.PREROLL_SECONDS == 4.0
