@@ -1539,7 +1539,7 @@ async def _stop_fake_session_loop(stream: LocalStream, handler: _FakeSessionHand
 
 
 @pytest.mark.asyncio
-async def test_the_preroll_buffer_holds_at_most_two_seconds() -> None:
+async def test_the_preroll_buffer_holds_at_most_its_bound() -> None:
     """Feed 5 s of audio through record_loop.
 
     At most PREROLL_SECONDS ends up buffered, and what remains is the most
@@ -1548,7 +1548,7 @@ async def test_the_preroll_buffer_holds_at_most_two_seconds() -> None:
     sample_rate = 16000
     frame_seconds = 0.1
     frame_len = int(sample_rate * frame_seconds)
-    total_frames = 50  # 5.0 s at 0.1 s/frame
+    total_frames = 150  # 15.0 s at 0.1 s/frame, over the buffer's bound
 
     robot = _audio_robot(get_input_audio_samplerate=MagicMock(return_value=sample_rate), get_audio_sample=MagicMock())
     handler = MagicMock()
@@ -1569,8 +1569,8 @@ async def test_the_preroll_buffer_holds_at_most_two_seconds() -> None:
     await stream.record_loop()
 
     total_duration = sum(len(samples) / rate for rate, samples in stream._preroll)
-    assert total_duration <= console_mod.PREROLL_SECONDS + 1e-9
-    assert total_duration > console_mod.PREROLL_SECONDS - (2 * frame_seconds)
+    assert total_duration <= console_mod.PREROLL_BUFFER_SECONDS + 1e-9
+    assert total_duration > console_mod.PREROLL_BUFFER_SECONDS - (2 * frame_seconds)
 
     kept_indices = [int(samples[0]) for _, samples in stream._preroll]
     assert kept_indices == list(range(total_frames - len(kept_indices), total_frames))
@@ -1589,12 +1589,13 @@ def test_append_preroll_bounds_stereo_channels_last_frames_by_sample_count() -> 
     sample_rate = 16000
 
     frame = (sample_rate, np.zeros((1600, 2), dtype=np.float32))  # 0.1 s of stereo audio
-    for _ in range(25):  # 2.5 s worth, well over the 2.0 s bound
+    bound = round(console_mod.PREROLL_BUFFER_SECONDS * 10)  # frames of 0.1 s in the bound
+    for _ in range(bound + 5):  # well over the bound
         stream._append_preroll(frame)
 
     total_duration = sum(len(samples) / rate for rate, samples in stream._preroll)
-    assert total_duration <= console_mod.PREROLL_SECONDS + 1e-9
-    assert 19 <= len(stream._preroll) <= 20  # ~2.0 s / 0.1 s per frame, float-rounding tolerant
+    assert total_duration <= console_mod.PREROLL_BUFFER_SECONDS + 1e-9
+    assert bound - 1 <= len(stream._preroll) <= bound  # float-rounding tolerant
 
 
 @pytest.mark.asyncio
@@ -1655,18 +1656,18 @@ async def test_record_loop_holds_live_frames_behind_an_armed_flush() -> None:
 
 
 @pytest.mark.asyncio
-async def test_frames_queued_behind_a_flush_stay_within_the_two_second_bound() -> None:
+async def test_frames_queued_behind_a_flush_stay_within_the_bound() -> None:
     """Route frames queued behind an in-flight flush through the same bounded append.
 
     If the drain does not keep up (here it never runs at all -- the worst
     case), the frames record_loop queues behind it must still be trimmed the
-    same way everything else in the buffer is, so the 2 s bound holds
+    same way everything else in the buffer is, so the bound holds
     regardless of which path added a frame.
     """
     sample_rate = 16000
     frame_seconds = 0.1
     frame_len = int(sample_rate * frame_seconds)
-    total_frames = 50  # 5.0 s worth, well over the 2.0 s bound
+    total_frames = 150  # 15.0 s worth, well over the buffer's bound
 
     robot = _audio_robot(get_input_audio_samplerate=MagicMock(return_value=sample_rate), get_audio_sample=MagicMock())
     handler = MagicMock()
@@ -1689,7 +1690,7 @@ async def test_frames_queued_behind_a_flush_stay_within_the_two_second_bound() -
 
     handler.receive.assert_not_awaited()  # nothing sent directly while the flush is pending
     total_duration = sum(len(samples) / rate for rate, samples in stream._preroll)
-    assert total_duration <= console_mod.PREROLL_SECONDS + 1e-9
+    assert total_duration <= console_mod.PREROLL_BUFFER_SECONDS + 1e-9
 
 
 @pytest.mark.asyncio
@@ -2403,3 +2404,72 @@ def test_an_unknown_cue_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert resp["error"]["data"]["reason"] == "unknown_cue"
     assert len(manager.move_queue) == 0
+
+
+def test_the_preroll_keeps_four_seconds() -> None:
+    """The companion's audit, D27: 2 s counted back from connect left about 0.7 s of
+    margin, and decision 030's camera check after a quiet name spends most of it."""
+    assert console_mod.PREROLL_SECONDS == 4.0
+
+
+async def _name_last_flush(monkeypatch: pytest.MonkeyPatch, anchor_ago: float | None) -> list[int]:
+    """A 3 s utterance ending in the name (frames 0-29, 0.1 s each, the name's
+    peak at 2.8 s); the open lands at 3.5 s after the companion's look; frames
+    keep arriving until the session connects 1.5 s later, at 5.0 s. Returns the
+    first-input frames' markers, in order."""
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    fake_now = [0.0]
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = _FakeSessionHandler()
+    stream = LocalStream(handler, robot, preroll_clock=lambda: fake_now[0])
+    stream._session_wanted.clear()
+    stream._backend_retry_delay = 0.01
+
+    def frame(i: int) -> None:
+        fake_now[0] = i / 10
+        stream._append_preroll((16000, np.full(1600, i, dtype=np.int16)))
+
+    for i in range(35):
+        frame(i)
+    await stream.open_session(preroll=True, anchor_ago=anchor_ago)
+    for i in range(35, 50):
+        frame(i)
+    fake_now[0] = 5.0
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    try:
+        await _wait_until(lambda: handler.started.is_set())
+        await _wait_until(lambda: stream._preroll_flush_pending is False)
+        return [int(samples[0]) for _rate, samples in handler.received]
+    finally:
+        await _stop_fake_session_loop(stream, handler, loop_task)
+
+
+@pytest.mark.asyncio
+async def test_a_request_said_before_the_name_arrives_whole(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ "Set a timer for 30 seconds, Reachy": the pre-roll counts back from the name's
+    peak, not from the connect, so the words before the name are all there."""
+    markers = await _name_last_flush(monkeypatch, anchor_ago=0.7)  # the peak, 0.7 s before the open
+    assert markers == list(range(50))
+
+
+@pytest.mark.asyncio
+async def test_without_an_anchor_the_preroll_counts_back_from_the_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    markers = await _name_last_flush(monkeypatch, anchor_ago=None)
+    assert markers[0] == 10  # 4 s before the 5.0 s connect: the first second is lost
+
+
+def test_the_session_verb_passes_the_anchor() -> None:
+    _stream, _manager, app = _pose_stream()
+    stream = _stream
+    seen = {}
+
+    async def open_session(*, preroll: bool = False, anchor_ago: float | None = None) -> None:
+        seen.update(preroll=preroll, anchor_ago=anchor_ago)
+
+    stream.open_session = open_session
+    _rpc_call(app, "conversation.session", {"open": True, "preroll": True, "preroll_anchor_ago": 0.7})
+    assert seen == {"preroll": True, "anchor_ago": 0.7}
+    _rpc_call(app, "conversation.session", {"open": True, "preroll": True, "preroll_anchor_ago": "x"})
+    assert seen == {"preroll": True, "anchor_ago": None}

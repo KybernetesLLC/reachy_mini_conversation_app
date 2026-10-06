@@ -127,9 +127,29 @@ BACKEND_RETRY_DELAY_SECONDS = 5.0
 # At most this many seconds of recent mic frames are kept while no realtime
 # connection is up, so a wake word and the command spoken in the same breath
 # are not lost during the moment it takes a session to connect. See
-# LocalStream's pre-roll buffer, below.
-PREROLL_SECONDS = 2.0
+# LocalStream's pre-roll buffer, below. 4 s (the companion's audit D27): 2 s
+# counted back from connect left about 0.7 s, and a wake decided with the
+# camera (its decision 030) spends most of that before the session opens.
+PREROLL_SECONDS = 4.0
+# How much the buffer holds: the pre-roll counted back from the wake word's
+# peak (the companion passes how long ago it was), plus the time from the name
+# to the session connecting, about 1.3 s, and the companion's camera check
+# after a quiet name. "Set a timer for 30 seconds, Reachy" needs the words
+# before the name (the owner, 2026-10-06).
+PREROLL_BUFFER_SECONDS = 10.0
 _PREROLL_POLL_INTERVAL_S = 0.01
+
+
+def _anchor_ago(value: object) -> float | None:
+    """Read conversation.session's ``preroll_anchor_ago``.
+
+    Seconds since the wake word peaked, as the opener measured them. Anything
+    unusable means no anchor.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    ago = float(value)
+    return ago if math.isfinite(ago) and 0.0 <= ago <= PREROLL_BUFFER_SECONDS else None
 
 
 class LocalStream:
@@ -195,6 +215,9 @@ class LocalStream:
         self._preroll_duration = 0.0
         self._preroll_flush_pending = False
         self._preroll_clock = preroll_clock
+        # Where the pre-roll counts back from, on _preroll_clock: the wake word's
+        # peak when the opener said when it was, else None (the connect).
+        self._preroll_anchor: float | None = None
         # Set whenever _session_wanted changes, so the retry sleep can wake on a
         # close the way it already wakes on a restart request. Separate from
         # _session_wanted itself because the sleep must wake on *clearing* it, and
@@ -431,7 +454,7 @@ class LocalStream:
         finally:
             self._session_parked.clear()
 
-    async def open_session(self, *, preroll: bool = False) -> None:
+    async def open_session(self, *, preroll: bool = False, anchor_ago: float | None = None) -> None:
         """Let the startup loop open a realtime session, and wake it now.
 
         ``preroll=True`` marks the connection this opens as one a wake word
@@ -458,6 +481,11 @@ class LocalStream:
             return
         if preroll:
             self._preroll_flush_pending = True
+            if anchor_ago is not None:
+                # ``anchor_ago``: how many seconds before this call the wake word
+                # peaked. The flush then keeps PREROLL_SECONDS before that moment
+                # and everything after it, wherever the connect lands.
+                self._preroll_anchor = self._preroll_clock() - anchor_ago
         logger.info("Realtime session open requested.")
         self._session_wanted.set()
         self._session_gate_changed.set()
@@ -849,7 +877,10 @@ class LocalStream:
         async def _rpc_session(params: dict[str, object]) -> dict[str, object]:
             if "open" in params:
                 if bool(params["open"]):
-                    await self.open_session(preroll=bool(params.get("preroll", False)))
+                    await self.open_session(
+                        preroll=bool(params.get("preroll", False)),
+                        anchor_ago=_anchor_ago(params.get("preroll_anchor_ago")),
+                    )
                 else:
                     await self.close_session()
             return {
@@ -1078,10 +1109,11 @@ class LocalStream:
                 return
 
             now = self._preroll_clock()
+            anchor = self._preroll_anchor if self._preroll_anchor is not None else now
             while self._preroll:
                 frame = self._preroll.popleft()
                 timestamp = self._preroll_times.popleft()
-                if now - timestamp > PREROLL_SECONDS:
+                if anchor - timestamp > PREROLL_SECONDS or now - timestamp > PREROLL_BUFFER_SECONDS:
                     continue
                 try:
                     await self.handler.receive(frame)
@@ -1319,7 +1351,7 @@ class LocalStream:
         self._preroll.append(frame)
         self._preroll_times.append(self._preroll_clock())
         self._preroll_duration += len(samples) / sample_rate
-        while self._preroll and self._preroll_duration > PREROLL_SECONDS:
+        while self._preroll and self._preroll_duration > PREROLL_BUFFER_SECONDS:
             oldest_rate, oldest_samples = self._preroll.popleft()
             self._preroll_times.popleft()
             self._preroll_duration -= len(oldest_samples) / oldest_rate
@@ -1334,6 +1366,7 @@ class LocalStream:
         """Discard the pre-roll buffer and cancel any pending flush."""
         self._clear_preroll()
         self._preroll_flush_pending = False
+        self._preroll_anchor = None
 
     async def record_loop(self) -> None:
         """Read mic frames from the recorder and forward them to the handler.
