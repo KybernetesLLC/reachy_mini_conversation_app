@@ -683,3 +683,45 @@ def test_a_still_start_holds_the_robots_present_pose_before_anything_moves() -> 
     manager._update_primary_motion(t + 5.0)  # well past the 0.3 s breathing delay
     assert manager.is_holding()
     assert not any(isinstance(m, BreathingMove) for m in manager.move_queue)
+
+
+# --- the companion: a queued move preempts the supervisor's hold (R-39) -----------
+
+
+def _held_manager() -> tuple[MovementManager, float]:
+    manager = MovementManager(_robot())
+    manager._seed_from_robot()
+    t = manager._now()
+    attentive = create_head_pose(0, 0, 0, 0, -6, 0, degrees=True)
+    manager._handle_command("hold_pose", (attentive, (-0.4, 0.4), 0.8, 0.2), t)
+    manager._update_primary_motion(t)
+    assert isinstance(manager.state.current_move, HoldPoseMove)
+    return manager, t
+
+
+def test_a_queued_move_runs_while_a_pose_is_held_and_the_hold_comes_back() -> None:
+    """2026-10-06 07:10: move_head right returned 'looking right' three times and
+    nothing moved, because the ENGAGED hold never ends and the queue waits."""
+    manager, t = _held_manager()
+    look = GotoQueueMove(target_head_pose=create_head_pose(0, 0, 0, 0, 0, -30, degrees=True), duration=1.0)
+    manager._handle_command("queue_move", look, t + 0.1)
+    manager._update_primary_motion(t + 0.2)
+    assert manager.state.current_move is look
+    assert manager.is_holding()  # the supervisor's hold is set aside, not dropped
+
+    manager._update_primary_motion(t + 1.3)  # the look has ended
+    back = manager.state.current_move
+    assert isinstance(back, HoldPoseMove)
+    np.testing.assert_allclose(back.target_antennas, (-0.4, 0.4))
+    assert back.target_body_yaw == pytest.approx(0.2)
+
+
+def test_a_new_hold_or_a_release_replaces_the_one_set_aside() -> None:
+    manager, t = _held_manager()
+    look = GotoQueueMove(target_head_pose=create_head_pose(0, 0, 0, 0, 0, -30, degrees=True), duration=1.0)
+    manager._handle_command("queue_move", look, t + 0.1)
+    manager._update_primary_motion(t + 0.2)
+    manager._handle_command("release_hold", None, t + 0.3)
+    manager._update_primary_motion(t + 1.3)
+    assert not isinstance(manager.state.current_move, HoldPoseMove)
+    assert not manager.is_holding()
