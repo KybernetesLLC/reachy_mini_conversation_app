@@ -23,6 +23,18 @@ except Exception as e:
     EMOTION_AVAILABLE = False
 
 
+_shared_library: "RecordedMoves | None" = None
+
+
+def emotions_library() -> "RecordedMoves":
+    """Return the recorded emotions library, loaded once on first use."""
+    global _shared_library
+    if _shared_library is None:
+        # Constructing this downloads the dataset, so it must not run at import.
+        _shared_library = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
+    return _shared_library
+
+
 EMOTION_INTENTS: tuple[str, ...] = (
     "random",
     "happy",
@@ -265,8 +277,7 @@ class PlayEmotion(Tool):
 
         try:
             if self._library is None:
-                # Constructing this downloads the dataset, so it must not run at import.
-                self._library = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
+                self._library = emotions_library()
             library = self._library
             emotion_names = library.list_moves()
             if not emotion_names:
