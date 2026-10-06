@@ -103,3 +103,23 @@ def test_prompt_includes_memory_fragment(tmp_path: Path, monkeypatch: pytest.Mon
     assert instructions.startswith("Things you remember about the user")
     assert "- Prefers concise answers" in instructions
     assert "## IDENTITY" in instructions
+
+
+def test_the_companions_memory_file_replaces_the_apps_own(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensouled C3: the companion supervisor writes the memory block; the app prepends it."""
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    clear_memory_facts(tmp_path)
+    add_memory_fact(tmp_path, "Prefers concise answers")
+    block = tmp_path / "session-memory.md"
+    block.write_text("## Your memory\nThe plant is by my left antenna.\n")
+    monkeypatch.setenv("REACHY_COMPANION_SESSION_MEMORY", str(block))
+
+    instructions = prompts_mod.get_session_instructions(instance_path=tmp_path)
+
+    assert instructions.startswith("## Your memory\nThe plant is by my left antenna.\n\n")
+    assert "Prefers concise answers" not in instructions
+    assert "## IDENTITY" in instructions
+
+    block.unlink()  # no memories yet: no block, and still not the app's own
+    instructions = prompts_mod.get_session_instructions(instance_path=tmp_path)
+    assert not instructions.startswith("Things you remember")
