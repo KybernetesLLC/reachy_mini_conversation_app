@@ -1,5 +1,6 @@
 """Resolve active profile prompts and voice settings."""
 
+import os
 import random
 import logging
 from pathlib import Path
@@ -33,6 +34,19 @@ def _active_profile() -> ProfileDefinition:
     return read_profile(config.REACHY_MINI_CUSTOM_PROFILE)
 
 
+# The companion supervisor keeps the robot's memory and writes it as one block,
+# read at each session start in place of the app's own memory.v1.json facts.
+COMPANION_MEMORY_ENV = "REACHY_COMPANION_SESSION_MEMORY"
+
+
+def _companion_memory() -> str:
+    try:
+        return Path(os.environ[COMPANION_MEMORY_ENV]).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        logger.info("No companion memory block: %s", exc)
+        return ""
+
+
 def get_session_instructions(instance_path: str | Path | None = None) -> str:
     """Return instructions for the active profile with memory context."""
     selected_profile = config.REACHY_MINI_CUSTOM_PROFILE
@@ -53,7 +67,9 @@ def get_session_instructions(instance_path: str | Path | None = None) -> str:
     if not instructions:
         raise RuntimeError("Default profile has no usable instructions")
 
-    memory_prompt = format_memory_for_prompt(instance_path)
+    memory_prompt = (
+        _companion_memory() if COMPANION_MEMORY_ENV in os.environ else format_memory_for_prompt(instance_path)
+    )
     if memory_prompt:
         return f"{memory_prompt}\n\n{instructions}"
     return instructions
