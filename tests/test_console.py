@@ -2366,3 +2366,40 @@ def test_an_ordinary_start_starts_both_pipelines(monkeypatch: pytest.MonkeyPatch
     stream = LocalStream(MagicMock(), robot)
     stream._start_media_if_wanted()
     assert robot.media.start_recording.called and robot.media.start_playing.called
+
+
+class _FakeEmotions:
+    """A recorded-moves library with one short emotion."""
+
+    def list_moves(self) -> list[str]:
+        return ["inquiring2"]
+
+    def get(self, name: str) -> Any:
+        return SimpleNamespace(duration=1.0, evaluate=lambda t: (np.eye(4), (0.0, 0.0), 0.0))
+
+
+def test_a_cue_over_rpc_queues_the_named_emotion_silently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """conversation.cue queues the recorded motion, as play_emotion does, and nothing else."""
+    from reachy_mini_conversation_app.tools import play_emotion
+
+    monkeypatch.setattr(play_emotion, "emotions_library", lambda: _FakeEmotions())
+    _stream, manager, app = _pose_stream()
+
+    resp = _rpc_call(app, "conversation.cue", {"name": "inquiring2"})
+
+    assert resp["result"] == {"queued": "inquiring2"}
+    _drive_manager(manager)
+    assert manager.state.current_move.emotion_name == "inquiring2"
+
+
+def test_an_unknown_cue_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unknown name queues nothing and says why."""
+    from reachy_mini_conversation_app.tools import play_emotion
+
+    monkeypatch.setattr(play_emotion, "emotions_library", lambda: _FakeEmotions())
+    _stream, manager, app = _pose_stream()
+
+    resp = _rpc_call(app, "conversation.cue", {"name": "no-such-move"})
+
+    assert resp["error"]["data"]["reason"] == "unknown_cue"
+    assert len(manager.move_queue) == 0

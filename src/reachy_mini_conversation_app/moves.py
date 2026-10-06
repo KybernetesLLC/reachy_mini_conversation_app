@@ -52,7 +52,10 @@ from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
 logger = logging.getLogger(__name__)
 
 # Configuration constants
-CONTROL_LOOP_FREQUENCY_HZ = 60.0  # Hz - Target frequency for the movement control loop
+CONTROL_LOOP_FREQUENCY_HZ = 60.0
+HOLD_RETURN_SECONDS = (
+    0.8  # the companion: back to a hold a move set aside  # Hz - Target frequency for the movement control loop
+)
 
 # Type definitions
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
@@ -392,6 +395,9 @@ class MovementManager:
         self._antenna_blend_duration = 0.4  # seconds to blend back after listening
         self._last_listening_blend_time = self._now()
         self._breathing_active = False  # true when breathing move is running or queued
+        # The companion (R-39): a hold set aside by a queued move, as (head pose,
+        # antennas, body yaw), held again once the queue drains.
+        self._held_aside: tuple[NDArray[np.float64], Tuple[float, float], float] | None = None
         # The companion (decision 026): a turn asked for while no breathing is
         # current, as (yaw, duration); applied when breathing next becomes current.
         self._pending_turn: Tuple[float, float] | None = None
@@ -462,7 +468,9 @@ class MovementManager:
         self._command_queue.put(("release_hold", None))
 
     def is_holding(self) -> bool:
-        """Return True while a HoldPoseMove is the current or a queued move."""
+        """Return True while a HoldPoseMove is the current or a queued move, or set aside."""
+        if self._held_aside is not None:
+            return True
         if isinstance(self.state.current_move, HoldPoseMove):
             return True
         return any(isinstance(move, HoldPoseMove) for move in tuple(self.move_queue))
@@ -568,6 +576,7 @@ class MovementManager:
                 interpolation_start_body_yaw=start_body_yaw,
             )
             self._pending_turn = None  # the hold's own body yaw wins
+            self._held_aside = None
             self.move_queue.clear()
             self.state.current_move = None
             self.state.move_start_time = None
@@ -577,6 +586,7 @@ class MovementManager:
             logger.info("Holding pose, interpolating over %.2fs", duration)
         elif command == "release_hold":
             if self.is_holding():
+                self._held_aside = None
                 if self._is_listening:
                     # The freeze's own snapshot predates the hold and was never
                     # updated during it (the hold bypasses this freeze entirely
@@ -682,6 +692,23 @@ class MovementManager:
 
     def _manage_move_queue(self, current_time: float) -> None:
         """Manage the primary move queue (sequential execution)."""
+        if (
+            isinstance(self.state.current_move, HoldPoseMove)
+            and self.move_queue
+            and not isinstance(self.move_queue[0], HoldPoseMove)
+        ):
+            # The companion (R-39): a hold never ends, so a move the model asked
+            # for would wait behind it forever. Set the hold aside, run the move,
+            # and hold it again after (2026-10-06, move_head did nothing).
+            hold = self.state.current_move
+            self._held_aside = (
+                np.asarray(hold.target_head_pose, dtype=np.float64).copy(),
+                (float(hold.target_antennas[0]), float(hold.target_antennas[1])),
+                float(hold.target_body_yaw),
+            )
+            self.state.current_move = None
+            self.state.move_start_time = None
+            logger.info("A move sets the held pose aside; it is held again afterwards")
         if self.state.current_move is None or (
             self.state.move_start_time is not None
             and current_time - self.state.move_start_time >= self.state.current_move.duration
@@ -689,6 +716,21 @@ class MovementManager:
             self.state.current_move = None
             self.state.move_start_time = None
 
+            if not self.move_queue and self._held_aside is not None:
+                head, antennas, body_yaw = self._held_aside
+                self._held_aside = None
+                start_head, start_antennas, start_yaw = self._last_commanded_pose
+                self.move_queue.append(
+                    HoldPoseMove(
+                        target_head_pose=head,
+                        target_antennas=antennas,
+                        interpolation_start_pose=start_head.copy(),
+                        interpolation_start_antennas=start_antennas,
+                        interpolation_duration=HOLD_RETURN_SECONDS,
+                        target_body_yaw=body_yaw,
+                        interpolation_start_body_yaw=start_yaw,
+                    )
+                )
             if self.move_queue:
                 self.state.current_move = self.move_queue.popleft()
                 self.state.move_start_time = current_time
