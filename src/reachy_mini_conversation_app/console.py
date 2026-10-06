@@ -141,8 +141,11 @@ _PREROLL_POLL_INTERVAL_S = 0.01
 
 
 def _anchor_ago(value: object) -> float | None:
-    """conversation.session's ``preroll_anchor_ago``: seconds since the wake word
-    peaked, as the opener measured them. Anything unusable means no anchor."""
+    """Read conversation.session's ``preroll_anchor_ago``.
+
+    Seconds since the wake word peaked, as the opener measured them. Anything
+    unusable means no anchor.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     ago = float(value)
