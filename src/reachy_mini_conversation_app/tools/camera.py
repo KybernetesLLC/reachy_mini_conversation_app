@@ -43,7 +43,7 @@ def _light_log() -> Path:
 
 
 def _room_luma() -> Optional[float]:
-    """The companion's last light reading, if recent: its own camera's mean luma."""
+    """Return the companion's last light reading if recent: its camera's mean luma."""
     try:
         lines = _light_log().read_text().splitlines()
         header, last = lines[0].split(","), lines[-1].split(",")
@@ -59,7 +59,8 @@ def _fresh_frame(media: Any) -> Tuple[Optional[bytes], Optional[float]]:
     """Reopen the IPC camera and return (JPEG, the frame's mean luma).
 
     Runs in a worker thread: opening waits for the pipeline. A camera that is
-    not the IPC reader is read as before, with no luma."""
+    not the IPC reader is read as before, with no luma.
+    """
     old = getattr(media, "camera", None)
     if not _REOPENABLE or not isinstance(old, _REOPENABLE):
         return media.get_frame_jpeg(), None
