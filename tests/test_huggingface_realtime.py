@@ -1145,8 +1145,7 @@ async def test_a_camera_picture_is_noted_after_the_spoken_answer(monkeypatch: An
 
 @pytest.mark.asyncio
 async def test_a_sight_note_waits_for_a_quiet_moment(monkeypatch: Any) -> None:
-    """Never between a person's last word and the reply: nobody speaking for two
-    seconds, and no response active."""
+    """Never between a person's last word and the reply: two quiet seconds, no response active."""
     handler = _plain_handler()
     handler.connection = AsyncMock()
     create = AsyncMock()
