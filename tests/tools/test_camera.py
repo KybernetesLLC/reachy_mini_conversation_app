@@ -95,13 +95,17 @@ class FakeCamera:
         value = self.frames.pop(0) if self.frames else None
         return None if value is None else np.full((4, 4, 3), value, dtype=np.uint8)
 
-    def read_jpeg(self) -> bytes:
-        return b"\xff\xd8fresh\xff\xd9"
+    def read_jpeg(self) -> bytes | None:
+        # As the SDK's does: a second read() (the review, 2026-10-07).
+        frame = self.read()
+        return None if frame is None else b"\xff\xd8fresh\xff\xd9"
 
 
 def _deps(monkeypatch, tmp_path, *, stale: FakeCamera, room_luma: float | None):
     FakeCamera.made = [stale]
     monkeypatch.setattr(camera_mod, "_REOPENABLE", (FakeCamera,))
+    # The frame measured is the frame encoded.
+    monkeypatch.setattr(camera_mod, "_encode", lambda camera, frame: b"\xff\xd8fresh\xff\xd9")
     monkeypatch.setattr(camera_mod, "FRAME_WAIT_SECONDS", 0.05)
     light = tmp_path / "light.csv"
     if room_luma is not None:
@@ -154,3 +158,58 @@ async def test_a_dark_frame_in_a_dark_room_is_sent(monkeypatch, tmp_path) -> Non
     result = await Camera()(deps, question="what do you see")
 
     assert "b64_im" in result
+
+
+def test_the_jpeg_is_the_frame_that_was_measured(monkeypatch) -> None:
+    """The review, 2026-10-07: read_jpeg read a second frame, often none at all."""
+    stale = FakeCamera.__new__(FakeCamera)
+    stale.camera_specs, stale.frames, stale.closed = None, [], False
+    FakeCamera.made = [stale]
+    FakeCamera.scripts = [[None, 91.0]]  # one frame, then the buffer is empty
+    monkeypatch.setattr(camera_mod, "_REOPENABLE", (FakeCamera,))
+    monkeypatch.setattr(camera_mod, "FRAME_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(camera_mod, "_encode", lambda camera, frame: f"jpeg:{frame.mean():.0f}".encode())
+    media = MagicMock()
+    media.camera = stale
+
+    jpeg, luma = camera_mod._fresh_frame(media)
+
+    assert jpeg == b"jpeg:91" and luma == 91.0
+
+
+def test_two_fresh_frames_at_once_never_share_or_leak_a_camera(monkeypatch) -> None:
+    """The review, 2026-10-07: the tool and a glance could both reopen the camera."""
+    import threading
+    import time as _time
+
+    open_now = {"n": 0, "most": 0}
+
+    class Slow(FakeCamera):
+        def open(self) -> None:
+            open_now["n"] += 1
+            open_now["most"] = max(open_now["most"], open_now["n"])
+            _time.sleep(0.05)
+            self.opened = True
+
+        def close(self) -> None:
+            if getattr(self, "opened", False) and not self.closed:
+                open_now["n"] -= 1
+            self.closed = True
+
+    stale = Slow.__new__(Slow)
+    stale.camera_specs, stale.frames, stale.closed, stale.opened = None, [], False, False
+    FakeCamera.made = [stale]
+    FakeCamera.scripts = [[91.0], [92.0]]
+    monkeypatch.setattr(camera_mod, "_REOPENABLE", (Slow,))
+    monkeypatch.setattr(camera_mod, "_encode", lambda camera, frame: b"j")
+    media = MagicMock()
+    media.camera = stale
+
+    threads = [threading.Thread(target=camera_mod._fresh_frame, args=(media,)) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert open_now["most"] == 1
+    assert [c.closed for c in FakeCamera.made[1:-1]] == [True]  # only the newest is left open

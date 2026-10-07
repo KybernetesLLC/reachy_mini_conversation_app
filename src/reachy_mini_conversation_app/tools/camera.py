@@ -4,6 +4,7 @@ import base64
 import asyncio
 import logging
 import datetime
+import threading
 from typing import Any, Dict, Tuple, Optional
 from pathlib import Path
 
@@ -55,7 +56,40 @@ def _room_luma() -> Optional[float]:
         return None
 
 
+# One reopen at a time: the camera tool and a glance may both want a frame, and
+# each closes and replaces the shared camera (the review, 2026-10-07).
+_CAMERA_LOCK = threading.Lock()
+
+
+def _encode(camera: Any, frame: Any) -> Optional[bytes]:
+    """Encode this frame, the one measured, with the camera's own JPEG encoder.
+
+    The SDK's read_jpeg() reads a second frame from a one-frame buffer the first
+    read just emptied, and often gets none (the review, 2026-10-07). This is its
+    body, given the frame. OpenCV is not in the app's environment on the robot.
+    """
+    from gi.repository import Gst
+
+    from reachy_mini.media.gstreamer_utils import get_sample
+
+    height, width = frame.shape[:2]
+    if camera._jpeg_pipeline is None or camera._jpeg_resolution != (width, height):
+        camera._release_jpeg_encoder()
+        camera._build_jpeg_encoder(width, height)
+    camera._jpeg_pipeline.set_state(Gst.State.PLAYING)
+    camera._jpeg_appsrc.push_buffer(Gst.Buffer.new_wrapped(frame.tobytes()))
+    jpeg = get_sample(camera._jpeg_appsink, camera.logger, timeout_ns=Gst.SECOND)
+    camera._jpeg_pipeline.set_state(Gst.State.PAUSED)
+    return jpeg
+
+
 def _fresh_frame(media: Any) -> Tuple[Optional[bytes], Optional[float]]:
+    """Reopen the IPC camera; return (JPEG, mean luma) of one frame, under the lock."""
+    with _CAMERA_LOCK:
+        return _fresh_frame_held(media)
+
+
+def _fresh_frame_held(media: Any) -> Tuple[Optional[bytes], Optional[float]]:
     """Reopen the IPC camera and return (JPEG, the frame's mean luma).
 
     Runs in a worker thread: opening waits for the pipeline. A camera that is
@@ -79,7 +113,7 @@ def _fresh_frame(media: Any) -> Tuple[Optional[bytes], Optional[float]]:
         frame = camera.read()
     if frame is None:
         return None, None
-    return camera.read_jpeg(), float(np.mean(frame))
+    return _encode(camera, frame), float(np.mean(frame))
 
 
 def fresh_jpeg(media: Any) -> Tuple[Optional[bytes], Optional[float], Optional[str]]:

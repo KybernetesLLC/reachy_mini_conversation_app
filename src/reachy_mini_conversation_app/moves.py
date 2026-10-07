@@ -398,6 +398,8 @@ class MovementManager:
         # The companion (R-39): a hold set aside by a queued move, as (head pose,
         # antennas, body yaw), held again once the queue drains.
         self._held_aside: tuple[NDArray[np.float64], Tuple[float, float], float] | None = None
+        # The body yaw a recorded move is turned by while it plays (None: not turned).
+        self._move_yaw_offset: float | None = None
         # The companion (decision 026): a turn asked for while no breathing is
         # current, as (yaw, duration); applied when breathing next becomes current.
         self._pending_turn: Tuple[float, float] | None = None
@@ -734,6 +736,14 @@ class MovementManager:
             if self.move_queue:
                 self.state.current_move = self.move_queue.popleft()
                 self.state.move_start_time = current_time
+                # A recorded move (an emotion, a dance, a cue) is choreographed
+                # about a body facing front: play it turned by the body's yaw as
+                # it starts, head and body together, so a body facing a person
+                # stays facing them (the companion's review, 2026-10-06).
+                self._move_yaw_offset = None
+                if getattr(self.state.current_move, "relative_to_body", False):
+                    last = self.state.last_primary_pose or self._last_commanded_pose
+                    self._move_yaw_offset = float(last[2]) if last is not None else 0.0
                 # Any real move cancels breathing mode flag
                 self._breathing_active = isinstance(self.state.current_move, BreathingMove)
                 if self._breathing_active and self._pending_turn is not None:
@@ -786,6 +796,11 @@ class MovementManager:
         if self.state.current_move is not None and self.state.move_start_time is not None:
             move_time = current_time - self.state.move_start_time
             head, antennas, body_yaw = self.state.current_move.evaluate(move_time)
+            offset = self._move_yaw_offset
+            if offset is not None:
+                if head is not None:
+                    head = _turned(np.asarray(head, dtype=np.float64), offset)
+                body_yaw = offset + (float(body_yaw) if body_yaw is not None else 0.0)
 
             if head is None:
                 head = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)

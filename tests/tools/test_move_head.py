@@ -9,7 +9,7 @@ from reachy_mini_conversation_app.dance_emotion_moves import GotoQueueMove
 
 def _deps() -> ToolDependencies:
     reachy_mini = MagicMock()
-    reachy_mini.get_current_joint_positions.return_value = (0.0, (0.1, 0.2))
+    reachy_mini.get_current_joint_positions.return_value = ([0.5] + [0.0] * 6, (0.1, 0.2))
     return ToolDependencies(reachy_mini=reachy_mini, movement_manager=MagicMock())
 
 
@@ -39,3 +39,18 @@ async def test_move_head_reports_robot_failure() -> None:
     result = await MoveHead()(deps, direction="up")
     assert "error" in result
     assert "RuntimeError" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_looking_right_is_from_where_the_body_faces() -> None:
+    """The review of 2026-10-06: the move took an antenna angle for the start yaw and
+    sent the body to 0; a turned body must stay turned, the head 40 degrees off it."""
+    import numpy as np
+
+    deps = _deps()  # body yaw 0.5
+    await MoveHead()(deps, direction="right")
+    move = deps.movement_manager.queue_move.call_args.args[0]
+    assert move.start_body_yaw == pytest.approx(0.5)
+    assert move.target_body_yaw == pytest.approx(0.5)
+    head_yaw = float(np.arctan2(move.target_head_pose[1, 0], move.target_head_pose[0, 0]))
+    assert head_yaw == pytest.approx(0.5 - np.radians(40), abs=1e-6)

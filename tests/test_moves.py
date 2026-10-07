@@ -725,3 +725,41 @@ def test_a_new_hold_or_a_release_replaces_the_one_set_aside() -> None:
     manager._update_primary_motion(t + 1.3)
     assert not isinstance(manager.state.current_move, HoldPoseMove)
     assert not manager.is_holding()
+
+
+# --- the review of 2026-10-06: a recorded move keeps the body's facing --------------
+
+
+from reachy_mini.motion.move import Move  # noqa: E402
+
+
+class _FrontFacingMove(Move):  # type: ignore[misc]
+    """A recorded move as the library holds one: about a body facing front."""
+
+    relative_to_body = True
+
+    @property
+    def duration(self) -> float:
+        return 1.0
+
+    def evaluate(self, t: float):
+        return create_head_pose(0, 0, 0, 0, 10, 0, degrees=True), np.array([0.3, -0.3]), 0.0
+
+
+def test_a_recorded_move_turns_with_the_body_it_starts_on() -> None:
+    """Facing a person at +0.7 rad, an emotion or a cue must not swing the body to
+    the front and back (it did, at every wake word)."""
+    manager = MovementManager(_robot(0.7))
+    manager._seed_from_robot()
+    t = manager._now()
+    attentive = create_head_pose(0, 0, 0, 0, -6, 0, degrees=True)
+    manager._handle_command("hold_pose", (attentive, (-0.4, 0.4), 0.8, 0.7), t)
+    manager._update_primary_motion(t)
+    manager._update_primary_motion(t + 1.0)  # the hold has arrived
+    manager._handle_command("queue_move", _FrontFacingMove(), t + 1.1)
+    manager._update_primary_motion(t + 1.2)
+
+    head, _antennas, body_yaw = manager._get_primary_pose(t + 1.3)
+    assert body_yaw == pytest.approx(0.7)
+    yaw = float(np.arctan2(head[1, 0], head[0, 0]))
+    assert yaw == pytest.approx(0.7, abs=1e-6)  # the head turns with the body
