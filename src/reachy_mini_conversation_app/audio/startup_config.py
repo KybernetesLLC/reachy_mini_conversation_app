@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 import logging
+import tomllib
+from pathlib import Path
 from collections.abc import Sequence
+
+from reachy_mini_conversation_app.config import config
 
 
 AudioControlValue = float | int
 AudioStartupParameter = tuple[str, tuple[AudioControlValue, ...]]
 WRITE_SETTLE_SECONDS = 0.1
+# A file beside the active profile's profile.md: parameter names to values, TOML.
+# Its entries replace or add to AUDIO_STARTUP_CONFIG. The companion's household
+# tunes the mic's own processing there (2026-10-07: one voice reached the
+# backend 12-15 dB quieter than the other, and the mic's gain control is the lever).
+AUDIO_OVERRIDES_FILE = "audio.toml"
 
 AUDIO_STARTUP_CONFIG: tuple[AudioStartupParameter, ...] = (
     ("PP_AGCMAXGAIN", (10.0,)),
@@ -20,16 +29,54 @@ AUDIO_STARTUP_CONFIG: tuple[AudioStartupParameter, ...] = (
 )
 
 
+def default_overrides_path() -> Path | None:
+    """The active custom profile's audio.toml, if a custom profile is selected."""
+    profile = config.REACHY_MINI_CUSTOM_PROFILE
+    if not profile:
+        return None
+    return config.resolve_profile_dir(profile) / AUDIO_OVERRIDES_FILE
+
+
+def load_overrides(path: Path | None, log: logging.Logger) -> tuple[AudioStartupParameter, ...]:
+    """Read `path` as parameter overrides; an absent file is none, a bad one is none with a warning."""
+    if path is None or not path.is_file():
+        return ()
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        overrides: list[AudioStartupParameter] = []
+        for name, value in raw.items():
+            values = value if isinstance(value, list) else [value]
+            if not values or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+                raise ValueError(f"{name}: values must be numbers")
+            overrides.append((str(name), tuple(values)))
+        return tuple(overrides)
+    except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+        log.warning("Ignoring %s: %s", path, exc)
+        return ()
+
+
+def merged_config(overrides: Sequence[AudioStartupParameter]) -> tuple[AudioStartupParameter, ...]:
+    """AUDIO_STARTUP_CONFIG with `overrides` replacing matching names, new names appended."""
+    by_name = dict(overrides)
+    merged = [(name, by_name.pop(name, values)) for name, values in AUDIO_STARTUP_CONFIG]
+    merged.extend(by_name.items())
+    return tuple(merged)
+
+
 def apply_audio_startup_config(
     robot: object,
     *,
     logger: logging.Logger | None = None,
     verify: bool = True,
     write_settle_seconds: float = WRITE_SETTLE_SECONDS,
+    overrides_path: Path | None = None,
 ) -> bool:
     """Apply the tuned XVF3800 audio configuration for the conversation app."""
     log = logger or logging.getLogger(__name__)
     audio = getattr(getattr(robot, "media", None), "audio", None)
+    startup_config = merged_config(
+        load_overrides(overrides_path if overrides_path is not None else default_overrides_path(), log)
+    )
 
     if audio is None:
         log.warning("Skipping Reachy audio startup config: robot media audio is unavailable.")
@@ -43,7 +90,7 @@ def apply_audio_startup_config(
     try:
         applied = bool(
             apply_audio_config(
-                AUDIO_STARTUP_CONFIG,
+                startup_config,
                 verify=verify,
                 write_settle_seconds=write_settle_seconds,
             )
@@ -53,7 +100,7 @@ def apply_audio_startup_config(
         return False
 
     if applied:
-        log.info("Applied Reachy audio startup config: %s", _format_config(AUDIO_STARTUP_CONFIG))
+        log.info("Applied Reachy audio startup config: %s", _format_config(startup_config))
     else:
         log.warning("Reachy audio startup config was not applied.")
 
