@@ -497,6 +497,26 @@ class LocalStream:
         self._session_wanted.set()
         self._session_gate_changed.set()
 
+    async def _on_handler_loop(self, coro: Any) -> Any:
+        """Run `coro` on the handler's own loop, from any loop.
+
+        The realtime session, its websocket and its queues live on the loop
+        `run()` starts; RPC handlers run on the Apps runtime's loop. A send from
+        there wrote the SSL transport from two threads at once: Python saw
+        "IndexError: deque index out of range" in sslproto and the connection
+        dropped (the say defect, plan 3), and OpenSSL's state was corrupted
+        under it, which ended the app with "malloc(): unsorted double linked
+        list corrupted" after a glance five times on 2026-10-07.
+        """
+        loop = self._asyncio_loop
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        if loop is None or loop is current or not loop.is_running():
+            return await coro
+        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, loop))
+
     async def glance(self) -> dict[str, object]:
         """Add one fresh camera frame to the live session, with no response.
 
@@ -518,12 +538,17 @@ class LocalStream:
         if jpeg is None:
             return {"glanced": False, "reason": why_not or "no frame"}
         b64 = base64.b64encode(jpeg).decode("ascii")
-        await add_image(b64)
-        logger.info("Glance: a frame added to the session (luma %s)", luma)
         note_image = getattr(self.handler, "note_image", None)
-        if callable(note_image):
-            # The inner monologue (2026-10-07): a note to itself of the same frame.
-            await note_image(b64)
+
+        async def send() -> None:
+            await add_image(b64)
+            logger.info("Glance: a frame added to the session (luma %s)", luma)
+            if callable(note_image):
+                # The inner monologue (2026-10-07): a note to itself of the same frame.
+                await note_image(b64)
+
+        # The sends go on the handler's loop: this runs on the RPC server's.
+        await self._on_handler_loop(send())
         return {"glanced": True}
 
     async def close_session(self, timeout: float = 15.0) -> bool:
@@ -884,7 +909,7 @@ class LocalStream:
             if not self.handler._is_connected():
                 raise JsonRpcError("no active session", reason="not_running")
             self.clear_audio_queue()  # barge in if mid-utterance
-            await self.handler.say(text)
+            await self._on_handler_loop(self.handler.say(text))
             return {"ok": True}
 
         @rpc.method("conversation.interrupt")  # type: ignore[untyped-decorator]

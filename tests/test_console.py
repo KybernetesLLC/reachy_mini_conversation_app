@@ -2601,3 +2601,113 @@ async def test_a_glance_also_asks_for_a_sight_note(monkeypatch: pytest.MonkeyPat
 
     b64 = base64.b64encode(b"jpg").decode()
     assert events == [f"image:{b64}", f"note:{b64}"]
+
+
+# --- the crash of 2026-10-07: sends from an RPC handler go on the handler's loop ----
+
+
+def _loop_in_a_thread() -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    return loop, thread
+
+
+def _stop_loop(loop: asyncio.AbstractEventLoop, thread: threading.Thread) -> None:
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(2.0)
+
+
+@pytest.mark.asyncio
+async def test_a_glance_sends_on_the_handlers_loop_from_another_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The glance RPC runs on the Apps runtime's loop; the websocket lives on the stream's.
+
+    Writing it from both corrupted OpenSSL's state (five aborts, 2026-10-07).
+    """
+    events: list[str] = []
+    seen: list[asyncio.AbstractEventLoop] = []
+    handler = _GlanceHandler(events)
+
+    async def add_image(b64: str) -> None:
+        seen.append(asyncio.get_running_loop())
+        events.append(f"image:{b64}")
+
+    async def note_image(b64: str) -> None:
+        seen.append(asyncio.get_running_loop())
+        events.append(f"note:{b64}")
+
+    handler.add_image = add_image
+    handler.note_image = note_image
+    handler.deps = SimpleNamespace(camera_enabled=True)
+    handler.connection = object()
+    stream = LocalStream(handler, SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    _fake_frames(monkeypatch, (b"jpg", 91.0, None))
+    try:
+        assert (await stream.glance())["glanced"] is True
+    finally:
+        _stop_loop(loop, thread)
+    b64 = base64.b64encode(b"jpg").decode()
+    assert events == [f"image:{b64}", f"note:{b64}"]
+    assert seen == [loop, loop] and loop is not asyncio.get_running_loop()
+
+
+@pytest.mark.asyncio
+async def test_a_send_on_the_handlers_own_loop_or_with_none_runs_inline() -> None:
+    """No hop when the loop is this one, or none is recorded yet."""
+    stream = LocalStream(_FakeSessionHandler(), SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))
+    seen: list[asyncio.AbstractEventLoop] = []
+
+    async def coro() -> str:
+        seen.append(asyncio.get_running_loop())
+        return "done"
+
+    assert await stream._on_handler_loop(coro()) == "done"  # no loop recorded yet
+    stream._asyncio_loop = asyncio.get_running_loop()
+    assert await stream._on_handler_loop(coro()) == "done"  # the same loop
+    assert seen == [asyncio.get_running_loop()] * 2
+
+
+@pytest.mark.asyncio
+async def test_say_from_the_rpc_runs_on_the_handlers_loop() -> None:
+    """The say defect (plan 3): a send from another loop ended sessions."""
+    seen: list[asyncio.AbstractEventLoop] = []
+    handler = _FakeSessionHandler()
+    handler.connection = object()
+    handler._is_connected = lambda: True
+
+    async def say(text: str) -> None:
+        seen.append(asyncio.get_running_loop())
+
+    handler.say = say
+    stream = LocalStream(handler, SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))
+    stream.clear_audio_queue = lambda: None
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    try:
+        await stream._on_handler_loop(handler.say("hello"))
+    finally:
+        _stop_loop(loop, thread)
+    assert seen == [loop]
+
+
+def test_say_over_the_rpc_server_runs_on_the_streams_loop() -> None:
+    """The RPC server's loop is the TestClient's here; the stream's loop runs in a thread."""
+    stream, _manager, app = _pose_stream()
+    seen: list[asyncio.AbstractEventLoop] = []
+
+    async def say(text: str) -> None:
+        seen.append(asyncio.get_running_loop())
+
+    stream.handler.say = say
+    stream.handler._is_connected = lambda: True
+    stream.clear_audio_queue = lambda: None
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    try:
+        response = _rpc_call(app, "conversation.say", {"text": "hello"})
+    finally:
+        _stop_loop(loop, thread)
+    assert response.get("result") == {"ok": True}
+    assert seen == [loop]
