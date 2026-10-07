@@ -2579,3 +2579,25 @@ def test_the_cue_loads_the_library_off_the_apps_loop(monkeypatch: pytest.MonkeyP
     _stream, _manager, app = _pose_stream()
     assert _rpc_call(app, "conversation.cue", {"name": "inquiring2"})["result"] == {"queued": "inquiring2"}
     assert threads == ["off the loop"]
+
+
+@pytest.mark.asyncio
+async def test_a_glance_also_asks_for_a_sight_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The inner monologue (2026-10-07): the same frame, a note to itself."""
+    events: list[str] = []
+    handler = _GlanceHandler(events)
+    handler.deps = SimpleNamespace(camera_enabled=True)
+
+    async def note_image(b64: str) -> None:
+        events.append(f"note:{b64}")
+
+    handler.note_image = note_image
+    handler.connection = object()
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    stream = LocalStream(handler, robot)
+    _fake_frames(monkeypatch, (b"jpg", 91.0, None))
+
+    assert (await stream.glance())["glanced"] is True
+
+    b64 = base64.b64encode(b"jpg").decode()
+    assert events == [f"image:{b64}", f"note:{b64}"]

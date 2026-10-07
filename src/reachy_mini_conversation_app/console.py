@@ -517,8 +517,13 @@ class LocalStream:
         jpeg, luma, why_not = await asyncio.to_thread(camera_tool.fresh_jpeg, self._robot.media)
         if jpeg is None:
             return {"glanced": False, "reason": why_not or "no frame"}
-        await add_image(base64.b64encode(jpeg).decode("ascii"))
+        b64 = base64.b64encode(jpeg).decode("ascii")
+        await add_image(b64)
         logger.info("Glance: a frame added to the session (luma %s)", luma)
+        note_image = getattr(self.handler, "note_image", None)
+        if callable(note_image):
+            # The inner monologue (2026-10-07): a note to itself of the same frame.
+            await note_image(b64)
         return {"glanced": True}
 
     async def close_session(self, timeout: float = 15.0) -> bool:

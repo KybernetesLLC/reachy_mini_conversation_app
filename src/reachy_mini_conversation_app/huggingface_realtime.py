@@ -114,6 +114,47 @@ def _build_openai_compatible_client_from_realtime_url(
     return client, parsed.connect_query
 
 
+# The inner monologue (the companion, 2026-10-07): a sight note is an out-of-band,
+# text-only response the backend never threads into the conversation (verified on
+# the hosted backend: conversation_id null, no audio, the chat untouched). It is
+# tagged so the receiver knows it from speech, and its text goes to the transcript
+# observer as "inner", never to the speaker. The frame is one already taken.
+SIGHT_NOTE_TAG = {"companion": "sight-note"}
+SIGHT_NOTE_INSTRUCTIONS = (
+    "You are Reachy, a small companion robot. This is a private note to yourself, not speech. "
+    "In one or two short sentences, first person, past tense, beginning 'I saw', say what is "
+    "notable in the picture: people (never named), what they hold or do, the room, the view "
+    "out of a window. No preamble."
+)
+
+
+def sight_note_request(b64_jpeg: str) -> dict[str, Any]:
+    """The response.create body for a sight note of `b64_jpeg`."""
+    return {
+        "conversation": "none",
+        "output_modalities": ["text"],
+        "metadata": dict(SIGHT_NOTE_TAG),
+        "instructions": SIGHT_NOTE_INSTRUCTIONS,
+        "tool_choice": "none",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64_jpeg}"},
+                    {"type": "input_text", "text": "What do you see?"},
+                ],
+            }
+        ],
+    }
+
+
+def _is_sight_note(event: Any) -> bool:
+    """Whether a response.created/done event is a sight note's (its metadata tag)."""
+    metadata = getattr(getattr(event, "response", None), "metadata", None)
+    return isinstance(metadata, dict) and metadata.get("companion") == SIGHT_NOTE_TAG["companion"]
+
+
 class HuggingFaceRealtimeHandler(ConversationHandler):
     """Realtime stream handler for the Hugging Face OpenAI-compatible endpoint."""
 
@@ -163,6 +204,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
+        self._sight_note_in_flight = False
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -467,6 +509,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             },
         )
 
+    async def note_image(self, b64_jpeg: str) -> None:
+        """Ask for a sight note of a frame already in the session (the companion's
+        glance, or the camera tool's picture). Queued through the serial sender, so
+        it waits behind, and never interrupts, a spoken response."""
+        if not self.connection:
+            raise RuntimeError("note_image: no active session")
+        await self._safe_response_create(response=sight_note_request(b64_jpeg))
+
     async def _send_startup_greeting_prompt(self) -> None:
         """Prompt the model to open the conversation once the session is ready."""
         if self._startup_greeting_sent or not self.connection:
@@ -658,12 +708,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 ),
             )
 
+            sight_note: str | None = None
             if model_result_submitted and completed_tool.tool_name == "camera" and "b64_im" in tool_result:
                 # use raw base64, don't json.dumps (which adds quotes)
                 b64_im = tool_result["b64_im"]
                 if not isinstance(b64_im, str):
                     logger.warning("Unexpected type for b64_im: %s", type(b64_im))
                     b64_im = str(b64_im)
+                sight_note = b64_im
                 image_width = tool_result.get("image_width")
                 image_height = tool_result.get("image_height")
                 jpeg_bytes_value = tool_result.get("jpeg_bytes")
@@ -705,6 +757,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if self._tool_batch_needs_response and not self._in_flight_tool_calls:
                 self._tool_batch_needs_response = False
                 await self._safe_response_create()
+            if sight_note is not None:
+                # Queued after the spoken answer, so it never delays it.
+                await self.note_image(sight_note)
 
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
@@ -780,23 +835,38 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("response text delta")
 
                     if event.type == "response.output_text.done":
-                        logger.debug("response text done: %s", event.text)
+                        if self._sight_note_in_flight:
+                            # The note's text: to the observer as "inner", never spoken.
+                            note_text = (getattr(event, "text", "") or "").strip()
+                            if note_text:
+                                self._emit_transcript("inner", note_text)
+                            logger.info("Sight note: %s", note_text)
+                        else:
+                            logger.debug("response text done: %s", event.text)
 
                     if event.type == "response.created":
-                        self._mark_activity("response_created")
-                        self.deps.movement_manager.set_speaking(True)
                         self._response_done_event.clear()
                         self._response_started_or_rejected_event.set()
-                        if self._turn_user_done_at is not None and self._turn_response_created_at is None:
-                            self._turn_response_created_at = time.perf_counter()
-                            delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
-                            logger.info("Turn latency: response.created %.0f ms after user transcript", delta_ms)
-                        logger.debug("Response created (active)")
+                        if _is_sight_note(event):
+                            # A note moves nothing and is not conversation activity.
+                            self._sight_note_in_flight = True
+                            logger.debug("Sight note started")
+                        else:
+                            self._mark_activity("response_created")
+                            self.deps.movement_manager.set_speaking(True)
+                            if self._turn_user_done_at is not None and self._turn_response_created_at is None:
+                                self._turn_response_created_at = time.perf_counter()
+                                delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
+                                logger.info("Turn latency: response.created %.0f ms after user transcript", delta_ms)
+                            logger.debug("Response created (active)")
 
                     if event.type == "response.done":
                         # Doesn't mean the audio is done playing
                         # Resume tracking for responses that emit no audio (text-only / tool-only).
-                        self.deps.movement_manager.set_speaking(False)
+                        if self._sight_note_in_flight:
+                            self._sight_note_in_flight = False
+                        else:
+                            self.deps.movement_manager.set_speaking(False)
                         self._response_done_event.set()
                         self._response_started_or_rejected_event.set()
                         logger.debug("Response done")

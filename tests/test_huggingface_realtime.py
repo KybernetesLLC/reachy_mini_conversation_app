@@ -1051,3 +1051,87 @@ async def test_handler_reopens_a_session_after_closing_a_live_connection(monkeyp
     assert handler.tool_manager._lifecycle_tasks == []
     # And it did not greet, which is what closes the plan 3 defect.
     assert greetings == ["greeted"]
+
+
+# --- the inner monologue (2026-10-07): sight notes ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_sight_note_is_out_of_band_text_only_and_tagged(monkeypatch: Any) -> None:
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+
+    await handler.note_image("abc")
+
+    (request,) = [c.kwargs["response"] for c in create.await_args_list]
+    assert request["conversation"] == "none" and request["output_modalities"] == ["text"]
+    assert request["metadata"] == {"companion": "sight-note"} and request["tool_choice"] == "none"
+    assert request["input"][0]["content"][0] == {
+        "type": "input_image",
+        "image_url": "data:image/jpeg;base64,abc",
+    }
+    assert "beginning 'I saw'" in request["instructions"]
+
+
+@pytest.mark.asyncio
+async def test_a_sight_note_needs_a_session() -> None:
+    handler = _plain_handler()
+    handler.connection = None
+    with pytest.raises(RuntimeError):
+        await handler.note_image("abc")
+
+
+@pytest.mark.asyncio
+async def test_a_sight_notes_text_goes_to_the_observer_as_inner_and_moves_nothing(monkeypatch: Any) -> None:
+    from types import SimpleNamespace
+
+    note = SimpleNamespace(metadata={"companion": "sight-note"}, conversation_id=None)
+    spoken = SimpleNamespace(metadata=None, conversation_id="conv_1")
+    handler = _session_handler(
+        monkeypatch,
+        events=(
+            _FakeEvent("response.created", response=note),
+            _FakeEvent("response.output_text.done", text="I saw a red mug on the table. "),
+            _FakeEvent("response.done", response=note),
+            _FakeEvent("response.created", response=spoken),
+            _FakeEvent("response.output_text.done", text="a spoken response's text is only logged"),
+            _FakeEvent("response.done", response=spoken),
+        ),
+    )
+    seen: list[tuple[str, str, bool]] = []
+    handler.set_transcript_observer(lambda role, text, final: seen.append((role, text, final)))
+
+    await handler._run_realtime_session()
+
+    assert seen == [("inner", "I saw a red mug on the table.", True)]
+    speaking = [c.args[0] for c in handler.deps.movement_manager.set_speaking.call_args_list]
+    assert speaking == [True, False]  # only the spoken response moved the body
+
+
+@pytest.mark.asyncio
+async def test_a_camera_picture_is_noted_after_the_spoken_answer(monkeypatch: Any) -> None:
+    from reachy_mini_conversation_app.huggingface_realtime import sight_note_request
+
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    handler._in_flight_tool_calls = {"cam"}
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="cam",
+            tool_name="camera",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"b64_im": "abc"},
+        )
+    )
+
+    items = [c.kwargs["item"] for c in handler.connection.conversation.item.create.await_args_list]
+    assert items[-1]["content"] == [{"type": "input_image", "image_url": "data:image/jpeg;base64,abc"}]
+    assert [c.kwargs for c in create.await_args_list] == [{}, {"response": sight_note_request("abc")}]
