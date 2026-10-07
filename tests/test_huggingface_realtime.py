@@ -1058,12 +1058,14 @@ async def test_handler_reopens_a_session_after_closing_a_live_connection(monkeyp
 
 @pytest.mark.asyncio
 async def test_a_sight_note_is_out_of_band_text_only_and_tagged(monkeypatch: Any) -> None:
+    """A note is a response the backend never threads into the conversation."""
     handler = _plain_handler()
     handler.connection = AsyncMock()
     create = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create)
 
     await handler.note_image("abc")
+    await handler._wait_notes()
 
     (request,) = [c.kwargs["response"] for c in create.await_args_list]
     assert request["conversation"] == "none" and request["output_modalities"] == ["text"]
@@ -1077,6 +1079,7 @@ async def test_a_sight_note_is_out_of_band_text_only_and_tagged(monkeypatch: Any
 
 @pytest.mark.asyncio
 async def test_a_sight_note_needs_a_session() -> None:
+    """Without a session there is nothing to note into."""
     handler = _plain_handler()
     handler.connection = None
     with pytest.raises(RuntimeError):
@@ -1085,6 +1088,7 @@ async def test_a_sight_note_needs_a_session() -> None:
 
 @pytest.mark.asyncio
 async def test_a_sight_notes_text_goes_to_the_observer_as_inner_and_moves_nothing(monkeypatch: Any) -> None:
+    """The note's text is an inner transcript; only speech moves the body."""
     from types import SimpleNamespace
 
     note = SimpleNamespace(metadata={"companion": "sight-note"}, conversation_id=None)
@@ -1112,6 +1116,7 @@ async def test_a_sight_notes_text_goes_to_the_observer_as_inner_and_moves_nothin
 
 @pytest.mark.asyncio
 async def test_a_camera_picture_is_noted_after_the_spoken_answer(monkeypatch: Any) -> None:
+    """The camera tool's picture is noted too, queued behind the spoken answer."""
     from reachy_mini_conversation_app.huggingface_realtime import sight_note_request
 
     handler = _plain_handler()
@@ -1132,6 +1137,65 @@ async def test_a_camera_picture_is_noted_after_the_spoken_answer(monkeypatch: An
         )
     )
 
+    await handler._wait_notes()
     items = [c.kwargs["item"] for c in handler.connection.conversation.item.create.await_args_list]
     assert items[-1]["content"] == [{"type": "input_image", "image_url": "data:image/jpeg;base64,abc"}]
     assert [c.kwargs for c in create.await_args_list] == [{}, {"response": sight_note_request("abc")}]
+
+
+@pytest.mark.asyncio
+async def test_a_sight_note_waits_for_a_quiet_moment(monkeypatch: Any) -> None:
+    """Never between a person's last word and the reply: nobody speaking for two
+    seconds, and no response active."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    monkeypatch.setattr(hf_mod, "_NOTE_POLL_SECONDS", 0.01)
+    handler._user_speaking = True
+    handler._last_speech_at = time.monotonic()
+
+    await handler.note_image("abc")
+    await asyncio.sleep(0.05)
+    assert create.await_count == 0  # someone is speaking
+    handler._user_speaking = False
+    await asyncio.sleep(0.05)
+    assert create.await_count == 0  # they stopped less than two seconds ago
+    handler._last_speech_at = time.monotonic() - 3.0
+    handler._response_done_event.clear()
+    await asyncio.sleep(0.05)
+    assert create.await_count == 0  # a response is active
+    handler._response_done_event.set()
+    await handler._wait_notes()
+    assert create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_sight_note_held_too_long_is_dropped(monkeypatch: Any) -> None:
+    """A minute without a quiet moment: the frame is stale, the note is dropped."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    monkeypatch.setattr(hf_mod, "_NOTE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(hf_mod, "NOTE_WAIT_MAX_SECONDS", 0.05)
+    handler._user_speaking = True
+
+    await handler.note_image("abc")
+    await handler._wait_notes()
+    assert create.await_count == 0 and not handler._note_tasks
+
+
+@pytest.mark.asyncio
+async def test_speech_marks_the_moment_for_the_notes(monkeypatch: Any) -> None:
+    """The receiver records when speech starts and stops, for the quiet check."""
+    handler = _session_handler(
+        monkeypatch,
+        events=(
+            _FakeEvent("input_audio_buffer.speech_started"),
+            _FakeEvent("input_audio_buffer.speech_stopped"),
+        ),
+    )
+    before = time.monotonic()
+    await handler._run_realtime_session()
+    assert handler._user_speaking is False and handler._last_speech_at >= before

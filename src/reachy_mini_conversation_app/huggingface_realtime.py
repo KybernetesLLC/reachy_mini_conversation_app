@@ -128,8 +128,17 @@ SIGHT_NOTE_INSTRUCTIONS = (
 )
 
 
+# A note waits for a quiet moment: nobody speaking for NOTE_QUIET_SECONDS and no
+# response active, so it never sits between a person's last word and the reply
+# (the backend takes one response at a time). Held longer than NOTE_WAIT_MAX_SECONDS,
+# it is dropped: the frame is stale by then, and the reply's latency matters more.
+NOTE_QUIET_SECONDS = 2.0
+NOTE_WAIT_MAX_SECONDS = 60.0
+_NOTE_POLL_SECONDS = 0.25
+
+
 def sight_note_request(b64_jpeg: str) -> dict[str, Any]:
-    """The response.create body for a sight note of `b64_jpeg`."""
+    """Build the response.create body for a sight note of `b64_jpeg`."""
     return {
         "conversation": "none",
         "output_modalities": ["text"],
@@ -205,6 +214,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
         self._sight_note_in_flight = False
+        self._user_speaking = False
+        self._last_speech_at = 0.0  # monotonic; the session's open counts as speech
+        self._note_tasks: set[asyncio.Task[None]] = set()
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -510,12 +522,37 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         )
 
     async def note_image(self, b64_jpeg: str) -> None:
-        """Ask for a sight note of a frame already in the session (the companion's
-        glance, or the camera tool's picture). Queued through the serial sender, so
-        it waits behind, and never interrupts, a spoken response."""
+        """Ask for a sight note of a frame already in the session, at the next quiet moment.
+
+        The frame is the companion's glance or the camera tool's picture. The note is
+        queued through the serial sender, so it waits behind, and never interrupts, a
+        spoken response.
+        """
         if not self.connection:
             raise RuntimeError("note_image: no active session")
+        task = asyncio.create_task(self._note_when_quiet(b64_jpeg), name="sight-note")
+        self._note_tasks.add(task)
+        task.add_done_callback(self._note_tasks.discard)
+
+    async def _note_when_quiet(self, b64_jpeg: str) -> None:
+        started = time.monotonic()
+        while True:
+            now = time.monotonic()
+            quiet = not self._user_speaking and now - self._last_speech_at >= NOTE_QUIET_SECONDS
+            if quiet and self._response_done_event.is_set():
+                break
+            if now - started >= NOTE_WAIT_MAX_SECONDS:
+                logger.info("Sight note dropped: no quiet moment in %.0f s", NOTE_WAIT_MAX_SECONDS)
+                return
+            await asyncio.sleep(_NOTE_POLL_SECONDS)
+        if not self.connection:
+            return
         await self._safe_response_create(response=sight_note_request(b64_jpeg))
+
+    async def _wait_notes(self) -> None:
+        """Wait for the pending sight notes to be queued or dropped (the tests)."""
+        if self._note_tasks:
+            await asyncio.gather(*list(self._note_tasks), return_exceptions=True)
 
     async def _send_startup_greeting_prompt(self) -> None:
         """Prompt the model to open the conversation once the session is ready."""
@@ -796,6 +833,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             # Manage events received from the realtime server.
             self.connection = conn
+            # The open counts as speech: the first note waits for a quiet moment.
+            self._user_speaking = False
+            self._last_speech_at = time.monotonic()
             try:
                 self._connected_event.set()
             except Exception:
@@ -813,6 +853,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "input_audio_buffer.speech_started":
+                        self._user_speaking = True
+                        self._last_speech_at = time.monotonic()
                         self._mark_activity("user_speech_started")
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
@@ -823,6 +865,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("User speech started")
 
                     if event.type == "input_audio_buffer.speech_stopped":
+                        self._user_speaking = False
+                        self._last_speech_at = time.monotonic()
                         self._mark_activity("user_speech_stopped")
                         self.deps.movement_manager.set_listening(False)
                         logger.debug("User speech stopped - server will auto-commit with VAD")
