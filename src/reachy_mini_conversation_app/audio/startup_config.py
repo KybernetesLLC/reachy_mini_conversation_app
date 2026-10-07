@@ -30,7 +30,7 @@ AUDIO_STARTUP_CONFIG: tuple[AudioStartupParameter, ...] = (
 
 
 def default_overrides_path() -> Path | None:
-    """The active custom profile's audio.toml, if a custom profile is selected."""
+    """Return the active custom profile's audio.toml path, if a custom profile is selected."""
     profile = config.REACHY_MINI_CUSTOM_PROFILE
     if not profile:
         return None
