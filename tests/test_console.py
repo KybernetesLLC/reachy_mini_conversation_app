@@ -1,6 +1,7 @@
 """Tests for the headless console stream."""
 
 import time
+import base64
 import asyncio
 import threading
 from types import SimpleNamespace
@@ -2465,7 +2466,7 @@ def test_the_session_verb_passes_the_anchor() -> None:
     stream = _stream
     seen = {}
 
-    async def open_session(*, preroll: bool = False, anchor_ago: float | None = None) -> None:
+    async def open_session(*, preroll: bool = False, anchor_ago: float | None = None, glance: bool = False) -> None:
         seen.update(preroll=preroll, anchor_ago=anchor_ago)
 
     stream.open_session = open_session
@@ -2473,3 +2474,88 @@ def test_the_session_verb_passes_the_anchor() -> None:
     assert seen == {"preroll": True, "anchor_ago": 0.7}
     _rpc_call(app, "conversation.session", {"open": True, "preroll": True, "preroll_anchor_ago": "x"})
     assert seen == {"preroll": True, "anchor_ago": None}
+
+
+# --- glances (the owner, 2026-10-06): a frame into the session, with no response ---
+#
+# Probed on the hosted backend: an input_image item with no response.create of its
+# own reaches the next response, and is stripped after it. So the glance at a
+# session's open goes in at connect, before the pre-roll that may start the first
+# response.
+
+
+class _GlanceHandler(_FakeSessionHandler):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self.events = events
+
+    async def receive(self, frame: Any) -> None:
+        self.events.append("audio")
+        await super().receive(frame)
+
+    async def add_image(self, b64: str) -> None:
+        self.events.append(f"image:{b64}")
+
+
+def _fake_frames(monkeypatch: pytest.MonkeyPatch, result: tuple) -> None:
+    from reachy_mini_conversation_app.tools import camera as camera_mod
+
+    monkeypatch.setattr(camera_mod, "fresh_jpeg", lambda media: result)
+
+
+@pytest.mark.asyncio
+async def test_a_glance_at_open_goes_in_before_the_preroll(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    _fake_frames(monkeypatch, (b"jpg", 91.0, None))
+    events: list[str] = []
+    handler = _GlanceHandler(events)
+    handler.deps = SimpleNamespace(camera_enabled=True)
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    stream = LocalStream(handler, robot)
+    stream._session_wanted.clear()
+    stream._backend_retry_delay = 0.01
+    stream._append_preroll((16000, np.zeros(1600, dtype=np.int16)))
+
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    try:
+        await stream.open_session(preroll=True, glance=True)
+        await _wait_until(lambda: "audio" in events)
+        assert events[0] == "image:" + base64.b64encode(b"jpg").decode()
+    finally:
+        await _stop_fake_session_loop(stream, handler, loop_task)
+
+
+@pytest.mark.asyncio
+async def test_a_glance_needs_a_session_and_a_usable_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+    handler = _GlanceHandler(events)
+    handler.deps = SimpleNamespace(camera_enabled=True)
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    stream = LocalStream(handler, robot)
+
+    _fake_frames(monkeypatch, (b"jpg", 91.0, None))
+    assert (await stream.glance())["glanced"] is False  # no session yet
+    handler.connection = object()
+    assert (await stream.glance())["glanced"] is True
+    _fake_frames(monkeypatch, (None, None, "dark frame in a lit room"))
+    assert await stream.glance() == {"glanced": False, "reason": "dark frame in a lit room"}
+    handler.deps.camera_enabled = False
+    assert (await stream.glance())["glanced"] is False
+    assert events == ["image:" + base64.b64encode(b"jpg").decode()]
+
+
+def test_the_glance_verb_and_the_session_flag() -> None:
+    _stream, _manager, app = _pose_stream()
+    seen: dict[str, Any] = {}
+
+    async def open_session(**kwargs: Any) -> None:
+        seen.update(kwargs)
+
+    async def glance() -> dict[str, object]:
+        return {"glanced": True}
+
+    _stream.open_session = open_session
+    _stream.glance = glance
+    _rpc_call(app, "conversation.session", {"open": True, "preroll": True, "glance": True})
+    assert seen["glance"] is True
+    assert _rpc_call(app, "conversation.glance", {})["result"] == {"glanced": True}

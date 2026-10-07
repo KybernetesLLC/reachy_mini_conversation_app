@@ -7,6 +7,7 @@ served via the Reachy Mini Apps settings server so users can configure it.
 import os
 import math
 import time
+import base64
 import asyncio
 import logging
 import contextlib
@@ -218,6 +219,9 @@ class LocalStream:
         # Where the pre-roll counts back from, on _preroll_clock: the wake word's
         # peak when the opener said when it was, else None (the connect).
         self._preroll_anchor: float | None = None
+        # The companion's glance at a session's open: one fresh frame added at
+        # connect, before the pre-roll, so the first response sees the room.
+        self._glance_on_connect = False
         # Set whenever _session_wanted changes, so the retry sleep can wake on a
         # close the way it already wakes on a restart request. Separate from
         # _session_wanted itself because the sleep must wake on *clearing* it, and
@@ -454,7 +458,9 @@ class LocalStream:
         finally:
             self._session_parked.clear()
 
-    async def open_session(self, *, preroll: bool = False, anchor_ago: float | None = None) -> None:
+    async def open_session(
+        self, *, preroll: bool = False, anchor_ago: float | None = None, glance: bool = False
+    ) -> None:
         """Let the startup loop open a realtime session, and wake it now.
 
         ``preroll=True`` marks the connection this opens as one a wake word
@@ -479,6 +485,7 @@ class LocalStream:
         """
         if self._session_wanted.is_set():
             return
+        self._glance_on_connect = glance
         if preroll:
             self._preroll_flush_pending = True
             if anchor_ago is not None:
@@ -489,6 +496,30 @@ class LocalStream:
         logger.info("Realtime session open requested.")
         self._session_wanted.set()
         self._session_gate_changed.set()
+
+    async def glance(self) -> dict[str, object]:
+        """Add one fresh camera frame to the live session, with no response.
+
+        The companion asks for it at a conversation's open and when its presence
+        sees the scene change (the owner, 2026-10-06). Words come back only from
+        the model's own reply; the frame is never stored here.
+        """
+        from reachy_mini_conversation_app.tools import camera as camera_tool
+
+        if not self._backend_connected():
+            return {"glanced": False, "reason": "no session"}
+        deps = getattr(self.handler, "deps", None)
+        if deps is not None and not getattr(deps, "camera_enabled", True):
+            return {"glanced": False, "reason": "camera disabled"}
+        add_image = getattr(self.handler, "add_image", None)
+        if add_image is None:
+            return {"glanced": False, "reason": "the handler takes no images"}
+        jpeg, luma, why_not = await asyncio.to_thread(camera_tool.fresh_jpeg, self._robot.media)
+        if jpeg is None:
+            return {"glanced": False, "reason": why_not or "no frame"}
+        await add_image(base64.b64encode(jpeg).decode("ascii"))
+        logger.info("Glance: a frame added to the session (luma %s)", luma)
+        return {"glanced": True}
 
     async def close_session(self, timeout: float = 15.0) -> bool:
         """Close the realtime session and keep it closed until asked to reopen.
@@ -873,6 +904,10 @@ class LocalStream:
                 logger.info("Microphone %s via /rpc", "muted" if self._mic_muted else "unmuted")
             return {"muted": self._mic_muted}
 
+        @rpc.method("conversation.glance")  # type: ignore[untyped-decorator]
+        async def _rpc_glance(params: dict[str, object]) -> dict[str, object]:
+            return await self.glance()
+
         @rpc.method("conversation.session")  # type: ignore[untyped-decorator]
         async def _rpc_session(params: dict[str, object]) -> dict[str, object]:
             if "open" in params:
@@ -880,6 +915,7 @@ class LocalStream:
                     await self.open_session(
                         preroll=bool(params.get("preroll", False)),
                         anchor_ago=_anchor_ago(params.get("preroll_anchor_ago")),
+                        glance=params.get("glance") is True,
                     )
                 else:
                     await self.close_session()
@@ -1104,6 +1140,14 @@ class LocalStream:
                 if self._stop_event.is_set():
                     return
                 await asyncio.sleep(_PREROLL_POLL_INTERVAL_S)
+
+            if self._glance_on_connect:
+                self._glance_on_connect = False
+                try:
+                    result = await self.glance()
+                    logger.info("Glance at open: %s", result)
+                except Exception:
+                    logger.exception("Glance at open failed")
 
             if not self._preroll_flush_pending:
                 return
@@ -1367,6 +1411,7 @@ class LocalStream:
         self._clear_preroll()
         self._preroll_flush_pending = False
         self._preroll_anchor = None
+        self._glance_on_connect = False
 
     async def record_loop(self) -> None:
         """Read mic frames from the recorder and forward them to the handler.

@@ -82,6 +82,25 @@ def _fresh_frame(media: Any) -> Tuple[Optional[bytes], Optional[float]]:
     return camera.read_jpeg(), float(np.mean(frame))
 
 
+def fresh_jpeg(media: Any) -> Tuple[Optional[bytes], Optional[float], Optional[str]]:
+    """Return (JPEG, luma, why not) from a fresh frame; for the tool and the glance.
+
+    A dark frame in a lit room is tried once more, then refused. Runs in a worker
+    thread: reopening the camera waits for its first frame.
+    """
+    room = _room_luma()
+    jpeg, luma = _fresh_frame(media)
+    if luma is not None and room is not None and luma < DARK_FRAME <= ROOM_LIT <= room:
+        logger.warning("camera frame dark (luma %.1f) in a lit room (%.1f); trying once more", luma, room)
+        jpeg, luma = _fresh_frame(media)
+        if luma is not None and luma < DARK_FRAME:
+            return None, luma, "dark frame in a lit room"
+    if jpeg is None:
+        return None, None, "no frame"
+    logger.info("camera frame: luma %s, room %s", "-" if luma is None else f"{luma:.1f}", room)
+    return jpeg, luma, None
+
+
 class Camera(Tool):
     """Take a picture with the camera to see what is in front of the robot."""
 
@@ -122,24 +141,15 @@ class Camera(Tool):
             logger.error("Camera is disabled")
             return {"error": "Camera is disabled"}
 
-        media = deps.reachy_mini.media
-        room = _room_luma()
-        jpeg_bytes, luma = await asyncio.to_thread(_fresh_frame, media)
-        dark_in_lit_room = luma is not None and room is not None and luma < DARK_FRAME <= ROOM_LIT <= room
-        if dark_in_lit_room:
-            logger.warning("camera frame dark (luma %.1f) in a lit room (%.1f); trying once more", luma, room)
-            jpeg_bytes, luma = await asyncio.to_thread(_fresh_frame, media)
-            dark_in_lit_room = luma is not None and luma < DARK_FRAME
-        if jpeg_bytes is None:
-            logger.error("No frame available from camera")
-            return {"error": "No frame available"}
-        logger.info("camera frame: luma %s, room %s", "-" if luma is None else f"{luma:.1f}", room)
-        if dark_in_lit_room:
+        jpeg_bytes, _luma, why_not = await asyncio.to_thread(fresh_jpeg, deps.reachy_mini.media)
+        if why_not == "dark frame in a lit room":
             return {
                 "error": (
                     "The camera returned a dark frame although the room is lit, so there is "
                     "nothing to describe. Say the camera isn't working right now."
                 )
             }
-
+        if jpeg_bytes is None:
+            logger.error("No frame available from camera")
+            return {"error": "No frame available"}
         return {"b64_im": base64.b64encode(jpeg_bytes).decode("utf-8")}

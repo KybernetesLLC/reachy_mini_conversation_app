@@ -451,6 +451,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._mark_activity("say")
         await self._safe_response_create()
 
+    async def add_image(self, b64_jpeg: str) -> None:
+        """Add a camera frame to the conversation with no response of its own.
+
+        The companion's glance (2026-10-06): the hosted backend keeps an image item
+        until the next response, which sees it, and strips it after that response.
+        """
+        if not self.connection:
+            raise RuntimeError("add_image: no active session")
+        await self.connection.conversation.item.create(
+            item={
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64_jpeg}"}],
+            },
+        )
+
     async def _send_startup_greeting_prompt(self) -> None:
         """Prompt the model to open the conversation once the session is ready."""
         if self._startup_greeting_sent or not self.connection:
