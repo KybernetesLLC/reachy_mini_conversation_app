@@ -2,6 +2,7 @@ import logging
 from typing import Any, Dict, Tuple, Literal
 
 from reachy_mini.utils import create_head_pose
+from reachy_mini_conversation_app.moves import _turned
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
 from reachy_mini_conversation_app.dance_emotion_moves import GotoQueueMove
 
@@ -46,7 +47,6 @@ class MoveHead(Tool):
         logger.info("Tool call: move_head direction=%s", direction)
 
         deltas = self.DELTAS.get(direction, self.DELTAS["front"])
-        target = create_head_pose(*deltas, degrees=True)
 
         # Use new movement manager
         try:
@@ -54,7 +54,11 @@ class MoveHead(Tool):
 
             # Get current state for interpolation
             current_head_pose = deps.reachy_mini.get_current_head_pose()
-            _, current_antennas = deps.reachy_mini.get_current_joint_positions()
+            head_joints, current_antennas = deps.reachy_mini.get_current_joint_positions()
+            # Left, right and front are the body's (the companion's review, 2026-10-06):
+            # the body keeps its yaw, and the head turns from where the body faces.
+            body_yaw = float(head_joints[0])  # joint 0 is the body yaw
+            target = _turned(create_head_pose(*deltas, degrees=True), body_yaw)
 
             # Create goto move
             goto_move = GotoQueueMove(
@@ -65,8 +69,8 @@ class MoveHead(Tool):
                     current_antennas[0],
                     current_antennas[1],
                 ),  # Skip body_yaw
-                target_body_yaw=0,  # Reset body yaw
-                start_body_yaw=current_antennas[0],  # body_yaw is first in joint positions
+                target_body_yaw=body_yaw,
+                start_body_yaw=body_yaw,
                 duration=deps.motion_duration_s,
             )
 

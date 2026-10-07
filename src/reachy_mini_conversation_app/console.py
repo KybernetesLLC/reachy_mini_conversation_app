@@ -1013,7 +1013,7 @@ class LocalStream:
             return {"holding": True, "body_yaw": body_yaw}
 
         @rpc.method("conversation.cue")  # type: ignore[untyped-decorator]
-        def _rpc_cue(params: dict[str, object]) -> dict[str, object]:
+        async def _rpc_cue(params: dict[str, object]) -> dict[str, object]:
             """Queue a recorded emotion by name: motion only, as play_emotion plays it.
 
             A queued move sets any hold aside and the hold comes back after it.
@@ -1026,7 +1026,9 @@ class LocalStream:
             if not play_emotion.EMOTION_AVAILABLE:
                 raise JsonRpcError("emotion library unavailable", reason="not_running")
             name = params.get("name")
-            library = play_emotion.emotions_library()
+            # Off the app's loop: the first load reads every move in the library
+            # (the companion's review, 2026-10-06).
+            library = await asyncio.to_thread(play_emotion.emotions_library)
             if not isinstance(name, str) or name not in library.list_moves():
                 raise JsonRpcError(f"unknown cue {name!r}", reason="unknown_cue", code=-32602)
             manager.queue_move(play_emotion.EmotionQueueMove(name, library))

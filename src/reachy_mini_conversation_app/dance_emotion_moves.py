@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 
 class DanceQueueMove(Move):  # type: ignore
+    # Choreographed about a body facing front; the movement manager turns it by
+    # the body's yaw as it starts.
+    relative_to_body = True
     """Wrapper for dance moves to work with the movement queue system."""
 
     def __init__(self, move_name: str):
@@ -54,6 +57,8 @@ class DanceQueueMove(Move):  # type: ignore
 
 
 class EmotionQueueMove(Move):  # type: ignore
+    # Recorded about a body facing front; turned by the body's yaw as it starts.
+    relative_to_body = True
     """Wrapper for emotion moves to work with the movement queue system."""
 
     def __init__(self, emotion_name: str, recorded_moves: RecordedMoves):

@@ -2559,3 +2559,23 @@ def test_the_glance_verb_and_the_session_flag() -> None:
     _rpc_call(app, "conversation.session", {"open": True, "preroll": True, "glance": True})
     assert seen["glance"] is True
     assert _rpc_call(app, "conversation.glance", {})["result"] == {"glanced": True}
+
+
+def test_the_cue_loads_the_library_off_the_apps_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The review of 2026-10-06: the first cue loaded every move on the app's loop."""
+    from reachy_mini_conversation_app.tools import play_emotion
+
+    threads: list[str] = []
+
+    def library() -> _FakeEmotions:
+        try:
+            asyncio.get_running_loop()
+            threads.append("on the loop")
+        except RuntimeError:
+            threads.append("off the loop")
+        return _FakeEmotions()
+
+    monkeypatch.setattr(play_emotion, "emotions_library", library)
+    _stream, _manager, app = _pose_stream()
+    assert _rpc_call(app, "conversation.cue", {"name": "inquiring2"})["result"] == {"queued": "inquiring2"}
+    assert threads == ["off the loop"]
