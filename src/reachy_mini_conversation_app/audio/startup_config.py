@@ -15,7 +15,7 @@ WRITE_SETTLE_SECONDS = 0.1
 # A file beside the active profile's profile.md: parameter names to values, TOML.
 # Its entries replace or add to AUDIO_STARTUP_CONFIG. The companion's household
 # tunes the mic's own processing there (2026-10-07: one voice reached the
-# backend 12-15 dB quieter than the other, and the mic's gain control is the lever).
+# backend 12-15 dB quieter than the other, and the mic's gain control is the setting to change).
 AUDIO_OVERRIDES_FILE = "audio.toml"
 
 AUDIO_STARTUP_CONFIG: tuple[AudioStartupParameter, ...] = (
