@@ -1254,3 +1254,18 @@ async def test_typed_text_is_a_user_turn_answered_and_reported() -> None:
     assert item["role"] == "user" and item["content"] == [{"type": "input_text", "text": "play it again"}]
     create.assert_awaited_once()
     assert seen == [("user", "play it again", True)]
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_greeting_sends_nothing_once(monkeypatch: Any) -> None:
+    """Skip the greeting for one open only (Type to Reachy, 2026-10-08)."""
+    import reachy_mini_conversation_app.huggingface_realtime as hr
+
+    monkeypatch.setattr(hr, "get_session_greeting_prompt", lambda: "Greet them.")
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    handler._safe_response_create = AsyncMock()
+    handler.skip_next_greeting = True
+    await handler._send_startup_greeting_prompt()
+    handler.connection.conversation.item.create.assert_not_awaited()
+    assert handler.skip_next_greeting is False and handler._startup_greeting_sent is False

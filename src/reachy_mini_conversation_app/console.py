@@ -459,7 +459,12 @@ class LocalStream:
             self._session_parked.clear()
 
     async def open_session(
-        self, *, preroll: bool = False, anchor_ago: float | None = None, glance: bool = False
+        self,
+        *,
+        preroll: bool = False,
+        anchor_ago: float | None = None,
+        glance: bool = False,
+        greet: bool = True,
     ) -> None:
         """Let the startup loop open a realtime session, and wake it now.
 
@@ -486,6 +491,9 @@ class LocalStream:
         if self._session_wanted.is_set():
             return
         self._glance_on_connect = glance
+        # ``greet=False``: no greeting at this open (Type to Reachy, the companion,
+        # 2026-10-08), so a typed line is answered at once.
+        self.handler.skip_next_greeting = not greet
         if preroll:
             self._preroll_flush_pending = True
             if anchor_ago is not None:
@@ -958,6 +966,7 @@ class LocalStream:
                         preroll=bool(params.get("preroll", False)),
                         anchor_ago=_anchor_ago(params.get("preroll_anchor_ago")),
                         glance=params.get("glance") is True,
+                        greet=params.get("greet") is not False,
                     )
                 else:
                     await self.close_session()

@@ -607,6 +607,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Prompt the model to open the conversation once the session is ready."""
         if self._startup_greeting_sent or not self.connection:
             return
+        if getattr(self, "skip_next_greeting", False):
+            # This open was asked for without one (Type to Reachy, 2026-10-08).
+            self.skip_next_greeting = False
+            logger.info("Startup greeting skipped for this session")
+            return
 
         greeting_prompt = get_session_greeting_prompt().strip()
         if not greeting_prompt:

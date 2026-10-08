@@ -2466,7 +2466,9 @@ def test_the_session_verb_passes_the_anchor() -> None:
     stream = _stream
     seen = {}
 
-    async def open_session(*, preroll: bool = False, anchor_ago: float | None = None, glance: bool = False) -> None:
+    async def open_session(
+        *, preroll: bool = False, anchor_ago: float | None = None, glance: bool = False, greet: bool = True
+    ) -> None:
         seen.update(preroll=preroll, anchor_ago=anchor_ago)
 
     stream.open_session = open_session
@@ -2750,3 +2752,40 @@ def test_typed_text_needs_a_session() -> None:
         ws.send_json({"jsonrpc": "2.0", "id": "1", "method": "conversation.type", "params": {"text": "hi"}})
         resp = ws.receive_json()
     assert resp["error"]["data"]["reason"] == "not_running"
+
+
+@pytest.mark.asyncio
+async def test_an_open_without_a_greeting_tells_the_handler_to_skip_it() -> None:
+    """Type to Reachy (the companion, 2026-10-08): a typed line opens the session
+    and is answered at once, with no greeting first."""
+    stream = _gate_stream()
+    stream._session_wanted.clear()  # closed, as the companion parks it
+    stream.handler.skip_next_greeting = False
+    await stream.open_session(greet=False)
+    assert stream._session_wanted.is_set() is True
+    assert stream.handler.skip_next_greeting is True
+
+
+@pytest.mark.asyncio
+async def test_an_open_greets_by_default() -> None:
+    """A spoken wake opens with the greeting, as before."""
+    stream = _gate_stream()
+    stream._session_wanted.clear()
+    stream.handler.skip_next_greeting = True
+    await stream.open_session()
+    assert stream.handler.skip_next_greeting is False
+
+
+
+def test_the_session_verb_passes_no_greeting() -> None:
+    """Pass greet=False through only when the caller asks for no greeting."""
+    stream, _manager, app = _pose_stream()
+    seen: list[bool] = []
+
+    async def open_session(**kw: Any) -> None:
+        seen.append(kw.get("greet", True))
+
+    stream.open_session = open_session
+    _rpc_call(app, "conversation.session", {"open": True, "greet": False})
+    _rpc_call(app, "conversation.session", {"open": True})
+    assert seen == [False, True]
