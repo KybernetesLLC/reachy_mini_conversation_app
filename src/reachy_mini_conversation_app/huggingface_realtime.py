@@ -123,9 +123,36 @@ SIGHT_NOTE_TAG = {"companion": "sight-note"}
 SIGHT_NOTE_INSTRUCTIONS = (
     "You are Reachy, a small companion robot. This is a private note to yourself, not speech. "
     "In one or two short sentences, first person, past tense, beginning 'I saw', say what is "
-    "notable in the picture: people (never named), what they hold or do, the room, the view "
-    "out of a window. No preamble."
+    "notable in the picture: people (never named), what they hold or do, objects, a vessel or a "
+    "plane, the weather. Never describe the standing scene below, and never write that something "
+    "is the same as before or still there; mention a part of it only if it changed. If nothing "
+    "beyond the standing scene is worth noting, answer exactly NOTHING. Say snow only when snow "
+    "is visibly falling, or covers several surfaces including the sill or the towers' ledges. "
+    "No preamble."
 )
+# The window's standing scene (the companion, 2026-10-08): the supervisor writes it
+# from household.json beside the memory block, so its directory comes from the same
+# environment variable and needs no new one.
+STANDING_SCENE_FILE = "standing-scene.md"
+
+
+def sight_note_instructions() -> str:
+    """Return the note's instructions, with the standing scene when the supervisor wrote one."""
+    import os
+    from pathlib import Path
+
+    from reachy_mini_conversation_app.prompts import COMPANION_MEMORY_ENV
+
+    memory = os.environ.get(COMPANION_MEMORY_ENV)
+    if not memory:
+        return SIGHT_NOTE_INSTRUCTIONS
+    try:
+        scene = (Path(memory).parent / STANDING_SCENE_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        return SIGHT_NOTE_INSTRUCTIONS
+    if not scene:
+        return SIGHT_NOTE_INSTRUCTIONS
+    return f"{SIGHT_NOTE_INSTRUCTIONS}\n\nThe standing scene, already known:\n{scene}"
 
 
 # A note waits for a quiet moment: nobody speaking for NOTE_QUIET_SECONDS and no
@@ -143,7 +170,7 @@ def sight_note_request(b64_jpeg: str) -> dict[str, Any]:
         "conversation": "none",
         "output_modalities": ["text"],
         "metadata": dict(SIGHT_NOTE_TAG),
-        "instructions": SIGHT_NOTE_INSTRUCTIONS,
+        "instructions": sight_note_instructions(),
         "tool_choice": "none",
         "input": [
             {
@@ -882,7 +909,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if self._sight_note_in_flight:
                             # The note's text: to the observer as "inner", never spoken.
                             note_text = (getattr(event, "text", "") or "").strip()
-                            if note_text:
+                            if note_text and not note_text.upper().startswith("NOTHING"):
                                 self._emit_transcript("inner", note_text)
                             logger.info("Sight note: %s", note_text)
                         else:

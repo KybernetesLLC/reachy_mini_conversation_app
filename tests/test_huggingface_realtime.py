@@ -1198,3 +1198,40 @@ async def test_speech_marks_the_moment_for_the_notes(monkeypatch: Any) -> None:
     before = time.monotonic()
     await handler._run_realtime_session()
     assert handler._user_speaking is False and handler._last_speech_at >= before
+
+
+def test_a_sight_note_carries_the_standing_scene(monkeypatch: Any, tmp_path: Any) -> None:
+    """Carry the window's standing scene, which sits beside the memory block.
+
+    The companion, 2026-10-08: a note never describes it again, and a white roof is never snow.
+    """
+    from reachy_mini_conversation_app.huggingface_realtime import sight_note_request
+
+    memory = tmp_path / "session-memory.md"
+    monkeypatch.setenv("REACHY_COMPANION_SESSION_MEMORY", str(memory))
+    bare = sight_note_request("abc")["instructions"]
+    assert "NOTHING" in bare and "already known" not in bare
+    (tmp_path / "standing-scene.md").write_text("- a white flat roof below; it is white, not snow\n")
+    text = sight_note_request("abc")["instructions"]
+    assert "- a white flat roof below; it is white, not snow" in text
+    assert "snow only when snow is visibly falling" in text
+
+
+@pytest.mark.asyncio
+async def test_a_sight_note_of_nothing_is_not_passed_on(monkeypatch: Any) -> None:
+    """A NOTHING answer is not a note."""
+    from types import SimpleNamespace
+
+    note = SimpleNamespace(metadata={"companion": "sight-note"}, conversation_id=None)
+    handler = _session_handler(
+        monkeypatch,
+        events=(
+            _FakeEvent("response.created", response=note),
+            _FakeEvent("response.output_text.done", text="NOTHING"),
+            _FakeEvent("response.done", response=note),
+        ),
+    )
+    seen: list[tuple[str, str, bool]] = []
+    handler.set_transcript_observer(lambda role, text, final: seen.append((role, text, final)))
+    await handler._run_realtime_session()
+    assert seen == []
