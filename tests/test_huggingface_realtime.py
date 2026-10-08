@@ -1269,3 +1269,21 @@ async def test_a_skipped_greeting_sends_nothing_once(monkeypatch: Any) -> None:
     await handler._send_startup_greeting_prompt()
     handler.connection.conversation.item.create.assert_not_awaited()
     assert handler.skip_next_greeting is False and handler._startup_greeting_sent is False
+
+
+@pytest.mark.asyncio
+async def test_a_glance_frame_is_marked_as_context_only() -> None:
+    """Mark the frame so the model does not describe it unasked.
+
+    The companion, 2026-10-08: after a song the model, with nothing left to say,
+    described the frame taken as the conversation opened.
+    """
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    await handler.add_image("abc")
+    item = handler.connection.conversation.item.create.await_args.kwargs["item"]
+    kinds = [part["type"] for part in item["content"]]
+    assert kinds == ["input_text", "input_image"]
+    note = item["content"][0]["text"].lower()
+    assert "context only" in note and "unless" in note
+    assert item["content"][1]["image_url"] == "data:image/jpeg;base64,abc"

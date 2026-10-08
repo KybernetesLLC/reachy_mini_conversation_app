@@ -155,6 +155,15 @@ def sight_note_instructions() -> str:
     return f"{SIGHT_NOTE_INSTRUCTIONS}\n\nThe standing scene, already known:\n{scene}"
 
 
+# A glance's frame is context, not a question (the companion, 2026-10-08): after a
+# song, with nothing left to say, the model described the frame taken as the
+# conversation opened.
+GLANCE_CONTEXT_NOTE = (
+    "(A frame from your camera, for context only. Do not describe it or mention it "
+    "unless the person asks what you see, or it bears on what they asked.)"
+)
+
+
 # A note waits for a quiet moment: nobody speaking for NOTE_QUIET_SECONDS and no
 # response active, so it never sits between a person's last word and the reply
 # (the backend takes one response at a time). Held longer than NOTE_WAIT_MAX_SECONDS,
@@ -566,7 +575,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             item={
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64_jpeg}"}],
+                "content": [
+                    {"type": "input_text", "text": GLANCE_CONTEXT_NOTE},
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64_jpeg}"},
+                ],
             },
         )
 
