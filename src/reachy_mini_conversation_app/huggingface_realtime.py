@@ -532,6 +532,28 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._mark_activity("say")
         await self._safe_response_create()
 
+    async def type_text(self, text: str) -> None:
+        """Add ``text`` as the person's own words and answer it as speech would be.
+
+        Type to Reachy (the companion, 2026-10-08): tools included, and reported to
+        the transcript observer as a user turn so the companion's memory keeps it.
+        """
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("type_text: empty text")
+        if not self.connection:
+            raise RuntimeError("type_text: no active session")
+        await self.connection.conversation.item.create(
+            item={
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        )
+        self._mark_activity("typed")
+        self._emit_transcript("user", text, True)
+        await self._safe_response_create()
+
     async def add_image(self, b64_jpeg: str) -> None:
         """Add a camera frame to the conversation with no response of its own.
 

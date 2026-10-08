@@ -912,6 +912,18 @@ class LocalStream:
             await self._on_handler_loop(self.handler.say(text))
             return {"ok": True}
 
+        @rpc.method("conversation.type")  # type: ignore[untyped-decorator]
+        async def _rpc_type(params: dict[str, object]) -> dict[str, object]:
+            # Type to Reachy (the companion, 2026-10-08): text as if spoken.
+            text = str(params.get("text", "")).strip()
+            if not text:
+                raise JsonRpcError("type requires 'text'", reason="invalid_params", code=-32602)
+            if not self.handler._is_connected():
+                raise JsonRpcError("no active session", reason="not_running")
+            self.clear_audio_queue()  # as speaking over him would
+            await self._on_handler_loop(self.handler.type_text(text))
+            return {"ok": True}
+
         @rpc.method("conversation.interrupt")  # type: ignore[untyped-decorator]
         def _rpc_interrupt(_params: dict[str, object]) -> dict[str, object]:
             if not self.handler._is_connected():

@@ -2711,3 +2711,42 @@ def test_say_over_the_rpc_server_runs_on_the_streams_loop() -> None:
         _stop_loop(loop, thread)
     assert response.get("result") == {"ok": True}
     assert seen == [loop]
+
+
+def test_typed_text_over_the_rpc_is_heard_as_the_persons_words() -> None:
+    """Send typed text in as a user turn, on the stream's loop, as say does.
+
+    Type to Reachy (the companion, 2026-10-08).
+    """
+    stream, _manager, app = _pose_stream()
+    seen: list[tuple[str, asyncio.AbstractEventLoop]] = []
+
+    async def type_text(text: str) -> None:
+        seen.append((text, asyncio.get_running_loop()))
+
+    stream.handler.type_text = type_text
+    stream.handler._is_connected = lambda: True
+    stream.clear_audio_queue = lambda: None
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    try:
+        response = _rpc_call(app, "conversation.type", {"text": "play it again"})
+        empty = _rpc_call(app, "conversation.type", {"text": "  "})
+    finally:
+        _stop_loop(loop, thread)
+    assert response.get("result") == {"ok": True}
+    assert seen == [("play it again", loop)]
+    assert empty["error"]["data"]["reason"] == "invalid_params"
+
+
+def test_typed_text_needs_a_session() -> None:
+    """Refuse typed text with no session, as say does."""
+    handler = MagicMock()
+    handler._is_connected.return_value = False
+    app = FastAPI()
+    stream = LocalStream(handler, _rpc_robot(), settings_app=app)
+    stream._init_settings_ui_if_needed()
+    with TestClient(app).websocket_connect("/rpc") as ws:
+        ws.send_json({"jsonrpc": "2.0", "id": "1", "method": "conversation.type", "params": {"text": "hi"}})
+        resp = ws.receive_json()
+    assert resp["error"]["data"]["reason"] == "not_running"

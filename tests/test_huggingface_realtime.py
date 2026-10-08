@@ -1235,3 +1235,22 @@ async def test_a_sight_note_of_nothing_is_not_passed_on(monkeypatch: Any) -> Non
     handler.set_transcript_observer(lambda role, text, final: seen.append((role, text, final)))
     await handler._run_realtime_session()
     assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_typed_text_is_a_user_turn_answered_and_reported() -> None:
+    """Add typed text as a user message, ask for a response, and report it.
+
+    The observer hears it as the person's words, so the companion's memory keeps it.
+    """
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    create = AsyncMock()
+    handler._safe_response_create = create
+    seen: list[tuple[str, str, bool]] = []
+    handler.set_transcript_observer(lambda role, text, final: seen.append((role, text, final)))
+    await handler.type_text("  play it again ")
+    item = handler.connection.conversation.item.create.await_args.kwargs["item"]
+    assert item["role"] == "user" and item["content"] == [{"type": "input_text", "text": "play it again"}]
+    create.assert_awaited_once()
+    assert seen == [("user", "play it again", True)]
