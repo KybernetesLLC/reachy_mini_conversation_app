@@ -1302,7 +1302,8 @@ async def test_ending_a_user_turn_clears_the_input_and_the_listening_pose() -> N
     await handler.end_user_turn()
     assert handler._user_speaking is False
     handler.deps.movement_manager.set_listening.assert_called_with(False)
-    handler.connection.input_audio_buffer.clear.assert_awaited_once()
+    # Never input_audio_buffer.clear: the hosted backend rejects it (2026-10-09, 11:22).
+    handler.connection.input_audio_buffer.clear.assert_not_awaited()
 
 
 @pytest.mark.asyncio
