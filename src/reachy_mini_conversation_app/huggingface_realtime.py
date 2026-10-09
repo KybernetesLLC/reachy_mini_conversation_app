@@ -137,7 +137,7 @@ LOOKUP_PROMISE = re.compile(
     re.IGNORECASE,
 )
 MISSED_CALL_NOTE = (
-    "You said you would look that up but did not call search_web. Call it now with the person's question."
+    "You said you would look that up but did not call web_search. Call it now with the person's question."
 )
 SIGHT_NOTE_INSTRUCTIONS = (
     "You are Reachy, a small companion robot. This is a private note to yourself, not speech. "

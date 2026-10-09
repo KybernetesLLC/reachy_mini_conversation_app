@@ -1365,7 +1365,7 @@ async def test_a_spoken_promise_with_no_call_is_caught_once(monkeypatch: Any, ca
         assert await handler._response_finished(_done()) is True
     assert any("missed tool call" in r.getMessage() for r in caplog.records)
     item = handler.connection.conversation.item.create.await_args.kwargs["item"]
-    assert item["role"] == "system" and "search_web" in item["content"][0]["text"]
+    assert item["role"] == "system" and "call web_search" in item["content"][0]["text"]
     assert create.await_count == 1
     # The same turn: never again, never a loop.
     handler._response_started(_done())
