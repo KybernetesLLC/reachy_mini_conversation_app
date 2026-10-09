@@ -228,3 +228,60 @@ async def test_play_emotion_queues_random_for_unknown_emotion(
     assert "play_emotion: 'contento' did not resolve; using random curated" in caplog.text
     queued_move = movement_manager.queue_move.call_args.args[0]
     assert queued_move.emotion_name == "confused1"
+
+
+@pytest.mark.asyncio
+async def test_a_sound_hook_hears_the_emotion_after_its_motion_is_queued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Play his own motif with an emotion's motion (the companion, 2026-10-08).
+
+    The recorded moves' bundled sounds are never played; a registered hook may add one.
+    """
+
+    class FakeRecordedMoves:
+        def list_moves(self) -> list[str]:
+            return AVAILABLE_EMOTIONS
+
+    class FakeEmotionQueueMove:
+        def __init__(self, emotion_name: str, recorded_moves: FakeRecordedMoves) -> None:
+            self.emotion_name = emotion_name
+
+    heard: list[tuple[str, str]] = []
+    order: list[str] = []
+
+    async def hook(intent: str, move: str, deps: ToolDependencies) -> None:
+        order.append("sound")
+        heard.append((intent, move))
+
+    monkeypatch.setattr(play_emotion_module, "EMOTION_AVAILABLE", True)
+    monkeypatch.setattr(play_emotion_module, "EmotionQueueMove", FakeEmotionQueueMove)
+    monkeypatch.setattr(play_emotion_module, "SOUND_HOOK", hook)
+    movement_manager = MagicMock()
+    movement_manager.queue_move.side_effect = lambda m: order.append("motion")
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager)
+    tool = PlayEmotion()
+    monkeypatch.setattr(tool, "_library", FakeRecordedMoves())
+    result = await tool(deps, emotion="happy")
+    assert result["status"] == "queued"
+    assert order == ["motion", "sound"] and heard[0][0] == "happy"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_sound_hook_never_fails_the_emotion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the motion even when the sound hook raises."""
+
+    class FakeRecordedMoves:
+        def list_moves(self) -> list[str]:
+            return AVAILABLE_EMOTIONS
+
+    async def hook(intent: str, move: str, deps: ToolDependencies) -> None:
+        raise RuntimeError("no speaker")
+
+    monkeypatch.setattr(play_emotion_module, "EMOTION_AVAILABLE", True)
+    monkeypatch.setattr(play_emotion_module, "EmotionQueueMove", lambda name, lib: name)
+    monkeypatch.setattr(play_emotion_module, "SOUND_HOOK", hook)
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    tool = PlayEmotion()
+    monkeypatch.setattr(tool, "_library", FakeRecordedMoves())
+    assert (await tool(deps, emotion="happy"))["status"] == "queued"

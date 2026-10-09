@@ -2,7 +2,7 @@ import re
 import random
 import logging
 import unicodedata
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Callable, Awaitable
 
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
 
@@ -24,6 +24,11 @@ except Exception as e:
 
 
 _shared_library: "RecordedMoves | None" = None
+
+# His own sound for an emotion (the companion, 2026-10-08): the recorded moves'
+# bundled sounds are never played here, only their motion. A companion tool may
+# register an async hook(intent, move_name, deps) that plays a sound of his own.
+SOUND_HOOK: "Callable[[str, str, ToolDependencies], Awaitable[Any]] | None" = None
 
 
 def emotions_library() -> "RecordedMoves":
@@ -291,6 +296,13 @@ class PlayEmotion(Tool):
             movement_manager = deps.movement_manager
             emotion_move = EmotionQueueMove(emotion_name, library)
             movement_manager.queue_move(emotion_move)
+
+            hook = SOUND_HOOK
+            if hook is not None:
+                try:
+                    await hook(str(requested_emotion or ""), emotion_name, deps)
+                except Exception:
+                    logger.exception("play_emotion: the sound hook failed; the motion still plays")
 
             return {"status": "queued", "emotion": emotion_name}
 
