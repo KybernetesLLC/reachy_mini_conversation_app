@@ -1287,3 +1287,28 @@ async def test_a_glance_frame_is_marked_as_context_only() -> None:
     note = item["content"][0]["text"].lower()
     assert "context only" in note and "unless" in note
     assert item["content"][1]["image_url"] == "data:image/jpeg;base64,abc"
+
+
+@pytest.mark.asyncio
+async def test_ending_a_user_turn_clears_the_input_and_the_listening_pose() -> None:
+    """End a half-heard turn: the companion's audio audit, A4.
+
+    A mute or capture-off mid-utterance left _user_speaking set, the listening pose
+    held, and the server's input buffer mid-turn.
+    """
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    handler._user_speaking = True
+    await handler.end_user_turn()
+    assert handler._user_speaking is False
+    handler.deps.movement_manager.set_listening.assert_called_with(False)
+    handler.connection.input_audio_buffer.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ending_a_turn_with_no_session_is_harmless() -> None:
+    """With no session there is no input buffer to clear; the flags still reset."""
+    handler = _plain_handler()
+    handler.connection = None
+    await handler.end_user_turn()
+    assert handler._user_speaking is False

@@ -9,6 +9,7 @@ import math
 import time
 import base64
 import asyncio
+import inspect
 import logging
 import contextlib
 from typing import Any, List, Optional
@@ -153,6 +154,25 @@ def _anchor_ago(value: object) -> float | None:
     return ago if math.isfinite(ago) and 0.0 <= ago <= PREROLL_BUFFER_SECONDS else None
 
 
+def _flush_appsrc(appsrc: Any) -> None:
+    """Drop the audio queued in the playback appsrc, without pausing the pipeline.
+
+    The companion's audio audit (2026-10-09, A1): the SDK's clear_player() sets the
+    one pipeline that carries both playback and the microphone to PAUSED and back,
+    so every barge-in corked the microphone ("Can't record audio fast enough", and
+    PipeWire relinked the capture). A flush on the appsrc alone drops the queued
+    speech and leaves the record branch running; measured on the robot the same day
+    with the SDK's own branch layout.
+    """
+    from gi.repository import Gst
+
+    appsrc.send_event(Gst.Event.new_flush_start())
+    appsrc.send_event(Gst.Event.new_flush_stop(True))
+
+
+_HEALTH_WINDOW_S = 5.0
+
+
 class LocalStream:
     """LocalStream using Reachy Mini's recorder/player."""
 
@@ -215,6 +235,9 @@ class LocalStream:
         self._preroll_times: "deque[float]" = deque()
         self._preroll_duration = 0.0
         self._preroll_flush_pending = False
+        # conversation.audio_health (the companion's audio audit, A2).
+        self._last_frame_at: float | None = None
+        self._recent_frames: deque[tuple[float, float]] = deque()
         self._preroll_clock = preroll_clock
         # Where the pre-roll counts back from, on _preroll_clock: the wake word's
         # peak when the opener said when it was, else None (the connect).
@@ -942,8 +965,9 @@ class LocalStream:
             return {"ok": True}
 
         @rpc.method("conversation.mic")  # type: ignore[untyped-decorator]
-        def _rpc_mic(params: dict[str, object]) -> dict[str, object]:
+        async def _rpc_mic(params: dict[str, object]) -> dict[str, object]:
             if "muted" in params:
+                was_muted = self._mic_muted
                 self._mic_muted = bool(params["muted"])
                 if self._mic_muted:
                     # Nothing from before the mute may sit in the buffer and
@@ -952,7 +976,13 @@ class LocalStream:
                     # discard whatever was already there.
                     self._clear_preroll()
                 logger.info("Microphone %s via /rpc", "muted" if self._mic_muted else "unmuted")
+                if self._mic_muted and not was_muted:
+                    await self._end_user_turn()
             return {"muted": self._mic_muted}
+
+        @rpc.method("conversation.audio_health")  # type: ignore[untyped-decorator]
+        def _rpc_audio_health(_params: dict[str, object]) -> dict[str, object]:
+            return self.audio_health()
 
         @rpc.method("conversation.glance")  # type: ignore[untyped-decorator]
         async def _rpc_glance(params: dict[str, object]) -> dict[str, object]:
@@ -996,6 +1026,7 @@ class LocalStream:
                     else:
                         media.stop_recording()
                         media.stop_playing()
+                        self._end_user_turn_soon()
                         # No audio from before a capture-off may survive into
                         # a later session.
                         self._clear_preroll()
@@ -1405,6 +1436,69 @@ class LocalStream:
             if not task.done():
                 loop.call_soon_threadsafe(task.cancel)
 
+    async def _end_user_turn(self) -> None:
+        """End a half-heard user turn when the microphone is muted or stopped (audit A4)."""
+        end = getattr(self.handler, "end_user_turn", None)
+        if end is None:
+            return
+        result = end()
+        if inspect.isawaitable(result):
+            try:
+                await self._on_handler_loop(result)
+            except Exception:
+                logger.debug("could not end the user turn", exc_info=True)
+
+    def _end_user_turn_soon(self) -> None:
+        """_end_user_turn from a synchronous route, on the handler's loop."""
+        loop = self._asyncio_loop
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._end_user_turn(), loop)
+
+    def _note_frame(self, frame: Any) -> None:
+        """Count a microphone frame and its level, for conversation.audio_health."""
+        now = time.monotonic()
+        try:
+            samples = np.asarray(frame, dtype=np.float32)
+            if samples.dtype.kind in "iu" or np.abs(samples).max(initial=0.0) > 1.5:
+                samples = samples / 32768.0
+            rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
+        except Exception:
+            rms = 0.0
+        self._last_frame_at = now
+        self._recent_frames.append((now, rms))
+        while self._recent_frames and now - self._recent_frames[0][0] > _HEALTH_WINDOW_S:
+            self._recent_frames.popleft()
+
+    def audio_health(self) -> dict[str, object]:
+        """Report what the microphone actually delivers (the companion's audio audit, A2).
+
+        Frames and level over the last few seconds, and the device the capture is
+        on, beside the flags the app sets itself.
+        """
+        now = time.monotonic()
+        recent = [r for t, r in self._recent_frames if now - t <= _HEALTH_WINDOW_S]
+        requested = current = None
+        audio = getattr(getattr(self._robot, "media", None), "audio", None)
+        pipeline = getattr(audio, "_pipeline", None)
+        if pipeline is not None:
+            try:
+                for element in pipeline.iterate_elements():
+                    factory = element.get_factory()
+                    if factory is not None and factory.get_name() == "pulsesrc":
+                        requested = element.get_property("device")
+                        current = element.get_property("current-device")
+            except Exception:
+                logger.debug("audio_health: could not read the capture element", exc_info=True)
+        return {
+            "capture": self._capture_on,
+            "muted": self._mic_muted,
+            "requested_source": requested,
+            "current_source": current,
+            "last_frame_age_s": None if self._last_frame_at is None else now - self._last_frame_at,
+            "frames_5s": len(recent),
+            "rms_5s": float(np.mean(recent)) if recent else 0.0,
+        }
+
     def clear_audio_queue(self) -> None:
         """Flush queued playback audio immediately on user barge-in.
 
@@ -1416,7 +1510,14 @@ class LocalStream:
         logger.info("User intervention: flushing player queue")
         audio = getattr(self._robot.media, "audio", None)
         if audio is not None:
-            if hasattr(audio, "clear_player") and callable(audio.clear_player):
+            appsrc = getattr(audio, "_appsrc", None)
+            if appsrc is not None:
+                # The playback branch only; never the microphone (see _flush_appsrc).
+                wobbler = getattr(audio, "_head_wobbler", None)
+                if wobbler is not None:
+                    wobbler.reset()
+                _flush_appsrc(appsrc)
+            elif hasattr(audio, "clear_player") and callable(audio.clear_player):
                 audio.clear_player()
             elif hasattr(audio, "clear_output_buffer") and callable(audio.clear_output_buffer):
                 # Older SDK without clear_player(); best-effort.
@@ -1502,6 +1603,7 @@ class LocalStream:
                 # long as the mute lasts.
                 self._clear_preroll()
             elif audio_frame is not None:
+                self._note_frame(audio_frame)
                 frame = (input_sample_rate, audio_frame)
                 connected = self._backend_connected()
                 if connected and self._preroll_flush_pending:

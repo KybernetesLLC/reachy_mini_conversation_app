@@ -541,6 +541,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._mark_activity("say")
         await self._safe_response_create()
 
+    async def end_user_turn(self) -> None:
+        """End a half-heard user turn: the microphone was muted or stopped mid-utterance.
+
+        The companion's audio audit (2026-10-09, A4): no speech_stopped would ever
+        come, so _user_speaking stayed set, the listening pose stayed held, and the
+        server's input buffer stayed mid-turn.
+        """
+        self._user_speaking = False
+        try:
+            self.deps.movement_manager.set_listening(False)
+        except Exception:
+            logger.debug("end_user_turn: could not release the listening pose", exc_info=True)
+        if self.connection is None:
+            return
+        try:
+            await self.connection.input_audio_buffer.clear()
+        except Exception as e:
+            logger.debug("end_user_turn: could not clear the input buffer (%s)", e)
+
     async def type_text(self, text: str) -> None:
         """Add ``text`` as the person's own words and answer it as speech would be.
 

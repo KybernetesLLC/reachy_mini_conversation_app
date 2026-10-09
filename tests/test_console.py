@@ -2776,7 +2776,6 @@ async def test_an_open_greets_by_default() -> None:
     assert stream.handler.skip_next_greeting is False
 
 
-
 def test_the_session_verb_passes_no_greeting() -> None:
     """Pass greet=False through only when the caller asks for no greeting."""
     stream, _manager, app = _pose_stream()
@@ -2789,3 +2788,55 @@ def test_the_session_verb_passes_no_greeting() -> None:
     _rpc_call(app, "conversation.session", {"open": True, "greet": False})
     _rpc_call(app, "conversation.session", {"open": True})
     assert seen == [False, True]
+
+
+# --- the companion's audio audit, 2026-10-09 -------------------------------------------------
+
+
+def test_clear_audio_queue_flushes_only_the_playback_branch(monkeypatch) -> None:
+    """Flush only the playback branch (the companion's audio audit, A1).
+
+    clear_player() paused the shared pipeline, the microphone with it, on every
+    barge-in; then 'Can't record audio fast enough' and a relinked capture (06:46).
+    """
+    flushed: list[Any] = []
+    monkeypatch.setattr(console_mod, "_flush_appsrc", lambda appsrc: flushed.append(appsrc))
+    handler = MagicMock()
+    handler.output_queue = asyncio.Queue()
+    appsrc = object()
+    audio = SimpleNamespace(_appsrc=appsrc, _head_wobbler=None, _pipeline=MagicMock(), clear_player=MagicMock())
+    robot = SimpleNamespace(media=SimpleNamespace(audio=audio))
+    LocalStream(handler, robot).clear_audio_queue()
+    assert flushed == [appsrc]
+    audio.clear_player.assert_not_called()
+    audio._pipeline.set_state.assert_not_called()
+
+
+def test_muting_ends_a_half_heard_user_turn() -> None:
+    """A4: a mute mid-utterance left _user_speaking and the listening pose stuck."""
+    app = FastAPI()
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    handler = MagicMock()
+    handler.end_user_turn = AsyncMock()
+    stream = LocalStream(handler, robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    _rpc_call(app, "conversation.mic", {"muted": True})
+    handler.end_user_turn.assert_awaited_once()
+    _rpc_call(app, "conversation.mic", {"muted": False})
+    handler.end_user_turn.assert_awaited_once()  # unmuting ends nothing
+
+
+def test_audio_health_reports_frames_and_level() -> None:
+    """A2: health, not intent: frames seen, how loud, and from which device."""
+    app = FastAPI()
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    stream = LocalStream(MagicMock(), robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    health = _rpc_call(app, "conversation.audio_health")["result"]
+    assert health["last_frame_age_s"] is None and health["frames_5s"] == 0
+    stream._note_frame(np.full(320, 0.25, dtype=np.float32))
+    stream._note_frame(np.zeros(320, dtype=np.float32))
+    health = _rpc_call(app, "conversation.audio_health")["result"]
+    assert health["frames_5s"] == 2 and health["last_frame_age_s"] < 1.0
+    assert 0.1 < health["rms_5s"] < 0.25
+    assert "current_source" in health and "capture" in health and "muted" in health
