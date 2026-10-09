@@ -61,6 +61,8 @@ class ToolNotification(BaseModel):
     status: ToolState
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    # Seconds from the call to its result (the companion's latency log, 2026-10-09).
+    duration_s: Optional[float] = None
 
 
 class BackgroundTool(ToolNotification):
@@ -85,6 +87,7 @@ class BackgroundTool(ToolNotification):
             status=self.status,
             result=self.result,
             error=self.error,
+            duration_s=(self.completed_at - self.started_at) if self.completed_at else None,
         )
 
 

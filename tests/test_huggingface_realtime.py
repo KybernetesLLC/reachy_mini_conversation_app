@@ -2,6 +2,7 @@ import json
 import time
 import base64
 import asyncio
+import logging
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -1335,3 +1336,126 @@ async def test_a_say_with_no_live_response_cancels_nothing(monkeypatch: Any) -> 
     monkeypatch.setattr(handler, "_safe_response_create", AsyncMock())
     await handler.say("Your timer is up")
     handler.connection.response.cancel.assert_not_awaited()
+
+
+# --- reliable search (the companion, 2026-10-09) ---------------------------------------------
+
+
+def _search_handler(monkeypatch: Any) -> tuple[HuggingFaceRealtimeHandler, AsyncMock]:
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    handler._start_user_turn()
+    return handler, create
+
+
+def _done(tag: str | None = None) -> Any:
+    metadata = {"companion": tag} if tag else None
+    return SimpleNamespace(response=SimpleNamespace(metadata=metadata))
+
+
+@pytest.mark.asyncio
+async def test_a_spoken_promise_with_no_call_is_caught_once(monkeypatch: Any, caplog: Any) -> None:
+    """09:50:26: 'Let me check.' and no call; then 'I'm looking it up' and no call again."""
+    handler, create = _search_handler(monkeypatch)
+    handler._response_started(_done())
+    handler._response_transcript("Let me check.")
+    with caplog.at_level(logging.WARNING):
+        assert await handler._response_finished(_done()) is True
+    assert any("missed tool call" in r.getMessage() for r in caplog.records)
+    item = handler.connection.conversation.item.create.await_args.kwargs["item"]
+    assert item["role"] == "system" and "search_web" in item["content"][0]["text"]
+    assert create.await_count == 1
+    # The same turn: never again, never a loop.
+    handler._response_started(_done())
+    handler._response_transcript("Yes, I'm looking it up for you now.")
+    assert await handler._response_finished(_done()) is False
+    assert create.await_count == 1
+    # A new turn may be guarded again.
+    handler._start_user_turn()
+    handler._response_started(_done())
+    handler._response_transcript("Let me find out.")
+    assert await handler._response_finished(_done()) is True
+
+
+@pytest.mark.asyncio
+async def test_a_promise_with_its_call_is_left_alone(monkeypatch: Any) -> None:
+    handler, create = _search_handler(monkeypatch)
+    handler._response_started(_done())
+    handler._response_transcript("Let me check.")
+    handler._response_called_a_tool()
+    assert await handler._response_finished(_done()) is False
+    assert create.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_let_me_see_you_is_not_a_lookup(monkeypatch: Any) -> None:
+    """A camera request: 'let me see you' promises a look, not a search."""
+    handler, create = _search_handler(monkeypatch)
+    handler._response_started(_done())
+    handler._response_transcript("Sure, let me see you.")
+    assert await handler._response_finished(_done()) is False
+
+
+@pytest.mark.asyncio
+async def test_the_apps_own_filler_is_never_guarded(monkeypatch: Any) -> None:
+    handler, create = _search_handler(monkeypatch)
+    handler._response_started(_done("filler"))
+    handler._response_transcript("Let me check.")
+    assert await handler._response_finished(_done("filler")) is False
+
+
+@pytest.mark.asyncio
+async def test_a_search_call_gets_one_filler_never_over_speech(monkeypatch: Any) -> None:
+    handler, create = _search_handler(monkeypatch)
+    await handler._tool_started("pollen_robotics_reachy_mini_search_tool__search_web", "c1")
+    assert create.await_count == 1
+    body = create.await_args.kwargs["response"]
+    assert body["metadata"] == {"companion": "filler"} and body["conversation"] == "none"
+    assert body["output_modalities"] == ["audio"]
+    first = handler._last_filler
+    await handler._tool_started("pollen_robotics_reachy_mini_search_tool__search_web", "c2")
+    assert create.await_count == 1  # once per turn
+    handler._start_user_turn()
+    handler._turn_first_audio_at = 1.0  # he already said something this turn
+    await handler._tool_started("web_search", "c3")
+    assert create.await_count == 1  # never over the response's own audio
+    handler._start_user_turn()
+    handler._turn_first_audio_at = None  # the event loop resets it at each user turn
+    await handler._tool_started("web_search", "c4")
+    assert create.await_count == 2 and handler._last_filler != first  # not the same twice
+
+
+@pytest.mark.asyncio
+async def test_a_slow_lookup_gets_a_filler_a_quick_one_and_a_song_do_not(monkeypatch: Any) -> None:
+    monkeypatch.setattr(hf_mod, "FILLER_AFTER_S", 0.05)
+    handler, create = _search_handler(monkeypatch)
+    handler._in_flight_tool_calls.add("slow")
+    await handler._tool_started("flights", "slow")
+    await asyncio.sleep(0.1)
+    assert create.await_count == 1
+    handler._start_user_turn()
+    await handler._tool_started("flights", "quick")  # not in flight: already answered
+    await asyncio.sleep(0.1)
+    handler._start_user_turn()
+    handler._in_flight_tool_calls.add("song")
+    await handler._tool_started("music", "song")  # the tool is the response
+    await asyncio.sleep(0.1)
+    assert create.await_count == 1
+
+
+def test_every_tool_result_logs_its_latency(caplog: Any) -> None:
+    handler = _plain_handler()
+    done = ToolNotification(
+        id="c1",
+        tool_name="web_search",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"answer": "x" * 40},
+        duration_s=1.25,
+    )
+    with caplog.at_level(logging.INFO):
+        handler._log_tool_latency(done)
+    line = [r.getMessage() for r in caplog.records if "tool latency" in r.getMessage()][0]
+    assert line.startswith("tool latency: web_search 1250 ms") and "completed" in line

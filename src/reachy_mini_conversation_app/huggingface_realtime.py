@@ -1,3 +1,4 @@
+import re
 import json
 import time
 import uuid
@@ -120,6 +121,24 @@ def _build_openai_compatible_client_from_realtime_url(
 # tagged so the receiver knows it from speech, and its text goes to the transcript
 # observer as "inner", never to the speaker. The frame is one already taken.
 SIGHT_NOTE_TAG = {"companion": "sight-note"}
+
+# Reliable search (the companion, 2026-10-09). At 09:50:26 "Let me check." was spoken
+# as a response of its own and no call followed, twice. The app now speaks the filler
+# itself (an out-of-band audio response, tagged), and a response that promises a lookup
+# without a call gets one nudge per user turn.
+FILLER_TAG = {"companion": "filler"}
+FILLER_LINES = ("Let me check.", "One moment.", "Let me look that up.", "Just a second.")
+FILLER_AFTER_S = 1.0  # a lookup tool still running this long gets a filler
+SEARCH_TOOLS = ("search_web", "web_search")  # by name ending: always slow enough
+LOOKUP_TOOLS = ("flights", "boats", "transit", "events", "why_lit", "get_weather")
+LOOKUP_PROMISE = re.compile(
+    r"\b(let me (check|look|find out|search)(?! at you)|let me see (what|if|whether)"
+    r"|(looking|look) (it|that|this) up|i'?ll (check|find out|look (it|that|this) up))\b",
+    re.IGNORECASE,
+)
+MISSED_CALL_NOTE = (
+    "You said you would look that up but did not call search_web. Call it now with the person's question."
+)
 SIGHT_NOTE_INSTRUCTIONS = (
     "You are Reachy, a small companion robot. This is a private note to yourself, not speech. "
     "In one or two short sentences, first person, past tense, beginning 'I saw', say what is "
@@ -248,6 +267,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._turn_first_audio_at: float | None = None
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
+        # Reliable search: this response's transcript and whether it called a tool; this
+        # user turn's guard and filler, each used at most once; the last filler line.
+        self._resp_text = ""
+        self._resp_called = False
+        self._turn_guarded = False
+        self._turn_filled = False
+        self._last_filler: str | None = None
+        self._search_answer_pending = False
         self._tool_batch_needs_response = False
         self._sight_note_in_flight = False
         self._user_speaking = False
@@ -519,6 +546,105 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """
         await self._pending_responses.put(kwargs)
 
+    # --- reliable search (the companion, 2026-10-09) ------------------------------------
+
+    def _start_user_turn(self) -> None:
+        self._turn_guarded = False
+        self._turn_filled = False
+
+    def _response_started(self, event: Any) -> None:
+        self._resp_text = ""
+        self._resp_called = False
+
+    def _response_transcript(self, text: str) -> None:
+        self._resp_text += " " + (text or "")
+
+    def _response_called_a_tool(self) -> None:
+        self._resp_called = True
+
+    async def _response_finished(self, event: Any) -> bool:
+        """Nudge a response that promised a lookup and called nothing, once per user turn.
+
+        The missed-call guard. True when it nudged.
+        """
+        metadata = getattr(getattr(event, "response", None), "metadata", None)
+        if isinstance(metadata, dict) and metadata.get("companion") in (
+            FILLER_TAG["companion"],
+            SIGHT_NOTE_TAG["companion"],
+        ):
+            return False
+        text = self._resp_text.strip()
+        if self._resp_called or self._turn_guarded or not LOOKUP_PROMISE.search(text):
+            return False
+        self._turn_guarded = True
+        logger.warning("missed tool call: %r", text)
+        if not self.connection:
+            return False
+        try:
+            await self.connection.conversation.item.create(
+                item={
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": MISSED_CALL_NOTE}],
+                },
+            )
+        except Exception as e:
+            logger.warning("missed tool call: could not add the note (%s)", e)
+            return False
+        await self._safe_response_create()
+        return True
+
+    async def _tool_started(self, tool_name: str, call_id: str) -> None:
+        """Play a filler while a lookup runs.
+
+        At once for a search, after FILLER_AFTER_S for another lookup tool. Never for a
+        tool that is itself the response.
+        """
+        name = tool_name or ""
+        if any(name.endswith(s) for s in SEARCH_TOOLS):
+            await self._play_filler()
+        elif any(name.endswith(s) for s in LOOKUP_TOOLS):
+            asyncio.create_task(self._filler_if_slow(call_id))
+
+    async def _filler_if_slow(self, call_id: str) -> None:
+        await asyncio.sleep(FILLER_AFTER_S)
+        if call_id in self._in_flight_tool_calls:
+            await self._play_filler()
+
+    async def _play_filler(self) -> None:
+        """Speak one short line in his voice, once per turn, never over his own audio."""
+        if self._turn_filled or self._turn_first_audio_at is not None or not self.connection:
+            return
+        self._turn_filled = True
+        line = random.choice([x for x in FILLER_LINES if x != self._last_filler])
+        self._last_filler = line
+        await self._safe_response_create(
+            response={
+                "conversation": "none",
+                "output_modalities": ["audio"],
+                "metadata": dict(FILLER_TAG),
+                "instructions": f"Say exactly these words, briefly, and nothing else: {line}",
+                "tool_choice": "none",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "(Say the line now.)"}],
+                    }
+                ],
+            }
+        )
+
+    def _log_tool_latency(self, completed: Any) -> None:
+        took = getattr(completed, "duration_s", None)
+        ms = took * 1000 if took is not None else -1
+        payload = completed.error if completed.error is not None else completed.result
+        size = len(json.dumps(payload, default=str)) if payload is not None else 0
+        status = getattr(completed.status, "value", completed.status)
+        logger.info("tool latency: %s %.0f ms, %d bytes, %s", completed.tool_name, ms, size, status)
+        if any((completed.tool_name or "").endswith(s) for s in SEARCH_TOOLS):
+            self._search_answer_pending = True
+
     async def say(self, text: str) -> None:
         """Inject ``text`` as a turn and have the model voice it now.
 
@@ -754,6 +880,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
+        self._log_tool_latency(completed_tool)
         if completed_tool.error is not None:
             logger.error(
                 "Tool '%s' (id=%s) failed with error: %s",
@@ -983,6 +1110,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._sight_note_in_flight = True
                             logger.debug("Sight note started")
                         else:
+                            self._response_started(event)
                             self._mark_activity("response_created")
                             self.deps.movement_manager.set_speaking(True)
                             if self._turn_user_done_at is not None and self._turn_response_created_at is None:
@@ -994,13 +1122,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "response.done":
                         # Doesn't mean the audio is done playing
                         # Resume tracking for responses that emit no audio (text-only / tool-only).
+                        guard = False
                         if self._sight_note_in_flight:
                             self._sight_note_in_flight = False
                         else:
                             self.deps.movement_manager.set_speaking(False)
+                            guard = True
                         self._response_done_event.set()
                         self._response_started_or_rejected_event.set()
                         logger.debug("Response done")
+                        if guard:
+                            await self._response_finished(event)
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
                         self._mark_activity("user_transcription_delta")
@@ -1041,6 +1173,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._turn_first_audio_at = None
                         self._in_flight_tool_calls.clear()
                         self._tool_batch_needs_response = False
+                        self._start_user_turn()
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
@@ -1053,6 +1186,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             AdditionalOutputs({"role": "assistant", "content": event.transcript})
                         )
                         self._emit_transcript("assistant", event.transcript or "", True)
+                        self._response_transcript(event.transcript or "")
 
                     # Handle audio delta
                     if event.type == "response.output_audio.delta":
@@ -1063,6 +1197,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._turn_first_audio_at = time.perf_counter()
                             delta_ms = (self._turn_first_audio_at - self._turn_user_done_at) * 1000
                             logger.info("Turn latency: first audio delta %.0f ms after user transcript", delta_ms)
+                        if self._search_answer_pending and self._turn_user_done_at is not None:
+                            self._search_answer_pending = False
+                            logger.info(
+                                "search answer: first audio %.0f ms after the user's transcript",
+                                (time.perf_counter() - self._turn_user_done_at) * 1000,
+                            )
                         await self.output_queue.put(
                             (
                                 self.SAMPLE_RATE,
@@ -1095,6 +1235,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             continue
 
                         self._in_flight_tool_calls.add(call_id)
+                        self._response_called_a_tool()
                         background_tool = await self.tool_manager.start_tool(
                             call_id=call_id,
                             tool_call_routine=ToolCallRoutine(
@@ -1119,6 +1260,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             background_tool.tool_id,
                             call_id,
                         )
+                        await self._tool_started(tool_name, call_id)
 
                     # server error
                     if event.type == "error":
