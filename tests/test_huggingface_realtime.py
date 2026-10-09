@@ -1359,22 +1359,22 @@ def _done(tag: str | None = None) -> Any:
 async def test_a_spoken_promise_with_no_call_is_caught_once(monkeypatch: Any, caplog: Any) -> None:
     """09:50:26: 'Let me check.' and no call; then 'I'm looking it up' and no call again."""
     handler, create = _search_handler(monkeypatch)
-    handler._response_started(_done())
+    handler._response_started()
     handler._response_transcript("Let me check.")
     with caplog.at_level(logging.WARNING):
         assert await handler._response_finished(_done()) is True
     assert any("missed tool call" in r.getMessage() for r in caplog.records)
     item = handler.connection.conversation.item.create.await_args.kwargs["item"]
-    assert item["role"] == "system" and "call web_search" in item["content"][0]["text"]
+    assert item["role"] == "system" and "web_search" in item["content"][0]["text"]
     assert create.await_count == 1
     # The same turn: never again, never a loop.
-    handler._response_started(_done())
+    handler._response_started()
     handler._response_transcript("Yes, I'm looking it up for you now.")
     assert await handler._response_finished(_done()) is False
     assert create.await_count == 1
     # A new turn may be guarded again.
     handler._start_user_turn()
-    handler._response_started(_done())
+    handler._response_started()
     handler._response_transcript("Let me find out.")
     assert await handler._response_finished(_done()) is True
 
@@ -1382,7 +1382,7 @@ async def test_a_spoken_promise_with_no_call_is_caught_once(monkeypatch: Any, ca
 @pytest.mark.asyncio
 async def test_a_promise_with_its_call_is_left_alone(monkeypatch: Any) -> None:
     handler, create = _search_handler(monkeypatch)
-    handler._response_started(_done())
+    handler._response_started()
     handler._response_transcript("Let me check.")
     handler._response_called_a_tool()
     assert await handler._response_finished(_done()) is False
@@ -1393,7 +1393,7 @@ async def test_a_promise_with_its_call_is_left_alone(monkeypatch: Any) -> None:
 async def test_let_me_see_you_is_not_a_lookup(monkeypatch: Any) -> None:
     """A camera request: 'let me see you' promises a look, not a search."""
     handler, create = _search_handler(monkeypatch)
-    handler._response_started(_done())
+    handler._response_started()
     handler._response_transcript("Sure, let me see you.")
     assert await handler._response_finished(_done()) is False
 
@@ -1401,7 +1401,7 @@ async def test_let_me_see_you_is_not_a_lookup(monkeypatch: Any) -> None:
 @pytest.mark.asyncio
 async def test_the_apps_own_filler_is_never_guarded(monkeypatch: Any) -> None:
     handler, create = _search_handler(monkeypatch)
-    handler._response_started(_done("filler"))
+    handler._response_started()
     handler._response_transcript("Let me check.")
     assert await handler._response_finished(_done("filler")) is False
 
