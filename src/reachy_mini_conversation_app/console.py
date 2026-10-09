@@ -1489,7 +1489,15 @@ class LocalStream:
         pipeline = getattr(audio, "_pipeline", None)
         if pipeline is not None:
             try:
-                for element in pipeline.iterate_elements():
+                from gi.repository import Gst
+
+                # Walked with next(): a Gst.Iterator is not a Python iterable without
+                # gst-python's overrides, which the robot does not have.
+                elements = pipeline.iterate_elements()
+                while True:
+                    result, element = elements.next()
+                    if result != Gst.IteratorResult.OK:
+                        break
                     factory = element.get_factory()
                     if factory is not None and factory.get_name() == "pulsesrc":
                         requested = element.get_property("device")
