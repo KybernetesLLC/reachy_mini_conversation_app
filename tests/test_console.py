@@ -2804,12 +2804,35 @@ def test_clear_audio_queue_flushes_only_the_playback_branch(monkeypatch) -> None
     handler = MagicMock()
     handler.output_queue = asyncio.Queue()
     appsrc = object()
-    audio = SimpleNamespace(_appsrc=appsrc, _head_wobbler=None, _pipeline=MagicMock(), clear_player=MagicMock())
+
+    class GStreamerAudio(SimpleNamespace):
+        pass
+
+    audio = GStreamerAudio(
+        _appsrc=appsrc, _appsrc_pts=12.5, _head_wobbler=None, _pipeline=MagicMock(), clear_player=MagicMock()
+    )
     robot = SimpleNamespace(media=SimpleNamespace(audio=audio))
     LocalStream(handler, robot).clear_audio_queue()
     assert flushed == [appsrc]
     audio.clear_player.assert_not_called()
     audio._pipeline.set_state.assert_not_called()
+    assert audio._appsrc_pts == -1  # the review: the next reply starts a new run
+
+
+def test_clear_audio_queue_leaves_the_webrtc_backend_its_own_flush(monkeypatch) -> None:
+    """Keep the WebRTC client's own flush, which also drops what the daemon has queued."""
+    flushed: list[Any] = []
+    monkeypatch.setattr(console_mod, "_flush_appsrc", lambda appsrc: flushed.append(appsrc))
+
+    class GstWebRTCClient(SimpleNamespace):
+        pass
+
+    handler = MagicMock()
+    handler.output_queue = asyncio.Queue()
+    audio = GstWebRTCClient(_appsrc=object(), clear_player=MagicMock())
+    LocalStream(handler, SimpleNamespace(media=SimpleNamespace(audio=audio))).clear_audio_queue()
+    audio.clear_player.assert_called_once()
+    assert flushed == []
 
 
 def test_muting_ends_a_half_heard_user_turn() -> None:

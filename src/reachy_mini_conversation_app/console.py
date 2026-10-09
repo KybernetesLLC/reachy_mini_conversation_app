@@ -1476,7 +1476,9 @@ class LocalStream:
         on, beside the flags the app sets itself.
         """
         now = time.monotonic()
-        recent = [r for t, r in self._recent_frames if now - t <= _HEALTH_WINDOW_S]
+        # A copy first: record_loop appends from another thread meanwhile.
+        frames = list(self._recent_frames)
+        recent = [r for t, r in frames if now - t <= _HEALTH_WINDOW_S]
         requested = current = None
         audio = getattr(getattr(self._robot, "media", None), "audio", None)
         pipeline = getattr(audio, "_pipeline", None)
@@ -1502,20 +1504,24 @@ class LocalStream:
     def clear_audio_queue(self) -> None:
         """Flush queued playback audio immediately on user barge-in.
 
-        Calls the SDK's ``clear_player()`` — now a first-class flush on both
-        the local GStreamer and WebRTC backends (the WebRTC one also tells the
-        daemon to drop audio already queued for the speaker). Falls back to the
-        deprecated ``clear_output_buffer()`` only for older SDKs.
+        On the local GStreamer backend, flushes the playback appsrc alone, since
+        the SDK's ``clear_player()`` pauses the pipeline the microphone shares
+        (the companion's audio audit, A1). Any other backend gets its own
+        ``clear_player()`` (the WebRTC one also tells the daemon to drop audio
+        already queued for the speaker), and older SDKs ``clear_output_buffer()``.
         """
         logger.info("User intervention: flushing player queue")
         audio = getattr(self._robot.media, "audio", None)
         if audio is not None:
             appsrc = getattr(audio, "_appsrc", None)
-            if appsrc is not None:
-                # The playback branch only; never the microphone (see _flush_appsrc).
+            if appsrc is not None and type(audio).__name__ == "GStreamerAudio":
+                # The local pipeline: the playback branch only, never the
+                # microphone (see _flush_appsrc). The WebRTC client keeps its own
+                # clear_player(), which also drops what the daemon has queued.
                 wobbler = getattr(audio, "_head_wobbler", None)
                 if wobbler is not None:
                     wobbler.reset()
+                audio._appsrc_pts = -1  # the next reply starts a new run (DISCONT)
                 _flush_appsrc(appsrc)
             elif hasattr(audio, "clear_player") and callable(audio.clear_player):
                 audio.clear_player()
