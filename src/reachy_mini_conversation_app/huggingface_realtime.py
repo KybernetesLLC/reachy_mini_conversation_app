@@ -531,6 +531,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             raise ValueError("say: empty text")
         if not self.connection:
             raise RuntimeError("say: no active session")
+        if not self._response_done_event.is_set():
+            # The companion's audio audit, A5: a live response would otherwise keep
+            # streaming ahead of this say (an announcement behind an old reply).
+            try:
+                await self.connection.response.cancel()
+            except Exception as e:
+                logger.debug("say: could not cancel the live response (%s)", e)
         await self.connection.conversation.item.create(
             item={
                 "type": "message",
@@ -1142,7 +1149,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if code not in (
                             "input_audio_buffer_commit_empty",
                             "conversation_already_has_active_response",
-                        ):
+                        ) and "cancel" not in str(code):  # a say's cancel that came late
                             await self.output_queue.put(
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )

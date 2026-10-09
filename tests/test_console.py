@@ -2863,3 +2863,42 @@ def test_audio_health_reports_frames_and_level() -> None:
     assert health["frames_5s"] == 2 and health["last_frame_age_s"] < 1.0
     assert 0.1 < health["rms_5s"] < 0.25
     assert "current_source" in health and "capture" in health and "muted" in health
+
+
+def test_a_rebuilt_handler_keeps_the_opens_no_greeting() -> None:
+    """The companion's audio audit, A7: a handler rebuilt before connect greeted a
+    typed line's session anyway."""
+    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
+    first, second = MagicMock(), MagicMock()
+    stream = LocalStream(first, robot)
+    stream._handler_factory = lambda voice: second
+    stream._session_wanted.clear()  # closed, as the companion keeps it between sessions
+    asyncio.run(stream.open_session(greet=False))
+    assert first.skip_next_greeting is True
+    stream._build_handler_for_current_backend()
+    assert stream.handler is second and second.skip_next_greeting is True
+
+
+@pytest.mark.asyncio
+async def test_the_record_loop_reads_the_microphone_off_the_event_loop(monkeypatch) -> None:
+    """The companion's audio audit, A6: get_audio_sample() blocks up to 20 ms per call,
+    which stalled the websocket sends and the player on the same loop."""
+    import threading as _threading
+
+    main = _threading.get_ident()
+    seen: list[int] = []
+    robot = SimpleNamespace(
+        media=SimpleNamespace(
+            audio=None,
+            backend=None,
+            get_input_audio_samplerate=lambda: 16000,
+            get_audio_sample=lambda: seen.append(_threading.get_ident()) or None,
+        )
+    )
+    stream = LocalStream(MagicMock(), robot)
+    stream._capture_on = True
+    task = asyncio.create_task(stream.record_loop())
+    await _wait_until(lambda: len(seen) >= 2)
+    stream._stop_event.set()
+    await asyncio.wait_for(task, 1.0)
+    assert all(t != main for t in seen)

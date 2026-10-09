@@ -274,6 +274,10 @@ class LocalStream:
         """Set the active handler and wire LocalStream-owned helpers into it."""
         self.handler = handler
         self.handler._clear_queue = self.clear_audio_queue
+        # The companion's audio audit, A7: a handler rebuilt before connect keeps the
+        # open's greeting choice (a typed line's session opens without one).
+        if getattr(self, "_skip_greeting", False):
+            self.handler.skip_next_greeting = True
         self._attach_observers_to_handler()
 
     def _attach_observers_to_handler(self) -> None:
@@ -516,7 +520,8 @@ class LocalStream:
         self._glance_on_connect = glance
         # ``greet=False``: no greeting at this open (Type to Reachy, the companion,
         # 2026-10-08), so a typed line is answered at once.
-        self.handler.skip_next_greeting = not greet
+        self._skip_greeting = not greet
+        self.handler.skip_next_greeting = self._skip_greeting
         if preroll:
             self._preroll_flush_pending = True
             if anchor_ago is not None:
@@ -1601,7 +1606,9 @@ class LocalStream:
                 # loop from 49.5 Hz to 45.9 Hz. Back off instead of polling.
                 await asyncio.sleep(0.1)
                 continue
-            audio_frame = self._robot.media.get_audio_sample()
+            # Off the event loop (the companion's audio audit, A6): the pull blocks
+            # up to 20 ms, which stalled the websocket sends and the player.
+            audio_frame = await asyncio.to_thread(self._robot.media.get_audio_sample)
             if self._mic_muted:
                 # No audio from while the mic is muted may sit in the buffer
                 # and grow stale -- duration is tracked in audio time, not

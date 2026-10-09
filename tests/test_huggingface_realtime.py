@@ -1312,3 +1312,25 @@ async def test_ending_a_turn_with_no_session_is_harmless() -> None:
     handler.connection = None
     await handler.end_user_turn()
     assert handler._user_speaking is False
+
+
+@pytest.mark.asyncio
+async def test_a_say_during_a_live_response_cancels_it_first(monkeypatch: Any) -> None:
+    """The companion's audio audit, A5: a say behind a live response waited for it to
+    finish streaming, so the old reply played ahead of the announcement."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", AsyncMock())
+    handler._response_done_event.clear()  # a response is active
+    await handler.say("Your timer is up")
+    handler.connection.response.cancel.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_say_with_no_live_response_cancels_nothing(monkeypatch: Any) -> None:
+    """Explain the case: no cancel when nothing is streaming."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", AsyncMock())
+    await handler.say("Your timer is up")
+    handler.connection.response.cancel.assert_not_awaited()
