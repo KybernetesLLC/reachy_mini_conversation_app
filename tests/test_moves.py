@@ -13,6 +13,7 @@ from reachy_mini_conversation_app.moves import (
     HoldPoseMove,
     BreathingMove,
     MovementManager,
+    PoseSequenceMove,
     LoopFrequencyStats,
     clone_full_body_pose,
 )
@@ -797,3 +798,67 @@ def test_a_recorded_move_turns_with_the_body_it_starts_on() -> None:
     assert body_yaw == pytest.approx(0.7)
     yaw = float(np.arctan2(head[1, 0], head[0, 0]))
     assert yaw == pytest.approx(0.7, abs=1e-6)  # the head turns with the body
+
+
+
+# --- the companion's micro-moves as one queued move (2026-10-10) ------------------------
+
+
+def _pose(pitch: float = 0.0) -> np.ndarray:
+    from reachy_mini.utils import create_head_pose
+
+    return create_head_pose(0, 0, 0, 0, pitch, 0, degrees=False)
+
+
+def test_a_pose_sequence_eases_to_each_frame_and_holds_it() -> None:
+    """Ease into each frame and hold it, as one move.
+
+    One message for a whole micro-move, played on the app's own loop: fewer requests
+    than one hold per frame (the owner, 2026-10-10).
+    """
+    move = PoseSequenceMove(
+        frames=[
+            (_pose(0.03), (0.0, 0.2), 0.0, 0.8, 0.3),  # dip, eased in over 0.8 s, held 0.3 s
+            (_pose(0.0), (0.0, 0.0), 0.0, 1.0, 0.0),  # back, over 1 s
+        ],
+        start=(_pose(0.0), (0.0, 0.0), 0.0),
+    )
+    assert move.duration == pytest.approx(2.1)
+    head, antennas, _ = move.evaluate(0.4)  # half way in
+    assert antennas[1] == pytest.approx(0.1)
+    head, antennas, _ = move.evaluate(1.0)  # holding the dip
+    np.testing.assert_allclose(head, _pose(0.03), atol=1e-9)
+    assert antennas[1] == pytest.approx(0.2)
+    head, antennas, _ = move.evaluate(2.1)  # the end: the last frame exactly
+    np.testing.assert_allclose(head, _pose(0.0), atol=1e-9)
+    assert antennas[1] == pytest.approx(0.0)
+
+
+def test_a_sequence_sets_the_hold_aside_and_the_hold_comes_back() -> None:
+    """Set the hold aside for the sequence, then hold it again."""
+    robot = MagicMock()
+    manager = MovementManager(robot)
+    manager.hold_pose(_pose(0.0), (0.0, 0.0), 0.1)
+    manager._poll_signals(0.0)
+    manager._update_primary_motion(0.0)
+    assert manager.is_holding()
+
+    manager.play_sequence([(_pose(0.03), (0.0, 0.2), 0.0, 0.2, 0.0), (_pose(0.0), (0.0, 0.0), 0.0, 0.2, 0.0)])
+    manager._poll_signals(0.5)
+    manager._update_primary_motion(0.5)
+    assert isinstance(manager.state.current_move, PoseSequenceMove)
+    manager._update_primary_motion(2.0)  # past its 0.4 s
+    manager._update_primary_motion(2.01)
+    assert manager.is_holding()  # the still pose held again
+
+
+def test_a_sequence_frame_without_a_body_yaw_keeps_the_starting_yaw() -> None:
+    """Keep the starting body yaw for a frame that names none."""
+    robot = MagicMock()
+    manager = MovementManager(robot)
+    manager._last_commanded_pose = (_pose(0.0), (0.0, 0.0), 0.4)
+    manager.play_sequence([(_pose(0.03), (0.0, 0.0), None, 0.2, 0.0)])
+    manager._poll_signals(0.0)
+    manager._update_primary_motion(0.0)
+    _, _, yaw = manager.state.current_move.evaluate(0.2)
+    assert yaw == pytest.approx(0.4)

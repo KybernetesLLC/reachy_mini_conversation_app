@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from reachy_mini.utils import create_head_pose
 import reachy_mini_conversation_app.console as console_mod
-from reachy_mini_conversation_app.moves import HoldPoseMove, BreathingMove, MovementManager
+from reachy_mini_conversation_app.moves import HoldPoseMove, BreathingMove, MovementManager, PoseSequenceMove
 from reachy_mini_conversation_app.config import HF_AVAILABLE_VOICES, config
 from reachy_mini_conversation_app.console import LocalStream
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
@@ -2955,3 +2955,28 @@ def test_a_reply_after_the_playback_flush_plays_at_once() -> None:
         assert rendered[0] - pushed_at < 0.5
     finally:
         threading.Thread(target=pipeline.set_state, args=(Gst.State.NULL,), daemon=True).start()
+
+
+
+def test_a_micro_move_over_rpc_queues_one_sequence() -> None:
+    """The companion's idle micro-move in one request, not one hold per frame."""
+    _stream, manager, app = _pose_stream()
+    _rpc_call(app, "conversation.pose", {"antennas": [0.0, 0.0], "duration": 0.5})
+    _drive_manager(manager)
+    frame = {"head_pose": {"pitch": 0.03}, "antennas": [0.0, 0.2], "body_yaw": 0.1, "move": 0.8, "pause": 0.3}
+    back = {"head_pose": {}, "antennas": [0.0, 0.0], "body_yaw": 0.1, "move": 1.0, "pause": 0.0}
+    resp = _rpc_call(app, "conversation.micro", {"frames": [frame, back]})
+    assert resp["result"] == {"queued": 2, "seconds": pytest.approx(2.1)}
+    _drive_manager(manager)
+    assert isinstance(manager.state.current_move, PoseSequenceMove)
+
+
+@pytest.mark.parametrize(
+    "frames",
+    [[], [{"antennas": [0.0]}], [{"antennas": [0.0, 0.0], "move": 0}], "nope"],
+)
+def test_a_malformed_micro_move_is_refused(frames) -> None:
+    """Refuse a malformed micro-move with invalid_params."""
+    _stream, _manager, app = _pose_stream()
+    resp = _rpc_call(app, "conversation.micro", {"frames": frames})
+    assert resp["error"]["data"]["reason"] == "invalid_params"

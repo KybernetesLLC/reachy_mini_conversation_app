@@ -233,6 +233,55 @@ class BreathingMove(Move):  # type: ignore
         return (head_pose, antennas, yaw)
 
 
+# One frame of a pose sequence: head pose (4x4), antennas [right, left], body yaw,
+# seconds to ease in, seconds to hold.
+SequenceFrame = Tuple[NDArray[np.float64], Tuple[float, float], float, float, float]
+
+
+class PoseSequenceMove(Move):  # type: ignore
+    """The companion's micro-move as one queued move (2026-10-10).
+
+    Each frame is eased into from where the last one ended, over its own seconds, then
+    held for its pause; it ends on the last frame. Queued like any move, it sets a hold
+    aside and the hold comes back after it. One message for the whole gesture, instead
+    of one hold request per frame, so the companion does not drive the timing over /rpc.
+    """
+
+    def __init__(
+        self,
+        frames: list[SequenceFrame],
+        start: Tuple[NDArray[np.float64], Tuple[float, float], float],
+    ) -> None:
+        """Initialize from the frames and the pose the sequence starts from."""
+        self.frames = frames
+        self.start = start
+
+    @property
+    def duration(self) -> float:
+        """The sum of every frame's ease and hold."""
+        return float(sum(move + pause for _, _, _, move, pause in self.frames))
+
+    def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
+        """Return the pose at time t: easing into a frame, holding it, or the last frame."""
+        head_from, antennas_from, yaw_from = self.start
+        elapsed = 0.0
+        for head, antennas, yaw, move, pause in self.frames:
+            if t < elapsed + move:
+                u = (t - elapsed) / move
+                return (
+                    linear_pose_interpolation(head_from, head, u),
+                    (1 - u) * np.asarray(antennas_from, dtype=np.float64) + u * np.asarray(antennas, dtype=np.float64),
+                    (1 - u) * yaw_from + u * yaw,
+                )
+            elapsed += move
+            if t < elapsed + pause:
+                return (head, np.asarray(antennas, dtype=np.float64), yaw)
+            elapsed += pause
+            head_from, antennas_from, yaw_from = head, antennas, yaw
+        head, antennas, yaw, _, _ = self.frames[-1]
+        return (head, np.asarray(antennas, dtype=np.float64), yaw)
+
+
 class HoldPoseMove(Move):  # type: ignore
     """Static hold: interpolate to a target pose, then hold it exactly, forever."""
 
@@ -419,6 +468,10 @@ class MovementManager:
         self._freq_stats = LoopFrequencyStats()
         self._freq_snapshot = LoopFrequencyStats()
 
+    def play_sequence(self, frames: list[SequenceFrame]) -> None:
+        """Queue a pose sequence starting from the last commanded pose; thread-safe."""
+        self._command_queue.put(("play_sequence", frames))
+
     def queue_move(self, move: Move) -> None:
         """Queue a primary move to run after the currently executing one.
 
@@ -535,6 +588,16 @@ class MovementManager:
 
     def _handle_command(self, command: str, payload: Any, current_time: float) -> None:
         """Handle a single cross-thread command."""
+        if command == "play_sequence":
+            head, antennas, body_yaw = self._last_commanded_pose
+            start = (np.asarray(head, dtype=np.float64).copy(), (float(antennas[0]), float(antennas[1])), float(body_yaw))
+            # A frame without a body yaw keeps the yaw the sequence starts from.
+            frames = [(h, a, start[2] if y is None else y, m, p) for h, a, y, m, p in payload]
+            move = PoseSequenceMove(frames, start)
+            self.move_queue.append(move)
+            self.state.update_activity()
+            logger.info("Playing a pose sequence of %d frames over %.2fs", len(move.frames), move.duration)
+            return
         if command == "queue_move":
             if isinstance(payload, Move):
                 self.move_queue.append(payload)

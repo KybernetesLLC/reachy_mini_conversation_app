@@ -1106,6 +1106,51 @@ class LocalStream:
                 return {"holding": True}
             return {"holding": True, "body_yaw": body_yaw}
 
+        @rpc.method("conversation.micro")  # type: ignore[untyped-decorator]
+        def _rpc_micro(params: dict[str, object]) -> dict[str, object]:
+            """Play a micro-move: frames of a pose, each eased into and held, as one move.
+
+            The companion's idle micro-moves (2026-10-10), sent whole instead of one hold
+            per frame. Queued, it sets the hold aside and the hold comes back after it; a
+            hold sent meanwhile ends it at once.
+            """
+            manager = self._movement_manager()
+            if manager is None:
+                raise JsonRpcError("movement manager unavailable", reason="not_running")
+            raw = params.get("frames")
+            if not isinstance(raw, list) or not raw:
+                raise JsonRpcError("micro requires 'frames', a non-empty list", reason="invalid_params", code=-32602)
+            frames = []
+            for item in raw:
+                if not isinstance(item, dict):
+                    raise JsonRpcError("micro frames must be objects", reason="invalid_params", code=-32602)
+                antennas_raw = item.get("antennas")
+                if not isinstance(antennas_raw, (list, tuple)) or len(antennas_raw) != 2:
+                    raise JsonRpcError("micro frames need 'antennas' as [right, left]", reason="invalid_params", code=-32602)
+                head = item.get("head_pose") or {}
+                if not isinstance(head, dict):
+                    raise JsonRpcError("micro head_pose must be an object", reason="invalid_params", code=-32602)
+                error = "micro frame fields must be numeric"
+                move = _finite_float(item.get("move", 0.0), error)
+                pause = _finite_float(item.get("pause", 0.0), error)
+                if move <= 0 or pause < 0:
+                    raise JsonRpcError("micro frames need move > 0 and pause >= 0", reason="invalid_params", code=-32602)
+                pose = create_head_pose(
+                    *(_finite_float(head.get(k, 0.0), error) for k in ("x", "y", "z", "roll", "pitch", "yaw")),
+                    degrees=False,
+                )
+                frames.append(
+                    (
+                        pose,
+                        (_finite_float(antennas_raw[0], error), _finite_float(antennas_raw[1], error)),
+                        _body_yaw(item["body_yaw"]) if "body_yaw" in item else None,
+                        move,
+                        pause,
+                    )
+                )
+            manager.play_sequence(frames)
+            return {"queued": len(frames), "seconds": sum(f[3] + f[4] for f in frames)}
+
         @rpc.method("conversation.cue")  # type: ignore[untyped-decorator]
         async def _rpc_cue(params: dict[str, object]) -> dict[str, object]:
             """Queue a recorded emotion by name: motion only, as play_emotion plays it.
