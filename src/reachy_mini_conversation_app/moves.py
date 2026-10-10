@@ -58,6 +58,7 @@ HOLD_RETURN_SECONDS = (
 )
 
 # Type definitions
+UPRIGHT_ANTENNA_DEG = 2.9  # the most an upright antenna leans off vertical
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
 
 
@@ -162,7 +163,11 @@ class BreathingMove(Move):  # type: ignore
         # The owner, 2026-09-30: a calmer idle, so the motor loop's brief stalls
         # (one per presence check) do not show as a stutter in a wide, fast sway.
         self.breathing_z_amplitude = _idle_setting("REACHY_BREATHING_Z_MM", 3.0) / 1000.0
-        self.antenna_sway_amplitude = np.deg2rad(_idle_setting("REACHY_BREATHING_ANTENNA_DEG", 5.0))
+        # The owner, 2026-10-10: upright antennas no more than 2.9 degrees off vertical;
+        # past that the right one overloaded against its stop. A wider setting is capped.
+        self.antenna_sway_amplitude = np.deg2rad(
+            min(_idle_setting("REACHY_BREATHING_ANTENNA_DEG", UPRIGHT_ANTENNA_DEG), UPRIGHT_ANTENNA_DEG)
+        )
         self.antenna_frequency = _idle_setting("REACHY_BREATHING_ANTENNA_HZ", 0.25)
         self.breathing_frequency = 0.1  # Hz (6 breaths per minute)
 
