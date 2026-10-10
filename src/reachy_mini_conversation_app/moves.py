@@ -572,6 +572,7 @@ class MovementManager:
                 logger.warning("Ignored hold_pose command with invalid payload: %s", payload)
                 return
             body_yaw = rest[0] if rest else None
+            self._end_tracking_for_the_posture()
             start_head_pose, start_antennas, start_body_yaw = self._last_commanded_pose
             hold_move = HoldPoseMove(
                 target_head_pose=target_head_pose,
@@ -592,6 +593,7 @@ class MovementManager:
             self.state.update_activity()
             logger.info("Holding pose, interpolating over %.2fs", duration)
         elif command == "release_hold":
+            self._end_tracking_for_the_posture()
             if self.is_holding():
                 self._held_aside = None
                 if self._is_listening:
@@ -690,6 +692,24 @@ class MovementManager:
                 logger.warning("Head-tracking speaking handoff failed: %s", e)
         else:
             logger.warning("Unknown command received by MovementManager: %s", command)
+
+    def _end_tracking_for_the_posture(self) -> None:
+        """End face tracking: a hold or release from the companion owns the head now.
+
+        The companion's ownership audit, 2026-10-10: the companion turns the daemon's
+        tracker off for a still pose, but this flag stayed on, and the end of the next
+        utterance turned tracking back on at full weight under the held pose.
+        """
+        if not self._head_tracking:
+            return
+        self._head_tracking = False
+        self._is_speaking = False
+        self._track_anchor = None
+        try:
+            self.current_robot.stop_head_tracking()
+        except Exception as e:
+            logger.warning("Head-tracking stop failed: %s", e)
+        logger.info("Face tracking ends: the companion's posture holds the head")
 
     def _publish_shared_state(self) -> None:
         """Expose idle-related state for external threads."""

@@ -89,6 +89,40 @@ def test_head_tracking_follows_speaking() -> None:
     robot.stop_head_tracking.assert_called_once()
 
 
+@pytest.mark.parametrize("posture_command", ["hold", "release"])
+def test_a_pose_from_the_companion_ends_face_tracking(posture_command: str) -> None:
+    """End the app's face tracking on a hold or release from the companion.
+
+    The companion's ownership audit (2026-10-10): the supervisor turned the daemon's
+    tracker off for a still pose, but the app's own flag stayed on, and the end of the
+    next utterance turned tracking back on at full weight under the held pose.
+    """
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = np.eye(4)
+    robot.get_current_joint_positions.return_value = ([0.0] * 6, [0.0, 0.0])
+    manager = MovementManager(robot)
+    manager.start()
+    try:
+        manager.set_head_tracking(True)
+        assert _wait_for(lambda: call(weight=1.0) in robot.start_head_tracking.call_args_list)
+        manager.set_speaking(True)
+        assert _wait_for(lambda: manager._is_speaking)
+
+        if posture_command == "hold":
+            manager.hold_pose(np.eye(4), (0.0, 0.0), 0.5)
+        else:
+            manager.release_hold()
+        assert _wait_for(lambda: not manager._head_tracking)
+        assert _wait_for(lambda: robot.stop_head_tracking.called)
+
+        robot.start_head_tracking.reset_mock()
+        manager.set_speaking(False)  # the end of the utterance
+        time.sleep(0.1)
+        assert call(weight=1.0) not in robot.start_head_tracking.call_args_list
+    finally:
+        manager.stop(reset_to_neutral=False)
+
+
 def test_speaking_anchor_composes_emotions_and_holds_dances_from_neutral() -> None:
     """While speaking: hold the anchor, compose emotions onto it, play dances from neutral."""
     robot = MagicMock()
