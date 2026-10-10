@@ -2980,3 +2980,48 @@ def test_a_malformed_micro_move_is_refused(frames) -> None:
     _stream, _manager, app = _pose_stream()
     resp = _rpc_call(app, "conversation.micro", {"frames": frames})
     assert resp["error"]["data"]["reason"] == "invalid_params"
+
+
+def _sound_stream() -> tuple[LocalStream, MagicMock, FastAPI]:
+    """Return a LocalStream whose robot media is a mock with a play_sound."""
+    app = FastAPI()
+    audio = MagicMock()
+    media = SimpleNamespace(audio=audio, backend=None, play_sound=MagicMock())
+    robot = SimpleNamespace(media=media)
+    stream = LocalStream(MagicMock(), robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    return stream, media, app
+
+
+def test_a_sound_over_rpc_plays_through_the_apps_own_player(tmp_path) -> None:
+    """Play a sound file through the app's own player.
+
+    The ownership audit, 2026-10-10: the ring played through the daemon's player beside
+    the app's; the app is the only player while it runs.
+    """
+    _stream, media, app = _sound_stream()
+    wav = tmp_path / "ring.wav"
+    wav.write_bytes(b"RIFF")
+    resp = _rpc_call(app, "conversation.sound", {"file": str(wav)})
+    assert resp["result"] == {"playing": True}
+    media.play_sound.assert_called_once_with(str(wav))
+
+
+def test_a_sound_stop_ends_the_sound_and_leaves_speech_alone() -> None:
+    """Stop the played sound without touching the speech pipeline."""
+    _stream, media, app = _sound_stream()
+    playbin = MagicMock()
+    media.audio._playbin = playbin
+    resp = _rpc_call(app, "conversation.sound", {"stop": True})
+    assert resp["result"] == {"playing": False}
+    assert media.audio._playbin is None
+    playbin.set_state.assert_called_once()
+    media.audio.clear_player.assert_not_called()
+
+
+def test_a_sound_that_is_not_a_file_is_refused(tmp_path) -> None:
+    """Refuse a sound path that is not an existing file."""
+    _stream, media, app = _sound_stream()
+    resp = _rpc_call(app, "conversation.sound", {"file": str(tmp_path / "missing.wav")})
+    assert resp["error"]["data"]["reason"] == "invalid_params"
+    media.play_sound.assert_not_called()

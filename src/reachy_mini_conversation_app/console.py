@@ -1106,6 +1106,31 @@ class LocalStream:
                 return {"holding": True}
             return {"holding": True, "body_yaw": body_yaw}
 
+        @rpc.method("conversation.sound")  # type: ignore[untyped-decorator]
+        async def _rpc_sound(params: dict[str, object]) -> dict[str, object]:
+            """Play a sound file on the speaker through the app's own player, or stop it.
+
+            The companion's ring (the ownership audit, 2026-10-10): it played through
+            the daemon's player beside the app's; while the app runs it is the only
+            player, as for songs and emotion sounds. A stop ends the sound only, never
+            the speech pipeline.
+            """
+            media = self._robot.media
+            if params.get("stop"):
+                audio = getattr(media, "audio", None)
+                playbin = getattr(audio, "_playbin", None)
+                if playbin is not None:
+                    from gi.repository import Gst
+
+                    playbin.set_state(Gst.State.NULL)
+                    audio._playbin = None
+                return {"playing": False}
+            path = params.get("file")
+            if not isinstance(path, str) or not os.path.isfile(path):
+                raise JsonRpcError("sound requires 'file', an existing path", reason="invalid_params", code=-32602)
+            await asyncio.to_thread(media.play_sound, path)
+            return {"playing": True}
+
         @rpc.method("conversation.micro")  # type: ignore[untyped-decorator]
         def _rpc_micro(params: dict[str, object]) -> dict[str, object]:
             """Play a micro-move: frames of a pose, each eased into and held, as one move.
