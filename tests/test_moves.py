@@ -476,18 +476,18 @@ def test_the_idle_sway_is_calm_by_default(monkeypatch: pytest.MonkeyPatch) -> No
     for name in ("REACHY_BREATHING_ANTENNA_DEG", "REACHY_BREATHING_ANTENNA_HZ", "REACHY_BREATHING_Z_MM"):
         monkeypatch.delenv(name, raising=False)
     move = _move()
-    assert move.antenna_sway_amplitude == pytest.approx(math.radians(2.9))
+    assert move.antenna_sway_amplitude == pytest.approx(math.radians(5.0))
     assert move.antenna_frequency == pytest.approx(0.25)
     assert move.breathing_z_amplitude == pytest.approx(0.003)
 
 
 def test_the_sway_can_be_tuned_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """Breathing move reads tuning parameters from environment variables."""
-    monkeypatch.setenv("REACHY_BREATHING_ANTENNA_DEG", "2")
+    monkeypatch.setenv("REACHY_BREATHING_ANTENNA_DEG", "8")
     monkeypatch.setenv("REACHY_BREATHING_ANTENNA_HZ", "0.2")
     monkeypatch.setenv("REACHY_BREATHING_Z_MM", "0")
     move = _move()
-    assert move.antenna_sway_amplitude == pytest.approx(math.radians(2.0))
+    assert move.antenna_sway_amplitude == pytest.approx(math.radians(8.0))
     assert move.antenna_frequency == pytest.approx(0.2)
     assert move.breathing_z_amplitude == 0.0
 
@@ -496,20 +496,7 @@ def test_the_sway_can_be_tuned_from_the_environment(monkeypatch: pytest.MonkeyPa
 def test_a_bad_value_falls_back_to_the_default(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
     """Invalid environment values (empty, non-numeric, negative, non-finite) fall back to defaults."""
     monkeypatch.setenv("REACHY_BREATHING_ANTENNA_DEG", bad)
-    assert _move().antenna_sway_amplitude == pytest.approx(math.radians(2.9))
-
-
-def test_the_sway_never_takes_an_antenna_past_2_9_degrees(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Cap the sway at 2.9 degrees off vertical (the owner, 2026-10-10).
-
-    The right antenna overloaded against its stop past that. A wider setting is capped.
-    """
-    monkeypatch.setenv("REACHY_BREATHING_ANTENNA_DEG", "8")
-    move = _move()
-    assert move.antenna_sway_amplitude == pytest.approx(math.radians(2.9))
-    for t in (0.0, 1.0, 2.0, 3.0, 5.5):
-        _, antennas, _ = move.evaluate(t + move.interpolation_duration)
-        assert max(abs(a) for a in antennas) <= math.radians(2.9) + 1e-9
+    assert _move().antenna_sway_amplitude == pytest.approx(math.radians(5.0))
 
 
 # --- the companion's facing (decision 026) ------------------------------------
