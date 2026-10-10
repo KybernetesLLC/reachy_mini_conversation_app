@@ -2902,3 +2902,56 @@ async def test_the_record_loop_reads_the_microphone_off_the_event_loop(monkeypat
     stream._stop_event.set()
     await asyncio.wait_for(task, 1.0)
     assert all(t != main for t in seen)
+
+
+def test_a_reply_after_the_playback_flush_plays_at_once() -> None:
+    """Play the next reply at once after a barge-in flush (2026-10-10).
+
+    From 07:17 replies after a flush were held silent until the pipeline next changed
+    state. flush_stop(reset_time=True) reset the playback branch's running time under
+    a pipeline that kept its base time, so the next buffer, stamped with the
+    pipeline's running time (the SDK's audio_base), was held as far in the future as
+    the pipeline had been running: 4.5 s after 2.5 s here, hours on the robot. A real
+    GStreamer pipeline, as the SDK builds one.
+    """
+    gi = pytest.importorskip("gi")
+    gi.require_version("Gst", "1.0")
+    import time
+    import threading
+
+    from gi.repository import Gst
+
+    Gst.init(None)
+    pipeline = Gst.parse_launch(
+        "appsrc name=src format=time is-live=true "
+        "caps=audio/x-raw,format=F32LE,rate=16000,channels=1,layout=interleaved "
+        "! audioconvert ! fakesink name=sink sync=true signal-handoffs=true"
+    )
+    src, sink = pipeline.get_by_name("src"), pipeline.get_by_name("sink")
+    rendered: list[float] = []
+    sink.connect("handoff", lambda *_: rendered.append(time.monotonic()))
+    pipeline.set_state(Gst.State.PLAYING)
+    pipeline.get_state(2 * Gst.SECOND)
+
+    def push() -> None:
+        frames = 1600  # 100 ms
+        buf = Gst.Buffer.new_wrapped(bytes(4 * frames))
+        buf.pts = buf.dts = src.get_current_running_time()
+        buf.duration = frames * Gst.SECOND // 16000
+        src.emit("push-buffer", buf)
+
+    try:
+        time.sleep(1.5)
+        push()  # a reply plays
+        time.sleep(0.3)
+        console_mod._flush_appsrc(src)  # a barge-in
+        rendered.clear()
+        pushed_at = time.monotonic()
+        push()  # the next reply
+        deadline = pushed_at + 3.0
+        while not rendered and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert rendered, "the reply after the flush was held"
+        assert rendered[0] - pushed_at < 0.5
+    finally:
+        threading.Thread(target=pipeline.set_state, args=(Gst.State.NULL,), daemon=True).start()

@@ -163,11 +163,18 @@ def _flush_appsrc(appsrc: Any) -> None:
     PipeWire relinked the capture). A flush on the appsrc alone drops the queued
     speech and leaves the record branch running; measured on the robot the same day
     with the SDK's own branch layout.
+
+    2026-10-10: without resetting the running time. reset_time=True reset the
+    playback branch's clock under a pipeline that kept its base time, so the next
+    reply, stamped with the pipeline's running time, was held for as long as the
+    pipeline had been running (silent replies from 07:17, released only when a
+    capture change restarted the pipeline). The SDK's clear_player() avoided this
+    by pausing and resuming, which is what corked the microphone.
     """
     from gi.repository import Gst
 
     appsrc.send_event(Gst.Event.new_flush_start())
-    appsrc.send_event(Gst.Event.new_flush_stop(True))
+    appsrc.send_event(Gst.Event.new_flush_stop(False))
 
 
 _HEALTH_WINDOW_S = 5.0
