@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
+from websockets.exceptions import ConnectionClosedError
 
 import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
@@ -171,6 +172,22 @@ def _drain(handler: HuggingFaceRealtimeHandler) -> list[Any]:
 
 def _messages(items: list[Any]) -> list[dict[str, Any]]:
     return [item.args[0] for item in items if isinstance(item, AdditionalOutputs)]
+
+
+def _capture_tool_reports(handler: HuggingFaceRealtimeHandler) -> list[dict[str, Any]]:
+    """Attach an always-delivers observer to `handler` and return the list it appends to."""
+    reports: list[dict[str, Any]] = []
+
+    def _observer(payload: dict[str, Any]) -> bool:
+        reports.append(payload)
+        return True
+
+    handler.set_tool_call_observer(_observer)
+    return reports
+
+
+def _report_payload(name: str) -> dict[str, Any]:
+    return {"name": name}
 
 
 @pytest.mark.asyncio
@@ -709,6 +726,299 @@ async def test_handle_tool_result_missing_result_reports_error() -> None:
 
     expected = json.dumps({"error": "No result returned from tool execution"})
     assert {"role": "assistant", "content": expected} in _messages(_drain(handler))
+
+
+# ---------------------------------------------------------------------------
+# The tool-call-log brief (2026-10-11): conversation.tool reports
+# ---------------------------------------------------------------------------
+
+
+def test_cut_long_strings_truncates_nested_values() -> None:
+    """Every string, at any nesting depth, is cut to 200 characters; other types pass through."""
+    value = {
+        "question": "x" * 250,
+        "nested": {"note": "y" * 300},
+        "list": ["z" * 210, 5, True, None],
+        "n": 42,
+    }
+
+    cut = hf_mod._cut_long_strings(value)
+
+    assert cut["question"] == "x" * 200
+    assert cut["nested"]["note"] == "y" * 200
+    assert cut["list"][0] == "z" * 200
+    assert cut["list"][1:] == [5, True, None]
+    assert cut["n"] == 42
+
+
+def test_tool_report_status_maps_completed_failed_cancelled() -> None:
+    """ok/error/cancelled map directly from the BackgroundTool's ToolState."""
+    completed = ToolNotification(
+        id="1", tool_name="t", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": 1}
+    )
+    failed = ToolNotification(id="1", tool_name="t", is_idle_tool_call=False, status=ToolState.FAILED, error="boom")
+    cancelled = ToolNotification(
+        id="1", tool_name="t", is_idle_tool_call=False, status=ToolState.CANCELLED, error="Tool cancelled"
+    )
+
+    assert hf_mod._tool_report_status_and_reason(completed) == ("ok", None)
+    assert hf_mod._tool_report_status_and_reason(failed) == ("error", "boom")
+    assert hf_mod._tool_report_status_and_reason(cancelled) == ("cancelled", "Tool cancelled")
+
+
+def test_tool_report_status_refused_via_result_marker() -> None:
+    """A successful result marked `"refused": True` reports status='refused' with its reason."""
+    refused = ToolNotification(
+        id="1",
+        tool_name="express",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"played": False, "refused": True, "why": "quiet hours"},
+    )
+    assert hf_mod._tool_report_status_and_reason(refused) == ("refused", "quiet hours")
+
+
+def test_tool_report_status_ok_result_without_marker_stays_ok() -> None:
+    """A successful result with no refusal marker stays 'ok' (no tool sets one today)."""
+    ok = ToolNotification(
+        id="1", tool_name="express", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"played": "x"}
+    )
+    assert hf_mod._tool_report_status_and_reason(ok) == ("ok", None)
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_result_reports_ok_call_with_full_payload() -> None:
+    """A completed call is reported exactly once, with the brief's full field set."""
+    handler = _plain_handler()
+    handler.connection = _FakeConnection()
+    reports = _capture_tool_reports(handler)
+    note = ToolNotification(
+        id="c1",
+        tool_name="camera",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"seen": "a cat"},
+        duration_s=0.25,
+        args={"question": "x" * 250},
+        source="turn",
+        turn_id="resp-1",
+    )
+
+    await handler._handle_tool_result(note)
+
+    assert len(reports) == 1
+    report = reports[0]
+    assert report["name"] == "camera"
+    assert report["status"] == "ok"
+    assert report["error"] is None
+    assert report["ms"] == 250.0
+    assert report["result_bytes"] == len(json.dumps({"seen": "a cat"}))
+    assert report["background"] is True
+    assert report["session"] is True
+    assert report["source"] == "turn"
+    assert report["turn_id"] == "resp-1"
+    assert report["args"] == {"question": "x" * 200}
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_result_reports_error_call() -> None:
+    """A failed call is reported with status='error' and the short error text."""
+    handler = _plain_handler()
+    handler.connection = _FakeConnection()
+    reports = _capture_tool_reports(handler)
+    note = ToolNotification(id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.FAILED, error="boom")
+
+    await handler._handle_tool_result(note)
+
+    assert len(reports) == 1
+    assert reports[0]["status"] == "error"
+    assert reports[0]["error"] == "boom"
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_result_reports_cancelled_call() -> None:
+    """A cancelled call is reported with status='cancelled'."""
+    handler = _plain_handler()
+    handler.connection = _FakeConnection()
+    reports = _capture_tool_reports(handler)
+    note = ToolNotification(
+        id="c1", tool_name="flights", is_idle_tool_call=False, status=ToolState.CANCELLED, error="Tool cancelled"
+    )
+
+    await handler._handle_tool_result(note)
+
+    assert len(reports) == 1
+    assert reports[0]["status"] == "cancelled"
+    assert reports[0]["error"] == "Tool cancelled"
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_result_reports_refused_call() -> None:
+    """A tool that marks its own result refused is reported with status='refused'."""
+    handler = _plain_handler()
+    handler.connection = _FakeConnection()
+    reports = _capture_tool_reports(handler)
+    note = ToolNotification(
+        id="c1",
+        tool_name="express",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"played": False, "refused": True, "reason": "quiet hours"},
+    )
+
+    await handler._handle_tool_result(note)
+
+    assert len(reports) == 1
+    assert reports[0]["status"] == "refused"
+    assert reports[0]["error"] == "quiet hours"
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_result_reports_even_without_connection() -> None:
+    """With no connection, the call is still reported once, with session=False."""
+    handler = _plain_handler()
+    handler.connection = None
+    reports = _capture_tool_reports(handler)
+    note = ToolNotification(
+        id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": 1}
+    )
+
+    await handler._handle_tool_result(note)
+
+    assert len(reports) == 1
+    assert reports[0]["session"] is False
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_result_reports_once_on_connection_closed_error() -> None:
+    """A send that raises ConnectionClosedError is still reported, exactly once."""
+    handler = _plain_handler()
+    conn = _FakeConnection()
+    conn.conversation.item.create.side_effect = ConnectionClosedError(None, None)
+    handler.connection = conn
+    reports = _capture_tool_reports(handler)
+    note = ToolNotification(
+        id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": 1}
+    )
+
+    await handler._handle_tool_result(note)
+
+    assert len(reports) == 1
+    assert handler.connection is None
+
+
+def test_report_tool_call_caps_queue_and_counts_drops() -> None:
+    """With no observer attached, reports pile up capped at 100, dropping the oldest beyond that."""
+    handler = _plain_handler()
+    for i in range(105):
+        handler._report_tool_call(_report_payload(f"tool{i}"))
+
+    assert len(handler._tool_report_queue) == 100
+    assert handler._tool_reports_dropped == 5
+    assert handler._tool_report_queue[0]["name"] == "tool5"
+    assert handler._tool_report_queue[-1]["name"] == "tool104"
+
+
+def test_report_tool_call_is_plain_sync_never_awaited() -> None:
+    """The reporting path is synchronous, in-memory only -- never something a tool call awaits."""
+    handler = _plain_handler()
+    assert not asyncio.iscoroutinefunction(handler._report_tool_call)
+    assert not asyncio.iscoroutinefunction(handler._flush_tool_reports)
+
+
+def test_report_tool_call_retries_backlog_in_order_without_duplicates() -> None:
+    """A flaky observer leaves items queued; once it recovers, the backlog flushes once each, in order."""
+    handler = _plain_handler()
+    delivered: list[dict[str, Any]] = []
+    attempts = {"n": 0}
+
+    def flaky_observer(payload: dict[str, Any]) -> bool:
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            return False  # the supervisor (or no /rpc peer at all) is down
+        delivered.append(payload)
+        return True
+
+    handler.set_tool_call_observer(flaky_observer)
+
+    handler._report_tool_call(_report_payload("a"))
+    assert delivered == []
+    assert len(handler._tool_report_queue) == 1
+
+    handler._report_tool_call(_report_payload("b"))
+    assert delivered == []
+    assert len(handler._tool_report_queue) == 2
+
+    handler._report_tool_call(_report_payload("c"))
+    assert delivered == [_report_payload("a"), _report_payload("b"), _report_payload("c")]
+    assert len(handler._tool_report_queue) == 0
+
+
+def test_report_tool_call_stops_draining_on_observer_exception() -> None:
+    """An observer that raises leaves the item queued for a later attempt; nothing is dropped silently."""
+    handler = _plain_handler()
+    calls = {"n": 0}
+
+    def raising_observer(payload: dict[str, Any]) -> bool:
+        calls["n"] += 1
+        raise RuntimeError("rpc broadcast failed")
+
+    handler.set_tool_call_observer(raising_observer)
+    handler._report_tool_call(_report_payload("a"))
+
+    assert calls["n"] == 1
+    assert len(handler._tool_report_queue) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_session_turn_based_tool_call_reports_turn_source(monkeypatch: Any) -> None:
+    """An ordinary user-turn tool call is started with source='turn' and the response id."""
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="dance",
+                arguments="{}",
+                call_id="c1",
+                response_id="resp-7",
+            ),
+        ),
+    )
+    start_tool = AsyncMock(return_value=SimpleNamespace(tool_id="dance-1"))
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+
+    await handler._run_realtime_session()
+
+    kwargs = start_tool.call_args.kwargs
+    assert kwargs["source"] == "turn"
+    assert kwargs["turn_id"] == "resp-7"
+
+
+@pytest.mark.asyncio
+async def test_run_session_guard_nudged_tool_call_reports_missed_call_guard_source(monkeypatch: Any) -> None:
+    """A tool call made while the missed-call guard's nudge is still in force for this turn is reported as such."""
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="web_search",
+                arguments="{}",
+                call_id="c1",
+                response_id="resp-8",
+            ),
+        ),
+    )
+    handler._turn_guarded = True  # the guard already nudged this turn
+    start_tool = AsyncMock(return_value=SimpleNamespace(tool_id="web_search-1"))
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+
+    await handler._run_realtime_session()
+
+    kwargs = start_tool.call_args.kwargs
+    assert kwargs["source"] == "missed_call_guard"
+    assert kwargs["turn_id"] == "resp-8"
 
 
 @pytest.mark.asyncio

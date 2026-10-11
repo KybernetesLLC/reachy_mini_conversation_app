@@ -134,6 +134,29 @@ class TestBackgroundTool:
         assert n.status == ToolState.COMPLETED
         assert n.result == {"x": 1}
 
+    def test_get_notification_carries_args_source_and_turn_id(self) -> None:
+        """The tool-call-log brief's extra fields survive the BackgroundTool -> ToolNotification hop."""
+        t = BackgroundTool(
+            id="1",
+            tool_name="t",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            args={"question": "hi"},
+            source="missed_call_guard",
+            turn_id="resp-1",
+        )
+        n = t.get_notification()
+        assert n.args == {"question": "hi"}
+        assert n.source == "missed_call_guard"
+        assert n.turn_id == "resp-1"
+
+    def test_notification_defaults_args_source_turn_id(self) -> None:
+        """Omitted, the new fields default to an empty dict, 'turn', and no turn id."""
+        n = ToolNotification(id="1", tool_name="t", is_idle_tool_call=False, status=ToolState.COMPLETED)
+        assert n.args == {}
+        assert n.source == "turn"
+        assert n.turn_id is None
+
 
 # ---------------------------------------------------------------------------
 # BackgroundToolManager
@@ -203,6 +226,54 @@ class TestStartTool:
         assert bg.progress is not None
         assert bg.progress.progress == 0.0
         await asyncio.sleep(0.15)
+
+    @pytest.mark.asyncio
+    async def test_start_tool_parses_args_for_logging(self, manager: BackgroundToolManager) -> None:
+        """start_tool parses the routine's raw JSON args onto the BackgroundTool, for the report."""
+        routine = _make_routine("greet")
+        routine.args_json_str = '{"question": "how are you", "n": 2}'
+        bg = await manager.start_tool(call_id="c1", tool_call_routine=routine, is_idle_tool_call=False)
+        assert bg.args == {"question": "how are you", "n": 2}
+        await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_start_tool_bad_args_json_logs_as_empty(self, manager: BackgroundToolManager) -> None:
+        """Unparseable args never raise; they just log as an empty dict."""
+        routine = _make_routine("greet")
+        routine.args_json_str = "not json"
+        bg = await manager.start_tool(call_id="c1", tool_call_routine=routine, is_idle_tool_call=False)
+        assert bg.args == {}
+        await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_start_tool_default_source_is_turn(self, manager: BackgroundToolManager) -> None:
+        """Omitted, source defaults to 'turn' and turn_id to None."""
+        routine = _make_routine("greet")
+        bg = await manager.start_tool(call_id="c1", tool_call_routine=routine, is_idle_tool_call=False)
+        assert bg.source == "turn"
+        assert bg.turn_id is None
+        await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_start_tool_passes_source_and_turn_id_through_to_notification(
+        self, manager: BackgroundToolManager
+    ) -> None:
+        """An explicit source/turn_id survive start_tool, the run, and the completion notification."""
+        routine = _make_routine("greet", result={"ok": True})
+        bg = await manager.start_tool(
+            call_id="c1",
+            tool_call_routine=routine,
+            is_idle_tool_call=False,
+            source="missed_call_guard",
+            turn_id="resp-42",
+        )
+        await asyncio.sleep(0.05)
+
+        assert bg.source == "missed_call_guard"
+        assert bg.turn_id == "resp-42"
+        notification = manager._notification_queue.get_nowait()
+        assert notification.source == "missed_call_guard"
+        assert notification.turn_id == "resp-42"
 
 
 class TestRunToolLifecycle:

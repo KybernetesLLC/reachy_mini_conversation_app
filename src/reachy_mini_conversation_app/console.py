@@ -295,6 +295,9 @@ class LocalStream:
         transcript_setter = getattr(self.handler, "set_transcript_observer", None)
         if callable(transcript_setter):
             transcript_setter(self._dispatch_transcript)
+        tool_call_setter = getattr(self.handler, "set_tool_call_observer", None)
+        if callable(tool_call_setter):
+            tool_call_setter(self._dispatch_tool_call)
 
     def _dispatch_transcript(self, role: str, text: str, final: bool) -> None:
         """Push a conversation.transcript notification to JSON-RPC clients."""
@@ -303,6 +306,20 @@ class LocalStream:
                 "conversation.transcript",
                 {"role": role, "text": text, "final": final},
             )
+
+    def _dispatch_tool_call(self, payload: dict[str, object]) -> bool:
+        """Push a conversation.tool notification (the tool-call-log brief, 2026-10-11).
+
+        Returns whether a peer was attached to receive it, so the handler's own
+        capped queue knows whether to retry. JsonRpcServer exposes no public way
+        to tell "the supervisor is up" from "a browser tab is open" -- `_clients`
+        is the closest signal, and a non-empty set is as good as it gets without
+        an ack from the far end.
+        """
+        if self._rpc is None or not self._rpc._clients:
+            return False
+        self._rpc.broadcast_threadsafe("conversation.tool", payload)
+        return True
 
     # Audio level meter for the client orb. RMS is scaled into a visible 0..1
     # range and capped to ~15 Hz so it stays light on the DataChannel.

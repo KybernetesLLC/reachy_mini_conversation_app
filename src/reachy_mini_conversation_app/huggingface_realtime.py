@@ -7,6 +7,7 @@ import random
 import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional
+from collections import deque
 
 import httpx
 import numpy as np
@@ -50,6 +51,7 @@ from reachy_mini_conversation_app.tools.core_tools import (
     get_tool_specs,
 )
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
+from reachy_mini_conversation_app.tools.tool_constants import ToolState
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
@@ -238,6 +240,68 @@ def _is_sight_note(event: Any) -> bool:
     return _companion_tag(event) == SIGHT_NOTE_TAG["companion"]
 
 
+# The tool-call-log brief (2026-10-11): one /rpc notification per finished (or
+# refused) tool call -- console.py's _dispatch_tool_call sends it as
+# "conversation.tool" -- so the supervisor can keep a durable record
+# (events.jsonl, kind "tool") of which of the robot's tools actually get used.
+# Logging only: nothing here changes a tool's own behaviour, result, or timing.
+#
+# While the supervisor (or no /rpc peer at all) is unreachable, reports pile up
+# here instead of blocking a tool call; past this many, the oldest is dropped.
+TOOL_REPORT_QUEUE_MAX: Final[int] = 100
+_TOOL_ARG_STRING_LIMIT: Final[int] = 200
+
+_TOOL_REPORT_STATUS: Final[dict[ToolState, str]] = {
+    ToolState.COMPLETED: "ok",
+    ToolState.FAILED: "error",
+    ToolState.CANCELLED: "cancelled",
+}
+
+
+def _cut_long_strings(value: Any, limit: int = _TOOL_ARG_STRING_LIMIT) -> Any:
+    """Return `value` with every string truncated to `limit` characters, recursively.
+
+    The brief: args are logged as-is (this is the household's own robot, no
+    redaction), just capped so one long string can't bloat the report.
+    """
+    if isinstance(value, str):
+        return value[:limit]
+    if isinstance(value, dict):
+        return {key: _cut_long_strings(item, limit) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cut_long_strings(item, limit) for item in value]
+    return value
+
+
+def _tool_duration_ms_and_bytes(completed: ToolNotification) -> tuple[float, int]:
+    """Return (ms from call to result, bytes of the JSON result or error)."""
+    ms = completed.duration_s * 1000 if completed.duration_s is not None else -1.0
+    payload = completed.error if completed.error is not None else completed.result
+    size = len(json.dumps(payload, default=str)) if payload is not None else 0
+    return ms, size
+
+
+def _tool_report_status_and_reason(completed: ToolNotification) -> Tuple[str, Optional[str]]:
+    """Map a finished call to the conversation.tool report's status + a short reason.
+
+    A tool that refuses (the companion's stay_quiet, express, or a quiet-hours
+    gate) returns an ordinary successful result today, not an error -- the
+    generic dispatcher in core_tools.py has no way to tell a refusal from a
+    success by itself. A tool may opt in to `status: "refused"` by putting
+    `"refused": True` in its result (with an optional "reason" or "why" for the
+    short text); no tool does this today, so this status cannot fire yet. That
+    is a gap for the supervisor-side task to know about, not something invented
+    here: fabricating a per-tool-name or per-wording guess would couple this
+    generic reporter to another repo's tool semantics.
+    """
+    status = _TOOL_REPORT_STATUS.get(completed.status, "error")
+    reason = completed.error
+    if status == "ok" and isinstance(completed.result, dict) and completed.result.get("refused") is True:
+        status = "refused"
+        reason = completed.result.get("reason") or completed.result.get("why")
+    return status, reason
+
+
 class HuggingFaceRealtimeHandler(ConversationHandler):
     """Realtime stream handler for the Hugging Face OpenAI-compatible endpoint."""
 
@@ -300,6 +364,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._user_speaking = False
         self._last_speech_at = 0.0  # monotonic; the session's open counts as speech
         self._note_tasks: set[asyncio.Task[None]] = set()
+        # The tool-call-log brief: a capped, in-memory backlog of conversation.tool
+        # reports, drained through console.py's /rpc dispatch (see set_tool_call_observer).
+        self._tool_report_queue: "deque[dict[str, Any]]" = deque(maxlen=TOOL_REPORT_QUEUE_MAX)
+        self._tool_reports_dropped = 0
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -646,11 +714,63 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         )
 
     def _log_tool_latency(self, completed: Any) -> None:
-        ms = completed.duration_s * 1000 if completed.duration_s is not None else -1
-        payload = completed.error if completed.error is not None else completed.result
-        size = len(json.dumps(payload, default=str)) if payload is not None else 0
+        ms, size = _tool_duration_ms_and_bytes(completed)
         # Parsed by the companion's tools/search_stats.py: keep the wording.
         logger.info("tool latency: %s %.0f ms, %d bytes, %s", completed.tool_name, ms, size, completed.status.value)
+
+    def _build_tool_report(self, completed_tool: ToolNotification) -> dict[str, Any]:
+        """Build the conversation.tool /rpc payload for one finished (or refused) call."""
+        ms, result_bytes = _tool_duration_ms_and_bytes(completed_tool)
+        status, reason = _tool_report_status_and_reason(completed_tool)
+        return {
+            "name": completed_tool.tool_name,
+            "args": _cut_long_strings(completed_tool.args),
+            "status": status,
+            "error": reason,
+            "ms": round(ms, 1),
+            "result_bytes": result_bytes,
+            # Every tool call in this app runs through BackgroundToolManager
+            # (core_tools.dispatch_tool_call has no other caller); always true today.
+            "background": True,
+            "session": self.connection is not None,
+            "source": completed_tool.source,
+            "turn_id": completed_tool.turn_id,
+        }
+
+    def _report_tool_call(self, payload: dict[str, Any]) -> None:
+        """Queue one tool-call report and flush it; never blocks or slows a tool call."""
+        queue = self._tool_report_queue
+        if len(queue) >= (queue.maxlen or TOOL_REPORT_QUEUE_MAX):
+            self._tool_reports_dropped += 1
+            logger.warning(
+                "tool report queue full (%d); dropping the oldest (%d dropped so far)",
+                queue.maxlen,
+                self._tool_reports_dropped,
+            )
+        queue.append(payload)
+        self._flush_tool_reports()
+
+    def _flush_tool_reports(self) -> None:
+        """Send queued reports oldest-first; stop at the first one not delivered.
+
+        The observer (console.py's _dispatch_tool_call) returns whether a /rpc
+        peer could receive it. A report is popped only once delivered, so a
+        report is never sent twice, and a down supervisor's backlog is retried
+        -- in order -- on the next tool call.
+        """
+        observer = self._tool_call_observer
+        if observer is None:
+            return
+        while self._tool_report_queue:
+            item = self._tool_report_queue[0]
+            try:
+                delivered = observer(item)
+            except Exception:
+                logger.debug("tool-call observer raised; will retry later", exc_info=True)
+                return
+            if not delivered:
+                return
+            self._tool_report_queue.popleft()
 
     async def say(self, text: str) -> None:
         """Inject ``text`` as a turn and have the model voice it now.
@@ -964,6 +1084,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             tool_result = {"error": "No result returned from tool execution"}
             tool_result_for_model = tool_result
 
+        # The tool-call-log brief (2026-10-11): built once, here, so `session`
+        # reflects whether a conversation was open when the call finished, and
+        # sent exactly once on every exit below (including a closed connection).
+        report_payload = self._build_tool_report(completed_tool)
+
         # Connection may have closed while tool was running
         if not self.connection:
             logger.warning(
@@ -971,6 +1096,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 completed_tool.tool_name,
                 completed_tool.id,
             )
+            self._report_tool_call(report_payload)
             return
 
         try:
@@ -1070,6 +1196,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             logger.warning("Connection closed while sending tool result")
             self.connection = None
             self._response_done_event.set()
+        finally:
+            # Sent after the result reaches the model (or the attempt fails):
+            # the report itself is in-memory only and never blocks a tool call.
+            self._report_tool_call(report_payload)
 
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
@@ -1289,6 +1419,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         self._in_flight_tool_calls.add(call_id)
                         self._response_called_a_tool()
+                        # The tool-call-log brief: who asked -- the missed-call guard's
+                        # nudge, still in force for the rest of this user turn, or an
+                        # ordinary turn. is_idle_tool_call (never True here) covers the
+                        # third case, the model unprompted via the idle policy.
+                        source = "missed_call_guard" if self._turn_guarded else "turn"
                         background_tool = await self.tool_manager.start_tool(
                             call_id=call_id,
                             tool_call_routine=ToolCallRoutine(
@@ -1297,6 +1432,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 deps=self.deps,
                             ),
                             is_idle_tool_call=False,
+                            source=source,
+                            turn_id=getattr(event, "response_id", None),
                         )
 
                         await self.output_queue.put(

@@ -115,6 +115,7 @@ async def start_idle_tool_call(
             deps=deps,
         ),
         is_idle_tool_call=True,
+        source="idle",  # the tool-call-log brief: the model was not asked
     )
     await output_queue.put(
         AdditionalOutputs(

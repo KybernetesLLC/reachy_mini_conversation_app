@@ -2313,6 +2313,38 @@ def test_rpc_transcript_notification_broadcast() -> None:
     assert msg["params"] == {"role": "assistant", "text": "hello there", "final": True}
 
 
+def test_rpc_tool_call_notification_broadcast() -> None:
+    """The handler's tool-call observer pushes conversation.tool events, and reports delivery."""
+    app = FastAPI()
+    stream = LocalStream(MagicMock(), _rpc_robot(), settings_app=app)
+    stream._init_settings_ui_if_needed()
+    payload = {"name": "camera", "args": {}, "status": "ok", "error": None, "ms": 12.0, "result_bytes": 3}
+    with TestClient(app).websocket_connect("/rpc") as ws:
+        delivered = stream._dispatch_tool_call(payload)
+        msg = ws.receive_json()
+    assert delivered is True
+    assert msg["method"] == "conversation.tool"
+    assert msg["params"] == payload
+
+
+def test_rpc_tool_call_notification_not_delivered_without_a_peer() -> None:
+    """With no /rpc client attached, the tool-call dispatch reports it could not be delivered."""
+    app = FastAPI()
+    stream = LocalStream(MagicMock(), _rpc_robot(), settings_app=app)
+    stream._init_settings_ui_if_needed()
+
+    delivered = stream._dispatch_tool_call({"name": "camera"})
+
+    assert delivered is False
+
+
+def test_tool_call_observer_is_wired_to_handler_on_attach() -> None:
+    """console.py wires the handler's set_tool_call_observer the same way as the others."""
+    handler = MagicMock()
+    LocalStream(handler, _rpc_robot())
+    handler.set_tool_call_observer.assert_called_once()
+
+
 def test_rpc_settings_methods() -> None:
     """Personality, voice, and tool settings are reachable over /rpc."""
     app = FastAPI()

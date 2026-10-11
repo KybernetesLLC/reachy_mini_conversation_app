@@ -6,6 +6,7 @@ completion is announced vocally via a silent notification queue.
 """
 
 from __future__ import annotations
+import json
 import time
 import asyncio
 import logging
@@ -24,6 +25,19 @@ from reachy_mini_conversation_app.tools.tool_constants import ToolState, SystemT
 logger = logging.getLogger(__name__)
 
 _SYSTEM_TOOL_NAMES: set[str] = {t.value for t in SystemTool}
+
+
+def _safe_load_args(args_json_str: str) -> Dict[str, Any]:
+    """Best-effort parse of a call's raw JSON args, for logging only.
+
+    Execution parses ``args_json_str`` itself (core_tools._safe_load_obj); this is
+    a separate, independent parse so a logging failure can never affect dispatch.
+    """
+    try:
+        parsed = json.loads(args_json_str or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
 
 
 class ToolProgress(BaseModel):
@@ -63,6 +77,13 @@ class ToolNotification(BaseModel):
     error: Optional[str] = None
     # Seconds from the call to its result (the companion's latency log, 2026-10-09).
     duration_s: Optional[float] = None
+    # The tool-call-log brief (2026-10-11): the call's own arguments, for the
+    # app's /rpc report; who asked for it (the user's turn, the missed-call
+    # guard, or the model unprompted via the idle policy); and the response
+    # or turn id, so a report can be tied back to the transcript.
+    args: Dict[str, Any] = Field(default_factory=dict)
+    source: str = "turn"
+    turn_id: Optional[str] = None
 
 
 class BackgroundTool(ToolNotification):
@@ -88,6 +109,9 @@ class BackgroundTool(ToolNotification):
             result=self.result,
             error=self.error,
             duration_s=(self.completed_at - self.started_at) if self.completed_at else None,
+            args=self.args,
+            source=self.source,
+            turn_id=self.turn_id,
         )
 
 
@@ -133,6 +157,8 @@ class BackgroundToolManager(BaseModel):
         tool_call_routine: ToolCallRoutine,
         is_idle_tool_call: bool,
         with_progress: bool = False,
+        source: str = "turn",
+        turn_id: Optional[str] = None,
     ) -> BackgroundTool:
         """Start a new background tool.
 
@@ -141,6 +167,12 @@ class BackgroundToolManager(BaseModel):
             tool_call_routine: The ToolCallRoutine containing the callable and its arguments
             with_progress: Whether to track progress (0.0-1.0)
             is_idle_tool_call: Whether the tool call was triggered by an idle signal
+            source: Who asked for this call -- "turn" (the user's turn, the default),
+                "missed_call_guard" (the reliable-search nudge), or "idle" (the local
+                idle policy, unprompted). Carried through to the completion notification
+                for the tool-call-log brief's /rpc report; never used for dispatch.
+            turn_id: The realtime response id this call belongs to, if any. Also
+                carried through unchanged, for the same report.
 
         Returns:
             BackgroundTool object with tool ID
@@ -154,6 +186,9 @@ class BackgroundToolManager(BaseModel):
             is_idle_tool_call=is_idle_tool_call,
             progress=ToolProgress(progress=0.0) if with_progress else None,
             status=ToolState.RUNNING,
+            args=_safe_load_args(tool_call_routine.args_json_str),
+            source=source,
+            turn_id=turn_id,
         )
         self._tools[background_tool.tool_id] = background_tool
 

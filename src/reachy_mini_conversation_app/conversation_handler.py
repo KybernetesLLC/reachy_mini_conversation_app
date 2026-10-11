@@ -3,7 +3,7 @@ import time
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from typing import ClassVar, TypeAlias
+from typing import Any, ClassVar, TypeAlias
 from collections.abc import Callable
 
 import numpy as np
@@ -35,6 +35,10 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     last_idle_behavior_time: float
     _activity_observer: Callable[[str], None] | None = None
     _transcript_observer: Callable[[str, str, bool], None] | None = None
+    # The tool-call-log brief (2026-10-11): one report per finished (or refused)
+    # tool call, pushed to console.py's /rpc dispatch. Returns whether a peer
+    # could receive it, so the handler's capped queue knows what to retry.
+    _tool_call_observer: Callable[[dict[str, Any]], bool] | None = None
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -49,6 +53,10 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     def set_transcript_observer(self, observer: Callable[[str, str, bool], None] | None) -> None:
         """Attach/detach a transcript observer, called (role, text, final)."""
         self._transcript_observer = observer
+
+    def set_tool_call_observer(self, observer: Callable[[dict[str, Any]], bool] | None) -> None:
+        """Attach/detach the tool-call-report observer. Pass None to clear."""
+        self._tool_call_observer = observer
 
     def _emit_transcript(self, role: str, text: str, final: bool = True) -> None:
         """Forward one transcript chunk to the observer, if attached."""
