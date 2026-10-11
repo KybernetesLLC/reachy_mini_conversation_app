@@ -1325,12 +1325,11 @@ async def test_a_note_whose_session_closed_before_quiet_is_dropped_and_logged(mo
     monkeypatch.setattr(hf_mod, "_NOTE_POLL_SECONDS", 0.01)
     handler._response_done_event.clear()
 
-    handler.add_note("x")
-    await asyncio.sleep(0.03)
-    handler.connection = None
-    handler._response_done_event.set()
-
     with caplog.at_level(logging.INFO):
+        handler.add_note("x")
+        await asyncio.sleep(0.03)
+        handler.connection = None
+        handler._response_done_event.set()
         await handler._wait_notes()
 
     assert any("session closed" in r.getMessage() for r in caplog.records)
@@ -1348,13 +1347,12 @@ async def test_a_note_dropped_when_the_session_is_replaced_before_quiet(monkeypa
     monkeypatch.setattr(hf_mod, "_NOTE_POLL_SECONDS", 0.01)
     handler._response_done_event.clear()
 
-    handler.add_note("x")
-    await asyncio.sleep(0.03)
-    new_session = AsyncMock()
-    handler.connection = new_session
-    handler._response_done_event.set()
-
     with caplog.at_level(logging.INFO):
+        handler.add_note("x")
+        await asyncio.sleep(0.03)
+        new_session = AsyncMock()
+        handler.connection = new_session
+        handler._response_done_event.set()
         await handler._wait_notes()
 
     original.conversation.item.create.assert_not_awaited()
