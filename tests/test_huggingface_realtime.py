@@ -1238,6 +1238,71 @@ async def test_a_sight_note_of_nothing_is_not_passed_on(monkeypatch: Any) -> Non
     assert seen == []
 
 
+# --- the companion note (task 11, person recognition): who has joined, who left view --
+
+
+@pytest.mark.asyncio
+async def test_a_note_waits_for_quiet_and_asks_for_no_response(monkeypatch: Any) -> None:
+    """A companion note is a user-role item at the next quiet moment, never a response."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    monkeypatch.setattr(hf_mod, "_NOTE_POLL_SECONDS", 0.01)
+    handler._response_done_event.clear()
+
+    handler.add_note("Alli (she/her) has joined.")
+    await asyncio.sleep(0.05)
+    handler.connection.conversation.item.create.assert_not_awaited()
+    handler._response_done_event.set()
+    await handler._wait_notes()
+
+    item = handler.connection.conversation.item.create.await_args.kwargs["item"]
+    assert item["role"] == "user"
+    assert item["content"] == [
+        {"type": "input_text", "text": "[Companion note, not spoken: Alli (she/her) has joined.]"}
+    ]
+    create.assert_not_awaited()
+
+
+def test_a_note_needs_a_session() -> None:
+    """Without a session there is nothing to note into."""
+    handler = _plain_handler()
+    handler.connection = None
+    with pytest.raises(RuntimeError):
+        handler.add_note("x")
+
+
+@pytest.mark.asyncio
+async def test_a_note_held_too_long_is_dropped(monkeypatch: Any) -> None:
+    """Without a quiet moment inside COMPANION_NOTE_WAIT_S, the note is dropped."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    monkeypatch.setattr(hf_mod, "_NOTE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(hf_mod, "COMPANION_NOTE_WAIT_S", 0.05)
+    handler._user_speaking = True
+
+    handler.add_note("x")
+    await handler._wait_notes()
+
+    handler.connection.conversation.item.create.assert_not_awaited()
+    assert not handler._note_tasks
+
+
+@pytest.mark.asyncio
+async def test_a_notes_text_never_reaches_the_transcript_observer() -> None:
+    """The note is for the model alone; the companion's own memory never sees it."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    seen: list[tuple[str, str, bool]] = []
+    handler.set_transcript_observer(lambda role, text, final: seen.append((role, text, final)))
+
+    handler.add_note("x")
+    await handler._wait_notes()
+
+    assert seen == []
+
+
 @pytest.mark.asyncio
 async def test_typed_text_is_a_user_turn_answered_and_reported() -> None:
     """Add typed text as a user message, ask for a response, and report it.

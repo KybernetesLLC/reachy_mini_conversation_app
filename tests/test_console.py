@@ -2754,6 +2754,50 @@ def test_typed_text_needs_a_session() -> None:
     assert resp["error"]["data"]["reason"] == "not_running"
 
 
+def test_a_note_over_the_rpc_runs_on_the_handlers_loop() -> None:
+    """The note defect would be the say defect.
+
+    A send from the RPC loop, not the handler's, is the cross-thread write that
+    corrupted OpenSSL (2026-10-07).
+    """
+    stream, _manager, app = _pose_stream()
+    seen: list[tuple[str, asyncio.AbstractEventLoop]] = []
+
+    def add_note(text: str) -> None:
+        seen.append((text, asyncio.get_running_loop()))
+
+    stream.handler.add_note = add_note
+    stream.handler._is_connected.return_value = True
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    try:
+        response = _rpc_call(app, "conversation.note", {"text": "Alli (she/her) has joined."})
+    finally:
+        _stop_loop(loop, thread)
+    assert response.get("result") == {"queued": True}
+    assert seen == [("Alli (she/her) has joined.", loop)]
+
+
+def test_a_note_needs_text() -> None:
+    """Empty text is refused as a result, not an error -- the brief's own contract."""
+    _stream, _manager, app = _pose_stream()
+    response = _rpc_call(app, "conversation.note", {"text": "   "})
+    assert response.get("result") == {"queued": False, "reason": "empty"}
+
+
+def test_a_note_needs_a_session() -> None:
+    """Refuse a note with no session, as a result rather than a JsonRpcError."""
+    handler = MagicMock()
+    handler._is_connected.return_value = False
+    app = FastAPI()
+    stream = LocalStream(handler, _rpc_robot(), settings_app=app)
+    stream._init_settings_ui_if_needed()
+    with TestClient(app).websocket_connect("/rpc") as ws:
+        ws.send_json({"jsonrpc": "2.0", "id": "1", "method": "conversation.note", "params": {"text": "hi"}})
+        resp = ws.receive_json()
+    assert resp["result"] == {"queued": False, "reason": "no session"}
+
+
 @pytest.mark.asyncio
 async def test_an_open_without_a_greeting_tells_the_handler_to_skip_it() -> None:
     """Type to Reachy (the companion, 2026-10-08): a typed line opens the session

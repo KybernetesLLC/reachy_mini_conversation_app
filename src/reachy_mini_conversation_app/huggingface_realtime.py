@@ -192,6 +192,13 @@ NOTE_QUIET_SECONDS = 2.0
 NOTE_WAIT_MAX_SECONDS = 60.0
 _NOTE_POLL_SECONDS = 0.25
 
+# A companion note (person recognition, task 11: who has joined, who is no longer
+# in view) is dropped after this long without a quiet moment, not NOTE_WAIT_MAX_SECONDS's
+# 60 s.
+COMPANION_NOTE_WAIT_S = 30.0
+
+NOTE_TEXT = "[Companion note, not spoken: {text}]"
+
 
 def _out_of_band_request(
     tag: dict[str, str], modalities: list[str], instructions: str, content: list[dict[str, Any]]
@@ -761,6 +768,41 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Wait for the pending sight notes to be queued or dropped (the tests)."""
         if self._note_tasks:
             await asyncio.gather(*list(self._note_tasks), return_exceptions=True)
+
+    def add_note(self, text: str) -> "asyncio.Task[None]":
+        """Add a companion note at the next quiet moment, with no response of its own.
+
+        Who has joined, who is no longer in view. A user-role item: system items
+        were unreliable on the hosted backend (2026-10-09). Never reaches the
+        transcript observer.
+        """
+        if not self.connection:
+            raise RuntimeError("add_note: no active session")
+        task = asyncio.create_task(self._note_text_when_quiet(text), name="companion-note")
+        self._note_tasks.add(task)
+        task.add_done_callback(self._note_tasks.discard)
+        return task
+
+    async def _note_text_when_quiet(self, text: str) -> None:
+        started = time.monotonic()
+        while True:
+            now = time.monotonic()
+            quiet = not self._user_speaking and now - self._last_speech_at >= NOTE_QUIET_SECONDS
+            if quiet and self._response_done_event.is_set():
+                break
+            if now - started >= COMPANION_NOTE_WAIT_S:
+                logger.info("Companion note dropped: no quiet moment in %.0f s", COMPANION_NOTE_WAIT_S)
+                return
+            await asyncio.sleep(_NOTE_POLL_SECONDS)
+        if not self.connection:
+            return
+        await self.connection.conversation.item.create(
+            item={
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": NOTE_TEXT.format(text=text)}],
+            },
+        )
 
     async def _send_startup_greeting_prompt(self) -> None:
         """Prompt the model to open the conversation once the session is ready."""

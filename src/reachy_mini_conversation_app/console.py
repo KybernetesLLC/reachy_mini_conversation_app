@@ -1000,6 +1000,27 @@ class LocalStream:
         async def _rpc_glance(params: dict[str, object]) -> dict[str, object]:
             return await self.glance()
 
+        @rpc.method("conversation.note")  # type: ignore[untyped-decorator]
+        async def _rpc_note(params: dict[str, object]) -> dict[str, object]:
+            # A companion note (person recognition, task 11): who has joined, who is
+            # no longer in view. Added at the next quiet moment, with no response of
+            # its own.
+            text = str(params.get("text") or "").strip()
+            if not text:
+                return {"queued": False, "reason": "empty"}
+            if not self.handler._is_connected():
+                return {"queued": False, "reason": "no session"}
+
+            async def _add_note() -> None:
+                self.handler.add_note(text)
+
+            # On the handler's own loop: add_note's asyncio.create_task must bind to
+            # the loop that owns the websocket, not the RPC server's, or the eventual
+            # conversation.item.create becomes the cross-thread send that corrupted
+            # OpenSSL's state (the say defect, plan 3, 2026-10-07).
+            await self._on_handler_loop(_add_note())
+            return {"queued": True}
+
         @rpc.method("conversation.session")  # type: ignore[untyped-decorator]
         async def _rpc_session(params: dict[str, object]) -> dict[str, object]:
             if "open" in params:
