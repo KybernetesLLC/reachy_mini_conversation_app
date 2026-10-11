@@ -2798,6 +2798,25 @@ def test_a_note_needs_a_session() -> None:
     assert resp["result"] == {"queued": False, "reason": "no session"}
 
 
+def test_a_note_whose_session_closes_mid_hop_is_a_graceful_result() -> None:
+    """add_note's own RuntimeError (the review, fix round 1).
+
+    The session closed between the connected check and the hop onto the
+    handler's loop.
+    """
+    stream, _manager, app = _pose_stream()
+
+    def add_note(text: str) -> None:
+        raise RuntimeError("add_note: no active session")
+
+    stream.handler.add_note = add_note
+    stream.handler._is_connected.return_value = True
+
+    response = _rpc_call(app, "conversation.note", {"text": "x"})
+
+    assert response.get("result") == {"queued": False, "reason": "no session"}
+
+
 @pytest.mark.asyncio
 async def test_an_open_without_a_greeting_tells_the_handler_to_skip_it() -> None:
     """Type to Reachy (the companion, 2026-10-08): a typed line opens the session

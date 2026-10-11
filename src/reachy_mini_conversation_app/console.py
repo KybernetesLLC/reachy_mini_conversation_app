@@ -1018,7 +1018,12 @@ class LocalStream:
             # the loop that owns the websocket, not the RPC server's, or the eventual
             # conversation.item.create becomes the cross-thread send that corrupted
             # OpenSSL's state (the say defect, plan 3, 2026-10-07).
-            await self._on_handler_loop(_add_note())
+            try:
+                await self._on_handler_loop(_add_note())
+            except RuntimeError:
+                # The session closed between the check above and the hop onto the
+                # handler's loop: add_note's own "no active session" (fix round 1).
+                return {"queued": False, "reason": "no session"}
             return {"queued": True}
 
         @rpc.method("conversation.session")  # type: ignore[untyped-decorator]

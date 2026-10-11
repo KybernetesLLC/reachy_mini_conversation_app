@@ -778,12 +778,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """
         if not self.connection:
             raise RuntimeError("add_note: no active session")
-        task = asyncio.create_task(self._note_text_when_quiet(text), name="companion-note")
+        # A note belongs to the session it was asked for (fix round 1, the review):
+        # recorded here, and checked again after the quiet wait.
+        session = self.connection
+        task = asyncio.create_task(self._note_text_when_quiet(text, session), name="companion-note")
         self._note_tasks.add(task)
         task.add_done_callback(self._note_tasks.discard)
         return task
 
-    async def _note_text_when_quiet(self, text: str) -> None:
+    async def _note_text_when_quiet(self, text: str, session: "AsyncRealtimeConnection") -> None:
         started = time.monotonic()
         while True:
             now = time.monotonic()
@@ -795,14 +798,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 return
             await asyncio.sleep(_NOTE_POLL_SECONDS)
         if not self.connection:
+            logger.info("Companion note dropped: session closed")
             return
-        await self.connection.conversation.item.create(
-            item={
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": NOTE_TEXT.format(text=text)}],
-            },
-        )
+        if self.connection is not session:
+            logger.info("Companion note dropped: session changed")
+            return
+        try:
+            await self.connection.conversation.item.create(
+                item={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": NOTE_TEXT.format(text=text)}],
+                },
+            )
+        except Exception as exc:
+            logger.info("Companion note dropped: %s", exc)
 
     async def _send_startup_greeting_prompt(self) -> None:
         """Prompt the model to open the conversation once the session is ready."""

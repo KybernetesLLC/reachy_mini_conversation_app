@@ -1304,6 +1304,65 @@ async def test_a_notes_text_never_reaches_the_transcript_observer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_notes_failed_send_is_dropped_and_logged(caplog: Any) -> None:
+    """A send that raises (the review, fix round 1) is caught, not fatal."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    handler.connection.conversation.item.create.side_effect = RuntimeError("boom")
+
+    with caplog.at_level(logging.INFO):
+        handler.add_note("x")
+        await handler._wait_notes()
+
+    assert any("Companion note dropped" in r.getMessage() and "boom" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_note_whose_session_closed_before_quiet_is_dropped_and_logged(monkeypatch: Any, caplog: Any) -> None:
+    """The session ended while the note waited: nothing left to note into."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    monkeypatch.setattr(hf_mod, "_NOTE_POLL_SECONDS", 0.01)
+    handler._response_done_event.clear()
+
+    handler.add_note("x")
+    await asyncio.sleep(0.03)
+    handler.connection = None
+    handler._response_done_event.set()
+
+    with caplog.at_level(logging.INFO):
+        await handler._wait_notes()
+
+    assert any("session closed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_note_dropped_when_the_session_is_replaced_before_quiet(monkeypatch: Any, caplog: Any) -> None:
+    """A note belongs to the session it was asked for (the review, fix round 1).
+
+    A reconnect between the ask and the quiet moment is a different session.
+    """
+    handler = _plain_handler()
+    original = AsyncMock()
+    handler.connection = original
+    monkeypatch.setattr(hf_mod, "_NOTE_POLL_SECONDS", 0.01)
+    handler._response_done_event.clear()
+
+    handler.add_note("x")
+    await asyncio.sleep(0.03)
+    new_session = AsyncMock()
+    handler.connection = new_session
+    handler._response_done_event.set()
+
+    with caplog.at_level(logging.INFO):
+        await handler._wait_notes()
+
+    original.conversation.item.create.assert_not_awaited()
+    new_session.conversation.item.create.assert_not_awaited()
+    assert any("session changed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_typed_text_is_a_user_turn_answered_and_reported() -> None:
     """Add typed text as a user message, ask for a response, and report it.
 
