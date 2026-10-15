@@ -951,8 +951,41 @@ class LocalStream:
         if not self._capture_on:
             logger.info("Starting with capture off; conversation.capture turns it on")
             return
+        clocked = self._clock_playback_from_speaker()
         self._robot.media.start_recording()
         self._robot.media.start_playing()
+        if clocked:
+            self._prime_speaker()
+
+    def _clock_playback_from_speaker(self) -> bool:
+        """Clock the shared pipeline from the speaker before it starts (the 65 s lag, 2026-10-15).
+
+        See playback_health: slaved to the microphone's clock, pulsesink re-maps its
+        stream offsets after a capture stall and its writes land 65 s ahead of what
+        the server plays, or behind it. Set while the pipeline is stopped, so it is
+        never paused for it (pausing corks the microphone).
+        """
+        audio = getattr(getattr(self._robot, "media", None), "audio", None)
+        pipeline = getattr(audio, "_pipeline", None)
+        if pipeline is None:
+            return False
+        try:
+            sink = playback_health.speaker_sink(pipeline)
+            if playback_health.clock_playback_from_speaker(pipeline, sink):
+                logger.info("Playback clocked from the speaker (%s), not the microphone", sink)
+                return True
+            logger.info("Playback clock unchanged: the speaker provides none")
+        except Exception:
+            logger.warning("Could not clock playback from the speaker", exc_info=True)
+        return False
+
+    def _prime_speaker(self) -> None:
+        """Start the speaker's stream, and the clock with it (playback_health.prime_speaker)."""
+        audio = getattr(getattr(self._robot, "media", None), "audio", None)
+        try:
+            playback_health.prime_speaker(audio)
+        except Exception:
+            logger.warning("Could not prime the speaker stream", exc_info=True)
 
     async def playback_watchdog_loop(self, interval_s: float = playback_health.CHECK_INTERVAL_S) -> None:
         """Check the speaker stream's latency once per interval (playback_health.check_playback).
@@ -1159,8 +1192,11 @@ class LocalStream:
                 if wanted != self._capture_on:
                     media = self._robot.media
                     if wanted:
+                        clocked = self._clock_playback_from_speaker()
                         media.start_recording()
                         media.start_playing()
+                        if clocked:
+                            self._prime_speaker()
                     else:
                         media.stop_recording()
                         media.stop_playing()
