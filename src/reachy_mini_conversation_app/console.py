@@ -11,6 +11,7 @@ import base64
 import asyncio
 import inspect
 import logging
+import threading
 import contextlib
 from typing import Any, List, Optional
 from pathlib import Path
@@ -224,9 +225,18 @@ def _queues_below_mixer(appsrc: Any) -> list[Any]:
     return queues
 
 
+# One barge-in drop probe per pad: with no audio flowing a probe never meets a later
+# buffer and stays, so each barge-in replaces the last one rather than adding to it.
+_DROP_PROBES: dict[str, int] = {}
+_DROP_PROBES_LOCK = threading.Lock()
+
+
 def _drop_until(pad: Any, running_time: int) -> None:
     """Drop buffers leaving ``pad`` that end by ``running_time``; remove itself at the first later one."""
     from gi.repository import Gst
+
+    key = pad.get_path_string()
+    probe_id: list[int] = []
 
     def probe(_pad: Any, info: Any) -> Any:
         buf = info.get_buffer()
@@ -235,9 +245,17 @@ def _drop_until(pad: Any, running_time: int) -> None:
         end = buf.pts + (buf.duration if buf.duration != Gst.CLOCK_TIME_NONE else 0)
         if end <= running_time:
             return Gst.PadProbeReturn.DROP
+        with _DROP_PROBES_LOCK:
+            if probe_id and _DROP_PROBES.get(key) == probe_id[0]:
+                del _DROP_PROBES[key]
         return Gst.PadProbeReturn.REMOVE
 
-    pad.add_probe(Gst.PadProbeType.BUFFER, probe)
+    with _DROP_PROBES_LOCK:
+        previous = _DROP_PROBES.pop(key, None)
+        if previous is not None:
+            pad.remove_probe(previous)  # superseded: this barge-in's running time is later
+        probe_id.append(pad.add_probe(Gst.PadProbeType.BUFFER, probe))
+        _DROP_PROBES[key] = probe_id[0]
 
 
 _HEALTH_WINDOW_S = 5.0
@@ -1330,9 +1348,8 @@ class LocalStream:
             path = params.get("file")
             if not isinstance(path, str) or not os.path.isfile(path):
                 raise JsonRpcError("sound requires 'file', an existing path", reason="invalid_params", code=-32602)
-            await asyncio.to_thread(media.play_sound, path)
             # The SDK's playbin is a second speaker stream it never tears down (2026-10-15).
-            playbin = getattr(audio, "_playbin", None)
+            playbin = await asyncio.to_thread(playback_health.play_motif, media, audio, path)
             if playbin is not None:
                 playback_health.watch_motif(audio, playbin, path)
             return {"playing": True}

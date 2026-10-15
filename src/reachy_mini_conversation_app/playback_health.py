@@ -653,6 +653,16 @@ def keep_monitor(monitor: SpeakerMonitor, audio: Any, now: float, stale_s: float
 # --- the motif playbin: conversation.sound's second speaker stream ------------------------
 
 
+MOTIF_LOCK = threading.Lock()
+
+
+def play_motif(media: Any, audio: Any, path: str) -> Any:
+    """Start a sound with the SDK's play_sound under MOTIF_LOCK; return its playbin, to watch."""
+    with MOTIF_LOCK:
+        media.play_sound(path)
+        return getattr(audio, "_playbin", None)
+
+
 def watch_motif(audio: Any, playbin: Any, path: str) -> threading.Thread:
     """Log a motif's playbin as a second stream, and tear it down when the sound ends.
 
@@ -683,10 +693,11 @@ def watch_motif(audio: Any, playbin: Any, path: str) -> threading.Thread:
         if "replaced" in cause:
             logger.info("Motif stream closed (%s): %s", cause, path)
             return
-        current = getattr(audio, "_playbin", None)
-        if current is not None and current is playbin:
-            audio._playbin = None
-            current.set_state(Gst.State.NULL)
+        with MOTIF_LOCK:  # a new sound cannot take _playbin between the check and the clear
+            current = getattr(audio, "_playbin", None)
+            if current is not None and current is playbin:
+                audio._playbin = None
+                current.set_state(Gst.State.NULL)
         logger.info("Motif stream closed (%s, torn down): %s", cause, path)
 
     thread = threading.Thread(target=wait, name="motif-watch", daemon=True)
@@ -698,10 +709,11 @@ def stop_motif(audio: Any) -> bool:
     """conversation.sound's stop: the motif's stream alone, never speech."""
     from gi.repository import Gst
 
-    playbin = getattr(audio, "_playbin", None)
-    if playbin is None:
-        return False
-    audio._playbin = None
-    playbin.set_state(Gst.State.NULL)
+    with MOTIF_LOCK:
+        playbin = getattr(audio, "_playbin", None)
+        if playbin is None:
+            return False
+        audio._playbin = None
+        playbin.set_state(Gst.State.NULL)
     logger.info("Motif stream closed (stop requested, torn down)")
     return True

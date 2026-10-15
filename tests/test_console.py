@@ -3537,3 +3537,60 @@ async def test_the_playback_guard_rebuilds_off_the_event_loop_after_unheard_repl
     await asyncio.wait_for(stream.playback_guard_loop(interval_s=0.01), timeout=2.0)
     await asyncio.gather(*stream._background)
     assert rebuilt == [(robot.media.audio, "unheard replies", "3 replies in a row pushed but not heard within 5 s", False)]
+
+
+class _ProbePad:
+    """A pad that records its probes, for the barge-in's drop probes."""
+
+    def __init__(self) -> None:
+        self.next_id = 0
+        self.active: dict[int, Any] = {}
+
+    def get_path_string(self) -> str:
+        return "/GstPipeline:p/GstQueue:queue1.GstPad:src"
+
+    def add_probe(self, _mask: Any, callback: Any) -> int:
+        self.next_id += 1
+        self.active[self.next_id] = callback
+        return self.next_id
+
+    def remove_probe(self, probe_id: int) -> None:
+        del self.active[probe_id]
+
+
+def test_repeated_barge_ins_keep_one_drop_probe_per_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no audio flowing the drop probes never see a later buffer; each barge-in replaces the last one."""
+    pytest.importorskip("gi")
+    from reachy_mini_conversation_app import console
+    from reachy_mini_conversation_app.console import _drop_until
+
+    monkeypatch.setattr(console, "_DROP_PROBES", {})
+
+    pad = _ProbePad()
+    for running_time in (1, 2, 3, 4, 5):
+        _drop_until(pad, running_time)
+    assert len(pad.active) == 1
+
+
+def test_a_drop_probe_that_removed_itself_is_not_removed_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A probe gone at its first later buffer is forgotten, so the next barge-in only adds one."""
+    gi = pytest.importorskip("gi")
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    from reachy_mini_conversation_app import console
+    from reachy_mini_conversation_app.console import _drop_until
+
+    monkeypatch.setattr(console, "_DROP_PROBES", {})
+
+    Gst.init(None)
+    pad = _ProbePad()
+    _drop_until(pad, 10)
+    (probe_id, callback), = pad.active.items()
+    later = Gst.Buffer.new_allocate(None, 4, None)
+    later.pts = 20
+    info = SimpleNamespace(get_buffer=lambda: later)
+    assert callback(pad, info) == Gst.PadProbeReturn.REMOVE
+    del pad.active[probe_id]  # GStreamer removes it on REMOVE
+    _drop_until(pad, 30)  # must not try to remove the gone probe
+    assert len(pad.active) == 1

@@ -1152,3 +1152,73 @@ def test_the_triggers_recover_the_behind_case(rig: Rig, caplog: pytest.LogCaptur
     assert any(f"trigger: {BEHIND}" in m for m in rebuild_lines), rebuild_lines
     after = [lat for t, lat in latencies if rebuilt_at is not None and t > rebuilt_at]
     assert len(after) >= 3 and all(lat is not None and lat < 1.0 for lat in after[-3:]), latencies
+
+
+# --- the motif playbin's teardown race ---------------------------------------------------
+
+
+def test_a_sound_started_during_a_motif_teardown_is_not_orphaned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """watch_motif's check-and-clear and play_motif's start are one under MOTIF_LOCK.
+
+    The review (2026-10-15): between the watcher's identity check and its
+    ``_playbin = None``, a new sound could take ``_playbin``; the watcher then dropped
+    the new playbin's handle, and nothing could stop or tear it down.
+    """
+    Gst = _gst()
+    ended = Gst.Message.new_eos(None)
+    bus = SimpleNamespace(timed_pop_filtered=lambda timeout, types: ended)
+
+    class Playbin:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.states: list[Any] = []
+
+        def get_bus(self) -> Any:
+            return bus
+
+        def set_state(self, state: Any) -> None:
+            self.states.append(state)
+
+    old, new = Playbin("old"), Playbin("new")
+    started = threading.Event()
+
+    class Audio:
+        reads = 0
+
+        def __init__(self) -> None:
+            self.value: Any = old
+
+        @property
+        def _playbin(self) -> Any:
+            Audio.reads += 1
+            value = self.value
+            if Audio.reads == 2:  # the watcher's identity check at the end: a new sound starts right after it
+                threading.Thread(target=ph.play_motif, args=(media, self, "new.wav"), daemon=True).start()
+                started.wait(0.2)  # without the lock, play_motif runs to the end here
+                time.sleep(0.1)
+            return value
+
+        @_playbin.setter
+        def _playbin(self, value: Any) -> None:
+            self.value = value
+
+    audio = Audio()
+
+    def play_sound(path: str) -> None:
+        started.set()
+        audio.value = new
+
+    media = SimpleNamespace(play_sound=play_sound)
+    ph.watch_motif(audio, old, "old.wav").join(timeout=3.0)
+    deadline = time.monotonic() + 2.0
+    while audio.value is not new and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert audio.value is new  # the new sound kept its handle
+    assert old.states == [Gst.State.NULL] and new.states == []
+
+
+def test_play_motif_returns_the_new_playbin() -> None:
+    """The sound route starts the SDK's player under MOTIF_LOCK and watches what it made."""
+    audio = SimpleNamespace(_playbin=None)
+    media = SimpleNamespace(play_sound=lambda path: setattr(audio, "_playbin", f"playbin for {path}"))
+    assert ph.play_motif(media, audio, "ring.wav") == "playbin for ring.wav"
