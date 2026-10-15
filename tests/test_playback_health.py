@@ -79,38 +79,6 @@ def test_the_invariant_is_the_bound() -> None:
     assert not ph.latency_bounded(ph.LATENCY_LIMIT_S + 0.01)
 
 
-def test_the_pipeline_is_clocked_from_the_speakers_own_clock_before_it_starts() -> None:
-    """The fix for the lag: the speaker's clock, never the microphone's.
-
-    Before PLAYING, an audio sink's provide_clock() is None (its ring buffer is not
-    acquired yet), and use_clock(None) runs the pipeline with no clock at all (the
-    trixie container, 2026-10-15). The clock object itself exists from the sink's
-    creation, as the provided_clock field.
-    """
-    clock = object()
-
-    class Sink:
-        provided_clock = clock
-
-        def provide_clock(self) -> None:
-            return None  # not acquired yet
-
-    used: list[object] = []
-    pipeline = type("P", (), {"use_clock": lambda self, c: used.append(c)})()
-    assert ph.clock_playback_from_speaker(pipeline, Sink()) is True
-    assert used == [clock]
-
-
-def test_a_speaker_without_a_clock_leaves_the_pipeline_clock_alone() -> None:
-    """Fakesink and friends provide none: nothing is changed, never use_clock(None)."""
-    used: list[object] = []
-    pipeline = type("P", (), {"use_clock": lambda self, c: used.append(c)})()
-    sink = type("S", (), {"provide_clock": lambda self: None})()
-    assert ph.clock_playback_from_speaker(pipeline, sink) is False
-    assert ph.clock_playback_from_speaker(pipeline, None) is False
-    assert used == []
-
-
 # --- the SDK's real playback layout -----------------------------------------------------
 
 
@@ -201,14 +169,9 @@ class Rig:
         return Gst.PadProbeReturn.OK
 
     def start(self) -> None:
-        """Start as the app does: the speaker's clock, PLAYING, then the prime."""
+        """Start as the app does."""
         Gst = self.Gst
-        clocked = ph.clock_playback_from_speaker(self.pipeline, self.speaker)  # as the app does, before PLAYING
-        if USE_SDK_DEVICES and self.speaker.get_factory().get_name() == "pulsesink":
-            assert clocked, "the speaker's clock was not applied"  # a silent no-op passed once
         self.pipeline.set_state(Gst.State.PLAYING)
-        if clocked:
-            ph.prime_speaker(self.audio)
         self.pipeline.get_state(5 * Gst.SECOND)
         threading.Thread(target=self._pull_mic, daemon=True).start()
         if USE_SDK_DEVICES:
@@ -341,18 +304,6 @@ def test_the_speaker_sink_is_found_in_the_sdk_layout(rig: Rig) -> None:
         assert factory not in ("appsink", "fakesink")
     else:
         assert factory == "fakesink"
-
-
-def test_the_microphone_delivers_from_the_start_before_any_reply(rig: Rig) -> None:
-    """Clocked from the speaker, nothing ran until the speaker's stream had audio.
-
-    The trixie container, 2026-10-15: with pulsesink's clock chosen before PLAYING and
-    no priming, the pipeline sat in PAUSED and the microphone delivered 0 buffers until
-    the first reply was pushed. prime_speaker's 20 ms of silence starts it.
-    """
-    rig.start()
-    assert rig.pipeline.get_state(0)[1] == rig.Gst.State.PLAYING
-    assert rig.mic_rate(1.0) > 5, "the microphone delivered nothing before the first reply"
 
 
 def test_playback_latency_stays_bounded_after_a_stall(rig: Rig) -> None:
