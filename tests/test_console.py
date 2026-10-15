@@ -3,6 +3,7 @@
 import time
 import base64
 import asyncio
+import logging
 import threading
 from types import SimpleNamespace
 from typing import Any
@@ -3266,8 +3267,8 @@ async def test_the_playback_watchdog_checks_the_pipeline_each_interval(monkeypat
     stream = LocalStream(handler, robot)
     checked: list[Any] = []
 
-    def check(pipeline: Any, audio: Any = None) -> Any:
-        assert audio is robot.media.audio  # the governor restarts the speaker through it
+    def check(pipeline: Any, replies: Any = None) -> Any:
+        assert replies is stream._replies  # the minute line reports the tracker's last lag
         checked.append((pipeline, threading.current_thread() is threading.main_thread()))
         if len(checked) == 3:
             stream._stop_event.set()
@@ -3289,7 +3290,7 @@ async def test_the_playback_watchdog_survives_a_failed_check(monkeypatch: pytest
     stream = LocalStream(MagicMock(), _clocked_robot([]))
     calls: list[int] = []
 
-    def check(pipeline: Any, audio: Any = None) -> Any:
+    def check(pipeline: Any, replies: Any = None) -> Any:
         calls.append(1)
         if len(calls) == 2:
             stream._stop_event.set()
@@ -3485,6 +3486,46 @@ async def test_the_playback_guard_rebuilds_off_the_event_loop_after_unheard_repl
     await asyncio.wait_for(stream.playback_guard_loop(interval_s=0.01), timeout=2.0)
     await asyncio.gather(*stream._background)
     assert rebuilt == [(robot.media.audio, "unheard replies", "3 replies in a row pushed but not heard within 5 s", False)]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_heard_late_is_logged_and_rebuilds_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each measured lag is one INFO line; one over the bound goes to the governor as the playback latency trigger."""
+    from reachy_mini_conversation_app import playback_health
+
+    robot = _audio_robot()
+    robot.media.audio = SimpleNamespace(_pipeline=None)
+    stream = LocalStream(MagicMock(), robot)
+    cause = "a reply was heard 6.0 s after its first push, over the 5.0 s bound"
+    verdicts = [
+        [playback_health.Verdict("heard_after", "6.00 s"), playback_health.Verdict("lag_rebuild", cause)],
+        [playback_health.Verdict("heard_after", "0.31 s")],
+    ]
+    stream._replies = SimpleNamespace(
+        tick=lambda now: verdicts.pop() if verdicts else [], unheard_in_a_row=0, armed=True
+    )
+    monkeypatch.setattr(playback_health, "keep_monitor", lambda monitor, audio, now: "unavailable")
+    rebuilt: list[tuple[Any, str, str, bool]] = []
+    loop = asyncio.get_running_loop()
+
+    def rebuild(audio: Any, trigger: str, cause: str) -> bool:
+        rebuilt.append((audio, trigger, cause, threading.current_thread() is threading.main_thread()))
+        loop.call_soon_threadsafe(stream._stop_event.set)
+        return True
+
+    monkeypatch.setattr(playback_health.GOVERNOR, "rebuild", rebuild)
+    with caplog.at_level(logging.INFO):
+        await asyncio.wait_for(stream.playback_guard_loop(interval_s=0.01), timeout=2.0)
+        await asyncio.gather(*stream._background)
+    assert rebuilt == [(robot.media.audio, "playback latency", cause, False)]
+    heard = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Reply heard after")]
+    assert heard == [
+        "Reply heard after 0.31 s (first push to sound on the speaker's monitor)",
+        "Reply heard after 6.00 s (first push to sound on the speaker's monitor)",
+    ]
+    assert all(r.levelno == logging.INFO for r in caplog.records if r.getMessage().startswith("Reply heard after"))
 
 
 class _ProbePad:

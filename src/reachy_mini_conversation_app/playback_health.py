@@ -14,11 +14,13 @@ every reply is written into the past and never heard (the trixie container, afte
 maxlength: pulsesink always asks for -1, and the server only honours a smaller
 client value.
 
-The watchdog: once a minute it logs the stream's latency, and
-over LATENCY_LIMIT_S it recreates the speaker sink alone (the record branch is never
+Playback latency is measured end to end, per reply: from its first push to the first
+sound of it on the speaker's monitor (ReplyTracker). pa_stream_get_latency, read
+through pulsesink's ring buffer, is no measure: it read 0 on the robot while speech
+played (2026-10-15) and in every trixie-container reading. A reply heard more than
+LATENCY_LIMIT_S late recreates the speaker sink alone (the record branch is never
 paused or relinked); measured, that cleared a desync at once, replies heard in 0.16 s.
-pa_stream_get_latency reports a queue ahead of the read pointer, the robot's case; a
-write pointer behind it reads as 0, so the watchdog cannot see that case.
+Once a minute the watchdog logs the last measured lag and its age.
 """
 
 from __future__ import annotations
@@ -27,7 +29,6 @@ import time
 import logging
 import functools
 import threading
-from types import SimpleNamespace
 from typing import Any, TypeVar, Callable, Sequence, NamedTuple
 
 
@@ -125,21 +126,6 @@ def speaker_sink(pipeline: Any) -> Any:
     return None
 
 
-def measure_latency_s(sink: Any) -> float | None:
-    """Read the speaker stream's own latency (pa_stream_get_latency, via the ring buffer), in seconds."""
-    ringbuffer = getattr(sink, "ringbuffer", None)
-    try:
-        if ringbuffer is None or not ringbuffer.is_acquired():
-            return None
-        rate = ringbuffer.spec.info.rate
-        if not rate:
-            return None
-        return float(ringbuffer.delay()) / float(rate)
-    except Exception:
-        logger.debug("could not read the speaker stream's latency", exc_info=True)
-        return None
-
-
 def rebuild_sink(sink: Any, timeout_s: float = 2.0) -> bool:
     """Recreate the speaker's stream: the sink element alone, the pipeline stays PLAYING.
 
@@ -222,6 +208,7 @@ class RebuildGovernor:
         """Start with no rebuild history; ``clock`` is injectable for tests."""
         self._clock = clock
         self._history: list[float] = []
+        self.last_rebuild_at: float | None = None
 
     def rebuild(self, audio: Any, trigger: str, cause: str) -> bool:
         """Rebuild the speaker stream for ``trigger`` unless the cooldown holds it back.
@@ -246,6 +233,7 @@ class RebuildGovernor:
                 logger.info("Speaker stream rebuild skipped (trigger: %s): no speaker sink", trigger)
                 return False
             self._history = [t for t in self._history if now - t < REBUILD_WINDOW_S] + [now]
+            self.last_rebuild_at = now
             logger.warning(
                 "Rebuilding the speaker stream (trigger: %s, cause: %s; rebuild %d in the last %.0f s)",
                 trigger,
@@ -268,34 +256,29 @@ class RebuildGovernor:
 GOVERNOR = RebuildGovernor()
 
 
+def lag_report(last: tuple[float, float] | None, now: float) -> str:
+    """Say what the minute line reports: the last measured lag and its age, or that none was. Pure."""
+    if last is None:
+        return "no reply measured"
+    lag_s, at = last
+    return f"last reply heard after {lag_s:.2f} s, {max(0.0, now - at):.0f} s ago"
+
+
 def check_playback(
-    pipeline: Any, limit_s: float = LATENCY_LIMIT_S, audio: Any = None, governor: RebuildGovernor | None = None
+    pipeline: Any, limit_s: float = LATENCY_LIMIT_S, replies: Any = None, now: float | None = None
 ) -> Verdict:
-    """One watchdog check: log the latency, rebuild the speaker stream if it ran away, check the invariant."""
-    governor = governor or GOVERNOR
+    """Log the minute line, the last measured reply lag; the rebuild belongs to the per-reply trigger."""
     with MEDIA_LOCK:
         if not _playing(pipeline):
             return Verdict("unmeasured", "the pipeline is not playing")
         sink = speaker_sink(pipeline)
-        latency = measure_latency_s(sink) if sink is not None else None
     name = sink.get_name() if sink is not None else "none"
-    shown = "unmeasured" if latency is None else f"{latency:.3f} s"
-    logger.info("Playback latency: %s (speaker %s, bound %.1f s)", shown, name, limit_s)
-    verdict = decide(latency, limit_s)
-    if verdict.action != "rebuild":
-        return verdict
-    if audio is None:
-        audio = SimpleNamespace(_pipeline=pipeline)
-    if not governor.rebuild(audio, "playback latency", verdict.cause):
-        return verdict
-    with MEDIA_LOCK:
-        after = measure_latency_s(sink) if _playing(pipeline) else None
-    shown_after = "unmeasured" if after is None else f"{after:.3f} s"
-    if latency_bounded(after, limit_s):
-        logger.info("Speaker stream rebuilt; playback latency now %s, bounded (invariant held)", shown_after)
-    else:
-        logger.error("Invariant violated: playback latency stays bounded (latency now %s)", shown_after)
-    return verdict
+    last = replies.last_lag() if replies is not None else None
+    line = lag_report(last, time.monotonic() if now is None else now)
+    logger.info("Playback latency: %s (speaker %s, bound %.1f s)", line, name, limit_s)
+    if last is None:
+        return Verdict("unmeasured", line)
+    return Verdict("ok" if latency_bounded(last[0], limit_s) else "over", line)
 
 
 # --- the capture-gap trigger ---------------------------------------------------------------
@@ -396,6 +379,24 @@ LOUD_RMS = 0.003  # about -50 dBFS: speech, not silence or dither
 HEARD_FRACTION = 0.25  # of the speech pushed (up to the window less 1 s), heard by the deadline
 MIN_SPEECH_S = 0.3  # less speech than this is not judged
 
+# The measured lag. Each reply's lag is the time from its first push to the first
+# sound of it on the monitor. Replies play in the order pushed, so sounds are matched
+# to replies first in, first out: the oldest reply not yet heard claims the next sound
+# that starts (a loud monitor buffer after a quiet one) after its push. Sound already
+# playing at the push (a motif) has no start, so it is never a reply's. A reply pushed
+# while the one before it still plays is queued, not lagged: its lag counts from when
+# the one before ends (heard at + seconds pushed), and the first loud buffer from then
+# is its sound, start or not. LAG_WINDOW_S is longer than the robot's 65 s lag, so
+# that lag is measured; a reply heard by then has no lag, and a reply never heard is
+# the unheard trigger's case. A rebuild drops the replies pushed before it, so a reply
+# it cut off never claims a later reply's sound, and a barge-in drops every reply still
+# queued; neither leaves a reply to be queued behind. So does a monitor that delivered too
+# little to judge a reply by. The limit: a reply lost without a rebuild (one or two
+# unheard, then one heard) claims the next reply's sound, and a lag over the bound
+# rebuilds the speaker then, logged as playback latency.
+LAG_WINDOW_S = 90.0
+QUEUE_SLACK_S = 0.3  # a queued reply's sound may arrive this much before the estimate
+
 
 def loud_seconds(samples: Any, rate: int) -> tuple[float, float]:
     """Return (seconds, seconds above LOUD_RMS) of a buffer of float samples, in 10 ms blocks."""
@@ -444,13 +445,26 @@ class ReplyTracker:
     from the event loop, monitor buffers from GStreamer's thread.
     """
 
-    def __init__(self, window_s: float = UNHEARD_WINDOW_S, limit: int = UNHEARD_LIMIT) -> None:
-        """Start with nothing pushed, and disarmed until the monitor has heard one reply."""
+    def __init__(
+        self,
+        window_s: float = UNHEARD_WINDOW_S,
+        limit: int = UNHEARD_LIMIT,
+        rebuilt_at: Callable[[], float | None] | None = None,
+    ) -> None:
+        """Start with nothing pushed, and disarmed until the monitor has heard one reply.
+
+        ``rebuilt_at`` returns the time of the last speaker rebuild (the governor's, by default).
+        """
         self._window_s = window_s
         self._limit = limit
+        self._rebuilt_at = rebuilt_at or (lambda: GOVERNOR.last_rebuild_at)
         self._lock = threading.Lock()
         self._replies: list[dict[str, Any]] = []
         self._monitor: list[tuple[float, float, float]] = []  # (arrival, seconds, speech seconds)
+        self._was_loud = False  # the last monitor buffer had speech in it
+        self._before: dict[str, Any] | None = None  # the last reply heard, which a queued reply waits for
+        self._lags: list[float] = []  # measured, not yet reported by tick
+        self._last_lag: tuple[float, float] | None = None  # (lag, measured at)
         self.unheard_in_a_row = 0
         self.armed = False
 
@@ -459,9 +473,18 @@ class ReplyTracker:
         with self._lock:
             current = self._replies[-1] if self._replies else None
             if current is None or current["flushed"] or now - current["last"] > REPLY_GAP_S:
-                current = {"start": now, "last": now, "speech": 0.0, "flushed": False, "judged": False}
+                current = {
+                    "start": now,
+                    "last": now,
+                    "seconds": 0.0,
+                    "speech": 0.0,
+                    "flushed": False,
+                    "judged": False,
+                    "lag": "pending",  # "pending" | "measured" | "none"
+                }
                 self._replies.append(current)
             current["last"] = now
+            current["seconds"] += seconds
             current["speech"] += speech_s
 
     def flushed(self, now: float) -> None:
@@ -469,16 +492,85 @@ class ReplyTracker:
         with self._lock:
             if self._replies and not self._replies[-1]["judged"]:
                 self._replies[-1]["flushed"] = True
+            for reply in self._replies:  # everything queued was dropped: no lag, and nothing to wait for
+                if reply["lag"] == "pending":
+                    reply["lag"] = "none"
+            self._before = None
 
     def monitored(self, now: float, seconds: float, speech_s: float) -> None:
         """Note a buffer from the speaker's monitor, arriving at ``now``."""
         with self._lock:
             self._monitor.append((now, seconds, speech_s))
+            loud = speech_s > 0.0
+            starts = loud and not self._was_loud
+            self._was_loud = loud
+            if loud:
+                self._match(now, starts)
+
+    def _expire(self, now: float) -> None:
+        """Give up on replies past the lag window, and on replies a rebuild cut off. Holds the lock."""
+        rebuilt = self._rebuilt_at()
+        if rebuilt is not None and self._before is not None and self._before["heard_at"] < rebuilt:
+            self._before = None  # the rebuild dropped whatever of it was still queued
+        for reply in self._replies:
+            if reply["lag"] != "pending":
+                continue
+            if now > reply["start"] + LAG_WINDOW_S or (rebuilt is not None and reply["start"] < rebuilt):
+                reply["lag"] = "none"
+                self._before = None
+
+    def _match(self, now: float, starts: bool) -> None:
+        """Give a loud monitor buffer to the oldest reply not yet heard, if it is that reply's sound."""
+        self._expire(now)
+        reply = None
+        for candidate in self._replies:
+            if candidate["lag"] != "pending":
+                continue
+            if candidate["speech"] < MIN_SPEECH_S and now - candidate["last"] > REPLY_GAP_S:
+                candidate["lag"] = "none"  # finished with too little speech to be heard
+                continue
+            reply = candidate
+            break
+        if reply is None or now <= reply["start"] or reply["speech"] < MIN_SPEECH_S:
+            return
+        before = self._before
+        ends = before["heard_at"] + before["seconds"] if before is not None else None
+        if ends is not None and ends > reply["start"]:
+            if now < ends - QUEUE_SLACK_S:
+                return  # still the reply before it
+            expected = ends
+        elif starts:
+            expected = reply["start"]
+        else:
+            return  # sound that started before the push
+        reply["lag"] = "measured"
+        reply["heard_at"] = now
+        self._before = reply
+        lag = max(0.0, now - expected)
+        self._lags.append(lag)
+        self._last_lag = (lag, now)
+
+    def last_lag(self) -> tuple[float, float] | None:
+        """Return (seconds, measured at) of the last measured reply lag, or None."""
+        with self._lock:
+            return self._last_lag
 
     def tick(self, now: float) -> list[Verdict]:
         """Judge every reply whose window has closed; a rebuild verdict follows the third unheard in a row."""
         verdicts: list[Verdict] = []
         with self._lock:
+            self._expire(now)
+            for lag in self._lags:
+                verdicts.append(Verdict("heard_after", f"{lag:.2f} s"))
+                if not latency_bounded(lag):
+                    verdicts.append(
+                        Verdict(
+                            "lag_rebuild",
+                            f"a reply was heard {lag:.1f} s after its first push, "
+                            f"over the {LATENCY_LIMIT_S:.1f} s bound",
+                        )
+                    )
+            self._lags.clear()
             for reply in self._replies:
                 if reply["judged"] or now < reply["start"] + self._window_s:
                     continue
@@ -492,6 +584,9 @@ class ReplyTracker:
                     reply["speech"], sum(m[2] for m in window), sum(m[1] for m in window), self._window_s
                 )
                 verdicts.append(verdict)
+                if verdict.action == "unmeasured" and reply["lag"] == "pending":
+                    reply["lag"] = "none"  # the monitor was down: its sound may come later, or never
+                    self._before = None
                 if verdict.action == "heard":
                     self.unheard_in_a_row = 0
                     self.armed = True
@@ -502,7 +597,9 @@ class ReplyTracker:
                         verdicts.append(Verdict("rebuild", f"{streak.cause}; last: {verdict.cause}"))
                         self.unheard_in_a_row = 0
             horizon = now - 2 * self._window_s
-            self._replies = [r for r in self._replies if not r["judged"] or r["last"] > horizon]
+            self._replies = [
+                r for r in self._replies if not r["judged"] or r["last"] > horizon or r["lag"] == "pending"
+            ]
             self._monitor = [m for m in self._monitor if m[0] > horizon]
         return verdicts
 

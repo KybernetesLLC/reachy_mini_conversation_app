@@ -980,9 +980,9 @@ class LocalStream:
         self._robot.media.start_playing()
 
     async def playback_watchdog_loop(self, interval_s: float = playback_health.CHECK_INTERVAL_S) -> None:
-        """Check the speaker stream's latency once per interval (playback_health.check_playback).
+        """Log the last measured reply lag once per interval (playback_health.check_playback).
 
-        Off the event loop; it rebuilds only the speaker sink, never the session.
+        Off the event loop. The rebuild on a lag over the bound is the playback guard's.
         """
         while not self._stop_event.is_set():
             try:
@@ -995,12 +995,12 @@ class LocalStream:
             if pipeline is None:
                 continue
             try:
-                await asyncio.to_thread(playback_health.check_playback, pipeline, audio=audio)
+                await asyncio.to_thread(playback_health.check_playback, pipeline, replies=self._replies)
             except Exception:
                 logger.warning("Playback latency check failed", exc_info=True)
 
     async def playback_guard_loop(self, interval_s: float = 0.5) -> None:
-        """Judge pushed replies against the speaker's monitor; three unheard in a row rebuild the speaker.
+        """Judge pushed replies against the speaker's monitor; three unheard in a row, or one heard late, rebuild.
 
         The monitor is kept on the device the speaker plays to, off the event loop.
         """
@@ -1032,6 +1032,10 @@ class LocalStream:
                 )
             elif verdict.action == "rebuild":
                 self._run_off_loop(playback_health.GOVERNOR.rebuild, audio, "unheard replies", verdict.cause)
+            elif verdict.action == "heard_after":
+                logger.info("Reply heard after %s (first push to sound on the speaker's monitor)", verdict.cause)
+            elif verdict.action == "lag_rebuild":
+                self._run_off_loop(playback_health.GOVERNOR.rebuild, audio, "playback latency", verdict.cause)
             else:
                 logger.debug("Reply %s: %s", verdict.action, verdict.cause)
 
