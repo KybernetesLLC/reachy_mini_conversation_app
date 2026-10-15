@@ -3594,3 +3594,27 @@ def test_a_drop_probe_that_removed_itself_is_not_removed_again(monkeypatch: pyte
     del pad.active[probe_id]  # GStreamer removes it on REMOVE
     _drop_until(pad, 30)  # must not try to remove the gone probe
     assert len(pad.active) == 1
+
+
+def test_the_media_start_takes_capture_off_the_clock_before_starting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The microphone's appsink is unsynced before the start, on the first start and on capture on."""
+    from reachy_mini_conversation_app import playback_health
+
+    monkeypatch.delenv("REACHY_MINI_CAPTURE_ON_START", raising=False)
+    order: list[str] = []
+    robot = _clocked_robot(order)
+    monkeypatch.setattr(playback_health, "free_capture_from_clock", lambda audio: order.append("free") or True)
+    monkeypatch.setattr(playback_health, "speaker_sink", lambda pipeline: "sink")
+    monkeypatch.setattr(
+        playback_health, "clock_playback_from_speaker", lambda pipeline, sink: order.append("clock") or True
+    )
+    monkeypatch.setattr(playback_health, "prime_speaker", lambda audio: order.append("prime"))
+    app = FastAPI()
+    stream = LocalStream(MagicMock(), robot, settings_app=app)
+    stream._start_media_if_wanted()
+    assert order == ["free", "clock", "start_recording", "start_playing", "prime"]
+    stream._init_settings_ui_if_needed()
+    _rpc_call(app, "conversation.capture", {"on": False})
+    order.clear()
+    _rpc_call(app, "conversation.capture", {"on": True})
+    assert order == ["free", "clock", "start_recording", "start_playing", "prime"]

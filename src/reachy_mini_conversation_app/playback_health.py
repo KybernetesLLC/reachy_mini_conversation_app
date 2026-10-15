@@ -151,6 +151,26 @@ def clock_playback_from_speaker(pipeline: Any, sink: Any) -> bool:
     return True
 
 
+def free_capture_from_clock(audio: Any) -> bool:
+    """Let the microphone's appsink take frames as pulsesrc delivers them, never on the clock. Call before PLAYING.
+
+    Clocked from the speaker, a synced capture sink waits on a clock that stops whenever
+    the speaker's stream does (its sink at NULL, a dead stream), and only a pushed reply
+    restarted it; a deaf microphone never produces one. Measured in the trixie container
+    with the SDK's elements, the speaker sink at NULL for 5 s: 0 microphone buffers/s with
+    sync=True, still 0 after it came back; 100/s throughout with sync=False. Nothing needs
+    the capture sink synced: get_audio_sample pulls, DoA reads the USB device, and the
+    wobbler's appsink is on the playback side and stays synced. The prime is still
+    needed: unprimed, the speaker cannot preroll, the pipeline stays PAUSED, and capture
+    delivers nothing until the first reply (the container, sync=False, no prime).
+    """
+    appsink = getattr(audio, "_appsink_audio", None)
+    if appsink is None or not hasattr(appsink, "find_property") or appsink.find_property("sync") is None:
+        return False
+    appsink.set_property("sync", False)
+    return True
+
+
 def prime_speaker(audio: Any) -> None:
     """Push 20 ms of silence, so the speaker's stream starts and its clock with it. Call after starting.
 
@@ -252,8 +272,16 @@ def _playing(pipeline: Any) -> bool:
 
 
 def restart_speaker_clock(audio: Any) -> bool:
-    """Restart the speaker's clock after its sink went through NULL; nothing to do on the microphone's clock."""
-    return False
+    """Prime the speaker: clocked from it, its clock runs again only once its stream has audio.
+
+    After a rebuild the sink has been through NULL, and during a capture stall a dead
+    speaker stream may be what stopped; with no reply pushed nothing else restarts it
+    (the review, 2026-10-15). 20 ms of silence is harmless otherwise.
+    """
+    if not hasattr(audio, "push_audio_sample"):
+        return False
+    prime_speaker(audio)
+    return True
 
 
 class RebuildGovernor:
