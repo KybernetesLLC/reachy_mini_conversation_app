@@ -3414,3 +3414,69 @@ def test_capture_off_and_on_hold_the_media_lock_against_a_rebuild() -> None:
     _rpc_call(app, "conversation.capture", {"on": False})
     _rpc_call(app, "conversation.capture", {"on": True})
     assert held == [True, True, True, True]
+
+
+@pytest.mark.asyncio
+async def test_record_loop_reports_a_stall_then_rebuilds_the_speaker_after_a_capture_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No frames for 3 s: reported once; frames back after more than 5 s: one rebuild, off the event loop."""
+    from reachy_mini_conversation_app import playback_health
+
+    frame = np.zeros(4, dtype=np.int16)
+    # (now, frame or None) per poll: frames, a 7.2 s stall, frames again
+    polls = iter([(0.0, frame), (1.0, None), (3.5, None), (5.0, None), (7.2, frame), (7.21, frame)])
+    robot = _audio_robot(get_input_audio_samplerate=MagicMock(return_value=16000), get_audio_sample=MagicMock())
+    robot.media.audio = SimpleNamespace(_pipeline=None)
+    handler = MagicMock()
+    handler.receive = AsyncMock()
+    stream = LocalStream(handler, robot)
+    current: list[float] = [0.0]
+    stream._now = lambda: current[0]
+
+    def sample() -> Any:
+        try:
+            current[0], value = next(polls)
+        except StopIteration:
+            stream._stop_event.set()
+            return None
+        return value
+
+    robot.media.get_audio_sample.side_effect = sample
+    acted: list[tuple[str, Any, bool]] = []
+    monkeypatch.setattr(
+        playback_health,
+        "act_on_capture",
+        lambda verdict, audio: acted.append(
+            (verdict.action, audio, threading.current_thread() is threading.main_thread())
+        ),
+    )
+    await stream.record_loop()
+    await asyncio.gather(*stream._background)
+    assert acted == [("stalled", robot.media.audio, False), ("rebuild", robot.media.audio, False)]
+
+
+@pytest.mark.asyncio
+async def test_record_loop_counts_frames_while_muted_so_a_mute_is_no_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A muted microphone still delivers frames; ten seconds of mute is not a capture gap."""
+    from reachy_mini_conversation_app import playback_health
+
+    frame = np.zeros(4, dtype=np.int16)
+    robot = _audio_robot(get_input_audio_samplerate=MagicMock(return_value=16000), get_audio_sample=MagicMock())
+    handler = MagicMock()
+    handler.receive = AsyncMock()
+    stream = LocalStream(handler, robot)
+    stream._mic_muted = True
+    times = iter([0.0, 2.0, 4.0, 6.0, 8.0, 10.0])
+    stream._now = lambda: next(times)
+    count = [0]
+
+    def sample() -> Any:
+        count[0] += 1
+        if count[0] == 6:
+            stream._stop_event.set()
+        return frame
+
+    robot.media.get_audio_sample.side_effect = sample
+    monkeypatch.setattr(playback_health, "act_on_capture", lambda v, a: pytest.fail(f"acted: {v}"))
+    await stream.record_loop()

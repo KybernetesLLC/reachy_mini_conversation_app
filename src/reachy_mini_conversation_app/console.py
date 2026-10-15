@@ -308,6 +308,10 @@ class LocalStream:
         # conversation.audio_health (the companion's audio audit, A2).
         self._last_frame_at: float | None = None
         self._recent_frames: deque[tuple[float, float]] = deque()
+        # The capture-gap trigger: every frame the pipeline delivers, muted or not.
+        self._capture_watch = playback_health.CaptureWatch()
+        self._now: Callable[[], float] = time.monotonic
+        self._background: set[asyncio.Future[Any]] = set()
         self._preroll_clock = preroll_clock
         # Where the pre-roll counts back from, on _preroll_clock: the wake word's
         # peak when the opener said when it was, else None (the connect).
@@ -1845,6 +1849,7 @@ class LocalStream:
 
         while not self._stop_event.is_set():
             if not self._capture_on:
+                self._capture_watch.reset()  # time with capture off is no gap
                 # No audio from before a capture-off may survive into a later
                 # session.
                 self._clear_preroll()
@@ -1858,6 +1863,7 @@ class LocalStream:
             # Off the event loop (the companion's audio audit, A6): the pull blocks
             # up to 20 ms, which stalled the websocket sends and the player.
             audio_frame = await asyncio.to_thread(self._robot.media.get_audio_sample)
+            self._watch_capture(audio_frame is not None)
             if self._mic_muted:
                 # No audio from while the mic is muted may sit in the buffer
                 # and grow stale -- duration is tracked in audio time, not
@@ -1882,6 +1888,28 @@ class LocalStream:
                         self._append_preroll(frame)
                 self._emit_level("user", audio_frame)
             await asyncio.sleep(0)  # avoid busy loop
+
+    def _watch_capture(self, got_frame: bool) -> None:
+        """Feed the capture-gap trigger one poll; a stall or a gap is acted on off the event loop."""
+        now = self._now()
+        watch = self._capture_watch
+        verdict = watch.frame(now) if got_frame else watch.idle(now)
+        if verdict.action == "ok":
+            return
+        audio = getattr(getattr(self._robot, "media", None), "audio", None)
+        self._run_off_loop(playback_health.act_on_capture, verdict, audio)
+
+    def _run_off_loop(self, func: Callable[..., Any], *args: Any) -> None:
+        """Run ``func`` in a worker thread without waiting for it; a failure is logged."""
+        future = asyncio.ensure_future(asyncio.to_thread(func, *args))
+        self._background.add(future)
+
+        def done(f: "asyncio.Future[Any]") -> None:
+            self._background.discard(f)
+            if not f.cancelled() and f.exception() is not None:
+                logger.warning("%s failed", getattr(func, "__name__", func), exc_info=f.exception())
+
+        future.add_done_callback(done)
 
     async def play_loop(self) -> None:
         """Fetch outputs from the handler: log text and play audio frames."""

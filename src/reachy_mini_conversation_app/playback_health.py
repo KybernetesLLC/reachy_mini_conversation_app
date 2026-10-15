@@ -339,6 +339,83 @@ def check_playback(
     return verdict
 
 
+# --- the capture-gap trigger ---------------------------------------------------------------
+#
+# A capture stall is what desynced pulsesink from the server (the module docstring):
+# after one, replies may be written behind the server's read pointer and never heard,
+# and pa_stream_get_latency reads 0 then, so the latency watchdog cannot see it.
+# Frames normally arrive every 10 ms; the robot's harmful gaps were 10 s and more
+# (2026-10-10), the container's 75 s. 5 s is far above any scheduling hiccup (the
+# record loop's own pull stalls were 20 ms) and well under the robot's gaps, and a
+# needless rebuild costs a ~0.1 s blip in playback. While frames are missing, after
+# 3 s one WARNING says so and the speaker's clock is restarted (it may be what stopped).
+
+CAPTURE_GAP_S = 5.0
+CAPTURE_STALL_S = 3.0
+
+
+def capture_gap_decision(gap_s: float, limit_s: float = CAPTURE_GAP_S) -> Verdict:
+    """Decide from a gap between two microphone frames, seen when the second arrives. Pure."""
+    if gap_s > limit_s:
+        return Verdict(
+            "rebuild",
+            f"a {gap_s:.1f} s gap in microphone frames with capture on (bound {limit_s:.1f} s); "
+            "a capture stall can leave pulsesink writing where the server never plays",
+        )
+    return Verdict("ok", f"microphone frames {gap_s:.3f} s apart")
+
+
+def capture_stall_decision(age_s: float, warned: bool, stall_s: float = CAPTURE_STALL_S) -> Verdict:
+    """Decide while no frame comes: once per stall, past ``stall_s``, it is reported. Pure."""
+    if age_s > stall_s and not warned:
+        return Verdict("stalled", f"no microphone frames for {age_s:.1f} s with capture on")
+    return Verdict("ok", f"last microphone frame {age_s:.1f} s ago")
+
+
+class CaptureWatch:
+    """Track microphone frame arrivals for the record loop; times are passed in, so it is deterministic."""
+
+    def __init__(self, gap_s: float = CAPTURE_GAP_S, stall_s: float = CAPTURE_STALL_S) -> None:
+        """Start with no frame seen."""
+        self._gap_s = gap_s
+        self._stall_s = stall_s
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget the last frame: capture was off, and that time is no gap."""
+        self._last: float | None = None
+        self._warned = False
+
+    def frame(self, now: float) -> Verdict:
+        """Note a frame at ``now``; a gap over the bound before it asks for a rebuild."""
+        last, self._last, self._warned = self._last, now, False
+        if last is None:
+            return Verdict("ok", "first microphone frame")
+        return capture_gap_decision(now - last, self._gap_s)
+
+    def idle(self, now: float) -> Verdict:
+        """Note a poll with no frame at ``now``; the first such poll after a reset starts the wait."""
+        if self._last is None:
+            self._last = now
+            return Verdict("ok", "waiting for the first microphone frame")
+        verdict = capture_stall_decision(now - self._last, self._warned, self._stall_s)
+        if verdict.action == "stalled":
+            self._warned = True
+        return verdict
+
+
+def act_on_capture(verdict: Verdict, audio: Any, governor: RebuildGovernor | None = None) -> None:
+    """Carry out a CaptureWatch verdict, off the event loop: report a stall, or rebuild after a gap."""
+    if verdict.action == "stalled":
+        logger.warning("Capture stalled: %s; restarting the speaker's clock in case it stopped", verdict.cause)
+        try:
+            restart_speaker_clock(audio)
+        except Exception:
+            logger.warning("Could not restart the speaker's clock", exc_info=True)
+    elif verdict.action == "rebuild":
+        (governor or GOVERNOR).rebuild(audio, "capture gap", verdict.cause)
+
+
 # --- the motif playbin: conversation.sound's second speaker stream ------------------------
 
 

@@ -17,6 +17,7 @@ and "heard" is measured on the speaker's monitor source, past the server's queue
 
 from __future__ import annotations
 import os
+import re
 import math
 import time
 import logging
@@ -243,8 +244,12 @@ class Rig:
         Gst = self.Gst
         while not self._stop.is_set():
             sample = self.audio._appsink_audio.emit("try-pull-sample", 20 * Gst.MSECOND)
+            now = time.monotonic()
             if sample is not None:
-                self.mic_buffers.append(time.monotonic())
+                self.mic_buffers.append(now)
+            on_poll = getattr(self, "on_mic_poll", None)  # (now, got_frame), as the app's record loop polls
+            if on_poll is not None:
+                on_poll(now, sample is not None)
 
     def push_reply(self, seconds: float, level: float = 0.3) -> float:
         """Push a reply of constant ``level`` and return when its push began."""
@@ -638,3 +643,176 @@ def test_a_rebuild_waits_for_a_capture_change_in_progress(monkeypatch: pytest.Mo
     result.append(ph.RebuildGovernor().rebuild(audio, "capture gap", "test"))
     t.join()
     assert result == [False]
+
+
+# --- the capture-gap trigger ---------------------------------------------------------------
+
+IDLE_S = float(os.environ.get("REACHY_PLAYBACK_TEST_IDLE_S", "15"))
+
+
+@pytest.mark.parametrize(
+    ("gap_s", "action"),
+    [
+        (0.01, "ok"),  # one 10 ms buffer to the next
+        (1.0, "ok"),
+        (5.0, "ok"),
+        (5.01, "rebuild"),
+        (10.0, "rebuild"),  # the robot's gaps, 2026-10-10
+        (75.0, "rebuild"),  # the container's stall
+    ],
+)
+def test_a_capture_gap_over_the_bound_asks_for_a_rebuild(gap_s: float, action: str) -> None:
+    """A gap in microphone frames longer than CAPTURE_GAP_S (5 s) rebuilds the speaker stream."""
+    verdict = ph.capture_gap_decision(gap_s, limit_s=5.0)
+    assert verdict.action == action
+    assert verdict.cause
+
+
+def test_the_capture_gap_cause_names_the_gap() -> None:
+    """The WARNING line carries the gap length and the cause."""
+    cause = ph.capture_gap_decision(7.25).cause
+    assert "7.2" in cause and "microphone" in cause and "pulsesink" in cause
+
+
+@pytest.mark.parametrize(
+    ("age_s", "warned", "action"),
+    [
+        (0.5, False, "ok"),
+        (3.0, False, "ok"),
+        (3.01, False, "stalled"),  # no frames for 3 s with capture on: say so, restart the clock
+        (30.0, False, "stalled"),
+        (3.01, True, "ok"),  # once per stall
+        (30.0, True, "ok"),
+    ],
+)
+def test_a_capture_stall_is_reported_once(age_s: float, warned: bool, action: str) -> None:
+    """While no frames come, the stall is reported once."""
+    assert ph.capture_stall_decision(age_s, warned, stall_s=3.0).action == action
+
+
+def test_the_capture_watch_reports_a_stall_and_rebuilds_once_capture_recovers() -> None:
+    """The sequence the record loop drives: frames, a stall, one report, recovery, one rebuild."""
+    watch = ph.CaptureWatch()
+    assert watch.frame(0.0).action == "ok"
+    assert watch.frame(0.01).action == "ok"
+    assert watch.idle(1.0).action == "ok"
+    assert watch.idle(3.5).action == "stalled"
+    assert watch.idle(4.0).action == "ok"
+    assert watch.idle(6.0).action == "ok"  # no rebuild while capture is still stalled
+    verdict = watch.frame(7.21)
+    assert verdict.action == "rebuild" and "7.2" in verdict.cause
+    assert watch.frame(7.22).action == "ok"
+    assert watch.idle(7.5).action == "ok"
+    assert watch.idle(10.6).action == "stalled"  # a later stall is reported again
+
+
+def test_capture_off_is_not_a_gap() -> None:
+    """reset() at capture off: the time capture was off never counts, and waiting restarts."""
+    watch = ph.CaptureWatch()
+    watch.frame(0.0)
+    watch.reset()
+    assert watch.idle(100.0).action == "ok"  # the first poll after a restart only starts the wait
+    assert watch.frame(100.5).action == "ok"
+    watch.reset()
+    assert watch.idle(200.0).action == "ok"
+    assert watch.idle(203.5).action == "stalled"  # a pipeline that never delivers is reported
+
+
+def test_short_gaps_never_trigger() -> None:
+    """Scheduling hiccups, a slow pull, a busy Pi: anything up to 5 s is no gap."""
+    watch = ph.CaptureWatch()
+    t = 0.0
+    for gap in (0.01, 0.02, 0.5, 1.9, 2.9, 0.01, 4.9):
+        t += gap
+        assert watch.frame(t).action == "ok"
+
+
+def test_acting_on_a_gap_rebuilds_through_the_governor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """act_on_capture: a gap is a "capture gap" rebuild; a stall restarts the clock and rebuilds nothing."""
+    calls: list[tuple[str, str]] = []
+    governor = SimpleNamespace(rebuild=lambda audio, trigger, cause: calls.append((trigger, cause)) or True)
+    monkeypatch.setattr(ph, "restart_speaker_clock", lambda audio: calls.append(("restart", "")) or True)
+    ph.act_on_capture(ph.capture_stall_decision(3.5, False), "audio", governor)
+    ph.act_on_capture(ph.capture_gap_decision(7.2), "audio", governor)
+    ph.act_on_capture(ph.Verdict("ok", ""), "audio", governor)
+    assert [c[0] for c in calls] == ["restart", "capture gap"]
+    assert "7.2" in calls[1][1]
+
+
+def _drive_capture_watch(rig: Rig) -> list[ph.Verdict]:
+    """Feed a CaptureWatch from the rig's microphone polls and act as the app does, off the poll thread."""
+    watch = ph.CaptureWatch()
+    acted: list[ph.Verdict] = []
+
+    def on_poll(now: float, got: bool) -> None:
+        verdict = watch.frame(now) if got else watch.idle(now)
+        if verdict.action != "ok":
+            acted.append(verdict)
+            threading.Thread(target=ph.act_on_capture, args=(verdict, rig.audio), daemon=True).start()
+
+    rig.on_mic_poll = on_poll
+    return acted
+
+
+def _hold_capture(rig: Rig, seconds: float) -> None:
+    """Hold the capture thread in GStreamer for ``seconds``: an app-visible gap, robot-safe."""
+    Gst = rig.Gst
+    until = time.monotonic() + seconds
+
+    def hold(_pad: Any, _info: Any) -> Any:
+        while time.monotonic() < until:
+            time.sleep(0.01)
+        return Gst.PadProbeReturn.REMOVE
+
+    rig.mic.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, hold)
+    time.sleep(seconds)
+
+
+def test_the_capture_gap_trigger_rebuilds_the_speaker_once_capture_recovers(
+    rig: Rig, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Integration: a 6 s capture gap is reported once, then one rebuild when frames return, and replies play."""
+    rebuilt: list[Any] = []
+    real_rebuild = ph.rebuild_sink
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: rebuilt.append(sink) or real_rebuild(sink))
+    rig.start()
+    acted = _drive_capture_watch(rig)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        _hold_capture(rig, 6.0)
+        time.sleep(1.5)
+    assert [v.action for v in acted] == ["stalled", "rebuild"], acted
+    assert rebuilt == [rig.speaker]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    rebuilds = [m for m in warnings if "Rebuilding the speaker stream" in m]
+    assert len(rebuilds) == 1 and "trigger: capture gap" in rebuilds[0], warnings
+    assert re.search(r"a [5-7]\.\d s gap in microphone frames", rebuilds[0]), rebuilds  # the gap length (6 s held)
+    lat = rig.reply_latency(0.6)
+    assert lat is not None and lat < 1.0, lat
+
+
+def _barge_in(audio: Any) -> None:
+    """Flush as the app's barge-in does; the container lacks the app's other imports, so there the appsrc alone."""
+    try:
+        from reachy_mini_conversation_app.console import _flush_appsrc
+    except ImportError:
+        Gst = _gst()
+        audio._appsrc.send_event(Gst.Event.new_flush_start())
+        audio._appsrc.send_event(Gst.Event.new_flush_stop(False))
+        return
+    _flush_appsrc(audio._appsrc)
+
+
+def test_the_capture_gap_trigger_stays_quiet_through_speech_barge_ins_and_idle(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Normal replies, a barge-in flush and an idle stretch: no stall, no gap, no rebuild."""
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a healthy stream"))
+    rig.start()
+    acted = _drive_capture_watch(rig)
+    for level in (0.4, 0.5):
+        assert rig.reply_latency(level) is not None
+    threading.Thread(target=rig.push_reply, args=(2.0, 0.45), daemon=True).start()
+    time.sleep(0.5)
+    _barge_in(rig.audio)
+    time.sleep(IDLE_S)
+    assert acted == []
