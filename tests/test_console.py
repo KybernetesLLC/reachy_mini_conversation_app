@@ -3234,3 +3234,92 @@ def test_a_sound_that_is_not_a_file_is_refused(tmp_path) -> None:
     resp = _rpc_call(app, "conversation.sound", {"file": str(tmp_path / "missing.wav")})
     assert resp["error"]["data"]["reason"] == "invalid_params"
     media.play_sound.assert_not_called()
+
+
+# --- playback health: the 65 s lag (2026-10-15) -----------------------------------------
+
+
+def _clocked_robot(order: list[str]) -> SimpleNamespace:
+    """Return a robot whose media records any pipeline stop or start."""
+    pipeline = object()
+    audio = SimpleNamespace(_pipeline=pipeline)
+    return SimpleNamespace(
+        media=SimpleNamespace(
+            audio=audio,
+            backend=None,
+            start_recording=lambda: order.append("start_recording"),
+            start_playing=lambda: order.append("start_playing"),
+            stop_recording=lambda: order.append("stop_recording"),
+            stop_playing=lambda: order.append("stop_playing"),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_playback_watchdog_checks_the_pipeline_each_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Once per interval, off the event loop; it ends with the stream and never touches the session."""
+    from reachy_mini_conversation_app import playback_health
+
+    order: list[str] = []
+    robot = _clocked_robot(order)
+    handler = MagicMock()
+    stream = LocalStream(handler, robot)
+    checked: list[Any] = []
+
+    def check(pipeline: Any) -> Any:
+        checked.append((pipeline, threading.current_thread() is threading.main_thread()))
+        if len(checked) == 3:
+            stream._stop_event.set()
+        return playback_health.Verdict("rebuild", "test")
+
+    monkeypatch.setattr(playback_health, "check_playback", check)
+    await asyncio.wait_for(stream.playback_watchdog_loop(interval_s=0.01), timeout=2.0)
+    assert [p for p, _ in checked] == [robot.media.audio._pipeline] * 3
+    assert not any(on_main for _, on_main in checked)
+    assert order == []  # the pipeline itself was never stopped or started
+    handler.shutdown.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_playback_watchdog_survives_a_failed_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A check that raises is logged and the next one still runs."""
+    from reachy_mini_conversation_app import playback_health
+
+    stream = LocalStream(MagicMock(), _clocked_robot([]))
+    calls: list[int] = []
+
+    def check(pipeline: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 2:
+            stream._stop_event.set()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(playback_health, "check_playback", check)
+    await asyncio.wait_for(stream.playback_watchdog_loop(interval_s=0.01), timeout=2.0)
+    assert len(calls) == 2
+
+
+def test_a_sound_over_rpc_is_watched_as_a_second_stream(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """conversation.sound's playbin is logged, and torn down at its end by the watcher."""
+    from reachy_mini_conversation_app import playback_health
+
+    _stream, media, app = _sound_stream()
+    playbin = MagicMock()
+    media.play_sound.side_effect = lambda path: setattr(media.audio, "_playbin", playbin)
+    watched: list[Any] = []
+    monkeypatch.setattr(playback_health, "watch_motif", lambda audio, pb, path: watched.append((audio, pb, path)))
+    wav = tmp_path / "ring.wav"
+    wav.write_bytes(b"RIFF")
+    assert _rpc_call(app, "conversation.sound", {"file": str(wav)})["result"] == {"playing": True}
+    assert watched == [(media.audio, playbin, str(wav))]
+
+
+def test_a_sound_stop_goes_through_the_motif_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stop is logged as the motif stream's close."""
+    from reachy_mini_conversation_app import playback_health
+
+    _stream, media, app = _sound_stream()
+    stopped: list[Any] = []
+    monkeypatch.setattr(playback_health, "stop_motif", lambda audio: stopped.append(audio) or True)
+    assert _rpc_call(app, "conversation.sound", {"stop": True})["result"] == {"playing": False}
+    assert stopped == [media.audio]

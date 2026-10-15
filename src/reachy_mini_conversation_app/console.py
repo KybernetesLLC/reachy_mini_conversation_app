@@ -24,7 +24,7 @@ from reachy_mini.utils import create_head_pose
 from reachy_mini.io.jsonrpc import JsonRpcError
 from reachy_mini.apps.jsonrpc_server import JsonRpcServer
 from reachy_mini.media.media_manager import MediaBackend
-from reachy_mini_conversation_app import startup
+from reachy_mini_conversation_app import startup, playback_health
 from reachy_mini_conversation_app.config import (
     HF_BACKEND,
     LOCKED_PROFILE,
@@ -954,6 +954,26 @@ class LocalStream:
         self._robot.media.start_recording()
         self._robot.media.start_playing()
 
+    async def playback_watchdog_loop(self, interval_s: float = playback_health.CHECK_INTERVAL_S) -> None:
+        """Check the speaker stream's latency once per interval (playback_health.check_playback).
+
+        Off the event loop; it rebuilds only the speaker sink, never the session.
+        """
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval_s)
+                return
+            except asyncio.TimeoutError:
+                pass
+            audio = getattr(getattr(self._robot, "media", None), "audio", None)
+            pipeline = getattr(audio, "_pipeline", None)
+            if pipeline is None:
+                continue
+            try:
+                await asyncio.to_thread(playback_health.check_playback, pipeline)
+            except Exception:
+                logger.warning("Playback latency check failed", exc_info=True)
+
     def _init_settings_ui_if_needed(self) -> None:
         """Attach minimal settings UI to the settings app.
 
@@ -1222,19 +1242,19 @@ class LocalStream:
             the speech pipeline.
             """
             media = self._robot.media
+            audio = getattr(media, "audio", None)
             if params.get("stop"):
-                audio = getattr(media, "audio", None)
-                playbin = getattr(audio, "_playbin", None)
-                if playbin is not None:
-                    from gi.repository import Gst
-
-                    playbin.set_state(Gst.State.NULL)
-                    audio._playbin = None
+                if audio is not None:
+                    playback_health.stop_motif(audio)
                 return {"playing": False}
             path = params.get("file")
             if not isinstance(path, str) or not os.path.isfile(path):
                 raise JsonRpcError("sound requires 'file', an existing path", reason="invalid_params", code=-32602)
             await asyncio.to_thread(media.play_sound, path)
+            # The SDK's playbin is a second speaker stream it never tears down (2026-10-15).
+            playbin = getattr(audio, "_playbin", None)
+            if playbin is not None:
+                playback_health.watch_motif(audio, playbin, path)
             return {"playing": True}
 
         @rpc.method("conversation.micro")  # type: ignore[untyped-decorator]
@@ -1581,6 +1601,7 @@ class LocalStream:
             self._tasks += [
                 asyncio.create_task(self.record_loop(), name="stream-record-loop"),
                 asyncio.create_task(self.play_loop(), name="stream-play-loop"),
+                asyncio.create_task(self.playback_watchdog_loop(), name="playback-watchdog"),
             ]
             try:
                 await asyncio.gather(*self._tasks)
