@@ -1003,7 +1003,7 @@ class LocalStream:
             if pipeline is None:
                 continue
             try:
-                await asyncio.to_thread(playback_health.check_playback, pipeline)
+                await asyncio.to_thread(playback_health.check_playback, pipeline, audio=audio)
             except Exception:
                 logger.warning("Playback latency check failed", exc_info=True)
 
@@ -1177,6 +1177,7 @@ class LocalStream:
             }
 
         @rpc.method("conversation.capture")  # type: ignore[untyped-decorator]
+        @playback_health.under_media_lock  # no speaker rebuild or reading mid-start or mid-stop
         def _rpc_capture(params: dict[str, object]) -> dict[str, object]:
             """Stop or start audio capture outright, not merely the connection.
 

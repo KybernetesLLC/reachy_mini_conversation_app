@@ -31,15 +31,40 @@ write pointer behind it reads as 0, so the watchdog cannot see that case.
 
 from __future__ import annotations
 import math
+import time
 import logging
+import functools
 import threading
-from typing import Any, NamedTuple
+from types import SimpleNamespace
+from typing import Any, TypeVar, Callable, Sequence, NamedTuple
 
 
 logger = logging.getLogger(__name__)
 
 LATENCY_LIMIT_S = 5.0
 CHECK_INTERVAL_S = 60.0
+# One cooldown for every rebuild trigger: 30 s after a rebuild, doubling with each
+# further rebuild in the last 10 minutes, capped at 10 minutes. A fault a rebuild
+# cannot clear costs a handful of rebuilds, then about one every 10 minutes.
+REBUILD_COOLDOWN_S = 30.0
+REBUILD_COOLDOWN_MAX_S = 600.0
+REBUILD_WINDOW_S = 600.0
+
+# Held by capture on/off (LocalStream's conversation.capture) and by every reading or
+# rebuild of the speaker, so neither runs while the pipeline is being stopped or started.
+MEDIA_LOCK = threading.RLock()
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def under_media_lock(func: _F) -> _F:
+    """Run ``func`` holding MEDIA_LOCK."""
+
+    @functools.wraps(func)
+    def locked(*args: Any, **kwargs: Any) -> Any:
+        with MEDIA_LOCK:
+            return func(*args, **kwargs)
+
+    return locked  # type: ignore[return-value]
 
 
 class Verdict(NamedTuple):
@@ -194,26 +219,123 @@ def rebuild_sink(sink: Any, timeout_s: float = 2.0) -> bool:
     return bool(ok)
 
 
-def check_playback(pipeline: Any, limit_s: float = LATENCY_LIMIT_S) -> Verdict:
+def rebuild_decision(
+    now: float,
+    history: Sequence[float],
+    base_s: float = REBUILD_COOLDOWN_S,
+    max_s: float = REBUILD_COOLDOWN_MAX_S,
+    window_s: float = REBUILD_WINDOW_S,
+) -> Verdict:
+    """Decide whether a rebuild may run now, from the times of earlier ones. Pure; shared by every trigger."""
+    recent = [t for t in history if now - t < window_s]
+    if not recent:
+        return Verdict("rebuild", f"no rebuild in the last {window_s:.0f} s")
+    cooldown = min(max_s, base_s * 2 ** (len(recent) - 1))
+    left = recent[-1] + cooldown - now
+    if left > 0:
+        return Verdict(
+            "cooldown",
+            f"{len(recent)} rebuild(s) in the last {window_s:.0f} s, cooldown {cooldown:.0f} s, "
+            f"next allowed in {left:.0f} s",
+        )
+    return Verdict("rebuild", f"the {cooldown:.0f} s cooldown after {len(recent)} rebuild(s) has passed")
+
+
+def _playing(pipeline: Any) -> bool:
+    """Return whether the pipeline is PLAYING now; capture off sets it to NULL."""
+    from gi.repository import Gst
+
+    try:
+        return bool(pipeline is not None and pipeline.get_state(0)[1] == Gst.State.PLAYING)
+    except Exception:
+        return False
+
+
+def restart_speaker_clock(audio: Any) -> bool:
+    """Restart the speaker's clock after its sink went through NULL; nothing to do on the microphone's clock."""
+    return False
+
+
+class RebuildGovernor:
+    """Run speaker-stream rebuilds for every trigger, under one cooldown, each logged with its trigger."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        """Start with no rebuild history; ``clock`` is injectable for tests."""
+        self._clock = clock
+        self._history: list[float] = []
+
+    def rebuild(self, audio: Any, trigger: str, cause: str) -> bool:
+        """Rebuild the speaker stream for ``trigger`` unless the cooldown holds it back.
+
+        Returns whether a rebuild ran and the sink came back. A pipeline that is not
+        PLAYING (capture off) is left alone and uses no cooldown.
+        """
+        with MEDIA_LOCK:
+            pipeline = getattr(audio, "_pipeline", None)
+            if not _playing(pipeline):
+                logger.info("Speaker stream rebuild skipped (trigger: %s): the pipeline is not playing", trigger)
+                return False
+            now = self._clock()
+            verdict = rebuild_decision(now, self._history)
+            if verdict.action != "rebuild":
+                logger.info(
+                    "Speaker stream rebuild held back (trigger: %s, cause: %s): %s", trigger, cause, verdict.cause
+                )
+                return False
+            sink = speaker_sink(pipeline)
+            if sink is None:
+                logger.info("Speaker stream rebuild skipped (trigger: %s): no speaker sink", trigger)
+                return False
+            self._history = [t for t in self._history if now - t < REBUILD_WINDOW_S] + [now]
+            logger.warning(
+                "Rebuilding the speaker stream (trigger: %s, cause: %s; rebuild %d in the last %.0f s)",
+                trigger,
+                cause,
+                len(self._history),
+                REBUILD_WINDOW_S,
+            )
+            ok = rebuild_sink(sink)
+            try:
+                restarted = restart_speaker_clock(audio)
+            except Exception:
+                logger.warning("Could not restart the speaker's clock after the rebuild", exc_info=True)
+                restarted = False
+            logger.info(
+                "Speaker stream rebuilt (trigger: %s): sink back=%s%s", trigger, ok, ", primed" if restarted else ""
+            )
+            return bool(ok)
+
+
+GOVERNOR = RebuildGovernor()
+
+
+def check_playback(
+    pipeline: Any, limit_s: float = LATENCY_LIMIT_S, audio: Any = None, governor: RebuildGovernor | None = None
+) -> Verdict:
     """One watchdog check: log the latency, rebuild the speaker stream if it ran away, check the invariant."""
-    sink = speaker_sink(pipeline)
-    latency = measure_latency_s(sink) if sink is not None else None
+    governor = governor or GOVERNOR
+    with MEDIA_LOCK:
+        if not _playing(pipeline):
+            return Verdict("unmeasured", "the pipeline is not playing")
+        sink = speaker_sink(pipeline)
+        latency = measure_latency_s(sink) if sink is not None else None
     name = sink.get_name() if sink is not None else "none"
     shown = "unmeasured" if latency is None else f"{latency:.3f} s"
     logger.info("Playback latency: %s (speaker %s, bound %.1f s)", shown, name, limit_s)
     verdict = decide(latency, limit_s)
     if verdict.action != "rebuild":
         return verdict
-    logger.warning("Playback latency %.1f s: rebuilding the speaker stream (cause: %s)", latency, verdict.cause)
-    rebuilt = rebuild_sink(sink)
-    after = measure_latency_s(sink)
+    if audio is None:
+        audio = SimpleNamespace(_pipeline=pipeline)
+    if not governor.rebuild(audio, "playback latency", verdict.cause):
+        return verdict
+    with MEDIA_LOCK:
+        after = measure_latency_s(sink) if _playing(pipeline) else None
     shown_after = "unmeasured" if after is None else f"{after:.3f} s"
-    if rebuilt and latency_bounded(after, limit_s):
+    if latency_bounded(after, limit_s):
         logger.info("Speaker stream rebuilt; playback latency now %s, bounded (invariant held)", shown_after)
     else:
-        logger.error(
-            "Invariant violated: playback latency stays bounded (rebuilt=%s, latency now %s)", rebuilt, shown_after
-        )
+        logger.error("Invariant violated: playback latency stays bounded (latency now %s)", shown_after)
     return verdict
 
 

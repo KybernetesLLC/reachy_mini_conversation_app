@@ -22,6 +22,7 @@ import time
 import logging
 import threading
 import subprocess
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -420,14 +421,14 @@ def test_the_watchdog_rebuilds_the_speaker_when_latency_runs_away(
     monkeypatch.setattr(ph, "rebuild_sink", lambda sink: rebuilt.append(sink) or real_rebuild(sink))
 
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
-        verdict = ph.check_playback(rig.pipeline)
+        verdict = ph.check_playback(rig.pipeline, audio=rig.audio)
 
     assert verdict.action == "rebuild"
     assert rebuilt == [rig.speaker]
     infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("Playback latency" in m and "65.5" in m for m in infos)
-    assert any("65.5" in m and "rebuild" in m for m in warnings)
+    assert len(warnings) == 1 and "65.5" in warnings[0] and "trigger: playback latency" in warnings[0]
     assert any("bounded" in m and "0.03" in m for m in infos), infos  # the invariant, checked after
     lat = rig.reply_latency(0.6)
     assert lat is not None and lat < 3.0
@@ -509,3 +510,131 @@ def test_a_replaced_motif_is_not_torn_down_twice(rig: Rig, caplog: pytest.LogCap
     assert any("Motif stream closed" in m and "replaced" in m for m in messages), messages
     assert any("Motif stream closed" in m and "stop" in m for m in messages), messages
     assert rig.audio._playbin is None
+
+
+# --- one cooldown for every rebuild trigger -----------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def fresh_governor(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Each test starts with no rebuild history."""
+    governor = ph.RebuildGovernor()
+    monkeypatch.setattr(ph, "GOVERNOR", governor)
+    return governor
+
+
+@pytest.mark.parametrize(
+    ("now", "history", "action"),
+    [
+        (1000.0, (), "rebuild"),  # the first rebuild is at once
+        (1000.0, (990.0,), "cooldown"),  # 30 s after one
+        (1000.0, (970.5,), "cooldown"),
+        (1000.0, (970.0,), "rebuild"),
+        (1000.0, (900.0, 960.0), "cooldown"),  # 60 s after the second
+        (1000.0, (880.0, 940.0), "rebuild"),
+        (1000.0, (700.0, 760.0, 890.0), "cooldown"),  # 120 s after the third
+        (1000.0, (700.0, 760.0, 870.0), "rebuild"),
+        (5000.0, tuple(4410.0 + 60 * i for i in range(10)), "cooldown"),  # capped at 600 s
+        (1000.0, (100.0, 200.0, 300.0), "rebuild"),  # older than the 600 s window: forgotten
+    ],
+)
+def test_rebuilds_share_one_cooldown_that_doubles(now: float, history: tuple[float, ...], action: str) -> None:
+    """30 s after a rebuild, doubling with each further rebuild in 600 s, capped at 600 s."""
+    verdict = ph.rebuild_decision(now, history)
+    assert verdict.action == action
+    assert verdict.cause
+
+
+def test_the_cooldown_cause_says_how_long_is_left() -> None:
+    """The held-back log line says when the next rebuild is allowed."""
+    cause = ph.rebuild_decision(1000.0, (990.0,)).cause
+    assert "20" in cause and "30" in cause
+
+
+class _Pipeline:
+    """A stand-in pipeline in a given state."""
+
+    def __init__(self, playing: bool = True) -> None:
+        self.playing = playing
+
+    def get_state(self, _timeout: int) -> tuple[Any, Any, Any]:
+        Gst = _gst()
+        return (None, Gst.State.PLAYING if self.playing else Gst.State.NULL, None)
+
+
+def test_a_rebuild_is_logged_once_with_its_trigger_and_restarts_the_speaker_clock(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every rebuild logs one WARNING naming its trigger and cause; the speaker's clock is restarted after it."""
+    order: list[str] = []
+    audio = SimpleNamespace(_pipeline=_Pipeline())
+    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: order.append(f"rebuild:{sink}") or True)
+    monkeypatch.setattr(ph, "restart_speaker_clock", lambda a: order.append("restart") or True)
+    governor = ph.RebuildGovernor(clock=lambda: 100.0)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        assert governor.rebuild(audio, "unheard replies", "3 replies in a row not heard") is True
+    assert order == ["rebuild:sink", "restart"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "unheard replies" in warnings[0] and "3 replies in a row not heard" in warnings[0]
+
+
+def test_a_second_trigger_inside_the_cooldown_is_held_back_and_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No rebuild loops: triggers share the cooldown, and a held-back one says so."""
+    now = [100.0]
+    rebuilt: list[str] = []
+    audio = SimpleNamespace(_pipeline=_Pipeline())
+    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: rebuilt.append(sink) or True)
+    governor = ph.RebuildGovernor(clock=lambda: now[0])
+    assert governor.rebuild(audio, "capture gap", "no microphone frames for 7.0 s")
+    now[0] = 110.0
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        assert governor.rebuild(audio, "playback latency", "latency 65.5 s") is False
+    assert rebuilt == ["sink"]
+    held = [r.getMessage() for r in caplog.records if "held back" in r.getMessage()]
+    assert len(held) == 1 and "playback latency" in held[0]
+    now[0] = 131.0
+    assert governor.rebuild(audio, "unheard replies", "3 in a row")
+    assert rebuilt == ["sink", "sink"]
+
+
+def test_a_rebuild_never_touches_a_pipeline_that_capture_off_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A trigger racing conversation.capture {"on": false} finds the pipeline not PLAYING and leaves it."""
+    audio = SimpleNamespace(_pipeline=_Pipeline(playing=False))
+    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: pytest.fail("looked for the sink"))
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a stopped pipeline"))
+    governor = ph.RebuildGovernor(clock=lambda: 100.0)
+    assert governor.rebuild(audio, "capture gap", "test") is False
+    assert governor.rebuild(audio, "capture gap", "test") is False  # and a skip uses no cooldown
+
+
+def test_the_latency_check_leaves_a_stopped_pipeline_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """measure_latency_s and the rebuild race a capture off; a pipeline not PLAYING is not read."""
+    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: pytest.fail("walked a stopped pipeline"))
+    assert ph.check_playback(_Pipeline(playing=False)).action == "unmeasured"
+
+
+def test_a_rebuild_waits_for_a_capture_change_in_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MEDIA_LOCK: a rebuild requested mid capture-off runs after it, and finds the pipeline stopped."""
+    pipeline = _Pipeline()
+    audio = SimpleNamespace(_pipeline=pipeline)
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt mid capture-off"))
+    in_change = threading.Event()
+    result: list[bool] = []
+
+    @ph.under_media_lock
+    def capture_off() -> None:
+        in_change.set()
+        time.sleep(0.2)
+        pipeline.playing = False
+
+    t = threading.Thread(target=capture_off)
+    t.start()
+    in_change.wait(1.0)
+    result.append(ph.RebuildGovernor().rebuild(audio, "capture gap", "test"))
+    t.join()
+    assert result == [False]

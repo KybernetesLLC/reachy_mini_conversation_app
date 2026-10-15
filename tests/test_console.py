@@ -3318,7 +3318,8 @@ async def test_the_playback_watchdog_checks_the_pipeline_each_interval(monkeypat
     stream = LocalStream(handler, robot)
     checked: list[Any] = []
 
-    def check(pipeline: Any) -> Any:
+    def check(pipeline: Any, audio: Any = None) -> Any:
+        assert audio is robot.media.audio  # the governor restarts the speaker through it
         checked.append((pipeline, threading.current_thread() is threading.main_thread()))
         if len(checked) == 3:
             stream._stop_event.set()
@@ -3340,7 +3341,7 @@ async def test_the_playback_watchdog_survives_a_failed_check(monkeypatch: pytest
     stream = LocalStream(MagicMock(), _clocked_robot([]))
     calls: list[int] = []
 
-    def check(pipeline: Any) -> Any:
+    def check(pipeline: Any, audio: Any = None) -> Any:
         calls.append(1)
         if len(calls) == 2:
             stream._stop_event.set()
@@ -3375,3 +3376,41 @@ def test_a_sound_stop_goes_through_the_motif_teardown(monkeypatch: pytest.Monkey
     monkeypatch.setattr(playback_health, "stop_motif", lambda audio: stopped.append(audio) or True)
     assert _rpc_call(app, "conversation.sound", {"stop": True})["result"] == {"playing": False}
     assert stopped == [media.audio]
+
+
+def test_capture_off_and_on_hold_the_media_lock_against_a_rebuild() -> None:
+    """A rebuild trigger cannot race a capture change: the route holds playback_health.MEDIA_LOCK."""
+    from reachy_mini_conversation_app import playback_health
+
+    held: list[bool] = []
+
+    def record() -> None:
+        got = threading.Event()
+
+        def take() -> None:
+            if playback_health.MEDIA_LOCK.acquire(timeout=0.05):
+                got.set()
+                playback_health.MEDIA_LOCK.release()
+
+        t = threading.Thread(target=take)
+        t.start()
+        t.join()
+        held.append(not got.is_set())
+
+    robot = SimpleNamespace(
+        media=SimpleNamespace(
+            audio=SimpleNamespace(_pipeline=None),
+            backend=None,
+            start_recording=record,
+            start_playing=record,
+            stop_recording=record,
+            stop_playing=record,
+        )
+    )
+    app = FastAPI()
+    stream = LocalStream(MagicMock(), robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    stream._capture_on = True
+    _rpc_call(app, "conversation.capture", {"on": False})
+    _rpc_call(app, "conversation.capture", {"on": True})
+    assert held == [True, True, True, True]
