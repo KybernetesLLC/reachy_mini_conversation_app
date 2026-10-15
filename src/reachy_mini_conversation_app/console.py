@@ -170,11 +170,74 @@ def _flush_appsrc(appsrc: Any) -> None:
     pipeline had been running (silent replies from 07:17, released only when a
     capture change restarted the pipeline). The SDK's clear_player() avoided this
     by pausing and resuming, which is what corked the microphone.
+
+    2026-10-15: the flush stops at the SDK's audiomixer (an aggregator forwards a
+    flush only as part of a flushing seek), so audio the mixer had already output
+    still played: up to the speaker queue's second, and more while the sink holds
+    the branch back. Pushing a flush below the mixer instead pauses the mixer's
+    task for good, so those buffers are dropped as they leave each queue below the
+    mixer, up to the running time of the barge-in. Later audio is untouched.
     """
     from gi.repository import Gst
 
+    barge_in_at = appsrc.get_current_running_time()
     appsrc.send_event(Gst.Event.new_flush_start())
     appsrc.send_event(Gst.Event.new_flush_stop(False))
+    if barge_in_at != Gst.CLOCK_TIME_NONE:
+        for queue in _queues_below_mixer(appsrc):
+            _drop_until(queue.get_static_pad("src"), barge_in_at)
+
+
+def _next_elements(element: Any) -> list[Any]:
+    """Return the elements linked to ``element``'s source pads, walked with next() (no gst-python overrides)."""
+    from gi.repository import Gst
+
+    found: list[Any] = []
+    pads = element.iterate_src_pads()
+    while True:
+        result, pad = pads.next()
+        if result != Gst.IteratorResult.OK:
+            return found
+        peer = pad.get_peer()
+        if peer is not None and peer.get_parent_element() is not None:
+            found.append(peer.get_parent_element())
+
+
+def _queues_below_mixer(appsrc: Any) -> list[Any]:
+    """Every ``queue`` downstream of the audiomixer the appsrc feeds; empty without a mixer."""
+    seen: list[Any] = []
+    below_mixer = False
+    frontier = [appsrc]
+    queues: list[Any] = []
+    while frontier:
+        element = frontier.pop()
+        if any(element is s for s in seen):
+            continue
+        seen.append(element)
+        factory = element.get_factory()
+        name = factory.get_name() if factory is not None else ""
+        if name == "audiomixer":
+            below_mixer = True
+        elif below_mixer and name == "queue":
+            queues.append(element)
+        frontier.extend(_next_elements(element))
+    return queues
+
+
+def _drop_until(pad: Any, running_time: int) -> None:
+    """Drop buffers leaving ``pad`` that end by ``running_time``; remove itself at the first later one."""
+    from gi.repository import Gst
+
+    def probe(_pad: Any, info: Any) -> Any:
+        buf = info.get_buffer()
+        if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
+            return Gst.PadProbeReturn.OK
+        end = buf.pts + (buf.duration if buf.duration != Gst.CLOCK_TIME_NONE else 0)
+        if end <= running_time:
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.REMOVE
+
+    pad.add_probe(Gst.PadProbeType.BUFFER, probe)
 
 
 _HEALTH_WINDOW_S = 5.0

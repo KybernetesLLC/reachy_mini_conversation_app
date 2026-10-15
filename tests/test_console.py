@@ -3052,6 +3052,120 @@ def test_a_reply_after_the_playback_flush_plays_at_once() -> None:
         threading.Thread(target=pipeline.set_state, args=(Gst.State.NULL,), daemon=True).start()
 
 
+def test_a_barge_in_drops_the_reply_already_past_the_sdk_mixer() -> None:
+    """A barge-in silences a reply the SDK's audiomixer has already output (2026-10-15).
+
+    The SDK's real playback layout (GStreamerAudio._init_pipeline_playback: appsrc,
+    queue, audiomixer with a live silence source, tee, speaker and wobbler queues),
+    pushed through the SDK's _push_appsrc_buffer. The sink stalls for 3 s, as a
+    blocked PipeWire write would; a short reply pushed meanwhile waits below the
+    mixer. The appsrc flush stops at the mixer, so before the fix the flushed reply
+    played once the sink resumed (the robot, 2026-10-14: flushed audio still played).
+
+    Silent and deterministic by default: the record branch's microphone is a live
+    audiotestsrc and the speaker is fakesink sync=true. With
+    REACHY_PLAYBACK_TEST_SINK=sdk the SDK builds both itself (pulsesrc/pulsesink on
+    the robot), so the same test runs unchanged on the robot's stack.
+    """
+    gi = pytest.importorskip("gi")
+    gi.require_version("Gst", "1.0")
+    import os
+    import logging
+
+    from gi.repository import Gst
+
+    audio_gstreamer = pytest.importorskip("reachy_mini.media.audio_gstreamer")
+    Gst.init(None)
+    use_sdk_devices = os.environ.get("REACHY_PLAYBACK_TEST_SINK") == "sdk"
+    rendered: list[tuple[float, float]] = []  # (monotonic, peak) at the speaker sink
+
+    def on_buffer(pad: Any, info: Any) -> Any:
+        buf = info.get_buffer()
+        ok, mapped = buf.map(Gst.MapFlags.READ)
+        if ok:
+            fmt = pad.get_current_caps().get_structure(0).get_string("format")
+            kind, scale = {"S16LE": (np.int16, 32768.0), "S32LE": (np.int32, 2.0**31)}.get(fmt, (np.float32, 1.0))
+            samples = np.frombuffer(mapped.data, dtype=kind)
+            rendered.append((time.monotonic(), float(np.abs(samples).max()) / scale if samples.size else 0.0))
+            buf.unmap(mapped)
+        return Gst.PadProbeReturn.OK
+
+    class Playback(audio_gstreamer.GStreamerAudio):  # type: ignore[misc]
+        def __init__(self) -> None:
+            if use_sdk_devices:
+                super().__init__()
+                return
+            self.logger = logging.getLogger("playback-test")
+            self._appsrc_pts = -1
+            self._head_wobbler = None
+            self._webrtcechoprobe = None
+            self._playbin = None
+            self._pipeline = Gst.Pipeline.new("reachymini_audio")
+            # The record branch as the SDK builds it, a live test source for the microphone.
+            mic = Gst.parse_bin_from_description(
+                "audiotestsrc is-live=true wave=silence ! queue ! audioconvert ! audioresample "
+                "! appsink caps=audio/x-raw,rate=16000,channels=2,format=F32LE,layout=interleaved "
+                "drop=true max-buffers=200",
+                False,
+            )
+            self._pipeline.add(mic)
+            self._init_pipeline_playback(self._pipeline)
+
+        def _build_audiosink_element(self) -> Any:
+            if use_sdk_devices:
+                sink = super()._build_audiosink_element()
+            else:
+                sink = Gst.ElementFactory.make("fakesink")
+                sink.set_property("sync", True)
+            sink.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+            self.speaker = sink
+            return sink
+
+    audio = Playback()
+    if not hasattr(audio._appsrc, "push_buffer"):
+        # An appsrc made before GstApp was imported (an earlier test's parse_launch)
+        # leaves PyGObject's wrapper without GstApp's methods; the signal is the same call.
+        audio._appsrc.push_buffer = lambda buf: audio._appsrc.emit("push-buffer", buf)
+
+    def heard(after: float) -> bool:
+        return any(t >= after and peak > 0.05 for t, peak in rendered)
+
+    def push_reply(seconds: float) -> float:
+        pushed_at = time.monotonic()
+        tone = np.full((int(seconds * 16000), 2), 0.3, dtype=np.float32)
+        for start in range(0, len(tone), 1600):  # 100 ms chunks, as the app pushes them
+            audio._push_appsrc_buffer(tone[start : start + 1600])
+        return pushed_at
+
+    audio._pipeline.set_state(Gst.State.PLAYING)
+    try:
+        audio._pipeline.get_state(5 * Gst.SECOND)
+        time.sleep(1.0)
+        stall_until = time.monotonic() + 3.0
+
+        def stall(_pad: Any, _info: Any) -> Any:
+            while time.monotonic() < stall_until:
+                time.sleep(0.01)
+            return Gst.PadProbeReturn.REMOVE
+
+        audio.speaker.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, stall)
+        pushed_at = push_reply(0.5)
+        time.sleep(1.0)
+        audio._appsrc_pts = -1  # the app's clear_audio_queue, local path
+        console_mod._flush_appsrc(audio._appsrc)
+        time.sleep(stall_until - time.monotonic() + 1.5)
+        assert not heard(pushed_at), "the reply flushed by the barge-in still played"
+
+        next_at = push_reply(0.5)  # the next reply plays at once
+        deadline = next_at + 3.0
+        while not heard(next_at) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert heard(next_at), "the reply after the barge-in never played"
+        assert min(t for t, peak in rendered if t >= next_at and peak > 0.05) - next_at < 0.5
+    finally:
+        threading.Thread(target=audio._pipeline.set_state, args=(Gst.State.NULL,), daemon=True).start()
+
+
 
 def test_a_micro_move_over_rpc_queues_one_sequence() -> None:
     """The companion's idle micro-move in one request, not one hold per frame."""
