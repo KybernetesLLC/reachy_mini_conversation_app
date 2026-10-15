@@ -312,6 +312,9 @@ class LocalStream:
         self._capture_watch = playback_health.CaptureWatch()
         self._now: Callable[[], float] = time.monotonic
         self._background: set[asyncio.Future[Any]] = set()
+        # The unheard-reply trigger: replies pushed, judged against the speaker's monitor.
+        self._replies = playback_health.ReplyTracker()
+        self._speaker_monitor = playback_health.SpeakerMonitor(self._replies.monitored)
         self._preroll_clock = preroll_clock
         # Where the pre-roll counts back from, on _preroll_clock: the wake word's
         # peak when the opener said when it was, else None (the connect).
@@ -1011,6 +1014,42 @@ class LocalStream:
             except Exception:
                 logger.warning("Playback latency check failed", exc_info=True)
 
+    async def playback_guard_loop(self, interval_s: float = 0.5) -> None:
+        """Judge pushed replies against the speaker's monitor; three unheard in a row rebuild the speaker.
+
+        The monitor is kept on the device the speaker plays to, off the event loop.
+        """
+        tick = 0
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval_s)
+                return
+            except asyncio.TimeoutError:
+                pass
+            audio = getattr(getattr(self._robot, "media", None), "audio", None)
+            tick += 1
+            if tick % 2 == 0 and audio is not None:
+                try:
+                    await asyncio.to_thread(playback_health.keep_monitor, self._speaker_monitor, audio, self._now())
+                except Exception:
+                    logger.warning("Speaker monitor check failed", exc_info=True)
+            self._judge_replies(audio)
+
+    def _judge_replies(self, audio: Any) -> None:
+        """Log the replies judged since the last tick; a rebuild verdict is carried out off the event loop."""
+        for verdict in self._replies.tick(self._now()):
+            if verdict.action == "unheard":
+                logger.info(
+                    "Reply not heard (%d in a row%s): %s",
+                    self._replies.unheard_in_a_row,
+                    "" if self._replies.armed else "; not counted until a reply is heard",
+                    verdict.cause,
+                )
+            elif verdict.action == "rebuild":
+                self._run_off_loop(playback_health.GOVERNOR.rebuild, audio, "unheard replies", verdict.cause)
+            else:
+                logger.debug("Reply %s: %s", verdict.action, verdict.cause)
+
     def _init_settings_ui_if_needed(self) -> None:
         """Attach minimal settings UI to the settings app.
 
@@ -1643,6 +1682,7 @@ class LocalStream:
                 asyncio.create_task(self.record_loop(), name="stream-record-loop"),
                 asyncio.create_task(self.play_loop(), name="stream-play-loop"),
                 asyncio.create_task(self.playback_watchdog_loop(), name="playback-watchdog"),
+                asyncio.create_task(self.playback_guard_loop(), name="playback-guard"),
             ]
             try:
                 await asyncio.gather(*self._tasks)
@@ -1663,6 +1703,10 @@ class LocalStream:
         - Cancels all pending async tasks (openai-handler, record-loop, play-loop)
         """
         logger.info("Stopping LocalStream...")
+        try:
+            self._speaker_monitor.stop()
+        except Exception as e:
+            logger.debug(f"Error stopping the speaker monitor: {e}")
 
         # Stop media pipelines FIRST before cancelling async tasks
         # This ensures clean shutdown before PortAudio cleanup
@@ -1769,6 +1813,7 @@ class LocalStream:
         already queued for the speaker), and older SDKs ``clear_output_buffer()``.
         """
         logger.info("User intervention: flushing player queue")
+        self._replies.flushed(self._now())  # dropped audio is not unheard
         audio = getattr(self._robot.media, "audio", None)
         if audio is not None:
             appsrc = getattr(audio, "_appsrc", None)
@@ -1950,6 +1995,8 @@ class LocalStream:
                 audio_frame = audio_to_float32(audio_data)
 
                 self._robot.media.push_audio_sample(audio_frame)
+                seconds, speech = playback_health.loud_seconds(audio_frame, int(handler_output[0] or 0))
+                self._replies.pushed(self._now(), seconds, speech)
                 self._emit_level("assistant", audio_frame)
 
             else:

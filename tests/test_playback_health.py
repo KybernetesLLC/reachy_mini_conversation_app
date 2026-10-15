@@ -816,3 +816,339 @@ def test_the_capture_gap_trigger_stays_quiet_through_speech_barge_ins_and_idle(
     _barge_in(rig.audio)
     time.sleep(IDLE_S)
     assert acted == []
+
+
+# --- the unheard-reply trigger -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("speech_pushed_s", "heard_s", "monitored_s", "action"),
+    [
+        (0.1, 0.0, 5.0, "skip"),  # too little speech to judge
+        (2.0, 1.9, 5.0, "heard"),
+        (2.0, 0.5, 5.0, "heard"),  # a quarter of what was pushed
+        (2.0, 0.49, 5.0, "unheard"),
+        (2.0, 0.0, 5.0, "unheard"),  # the behind case: nothing reaches the device
+        (10.0, 1.0, 5.0, "heard"),  # a long reply: judged on the first 4 s
+        (10.0, 0.99, 5.0, "unheard"),
+        (2.0, 0.0, 2.4, "unmeasured"),  # the monitor itself stalled: no verdict
+    ],
+)
+def test_a_reply_is_judged_by_the_speech_the_monitor_heard(
+    speech_pushed_s: float, heard_s: float, monitored_s: float, action: str
+) -> None:
+    """Heard at the deadline: at least a quarter of the speech pushed (up to 4 s), on the speaker's monitor."""
+    verdict = ph.reply_verdict(speech_pushed_s, heard_s, monitored_s, window_s=5.0)
+    assert verdict.action == action
+    assert verdict.cause
+
+
+@pytest.mark.parametrize(("count", "action"), [(0, "ok"), (1, "ok"), (2, "ok"), (3, "rebuild"), (4, "rebuild")])
+def test_three_unheard_replies_in_a_row_ask_for_a_rebuild(count: int, action: str) -> None:
+    """The streak bound is UNHEARD_LIMIT = 3, and the cause carries the count."""
+    verdict = ph.unheard_streak_decision(count, limit=3)
+    assert verdict.action == action
+    assert str(count) in verdict.cause
+
+
+def test_speech_seconds_count_only_audio_above_the_floor() -> None:
+    """loud_seconds: silence is 0 s of speech, a tone is all speech, half and half is half."""
+    assert ph.loud_seconds(np.zeros(16000, dtype=np.float32), 16000) == (1.0, 0.0)
+    assert ph.loud_seconds(np.full(16000, 0.3, dtype=np.float32), 16000) == (1.0, 1.0)
+    half = np.concatenate([np.zeros(8000), np.full(8000, 0.3)]).astype(np.float32)
+    assert ph.loud_seconds(half, 16000) == (1.0, 0.5)
+    assert ph.loud_seconds(np.zeros(0, dtype=np.float32), 16000) == (0.0, 0.0)
+
+
+def _reply(tracker: ph.ReplyTracker, at: float, heard: bool, speech_s: float = 1.0) -> None:
+    """Push one reply of ``speech_s`` at ``at`` in 100 ms chunks; the monitor hears it, or silence."""
+    for i in range(int(speech_s * 10)):
+        tracker.pushed(at + 0.025 * i, 0.1, 0.1)
+    for i in range(50):  # 5 s of monitor buffers, 100 ms each
+        t = at + 0.1 * i
+        tracker.monitored(t, 0.1, 0.1 if heard and 0.2 <= t - at < 0.2 + speech_s else 0.0)
+
+
+def _judge(tracker: ph.ReplyTracker, now: float) -> list[str]:
+    return [v.action for v in tracker.tick(now)]
+
+
+def test_the_third_unheard_reply_in_a_row_rebuilds_and_starts_the_count_again() -> None:
+    """Heard, then three unheard: the third asks for a rebuild, and the count starts again."""
+    tracker = ph.ReplyTracker()
+    _reply(tracker, 0.0, heard=True)
+    assert _judge(tracker, 5.1) == ["heard"]
+    _reply(tracker, 10.0, heard=False)
+    assert _judge(tracker, 15.1) == ["unheard"]
+    _reply(tracker, 20.0, heard=False)
+    assert _judge(tracker, 25.1) == ["unheard"]
+    assert tracker.unheard_in_a_row == 2
+    _reply(tracker, 30.0, heard=False)
+    assert _judge(tracker, 35.1) == ["unheard", "rebuild"]
+    assert tracker.unheard_in_a_row == 0
+
+
+def test_a_reply_that_plays_normally_resets_the_count() -> None:
+    """Two unheard, one heard, two unheard: no rebuild."""
+    tracker = ph.ReplyTracker()
+    _reply(tracker, 0.0, heard=True)
+    t = 10.0
+    for heard in (False, False, True, False, False):
+        _reply(tracker, t, heard=heard)
+        assert "rebuild" not in _judge(tracker, t + 5.1)
+        t += 10.0
+    assert tracker.unheard_in_a_row == 2
+
+
+def test_a_barge_in_flush_is_never_unheard() -> None:
+    """Dropped audio is expected: a flushed reply is not judged, and the count stands."""
+    tracker = ph.ReplyTracker()
+    _reply(tracker, 0.0, heard=True)
+    _judge(tracker, 5.1)
+    for t in (10.0, 20.0):
+        _reply(tracker, t, heard=False)
+        _judge(tracker, t + 5.1)
+    assert tracker.unheard_in_a_row == 2
+    _reply(tracker, 30.0, heard=False)
+    tracker.flushed(30.5)  # barge-in before the window closed
+    assert _judge(tracker, 35.1) == ["flushed"]
+    assert tracker.unheard_in_a_row == 2
+    # the next reply after the barge-in is a new reply, judged as usual
+    _reply(tracker, 31.0, heard=True)
+    assert _judge(tracker, 36.1) == ["heard"]
+    assert tracker.unheard_in_a_row == 0
+
+
+def test_a_barge_in_leaves_earlier_replies_to_be_judged() -> None:
+    """Only the reply being pushed is dropped; one that finished earlier is still judged."""
+    tracker = ph.ReplyTracker()
+    _reply(tracker, 0.0, heard=True)
+    _reply(tracker, 2.2, heard=True)
+    tracker.flushed(3.0)
+    assert _judge(tracker, 7.3) == ["heard", "flushed"]
+
+
+def test_pushes_close_together_are_one_reply_and_a_pause_starts_another() -> None:
+    """Chunks up to REPLY_GAP_S (1.5 s) apart are one reply."""
+    tracker = ph.ReplyTracker()
+    for t in (0.0, 0.5, 1.9, 3.3):  # one reply, chunks 1.4 s apart
+        tracker.pushed(t, 0.5, 0.5)
+    tracker.pushed(5.0, 0.5, 0.5)  # 1.7 s later: a second reply
+    for i in range(110):
+        tracker.monitored(0.1 * i, 0.1, 0.1)
+    assert _judge(tracker, 11.0) == ["heard", "heard"]
+
+
+def test_unheard_replies_count_only_once_the_monitor_has_heard_one() -> None:
+    """A monitor on the wrong device would hear nothing at all; until one reply is heard, nothing is counted."""
+    tracker = ph.ReplyTracker()
+    for t in (0.0, 10.0, 20.0, 30.0):
+        _reply(tracker, t, heard=False)
+        assert "rebuild" not in _judge(tracker, t + 5.1)
+    assert tracker.unheard_in_a_row == 0 and not tracker.armed
+
+
+def test_a_stalled_monitor_counts_nothing() -> None:
+    """No monitor buffers in the window: unmeasured, never unheard."""
+    tracker = ph.ReplyTracker()
+    _reply(tracker, 0.0, heard=True)
+    _judge(tracker, 5.1)
+    tracker.pushed(10.0, 1.0, 1.0)
+    assert _judge(tracker, 15.1) == ["unmeasured"]
+    assert tracker.unheard_in_a_row == 0
+
+
+def test_only_pulsesink_has_a_monitor_to_hear_on(rig: Rig) -> None:
+    """fakesink, alsasink and the rest: the unheard trigger is unavailable, not wrong."""
+    if USE_SDK_DEVICES:
+        assert ph.SpeakerMonitor.monitor_source(rig.speaker).endswith(".monitor")
+    else:
+        assert ph.SpeakerMonitor.monitor_source(rig.speaker) is None
+    assert ph.SpeakerMonitor.monitor_source(None) is None
+
+
+class _Desync:
+    """The behind case, on the local rig: the device plays silence, whatever is pushed, until a rebuild."""
+
+    def __init__(self, rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.on = False
+        self.rebuilds = 0
+        rig.silenced = lambda: self.on  # read by the rig's heard probe
+        real_rebuild = ph.rebuild_sink
+
+        def rebuild(sink: Any) -> bool:
+            self.rebuilds += 1
+            self.on = False
+            return real_rebuild(sink)
+
+        monkeypatch.setattr(ph, "rebuild_sink", rebuild)
+
+
+def _drive_reply_tracker(rig: Rig, stop: threading.Event) -> tuple[ph.ReplyTracker, list[ph.Verdict]]:
+    """Feed a ReplyTracker as the app does: pushes, the speaker heard, a tick every 0.2 s acting on verdicts.
+
+    Heard is the app's SpeakerMonitor in the container; locally, the buffers the
+    fakesink (sync=true) renders, counted on its pad.
+    """
+    Gst = rig.Gst
+    tracker = ph.ReplyTracker()
+    verdicts: list[ph.Verdict] = []
+    push = rig.audio._push_appsrc_buffer
+
+    def pushed(chunk: Any) -> Any:
+        seconds, speech = ph.loud_seconds(np.asarray(chunk)[:, 0], 16000)
+        tracker.pushed(time.monotonic(), seconds, speech)
+        return push(chunk)
+
+    rig.audio._push_appsrc_buffer = pushed
+    monitor = None
+    if USE_SDK_DEVICES:
+        monitor = ph.SpeakerMonitor(tracker.monitored)
+        assert monitor.start(ph.SpeakerMonitor.monitor_source(rig.speaker))
+    else:
+
+        def heard(pad: Any, info: Any) -> Any:
+            buf = info.get_buffer()
+            data = np.frombuffer(buf.extract_dup(0, buf.get_size()), dtype=np.float32)
+            channels = pad.get_current_caps().get_structure(0).get_value("channels")
+            seconds, speech = ph.loud_seconds(data.reshape(-1, channels)[:, 0], 16000)
+            silenced = getattr(rig, "silenced", None)
+            tracker.monitored(time.monotonic(), seconds, 0.0 if silenced is not None and silenced() else speech)
+            return Gst.PadProbeReturn.OK
+
+        rig.speaker.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, heard)
+
+    def ticker() -> None:
+        while not stop.wait(0.2):
+            for verdict in tracker.tick(time.monotonic()):
+                verdicts.append(verdict)
+                if verdict.action == "rebuild":
+                    threading.Thread(
+                        target=ph.GOVERNOR.rebuild, args=(rig.audio, "unheard replies", verdict.cause), daemon=True
+                    ).start()
+        if monitor is not None:
+            monitor.stop()
+
+    threading.Thread(target=ticker, daemon=True).start()
+    return tracker, verdicts
+
+
+def _wait_judged(verdicts: list[ph.Verdict], count: int, timeout: float = 8.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and len([v for v in verdicts if v.action != "rebuild"]) < count:
+        time.sleep(0.05)
+
+
+def test_three_unheard_replies_rebuild_the_speaker_and_the_next_is_heard(
+    rig: Rig, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Integration: one heard reply, then the device plays silence; the third unheard reply rebuilds it."""
+    if USE_SDK_DEVICES:
+        pytest.skip("the behind case itself is reproduced in test_the_triggers_recover_the_behind_case")
+    desync = _Desync(rig, monkeypatch)
+    rig.start()
+    stop = threading.Event()
+    try:
+        tracker, verdicts = _drive_reply_tracker(rig, stop)
+        with caplog.at_level(logging.INFO, logger=ph.logger.name):
+            rig.push_reply(0.5, 0.4)
+            _wait_judged(verdicts, 1)
+            desync.on = True
+            for _ in range(3):
+                rig.push_reply(0.5, 0.4)
+                time.sleep(2.0)  # a pause between replies
+            _wait_judged(verdicts, 4)
+            time.sleep(1.0)
+            assert desync.rebuilds == 1
+            rig.push_reply(0.5, 0.4)
+            _wait_judged(verdicts, 5)
+    finally:
+        stop.set()
+    actions = [v.action for v in verdicts]
+    assert actions == ["heard", "unheard", "unheard", "unheard", "rebuild", "heard"], verdicts
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    rebuilds = [m for m in warnings if "Rebuilding the speaker stream" in m]
+    assert len(rebuilds) == 1 and "trigger: unheard replies" in rebuilds[0] and "3 replies in a row" in rebuilds[0]
+
+
+def test_the_unheard_trigger_stays_quiet_through_speech_barge_ins_and_idle(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Normal replies, a barge-in mid-reply and an idle stretch: every judged reply heard or flushed."""
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a healthy stream"))
+    rig.start()
+    stop = threading.Event()
+    try:
+        tracker, verdicts = _drive_reply_tracker(rig, stop)
+        rig.push_reply(0.8, 0.4)
+        time.sleep(2.0)
+        rig.push_reply(0.8, 0.5)
+        time.sleep(2.0)
+        pusher = threading.Thread(target=rig.push_reply, args=(3.0, 0.45), daemon=True)
+        pusher.start()
+        time.sleep(0.6)
+        _barge_in(rig.audio)
+        tracker.flushed(time.monotonic())  # as LocalStream.clear_audio_queue does
+        pusher.join()
+        time.sleep(IDLE_S)
+        _wait_judged(verdicts, 3)
+    finally:
+        stop.set()
+    actions = [v.action for v in verdicts]
+    assert actions[:2] == ["heard", "heard"] and "unheard" not in actions and "rebuild" not in actions, verdicts
+    assert tracker.unheard_in_a_row == 0
+
+
+# --- both triggers against the behind case (the trixie container) ---------------------------
+
+# The trigger expected to fire: "unheard replies" or "capture gap".
+BEHIND = os.environ.get("REACHY_PLAYBACK_TEST_BEHIND", "")
+
+
+@pytest.mark.skipif(not (USE_SDK_DEVICES and BEHIND), reason="the trixie container's behind-case reproduction only")
+def test_the_triggers_recover_the_behind_case(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
+    """Both triggers live, the speaker desynced behind the server's read pointer, replies heard again.
+
+    Run on the microphone's clock (6522fb7 reverted), where a stall leaves pulsesink
+    writing behind the server's read pointer and every reply is silent while the
+    latency reads 0. REACHY_PLAYBACK_TEST_STALL=micfeed starves the pipe-fed
+    microphone (frames keep coming: the unheard trigger is the one that can see it);
+    =pipewire stops the daemon (frames stop: the capture-gap trigger). "Heard" for the
+    assertion is the rig's own monitor; the triggers use the app's SpeakerMonitor.
+    """
+    rig.start()
+    acted = _drive_capture_watch(rig)
+    stop = threading.Event()
+    try:
+        tracker, verdicts = _drive_reply_tracker(rig, stop)
+        with caplog.at_level(logging.INFO, logger=ph.logger.name):
+            before = rig.reply_latency(0.3)
+            assert before is not None and before < 1.0, f"baseline reply latency {before}"
+            time.sleep(5.0)
+            assert tracker.armed, verdicts
+            rig.stall(STALL_KIND, STALL_S)
+            stalled_at = time.monotonic()
+            rebuilt_at = None
+            latencies: list[tuple[float, float | None]] = []
+            levels = [round(0.35 + 0.01 * i, 2) for i in range(60)]
+            while time.monotonic() - stalled_at < RECOVERY_S:
+                lat = rig.reply_latency(levels[len(latencies) % len(levels)])
+                latencies.append((round(time.monotonic() - stalled_at, 1), None if lat is None else round(lat, 2)))
+                time.sleep(1.0)  # a pause: each reply is its own
+                rebuilds = [r for r in caplog.records if "Rebuilding the speaker stream" in r.getMessage()]
+                if rebuilds and rebuilt_at is None:
+                    rebuilt_at = time.monotonic() - stalled_at
+                heard = [lat for t, lat in latencies if rebuilt_at is not None and t > rebuilt_at]
+                if len(heard) >= 3 and all(lat is not None and lat < 1.0 for lat in heard[-3:]):
+                    break
+    finally:
+        stop.set()
+    messages = [r.getMessage() for r in caplog.records if r.name == ph.logger.name]
+    rebuild_lines = [m for m in messages if "Rebuilding the speaker stream" in m]
+    print(f"\nstall {STALL_KIND} {STALL_S:.0f}s; rebuilds: {rebuild_lines}")
+    print(f"capture watch: {[v.action for v in acted]}; reply verdicts: {[v.action for v in verdicts]}")
+    print(f"replies after the stall (s after it, push-to-heard s): {latencies}")
+    print(f"first rebuild {rebuilt_at} s after the stall")
+    assert any(f"trigger: {BEHIND}" in m for m in rebuild_lines), rebuild_lines
+    after = [lat for t, lat in latencies if rebuilt_at is not None and t > rebuilt_at]
+    assert len(after) >= 3 and all(lat is not None and lat < 1.0 for lat in after[-3:]), latencies

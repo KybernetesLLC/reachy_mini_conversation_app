@@ -416,6 +416,240 @@ def act_on_capture(verdict: Verdict, audio: Any, governor: RebuildGovernor | Non
         (governor or GOVERNOR).rebuild(audio, "capture gap", verdict.cause)
 
 
+# --- the unheard-reply trigger -------------------------------------------------------------
+#
+# "Heard" is measured on the speaker's monitor source: what the server actually mixed
+# into the device, in a separate capture pipeline. Nothing inside the app's pipeline
+# can tell: measured in the trixie container under the microphone's clock, before and
+# after a 75 s capture stall (every reply heard in 0.14 s, then none), per 1 s reply
+# the bytes reaching pulsesink's pad (208,000 vs 208,640), basesink's rendered count
+# (325 vs 326), the ring buffer's samples_done, the sink clock's advance (3.25 s vs
+# 3.26 s) and its position query were the same whether the reply was heard or not:
+# pulsesink consumes and clocks every buffer as usual, and the server discards the
+# writes that land behind its read pointer. pa_stream_get_latency reads 0 then. The
+# monitor carries the mix before the sink's volume (PipeWire's monitor.channel-volumes
+# is false by default), so a quiet or muted speaker still reads as heard.
+
+UNHEARD_WINDOW_S = 5.0  # a reply is judged this long after its first push
+UNHEARD_LIMIT = 3  # unheard replies in a row before a rebuild
+REPLY_GAP_S = 1.5  # pushes further apart than this start a new reply
+LOUD_RMS = 0.003  # about -50 dBFS: speech, not silence or dither
+HEARD_FRACTION = 0.25  # of the speech pushed (up to the window less 1 s), heard by the deadline
+MIN_SPEECH_S = 0.3  # less speech than this is not judged
+
+
+def loud_seconds(samples: Any, rate: int) -> tuple[float, float]:
+    """Return (seconds, seconds above LOUD_RMS) of a buffer of float samples, in 10 ms blocks."""
+    import numpy as np
+
+    data = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if data.size == 0 or rate <= 0:
+        return 0.0, 0.0
+    block = max(1, rate // 100)
+    usable = (data.size // block) * block
+    loud = 0
+    if usable:
+        rms = np.sqrt(np.mean(np.square(data[:usable].reshape(-1, block)), axis=1))
+        loud = int(np.count_nonzero(rms > LOUD_RMS)) * block
+    rest = data[usable:]
+    if rest.size and float(np.sqrt(np.mean(np.square(rest)))) > LOUD_RMS:
+        loud += rest.size
+    return data.size / rate, loud / rate
+
+
+def reply_verdict(
+    speech_pushed_s: float, heard_s: float, monitored_s: float, window_s: float = UNHEARD_WINDOW_S
+) -> Verdict:
+    """Judge one reply at its deadline, from speech pushed and speech the monitor heard in its window. Pure."""
+    expected = min(speech_pushed_s, window_s - 1.0)
+    if expected < MIN_SPEECH_S:
+        return Verdict("skip", f"{speech_pushed_s:.2f} s of speech pushed, too little to judge")
+    if monitored_s < 0.5 * window_s:
+        return Verdict("unmeasured", f"the speaker's monitor delivered {monitored_s:.1f} s of {window_s:.0f} s")
+    if heard_s >= HEARD_FRACTION * expected:
+        return Verdict("heard", f"{heard_s:.2f} s of speech heard of {expected:.2f} s expected")
+    return Verdict("unheard", f"{heard_s:.2f} s of speech heard of {expected:.2f} s expected within {window_s:.0f} s")
+
+
+def unheard_streak_decision(count: int, limit: int = UNHEARD_LIMIT) -> Verdict:
+    """Decide from the count of unheard replies in a row. Pure."""
+    if count >= limit:
+        return Verdict("rebuild", f"{count} replies in a row pushed but not heard within {UNHEARD_WINDOW_S:.0f} s")
+    return Verdict("ok", f"{count} unheard in a row")
+
+
+class ReplyTracker:
+    """Group pushed audio into replies, judge each against the speaker's monitor, count unheard ones.
+
+    Times are passed in, so it is deterministic. Thread-safe: pushes and flushes come
+    from the event loop, monitor buffers from GStreamer's thread.
+    """
+
+    def __init__(self, window_s: float = UNHEARD_WINDOW_S, limit: int = UNHEARD_LIMIT) -> None:
+        """Start with nothing pushed, and disarmed until the monitor has heard one reply."""
+        self._window_s = window_s
+        self._limit = limit
+        self._lock = threading.Lock()
+        self._replies: list[dict[str, Any]] = []
+        self._monitor: list[tuple[float, float, float]] = []  # (arrival, seconds, speech seconds)
+        self.unheard_in_a_row = 0
+        self.armed = False
+
+    def pushed(self, now: float, seconds: float, speech_s: float) -> None:
+        """Note audio pushed to the speaker at ``now``."""
+        with self._lock:
+            current = self._replies[-1] if self._replies else None
+            if current is None or current["flushed"] or now - current["last"] > REPLY_GAP_S:
+                current = {"start": now, "last": now, "speech": 0.0, "flushed": False, "judged": False}
+                self._replies.append(current)
+            current["last"] = now
+            current["speech"] += speech_s
+
+    def flushed(self, now: float) -> None:
+        """Note a barge-in: the reply being pushed is dropped audio, never unheard; earlier ones are judged."""
+        with self._lock:
+            if self._replies and not self._replies[-1]["judged"]:
+                self._replies[-1]["flushed"] = True
+
+    def monitored(self, now: float, seconds: float, speech_s: float) -> None:
+        """Note a buffer from the speaker's monitor, arriving at ``now``."""
+        with self._lock:
+            self._monitor.append((now, seconds, speech_s))
+
+    def tick(self, now: float) -> list[Verdict]:
+        """Judge every reply whose window has closed; a rebuild verdict follows the third unheard in a row."""
+        verdicts: list[Verdict] = []
+        with self._lock:
+            for reply in self._replies:
+                if reply["judged"] or now < reply["start"] + self._window_s:
+                    continue
+                reply["judged"] = True
+                if reply["flushed"]:
+                    verdicts.append(Verdict("flushed", "barge-in: dropped audio, not judged"))
+                    continue
+                start, end = reply["start"], reply["start"] + self._window_s
+                window = [m for m in self._monitor if start <= m[0] <= end]
+                verdict = reply_verdict(
+                    reply["speech"], sum(m[2] for m in window), sum(m[1] for m in window), self._window_s
+                )
+                verdicts.append(verdict)
+                if verdict.action == "heard":
+                    self.unheard_in_a_row = 0
+                    self.armed = True
+                elif verdict.action == "unheard" and self.armed:
+                    self.unheard_in_a_row += 1
+                    streak = unheard_streak_decision(self.unheard_in_a_row, self._limit)
+                    if streak.action == "rebuild":
+                        verdicts.append(Verdict("rebuild", f"{streak.cause}; last: {verdict.cause}"))
+                        self.unheard_in_a_row = 0
+            horizon = now - 2 * self._window_s
+            self._replies = [r for r in self._replies if not r["judged"] or r["last"] > horizon]
+            self._monitor = [m for m in self._monitor if m[0] > horizon]
+        return verdicts
+
+
+class SpeakerMonitor:
+    """Capture the speaker's monitor source in its own pipeline and report each buffer's speech."""
+
+    def __init__(self, on_buffer: Callable[[float, float, float], None]) -> None:
+        """``on_buffer(now, seconds, speech_seconds)`` is called from GStreamer's thread."""
+        self._on_buffer = on_buffer
+        self._pipeline: Any = None
+        self.source: str | None = None
+        self.last_buffer_at: float | None = None
+
+    @staticmethod
+    def monitor_source(sink: Any) -> str | None:
+        """Name the monitor of the device pulsesink is playing to, or None for any other sink."""
+        factory = sink.get_factory() if sink is not None else None
+        if factory is None or factory.get_name() != "pulsesink":
+            return None
+        device = sink.get_property("current-device") or sink.get_property("device")
+        return f"{device}.monitor" if device else None
+
+    def start(self, source: str) -> bool:
+        """Start capturing ``source``; returns whether it is running."""
+        from gi.repository import Gst
+
+        self.stop()
+        pipeline = Gst.Pipeline.new("speaker_monitor")
+        src = Gst.ElementFactory.make("pulsesrc")
+        convert = Gst.ElementFactory.make("audioconvert")
+        resample = Gst.ElementFactory.make("audioresample")
+        appsink = Gst.ElementFactory.make("appsink")
+        if not all((src, convert, resample, appsink)):
+            return False
+        src.set_property("device", source)
+        src.set_property("buffer-time", 200_000)
+        src.set_property("latency-time", 50_000)
+        appsink.set_property("caps", Gst.Caps.from_string("audio/x-raw,format=F32LE,channels=1,rate=16000"))
+        appsink.set_property("sync", False)
+        appsink.set_property("drop", True)
+        appsink.set_property("max-buffers", 50)
+        appsink.set_property("emit-signals", True)
+        appsink.connect("new-sample", self._on_sample)
+        for element in (src, convert, resample, appsink):
+            pipeline.add(element)
+        src.link(convert)
+        convert.link(resample)
+        resample.link(appsink)
+        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            pipeline.set_state(Gst.State.NULL)
+            return False
+        self._pipeline = pipeline
+        self.source = source
+        self.last_buffer_at = time.monotonic()
+        logger.info("Speaker monitor started on %s (heard replies are measured here)", source)
+        return True
+
+    def _on_sample(self, appsink: Any) -> Any:
+        from gi.repository import Gst
+
+        sample = appsink.emit("pull-sample")
+        if sample is not None:
+            import numpy as np
+
+            buf = sample.get_buffer()
+            data = np.frombuffer(buf.extract_dup(0, buf.get_size()), dtype=np.float32)
+            now = time.monotonic()
+            self.last_buffer_at = now
+            seconds, speech = loud_seconds(data, 16000)
+            self._on_buffer(now, seconds, speech)
+        return Gst.FlowReturn.OK
+
+    def stop(self) -> None:
+        """Stop capturing."""
+        from gi.repository import Gst
+
+        if self._pipeline is not None:
+            self._pipeline.set_state(Gst.State.NULL)
+            self._pipeline = None
+            self.source = None
+
+
+def keep_monitor(monitor: SpeakerMonitor, audio: Any, now: float, stale_s: float = 5.0) -> str:
+    """Keep the speaker monitor on the device the speaker plays to; restart it if it went quiet.
+
+    Returns what it did: "running", "started", "stopped" or "unavailable".
+    """
+    with MEDIA_LOCK:
+        pipeline = getattr(audio, "_pipeline", None)
+        if not _playing(pipeline):
+            if monitor.source is not None:
+                monitor.stop()
+                return "stopped"
+            return "unavailable"
+        source = SpeakerMonitor.monitor_source(speaker_sink(pipeline))
+    if source is None:
+        return "unavailable"
+    stale = monitor.last_buffer_at is None or now - monitor.last_buffer_at > stale_s
+    if monitor.source == source and not stale:
+        return "running"
+    if monitor.source is not None and stale:
+        logger.info("Speaker monitor on %s delivered nothing for %.0f s: restarting it", monitor.source, stale_s)
+    return "started" if monitor.start(source) else "unavailable"
+
+
 # --- the motif playbin: conversation.sound's second speaker stream ------------------------
 
 

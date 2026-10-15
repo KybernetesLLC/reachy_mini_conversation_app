@@ -3480,3 +3480,60 @@ async def test_record_loop_counts_frames_while_muted_so_a_mute_is_no_gap(monkeyp
     robot.media.get_audio_sample.side_effect = sample
     monkeypatch.setattr(playback_health, "act_on_capture", lambda v, a: pytest.fail(f"acted: {v}"))
     await stream.record_loop()
+
+
+@pytest.mark.asyncio
+async def test_play_loop_counts_each_pushed_frame_toward_its_reply() -> None:
+    """Every frame pushed to the speaker is noted with its length and its speech, at the handler's rate."""
+    robot = _audio_robot(push_audio_sample=MagicMock())
+    handler = MagicMock()
+    stream = LocalStream(handler, robot)
+    stream._now = lambda: 42.0
+    pushed: list[tuple[float, float, float]] = []
+    stream._replies = SimpleNamespace(pushed=lambda now, seconds, speech: pushed.append((now, seconds, speech)))
+    frame = np.full(2400, 9830, dtype=np.int16)  # 0.1 s at 24 kHz, about 0.3 full scale
+    handler.emit = AsyncMock(side_effect=_stop_after(stream, (24000, frame)))
+
+    await stream.play_loop()
+
+    assert pushed == [(42.0, pytest.approx(0.1), pytest.approx(0.1))]
+
+
+def test_a_barge_in_marks_the_reply_flushed_never_unheard() -> None:
+    """clear_audio_queue tells the reply tracker: dropped audio is expected."""
+    robot = _audio_robot()
+    stream = LocalStream(MagicMock(), robot)
+    stream._now = lambda: 7.0
+    flushed: list[float] = []
+    stream._replies = SimpleNamespace(flushed=flushed.append)
+    stream.clear_audio_queue()
+    assert flushed == [7.0]
+
+
+@pytest.mark.asyncio
+async def test_the_playback_guard_rebuilds_off_the_event_loop_after_unheard_replies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rebuild verdict from the reply tracker goes to the shared governor, from a worker thread."""
+    from reachy_mini_conversation_app import playback_health
+
+    robot = _audio_robot()
+    robot.media.audio = SimpleNamespace(_pipeline=None)
+    stream = LocalStream(MagicMock(), robot)
+    verdicts = [[playback_health.Verdict("rebuild", "3 replies in a row pushed but not heard within 5 s")]]
+    stream._replies = SimpleNamespace(
+        tick=lambda now: verdicts.pop() if verdicts else [], unheard_in_a_row=0, armed=True
+    )
+    monkeypatch.setattr(playback_health, "keep_monitor", lambda monitor, audio, now: "unavailable")
+    rebuilt: list[tuple[Any, str, str, bool]] = []
+    loop = asyncio.get_running_loop()
+
+    def rebuild(audio: Any, trigger: str, cause: str) -> bool:
+        rebuilt.append((audio, trigger, cause, threading.current_thread() is threading.main_thread()))
+        loop.call_soon_threadsafe(stream._stop_event.set)
+        return True
+
+    monkeypatch.setattr(playback_health.GOVERNOR, "rebuild", rebuild)
+    await asyncio.wait_for(stream.playback_guard_loop(interval_s=0.01), timeout=2.0)
+    await asyncio.gather(*stream._background)
+    assert rebuilt == [(robot.media.audio, "unheard replies", "3 replies in a row pushed but not heard within 5 s", False)]
