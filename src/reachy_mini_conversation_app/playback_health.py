@@ -248,14 +248,30 @@ def rebuild_decision(
     return Verdict("rebuild", f"the {cooldown:.0f} s cooldown after {len(recent)} rebuild(s) has passed")
 
 
+def _state(pipeline: Any) -> Any:
+    """Return the pipeline's current Gst.State, or None if there is none to read."""
+    try:
+        return pipeline.get_state(0)[1] if pipeline is not None else None
+    except Exception:
+        return None
+
+
 def _playing(pipeline: Any) -> bool:
     """Return whether the pipeline is PLAYING now; capture off sets it to NULL."""
     from gi.repository import Gst
 
-    try:
-        return bool(pipeline is not None and pipeline.get_state(0)[1] == Gst.State.PLAYING)
-    except Exception:
-        return False
+    return bool(_state(pipeline) == Gst.State.PLAYING)
+
+
+def _paused(pipeline: Any) -> bool:
+    """Return whether the pipeline is PAUSED now: never a resting state for the app, so stuck.
+
+    Capture off sets NULL, and capture on PLAYING. Clocked from the speaker, a pipeline
+    in PAUSED is one whose speaker has nothing to preroll on (prime_speaker).
+    """
+    from gi.repository import Gst
+
+    return bool(_state(pipeline) == Gst.State.PAUSED)
 
 
 def restart_speaker_clock(audio: Any) -> bool:
@@ -289,7 +305,11 @@ class RebuildGovernor:
         with MEDIA_LOCK:
             pipeline = getattr(audio, "_pipeline", None)
             if not _playing(pipeline):
-                logger.info("Speaker stream rebuild skipped (trigger: %s): the pipeline is not playing", trigger)
+                logger.info(
+                    "Speaker stream rebuild skipped (trigger: %s): the pipeline is %s",
+                    trigger,
+                    "stuck in PAUSED" if _paused(pipeline) else "not playing",
+                )
                 return False
             now = self._clock()
             verdict = rebuild_decision(now, self._history)
@@ -335,10 +355,28 @@ def lag_report(last: tuple[float, float] | None, now: float) -> str:
 
 
 def check_playback(
-    pipeline: Any, limit_s: float = LATENCY_LIMIT_S, replies: Any = None, now: float | None = None
+    pipeline: Any,
+    limit_s: float = LATENCY_LIMIT_S,
+    replies: Any = None,
+    now: float | None = None,
+    audio: Any = None,
 ) -> Verdict:
-    """Log the minute line, the last measured reply lag; the rebuild belongs to the per-reply trigger."""
+    """Log the minute line, the last measured reply lag; the rebuild belongs to the per-reply trigger.
+
+    A pipeline stuck in PAUSED is logged as a WARNING and the speaker primed, once a
+    minute while it lasts: nothing else retries it (the capture-stall prime runs once
+    per stall, and the speaker monitor is stopped while the pipeline is not PLAYING).
+    """
     with MEDIA_LOCK:
+        if _paused(pipeline):
+            logger.warning(
+                "Playback pipeline stuck in PAUSED: the speaker's stream has nothing to preroll on; priming the speaker"
+            )
+            try:
+                restart_speaker_clock(audio)
+            except Exception:
+                logger.warning("Could not prime the speaker", exc_info=True)
+            return Verdict("paused", "the pipeline is stuck in PAUSED")
         if not _playing(pipeline):
             return Verdict("unmeasured", "the pipeline is not playing")
         sink = speaker_sink(pipeline)

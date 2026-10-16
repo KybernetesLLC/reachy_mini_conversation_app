@@ -660,11 +660,14 @@ def test_the_cooldown_cause_says_how_long_is_left() -> None:
 class _Pipeline:
     """A stand-in pipeline in a given state."""
 
-    def __init__(self, playing: bool = True) -> None:
+    def __init__(self, playing: bool = True, state: str | None = None) -> None:
         self.playing = playing
+        self.state = state  # a Gst.State name, overriding ``playing``
 
     def get_state(self, _timeout: int) -> tuple[Any, Any, Any]:
         Gst = _gst()
+        if self.state is not None:
+            return (None, getattr(Gst.State, self.state), None)
         return (None, Gst.State.PLAYING if self.playing else Gst.State.NULL, None)
 
 
@@ -1707,3 +1710,42 @@ def test_a_rebuild_and_a_capture_stall_prime_the_speaker(monkeypatch: pytest.Mon
     ph.act_on_capture(ph.capture_stall_decision(3.5, False), audio)
     assert primed == [audio, audio]
     assert ph.restart_speaker_clock(SimpleNamespace()) is False  # no player to push to
+
+
+# --- a pipeline stuck in PAUSED (review, 2026-10-16) ---------------------------------------
+
+
+def test_the_minute_check_warns_about_a_pipeline_stuck_in_paused_and_primes_the_speaker(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Capture off is NULL; the app never rests in PAUSED. Clocked from the speaker, PAUSED is the unprimed wedge."""
+    primed: list[Any] = []
+    audio = SimpleNamespace(push_audio_sample=lambda s: None)
+    monkeypatch.setattr(ph, "prime_speaker", primed.append)
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a paused pipeline"))
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        verdict = ph.check_playback(_Pipeline(state="PAUSED"), audio=audio)
+    assert verdict.action == "paused"
+    assert primed == [audio]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "PAUSED" in warnings[0] and "priming" in warnings[0]
+
+
+def test_the_minute_check_stays_silent_for_capture_off(caplog: pytest.LogCaptureFixture) -> None:
+    """NULL is capture off, the normal case: no line, no prime."""
+    audio = SimpleNamespace(push_audio_sample=lambda s: pytest.fail("primed a stopped pipeline"))
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        assert ph.check_playback(_Pipeline(state="NULL"), audio=audio).action == "unmeasured"
+    assert not [r for r in caplog.records if r.name == ph.logger.name]
+
+
+def test_a_rebuild_skipped_on_a_paused_pipeline_names_the_state(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The governor still leaves a pipeline that is not PLAYING alone, but says it is PAUSED."""
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a paused pipeline"))
+    audio = SimpleNamespace(_pipeline=_Pipeline(state="PAUSED"))
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        assert ph.RebuildGovernor(clock=lambda: 100.0).rebuild(audio, "capture gap", "test") is False
+    assert any("PAUSED" in r.getMessage() for r in caplog.records)
+

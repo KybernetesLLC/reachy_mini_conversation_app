@@ -1033,7 +1033,7 @@ class LocalStream:
             if pipeline is None:
                 continue
             try:
-                await asyncio.to_thread(playback_health.check_playback, pipeline, replies=self._replies)
+                await asyncio.to_thread(playback_health.check_playback, pipeline, replies=self._replies, audio=audio)
             except Exception:
                 logger.warning("Playback latency check failed", exc_info=True)
 
