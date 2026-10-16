@@ -88,13 +88,18 @@ def jpeg_from_frame(frame: np.ndarray, spec: ModelImageSpec = MODEL_IMAGE) -> Op
     """Return a BGR frame as a JPEG for the model, fitted to `spec`, and log it."""
     height, width = frame.shape[:2]
     size = _target_size(width, height, spec.long_side)
-    jpeg = _encode(frame, *size, spec.quality)
-    stepped_from: Optional[Tuple[int, int]] = None
-    if jpeg is not None and len(jpeg) > spec.max_bytes:
-        smaller = _target_size(width, height, spec.step_down_long_side)
-        if smaller != size:
-            stepped_from, size = size, smaller
-            jpeg = _encode(frame, *size, spec.quality)
+    try:
+        jpeg = _encode(frame, *size, spec.quality)
+        stepped_from: Optional[Tuple[int, int]] = None
+        if jpeg is not None and len(jpeg) > spec.max_bytes:
+            smaller = _target_size(width, height, spec.step_down_long_side)
+            if smaller != size:
+                fitted = _encode(frame, *smaller, spec.quality)
+                if fitted is not None:  # a failed step-down keeps the first JPEG: it still fits the 16 MiB limit
+                    stepped_from, size, jpeg = size, smaller, fitted
+    except Exception:
+        logger.warning("Image to the model: encoding a %dx%d frame raised", width, height, exc_info=True)
+        return None
     if jpeg is None:
         logger.warning("Image to the model: encoding a %dx%d frame failed", width, height)
         return None

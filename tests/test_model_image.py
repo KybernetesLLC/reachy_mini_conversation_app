@@ -124,3 +124,27 @@ def test_each_image_is_logged_with_size_and_quality(caplog: pytest.LogCaptureFix
     assert jpeg is not None
     lines = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
     assert lines == [f"Image to the model: 1280x720, {round(len(jpeg) / 1000)} KB (q80)"]
+
+
+def test_a_failed_step_down_keeps_the_first_jpeg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Over the cap at 1280 and the 960 encode fails: the first JPEG is still sent, not None."""
+    big = b"\xff" * 500_000
+    calls: list[tuple[int, int]] = []
+
+    def encode(frame: np.ndarray, width: int, height: int, quality: int) -> bytes | None:
+        calls.append((width, height))
+        return big if len(calls) == 1 else None
+
+    monkeypatch.setattr(model_image, "_encode", encode)
+    assert model_image.jpeg_from_frame(np.zeros((1080, 1920, 3), dtype=np.uint8)) == big
+    assert calls == [(1280, 720), (960, 540)]
+
+
+def test_an_encode_that_raises_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pipeline error never reaches the camera tool or the glance: None, logged."""
+
+    def encode(frame: np.ndarray, width: int, height: int, quality: int) -> bytes | None:
+        raise RuntimeError("no jpegenc")
+
+    monkeypatch.setattr(model_image, "_encode", encode)
+    assert model_image.jpeg_from_frame(np.zeros((720, 1280, 3), dtype=np.uint8)) is None
