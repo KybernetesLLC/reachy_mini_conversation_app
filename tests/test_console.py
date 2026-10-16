@@ -3241,7 +3241,7 @@ def test_a_sound_that_is_not_a_file_is_refused(tmp_path) -> None:
 
 
 def _clocked_robot(order: list[str]) -> SimpleNamespace:
-    """Return a robot whose media records any pipeline stop or start."""
+    """Return a robot whose media records the order of the clock choice and the pipeline start."""
     pipeline = object()
     audio = SimpleNamespace(_pipeline=pipeline)
     return SimpleNamespace(
@@ -3254,6 +3254,58 @@ def _clocked_robot(order: list[str]) -> SimpleNamespace:
             stop_playing=lambda: order.append("stop_playing"),
         )
     )
+
+
+def test_the_media_start_clocks_playback_from_the_speaker_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The speaker's clock is chosen before the pipeline starts, never by pausing it."""
+    from reachy_mini_conversation_app import playback_health
+
+    monkeypatch.delenv("REACHY_MINI_CAPTURE_ON_START", raising=False)
+    order: list[str] = []
+    robot = _clocked_robot(order)
+    monkeypatch.setattr(playback_health, "speaker_sink", lambda pipeline: "sink")
+    monkeypatch.setattr(
+        playback_health, "clock_playback_from_speaker", lambda pipeline, sink: order.append(f"clock:{sink}") or True
+    )
+    monkeypatch.setattr(playback_health, "prime_speaker", lambda audio: order.append("prime"))
+    stream = LocalStream(MagicMock(), robot)
+    stream._start_media_if_wanted()
+    # Primed after the start: the speaker's clock runs only once its stream has audio,
+    # and until then the microphone delivered nothing (the trixie container, 2026-10-15).
+    assert order == ["clock:sink", "start_recording", "start_playing", "prime"]
+
+
+def test_a_speaker_without_a_clock_is_not_primed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing to start when the clock was left alone."""
+    from reachy_mini_conversation_app import playback_health
+
+    monkeypatch.delenv("REACHY_MINI_CAPTURE_ON_START", raising=False)
+    order: list[str] = []
+    robot = _clocked_robot(order)
+    monkeypatch.setattr(playback_health, "speaker_sink", lambda pipeline: None)
+    monkeypatch.setattr(playback_health, "clock_playback_from_speaker", lambda pipeline, sink: False)
+    monkeypatch.setattr(playback_health, "prime_speaker", lambda audio: order.append("prime"))
+    LocalStream(MagicMock(), robot)._start_media_if_wanted()
+    assert order == ["start_recording", "start_playing"]
+
+
+def test_capture_on_clocks_playback_from_the_speaker_before_starting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """conversation.capture's start takes the same clock choice first."""
+    from reachy_mini_conversation_app import playback_health
+
+    order: list[str] = []
+    robot = _clocked_robot(order)
+    monkeypatch.setattr(playback_health, "speaker_sink", lambda pipeline: "sink")
+    monkeypatch.setattr(
+        playback_health, "clock_playback_from_speaker", lambda pipeline, sink: order.append("clock") or True
+    )
+    monkeypatch.setattr(playback_health, "prime_speaker", lambda audio: order.append("prime"))
+    app = FastAPI()
+    stream = LocalStream(MagicMock(), robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    stream._capture_on = False
+    _rpc_call(app, "conversation.capture", {"on": True})
+    assert order == ["clock", "start_recording", "start_playing", "prime"]
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,14 @@ every reply is written into the past and never heard (the trixie container, afte
 maxlength: pulsesink always asks for -1, and the server only honours a smaller
 client value.
 
+So the bound comes from the clock. Clocked from the speaker, pulsesink is not slaved
+and never re-maps; capture follows the speaker instead. Measured in the container with
+the SDK's own elements, a pipe-fed microphone starved for 75 s while PipeWire and the
+speaker ran: with the microphone's clock 0 of 32 replies were heard in the next 100 s;
+with the speaker's, replies were heard in 0.14-0.17 s from the first second (two runs
+each, and the same as a pytest gate). A stop of the PipeWire daemon itself desyncs
+either clock and recovers in 22-35 s about four runs in five.
+
 Playback latency is measured end to end, per reply: from its first push to the first
 sound of it on the speaker's monitor (ReplyTracker). pa_stream_get_latency, read
 through pulsesink's ring buffer, is no measure: it read 0 on the robot while speech
@@ -125,6 +133,39 @@ def speaker_sink(pipeline: Any) -> Any:
             if parent is not None:
                 frontier.append(parent)
     return None
+
+
+def clock_playback_from_speaker(pipeline: Any, sink: Any) -> bool:
+    """Clock the shared pipeline from the speaker, never the microphone. Call before PLAYING.
+
+    Returns whether a clock was set; if so, prime_speaker must follow the start. A pipeline already PLAYING takes it at its next
+    start; it is never paused for it, since pausing corks the microphone.
+    """
+    if sink is None:
+        return False
+    # Before PLAYING provide_clock() is None (the ring buffer is not acquired yet), and
+    # use_clock(None) would run the pipeline with no clock at all. The clock object
+    # exists from the sink's creation: GstAudioBaseSink's provided_clock field.
+    clock = getattr(sink, "provided_clock", None) or sink.provide_clock()
+    if clock is None:
+        return False
+    pipeline.use_clock(clock)
+    return True
+
+
+def prime_speaker(audio: Any) -> None:
+    """Push 20 ms of silence, so the speaker's stream starts and its clock with it. Call after starting.
+
+    Clocked from the speaker, the pipeline cannot reach PLAYING on its own: pulsesink's
+    clock runs only once its stream has audio, and the live silence source and the mixer
+    wait on that clock. Measured in the trixie container: 0 microphone buffers until the
+    first reply; with this push, 100 buffers/s from the first second.
+    """
+    import numpy as np
+
+    channels = getattr(audio, "CHANNELS", 2)
+    rate = getattr(audio, "SAMPLE_RATE", 16000)
+    audio.push_audio_sample(np.zeros((rate // 50, channels), dtype=np.float32))
 
 
 def rebuild_sink(sink: Any, timeout_s: float = 2.0) -> bool:
