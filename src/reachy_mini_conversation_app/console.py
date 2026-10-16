@@ -982,7 +982,7 @@ class LocalStream:
     async def playback_watchdog_loop(self, interval_s: float = playback_health.CHECK_INTERVAL_S) -> None:
         """Log the last measured reply lag once per interval (playback_health.check_playback).
 
-        Off the event loop. The rebuild on a lag over the bound is the playback guard's.
+        Off the event loop. A lag over the bound is the playback guard's WARNING.
         """
         while not self._stop_event.is_set():
             try:
@@ -1000,7 +1000,7 @@ class LocalStream:
                 logger.warning("Playback latency check failed", exc_info=True)
 
     async def playback_guard_loop(self, interval_s: float = 0.5) -> None:
-        """Judge pushed replies against the speaker's monitor; three unheard in a row, or one heard late, rebuild.
+        """Judge pushed replies against the speaker's monitor; three unheard in a row rebuild, one heard late warns.
 
         The monitor is kept on the device the speaker plays to, off the event loop.
         """
@@ -1034,8 +1034,8 @@ class LocalStream:
                 self._run_off_loop(playback_health.GOVERNOR.rebuild, audio, "unheard replies", verdict.cause)
             elif verdict.action == "heard_after":
                 logger.info("Reply heard after %s (first push to sound on the speaker's monitor)", verdict.cause)
-            elif verdict.action == "lag_rebuild":
-                self._run_off_loop(playback_health.GOVERNOR.rebuild, audio, "playback latency", verdict.cause)
+            elif verdict.action == "heard_late":
+                logger.warning("Reply heard late: %s (logged only, no rebuild)", verdict.cause)
             else:
                 logger.debug("Reply %s: %s", verdict.action, verdict.cause)
 

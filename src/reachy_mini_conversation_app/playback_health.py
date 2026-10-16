@@ -18,9 +18,10 @@ Playback latency is measured end to end, per reply: from its first push to the f
 sound of it on the speaker's monitor (ReplyTracker). pa_stream_get_latency, read
 through pulsesink's ring buffer, is no measure: it read 0 on the robot while speech
 played (2026-10-15) and in every trixie-container reading. A reply heard more than
-LATENCY_LIMIT_S late recreates the speaker sink alone (the record branch is never
-paused or relinked); measured, that cleared a desync at once, replies heard in 0.16 s.
-Once a minute the watchdog logs the last measured lag and its age.
+LATENCY_LIMIT_S late is logged as a WARNING and nothing else: the measure can be
+fooled (a pause in a backlog, or a motif, reads as a reply's onset), so it may not
+rebuild the speaker and cut a reply off (owner, 2026-10-16: log only). Once a minute
+the watchdog logs the last measured lag and its age.
 """
 
 from __future__ import annotations
@@ -392,8 +393,8 @@ MIN_SPEECH_S = 0.3  # less speech than this is not judged
 # it cut off never claims a later reply's sound, and a barge-in drops every reply still
 # queued; neither leaves a reply to be queued behind. So does a monitor that delivered too
 # little to judge a reply by. The limit: a reply lost without a rebuild (one or two
-# unheard, then one heard) claims the next reply's sound, and a lag over the bound
-# rebuilds the speaker then, logged as playback latency.
+# unheard, then one heard) claims the next reply's sound, and its lag is logged as
+# heard late (a WARNING, never a rebuild).
 LAG_WINDOW_S = 90.0
 QUEUE_SLACK_S = 0.3  # a queued reply's sound may arrive this much before the estimate
 
@@ -565,7 +566,7 @@ class ReplyTracker:
                 if not latency_bounded(lag):
                     verdicts.append(
                         Verdict(
-                            "lag_rebuild",
+                            "heard_late",
                             f"a reply was heard {lag:.1f} s after its first push, "
                             f"over the {LATENCY_LIMIT_S:.1f} s bound",
                         )

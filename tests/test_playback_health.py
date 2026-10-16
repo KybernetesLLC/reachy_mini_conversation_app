@@ -796,7 +796,7 @@ def _reply(tracker: ph.ReplyTracker, at: float, heard: bool, speech_s: float = 1
 
 def _judge(tracker: ph.ReplyTracker, now: float) -> list[str]:
     """Return the unheard trigger's verdicts; the measured lags are tested on their own."""
-    return [v.action for v in tracker.tick(now) if v.action not in ("heard_after", "lag_rebuild")]
+    return [v.action for v in tracker.tick(now) if v.action not in ("heard_after", "heard_late")]
 
 
 def test_the_third_unheard_reply_in_a_row_rebuilds_and_starts_the_count_again() -> None:
@@ -912,20 +912,20 @@ def test_a_reply_heard_reports_its_lag_once() -> None:
     _hear(tracker, 9.0, 12.0, [(10.3, 11.3)])
     verdicts = tracker.tick(12.0)
     assert _lags(verdicts) == ["0.30 s"]
-    assert "lag_rebuild" not in [v.action for v in verdicts]
+    assert "heard_late" not in [v.action for v in verdicts]
     assert tracker.last_lag() == pytest.approx((0.3, 10.3))
     assert _lags(tracker.tick(12.5)) == []  # reported once
 
 
-def test_a_lag_over_the_bound_asks_for_a_rebuild_naming_it() -> None:
-    """A 6 s lag is past the 5 s bound: a lag_rebuild verdict whose cause names the value and the bound."""
+def test_a_lag_over_the_bound_is_heard_late_naming_it() -> None:
+    """A 6 s lag is past the 5 s bound: a heard_late verdict whose cause names the value and the bound."""
     tracker = ph.ReplyTracker(rebuilt_at=lambda: None)
     _push(tracker, 10.0, 1.0)
     _hear(tracker, 9.0, 18.0, [(16.0, 17.0)])
     verdicts = tracker.tick(18.0)
     assert _lags(verdicts) == ["6.00 s"]
-    rebuild = [v.cause for v in verdicts if v.action == "lag_rebuild"]
-    assert len(rebuild) == 1 and "6.0" in rebuild[0] and "5.0" in rebuild[0]
+    late = [v.cause for v in verdicts if v.action == "heard_late"]
+    assert len(late) == 1 and "6.0" in late[0] and "5.0" in late[0]
 
 
 def test_a_65_s_lag_is_measured() -> None:
@@ -1148,8 +1148,8 @@ def _drive_reply_tracker(rig: Rig, stop: threading.Event) -> tuple[ph.ReplyTrack
         while not stop.wait(0.2):
             for verdict in tracker.tick(time.monotonic()):
                 verdicts.append(verdict)
-                trigger = {"rebuild": "unheard replies", "lag_rebuild": "playback latency"}.get(verdict.action)
-                if trigger is not None:  # as LocalStream._judge_replies does
+                trigger = {"rebuild": "unheard replies"}.get(verdict.action)
+                if trigger is not None:  # as LocalStream._judge_replies does; heard_late only warns
                     threading.Thread(
                         target=ph.GOVERNOR.rebuild, args=(rig.audio, trigger, verdict.cause), daemon=True
                     ).start()
@@ -1168,7 +1168,7 @@ def _wait_judged(verdicts: list[ph.Verdict], count: int, timeout: float = 8.0) -
 
 def _judged(verdicts: list[ph.Verdict]) -> list[ph.Verdict]:
     """Return the unheard trigger's verdicts, one per reply."""
-    return [v for v in verdicts if v.action not in ("rebuild", "heard_after", "lag_rebuild")]
+    return [v for v in verdicts if v.action not in ("rebuild", "heard_after", "heard_late")]
 
 
 def _wait_lags(verdicts: list[ph.Verdict], count: int, timeout: float) -> list[float]:
@@ -1204,7 +1204,7 @@ def test_three_unheard_replies_rebuild_the_speaker_and_the_next_is_heard(
             _wait_judged(verdicts, 5)
     finally:
         stop.set()
-    actions = [v.action for v in verdicts if v.action not in ("heard_after", "lag_rebuild")]
+    actions = [v.action for v in verdicts if v.action not in ("heard_after", "heard_late")]
     assert actions == ["heard", "unheard", "unheard", "unheard", "rebuild", "heard"], verdicts
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     rebuilds = [m for m in warnings if "Rebuilding the speaker stream" in m]
@@ -1235,7 +1235,7 @@ def test_the_unheard_trigger_stays_quiet_through_speech_barge_ins_and_idle(
     finally:
         stop.set()
     actions = [v.action for v in verdicts]
-    assert "lag_rebuild" not in actions, verdicts
+    assert "heard_late" not in actions, verdicts
     actions = [v.action for v in _judged(verdicts)]
     assert actions[:2] == ["heard", "heard"] and "unheard" not in actions and "rebuild" not in actions, verdicts
     assert tracker.unheard_in_a_row == 0
@@ -1272,25 +1272,15 @@ def test_a_reply_lag_is_measured_during_speech_and_reported_each_minute(
 
 
 @pytest.mark.skipif(not USE_SDK_DEVICES, reason="pulsesink and its monitor: the trixie container or the robot")
-def test_a_reply_heard_over_5_s_late_rebuilds_the_speaker(
-    rig: Rig, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Integration: replies heard 6 s late are measured, logged, and rebuild the speaker once; then heard at once.
+def test_a_reply_heard_over_5_s_late_is_logged_and_never_rebuilds(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
+    """Integration: a reply heard 6 s late is measured and logged as heard late; the speaker is not rebuilt.
 
     The lag is pulsesink's ts-offset of 6 s: it writes 6 s ahead of the server's read
-    pointer, the robot's 65 s case in small, and nothing stalls. ts-offset is a
-    property that a rebuild keeps, so the rebuild here also clears it, as a real
-    rebuild clears the robot's offset. ringbuffer.delay() reads 0 throughout, and the
-    latency query returns the configured 124 ms: neither sees the lag.
+    pointer, the robot's 65 s case in small, and nothing stalls. ringbuffer.delay()
+    reads 0 throughout, and the latency query returns the configured 124 ms: neither
+    sees the lag.
     """
     Gst = rig.Gst
-    real_rebuild = ph.rebuild_sink
-
-    def rebuild(sink: Any) -> bool:
-        sink.set_property("ts-offset", 0)
-        return real_rebuild(sink)
-
-    monkeypatch.setattr(ph, "rebuild_sink", rebuild)
     rig.start()
     stop = threading.Event()
     try:
@@ -1300,17 +1290,9 @@ def test_a_reply_heard_over_5_s_late_rebuilds_the_speaker(
             assert len(_wait_lags(verdicts, 1, timeout=5.0)) == 1, verdicts
             time.sleep(2.0)
             rig.speaker.set_property("ts-offset", 6 * Gst.SECOND)
-            rig.push_reply(3.0, 0.5)  # still queued when the rebuild drops it
+            rig.push_reply(0.8, 0.5)
             lags = _wait_lags(verdicts, 2, timeout=12.0)
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline and not any(
-                "Speaker stream rebuilt" in r.getMessage() for r in caplog.records
-            ):
-                time.sleep(0.1)
-            for level in (0.45, 0.35):  # at once: the first may wait for the new stream
-                rig.push_reply(0.8, level)
-                time.sleep(2.0)
-            after = _wait_lags(verdicts, 4, timeout=6.0)
+            time.sleep(1.0)
         lines = [r.getMessage() for r in caplog.records if r.name == ph.logger.name]
         caplog.clear()
         with caplog.at_level(logging.INFO, logger=ph.logger.name):
@@ -1318,17 +1300,14 @@ def test_a_reply_heard_over_5_s_late_rebuilds_the_speaker(
     finally:
         stop.set()
     minute = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Playback latency")]
-    rebuilds = [m for m in lines if "Rebuilding the speaker stream" in m]
-    print(f"\nmeasured lags: {after}")
-    print(f"rebuild lines: {[m for m in lines if 'ebuil' in m]}")
+    print(f"\nmeasured lags: {lags}")
     print(f"verdicts: {verdicts}")
     print(f"minute line: {minute}")
     assert len(lags) >= 2 and 5.5 < lags[1] < 7.0, lags
-    assert [v.action for v in verdicts].count("lag_rebuild") == 1, verdicts
-    assert len(rebuilds) == 1 and "trigger: playback latency" in rebuilds[0], rebuilds
-    assert f"heard {lags[1]:.1f} s after its first push, over the 5.0 s bound" in rebuilds[0], rebuilds
-    assert len(after) == 4 and after[2] < 3.0 and after[3] < 1.0, after  # heard at once after the rebuild
-    assert len(minute) == 1 and f"last reply heard after {after[-1]:.2f} s" in minute[0], minute
+    late = [v.cause for v in verdicts if v.action == "heard_late"]
+    assert len(late) == 1 and f"heard {lags[1]:.1f} s after its first push, over the 5.0 s bound" in late[0], late
+    assert not [m for m in lines if "ebuil" in m], lines
+    assert len(minute) == 1 and f"last reply heard after {lags[1]:.2f} s" in minute[0], minute
 
 
 # --- both triggers against the behind case (the trixie container) ---------------------------
