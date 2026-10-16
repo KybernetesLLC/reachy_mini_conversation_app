@@ -2378,3 +2378,96 @@ async def test_an_out_of_band_create_is_not_held_for_an_owed_output(monkeypatch:
     await handler._run_realtime_session()
 
     assert [kind for kind, _ in sent] == ["response.create"]
+
+
+@pytest.mark.asyncio
+async def test_a_say_held_behind_a_long_tool_gives_exactly_one_response(monkeypatch: Any) -> None:
+    """The held say and the tool's follow-up merge: one response.create, after the output."""
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="search-1"))
+    )
+    done = ToolNotification(
+        id="c1",
+        tool_name="test__web_search",  # not a registered tool: its follow-up is always asked for
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"answer": "sunny"},
+    )
+
+    async def _say() -> None:
+        await handler.say("The timer is done.")
+        await asyncio.sleep(0.05)
+
+    async def _finish_tool() -> None:
+        await handler._handle_tool_result(done)
+        await asyncio.sleep(0.05)
+
+    handler.client = _ordering_client(
+        (
+            _FakeEvent("response.function_call_arguments.done", name="test__web_search", arguments="{}", call_id="c1"),
+            _say,
+            _finish_tool,
+        ),
+        sent,
+        handler,
+    )
+
+    await handler._run_realtime_session()
+
+    kinds = [
+        "output" if kind == "item" and payload.get("type") == "function_call_output" else kind
+        for kind, payload in sent
+    ]
+    # The search's filler is out of band and goes at once; the in-band create waits.
+    assert kinds.count("response.create") == 2
+    assert sent[kinds.index("response.create")][1]["response"]["conversation"] == "none"
+    in_band = [i for i, (kind, payload) in enumerate(sent) if kind == "response.create" and not payload]
+    assert len(in_band) == 1
+    assert kinds.index("output") < in_band[0]
+
+
+@pytest.mark.asyncio
+async def test_a_held_create_is_released_after_the_timeout(monkeypatch: Any, caplog: pytest.LogCaptureFixture) -> None:
+    """An output that never comes holds a create only up to the timeout."""
+    monkeypatch.setattr(hf_mod, "_OWED_OUTPUT_TIMEOUT", 0)
+    handler = _plain_handler()
+    handler._owe_output("c1")
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.__name__):
+        held = await handler._wait_for_owed_outputs({})
+
+    assert held is True
+    assert "still owed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_tool_result_settles_its_owed_output(monkeypatch: Any) -> None:
+    """No response.done in time: the output is dropped, and creates are no longer held for it."""
+    handler = _plain_handler()
+    handler.connection = _FakeConnection()
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=False))
+    handler._owe_output("c1")
+    note = ToolNotification(
+        id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": 1}
+    )
+
+    await handler._handle_tool_result(note)
+
+    handler.connection.conversation.item.create.assert_not_awaited()
+    assert handler._owed_outputs == set()
+    assert handler._no_outputs_owed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_owed_outputs_reset_on_reconnect(monkeypatch: Any) -> None:
+    """A call owed by the last session holds nothing in the next one."""
+    seen: list[set[str]] = []
+    handler = _session_handler(monkeypatch, (lambda: seen.append(set(handler._owed_outputs)),))
+    handler._owe_output("stale")
+
+    await handler._run_realtime_session()
+
+    assert seen == [set()]
+    assert handler._no_outputs_owed.is_set()

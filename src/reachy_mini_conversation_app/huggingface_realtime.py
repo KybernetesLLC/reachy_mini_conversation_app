@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
+_OWED_OUTPUT_TIMEOUT: float = _RESPONSE_DONE_TIMEOUT  # longest hold of an in-band create
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -867,22 +868,42 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._owed_outputs.clear()
         self._no_outputs_owed.set()
 
-    async def _wait_for_owed_outputs(self, kwargs: dict[str, Any]) -> None:
-        """Hold an in-band response.create until every function call has its output.
+    async def _wait_for_owed_outputs(self, kwargs: dict[str, Any]) -> bool:
+        """Hold an in-band response.create until every function call has its output; True if held.
 
         Out-of-band creates (fillers, sight notes) are not checked by the server and go at once.
         """
         if self._no_outputs_owed.is_set() or kwargs.get("response", {}).get("conversation") == "none":
-            return
+            return False
         logger.info("response.create deferred: %d function call output(s) owed", len(self._owed_outputs))
         try:
-            await asyncio.wait_for(self._no_outputs_owed.wait(), timeout=_RESPONSE_DONE_TIMEOUT)
+            await asyncio.wait_for(self._no_outputs_owed.wait(), timeout=_OWED_OUTPUT_TIMEOUT)
         except asyncio.TimeoutError:
             logger.warning(
-                "Function call outputs still owed after %.0f s; sending response.create", _RESPONSE_DONE_TIMEOUT
+                "Function call outputs still owed after %.0f s; sending response.create", _OWED_OUTPUT_TIMEOUT
             )
-            return
+            return True
         logger.debug("response.create released: function call outputs sent")
+        return True
+
+    def _coalesce_queued_creates(self) -> None:
+        """Merge queued plain creates into the one just released: one reply, not two.
+
+        A say held behind a tool and that tool's own follow-up both ask the model to
+        answer the same conversation. Other queued creates keep their order.
+        """
+        kept: list[dict[str, Any]] = []
+        merged = 0
+        while not self._pending_responses.empty():
+            queued = self._pending_responses.get_nowait()
+            if queued:
+                kept.append(queued)
+            else:
+                merged += 1
+        for queued in kept:
+            self._pending_responses.put_nowait(queued)
+        if merged:
+            logger.debug("response.create: merged %d queued create(s) into the released one", merged)
 
     async def _safe_response_create(self, **kwargs: Any) -> None:
         """Enqueue a response.create() kwargs for the sender worker _response_sender_loop().
@@ -1337,7 +1358,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             max_retries = 5
             attempts = 0
             while not sent and self.connection and attempts < max_retries:
-                await self._wait_for_owed_outputs(kwargs)
+                if await self._wait_for_owed_outputs(kwargs) and not kwargs:
+                    self._coalesce_queued_creates()
                 try:
                     await asyncio.wait_for(
                         self._response_done_event.wait(),
@@ -1468,7 +1490,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         },
                     )
                     model_result_submitted = True
-                    self._output_settled(completed_tool.id)
 
             await self.output_queue.put(
                 AdditionalOutputs(
@@ -1538,7 +1559,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._response_done_event.set()
         finally:
             if isinstance(completed_tool.id, str):
-                self._output_settled(completed_tool.id)  # dropped or failed: nothing more will be sent
+                # After the follow-up create is queued, so a held create merges with it.
+                # A dropped or failed output is settled too: nothing more will be sent.
+                self._output_settled(completed_tool.id)
             # Sent after the result reaches the model (or the attempt fails):
             # the report itself is in-memory only and never blocks a tool call.
             self._report_tool_call(report_payload)
