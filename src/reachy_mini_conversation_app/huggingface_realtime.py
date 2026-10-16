@@ -244,27 +244,38 @@ def _is_sight_note(event: Any) -> bool:
     return _companion_tag(event) == SIGHT_NOTE_TAG["companion"]
 
 
-# The audio cut (2026-10-16): a reply whose transcript opens with "(" or "*" (a stage
-# direction, "(stops talking)") or with "call:" (a tool call leaked into text,
-# "call:stay_quiet{}") is never spoken. speech-to-speech sends each text part's
-# transcript delta ahead of its audio, so the first delta decides before any audio
-# arrives. Audio that does arrive first is held for at most SPOKEN_ARTIFACT_HOLD_S,
-# then released. The server's copy of the reply is left alone.
+# The audio cut (2026-10-16): a reply whose transcript is only a stage direction
+# ("(stops talking)", "*sighs*") or only a tool call leaked into text
+# ("call:stay_quiet{}") is never spoken. A reply that opens with one and goes on
+# ("(Laughs) yes, it leaves at 3") is spoken whole: losing the answer is worse (the
+# owner, 2026-10-16, "for now"). speech-to-speech sends each text part's transcript
+# delta ahead of its audio, so the first delta decides before any audio arrives.
+# Audio that does arrive first is held for at most SPOKEN_ARTIFACT_HOLD_S, then
+# released. The server's copy of the reply is left alone.
 SPOKEN_ARTIFACT_HOLD_S = 0.3
 _LEAKED_CALL_PREFIX: Final[str] = "call:"
 _UNDECIDED: Final[str] = "undecided"
+_DIRECTION_MAX = 80  # the supervisor's stage_direction() allows 80 characters inside
+_CLOSERS: Final[dict[str, str]] = {"(": ")", "*": "*"}
+_LEAKED_CALL = re.compile(r"call:\s*\w+\s*\{.*\}", re.IGNORECASE | re.DOTALL)
 
 
 def spoken_artifact(text: str) -> str | None:
     """Return "stage direction", "leaked tool call", None (a reply), or "undecided" (too little text). Pure."""
-    head = text.lstrip()
+    head = text.strip()
     if not head:
         return _UNDECIDED
-    if head[0] in "(*":
-        return "stage direction"
+    if head[0] in _CLOSERS:
+        end = head.find(_CLOSERS[head[0]], 1)
+        if end == -1:
+            return _UNDECIDED if len(head) <= _DIRECTION_MAX + 1 else None
+        rest = head[end + 1 :].strip(" .!")
+        return "stage direction" if not rest and 0 < end <= _DIRECTION_MAX + 1 else None
     opening = head[: len(_LEAKED_CALL_PREFIX)].lower()
     if opening == _LEAKED_CALL_PREFIX:
-        return "leaked tool call"
+        if "}" not in head:
+            return _UNDECIDED
+        return "leaked tool call" if _LEAKED_CALL.fullmatch(head) else None
     if _LEAKED_CALL_PREFIX.startswith(opening):
         return _UNDECIDED
     return None

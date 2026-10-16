@@ -1958,6 +1958,12 @@ def _reply_events(transcript: str, *, audio_first: bool) -> tuple[Any, ...]:
         ("call:stay_quiet{}", "leaked tool call"),
         (" CALL:express{}", "leaked tool call"),
         ("Sure, (I think) yes.", None),
+        ("(Laughs) yes, the flight leaves at 3.", None),
+        ("*waves* Hello there!", None),
+        ("(stops", "undecided"),
+        ("(stops talking).", "stage direction"),
+        ("call:stay_quiet", "undecided"),
+        ("call:stay_quiet{} and then hello", None),
         ("Calling you now.", None),
         ("", "undecided"),
         ("   ", "undecided"),
@@ -1967,7 +1973,7 @@ def _reply_events(transcript: str, *, audio_first: bool) -> tuple[Any, ...]:
     ],
 )
 def test_spoken_artifact_rule(text: str, verdict: str | None) -> None:
-    """A transcript that opens with "(", "*" or "call:" is an artifact; a prefix of "call:" waits."""
+    """Only a whole stage direction or a whole leaked call is an artifact; an unfinished one waits."""
     assert hf_mod.spoken_artifact(text) == verdict
 
 
