@@ -721,6 +721,12 @@ class SpeakerMonitor:
         self._pipeline: Any = None
         self.source: str | None = None
         self.last_buffer_at: float | None = None
+        self.buffers = 0  # delivered since the last start
+        # keep_monitor's back-off: the source it last tried, when, and how many tries in a row delivered nothing
+        self.target: str | None = None
+        self.attempted_at: float | None = None
+        self.fruitless = 0
+        self.warned = False
 
     @staticmethod
     def monitor_source(sink: Any) -> str | None:
@@ -736,6 +742,7 @@ class SpeakerMonitor:
         from gi.repository import Gst
 
         self.stop()
+        self.buffers = 0
         pipeline = Gst.Pipeline.new("speaker_monitor")
         src = Gst.ElementFactory.make("pulsesrc")
         convert = Gst.ElementFactory.make("audioconvert")
@@ -777,6 +784,7 @@ class SpeakerMonitor:
             data = np.frombuffer(buf.extract_dup(0, buf.get_size()), dtype=np.float32)
             now = time.monotonic()
             self.last_buffer_at = now
+            self.buffers += 1
             seconds, speech = loud_seconds(data, 16000)
             self._on_buffer(now, seconds, speech)
         return Gst.FlowReturn.OK
@@ -791,14 +799,30 @@ class SpeakerMonitor:
             self.source = None
 
 
-def keep_monitor(monitor: SpeakerMonitor, audio: Any, now: float, stale_s: float = 5.0) -> str:
+MONITOR_RETRY_S = 5.0
+# A PipeWire restart takes 22-35 s to recover (the container); the monitor must be back within a minute of it.
+MONITOR_RETRY_MAX_S = 60.0
+
+
+def monitor_retry_s(fruitless: int, base_s: float = MONITOR_RETRY_S, max_s: float = MONITOR_RETRY_MAX_S) -> float:
+    """How long to wait after a monitor start before the next, after ``fruitless`` starts that delivered nothing. Pure."""
+    return min(max_s, base_s * 2**fruitless)
+
+
+def keep_monitor(monitor: SpeakerMonitor, audio: Any, now: float, stale_s: float = MONITOR_RETRY_S) -> str:
     """Keep the speaker monitor on the device the speaker plays to; restart it if it went quiet.
 
-    Returns what it did: "running", "started", "stopped" or "unavailable".
+    A monitor that went quiet after delivering is restarted at once. One that delivered
+    nothing since its last start, or could not start, is retried after 5 s, doubling to
+    at most every 60 s, with one WARNING per quiet spell. It never rebuilds the speaker:
+    with no monitor buffers, replies are unmeasured, never unheard.
+
+    Returns what it did: "running", "started", "backing off", "stopped" or "unavailable".
     """
     with MEDIA_LOCK:
         pipeline = getattr(audio, "_pipeline", None)
         if not _playing(pipeline):
+            monitor.target = None  # capture on again starts it at once
             if monitor.source is not None:
                 monitor.stop()
                 return "stopped"
@@ -808,9 +832,28 @@ def keep_monitor(monitor: SpeakerMonitor, audio: Any, now: float, stale_s: float
         return "unavailable"
     stale = monitor.last_buffer_at is None or now - monitor.last_buffer_at > stale_s
     if monitor.source == source and not stale:
+        if monitor.fruitless and monitor.buffers:
+            logger.info("Speaker monitor on %s delivering again after %d retries", source, monitor.fruitless)
+            monitor.fruitless, monitor.warned = 0, False
         return "running"
-    if monitor.source is not None and stale:
+    if source != monitor.target:
+        monitor.target, monitor.fruitless, monitor.warned = source, 0, False
+    elif not monitor.buffers and monitor.attempted_at is not None:
+        wait_s = monitor_retry_s(monitor.fruitless)
+        if now - monitor.attempted_at < wait_s:
+            return "backing off"
+        monitor.fruitless += 1
+        if not monitor.warned:
+            monitor.warned = True
+            logger.warning(
+                "Speaker monitor on %s delivered nothing since it was started: backing off, retrying at most "
+                "every %.0f s; replies go unmeasured meanwhile and the speaker is not rebuilt for it",
+                source,
+                MONITOR_RETRY_MAX_S,
+            )
+    elif monitor.source is not None:
         logger.info("Speaker monitor on %s delivered nothing for %.0f s: restarting it", monitor.source, stale_s)
+    monitor.attempted_at = now
     return "started" if monitor.start(source) else "unavailable"
 
 

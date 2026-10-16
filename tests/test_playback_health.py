@@ -1749,3 +1749,108 @@ def test_a_rebuild_skipped_on_a_paused_pipeline_names_the_state(
         assert ph.RebuildGovernor(clock=lambda: 100.0).rebuild(audio, "capture gap", "test") is False
     assert any("PAUSED" in r.getMessage() for r in caplog.records)
 
+
+# --- the speaker monitor's restarts are bounded (review, 2026-10-16) -----------------------
+
+
+class _Monitor(ph.SpeakerMonitor):
+    """A SpeakerMonitor whose start records the attempt and never builds a pipeline."""
+
+    def __init__(self, ok: bool = True) -> None:
+        super().__init__(lambda now, seconds, speech: None)
+        self.ok = ok
+        self.starts: list[float] = []
+        self.clock = 0.0
+
+    def start(self, source: str) -> bool:
+        self.starts.append(self.clock)
+        self.buffers = 0
+        if not self.ok:
+            self.source = None
+            return False
+        self.source = source
+        self.last_buffer_at = self.clock
+        return True
+
+    def deliver(self, now: float) -> None:
+        self.buffers += 1
+        self.last_buffer_at = now
+
+
+def _keep(monitor: _Monitor, now: float) -> str:
+    monitor.clock = now
+    return ph.keep_monitor(monitor, _MONITORED_AUDIO, now)
+
+
+_MONITORED_AUDIO = SimpleNamespace(_pipeline=_Pipeline())
+
+
+@pytest.fixture
+def monitored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One speaker device with a monitor; any rebuild fails the test."""
+    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
+    monkeypatch.setattr(ph.SpeakerMonitor, "monitor_source", staticmethod(lambda sink: "speaker.monitor"))
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("the monitor rebuilt the speaker"))
+    monkeypatch.setattr(ph.GOVERNOR, "rebuild", lambda *a: pytest.fail("the monitor asked for a rebuild"))
+
+
+@pytest.mark.parametrize(
+    ("fruitless", "wait_s"),
+    [(0, 5.0), (1, 10.0), (2, 20.0), (3, 40.0), (4, 60.0), (10, 60.0)],
+)
+def test_the_monitor_retry_doubles_and_is_capped(fruitless: int, wait_s: float) -> None:
+    """5 s, doubling, at most 60 s: back within a minute of a PipeWire restart (22-35 s)."""
+    assert ph.monitor_retry_s(fruitless) == wait_s
+
+
+@pytest.mark.usefixtures("monitored")
+def test_a_monitor_that_never_delivers_backs_off_and_warns_once(caplog: pytest.LogCaptureFixture) -> None:
+    """A monitor that delivers nothing is restarted 5, 10, 20, 40, then every 60 s, with one WARNING."""
+    monitor = _Monitor()
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        for t in range(0, 400):
+            _keep(monitor, float(t))
+    assert monitor.starts[:7] == [0.0, 6.0, 16.0, 36.0, 76.0, 136.0, 196.0]
+    assert len(monitor.starts) == 10  # then 256, 316, 376
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "backing off" in warnings[0] and "speaker.monitor" in warnings[0]
+
+
+@pytest.mark.usefixtures("monitored")
+def test_a_monitor_that_cannot_start_backs_off_too() -> None:
+    """A start that fails is a fruitless try too, never one a second."""
+    monitor = _Monitor(ok=False)
+    for t in range(0, 100):
+        _keep(monitor, float(t))
+    assert len(monitor.starts) <= 5
+
+
+@pytest.mark.usefixtures("monitored")
+def test_a_delivery_ends_the_back_off_and_the_next_quiet_spell_warns_again(caplog: pytest.LogCaptureFixture) -> None:
+    """A monitor that delivers again is restarted at once when it next goes quiet, and warns once more."""
+    monitor = _Monitor()
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        for t in range(0, 40):
+            _keep(monitor, float(t))
+        monitor.deliver(40.0)
+        for t in range(40, 46):
+            assert _keep(monitor, float(t)) == "running"
+            monitor.deliver(float(t))
+        starts = len(monitor.starts)
+        for t in range(46, 80):  # quiet again: restarted once after 5 s, then backed off with a new WARNING
+            _keep(monitor, float(t))
+    assert monitor.starts[starts] == 51.0
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+
+
+@pytest.mark.usefixtures("monitored")
+def test_a_new_speaker_device_restarts_the_monitor_at_once() -> None:
+    """The back-off is per device: a new one is started on the next check."""
+    monitor = _Monitor()
+    for t in range(0, 20):
+        _keep(monitor, float(t))
+    before = len(monitor.starts)
+    ph.SpeakerMonitor.monitor_source = staticmethod(lambda sink: "other.monitor")  # undone by monkeypatch
+    _keep(monitor, 20.0)
+    assert len(monitor.starts) == before + 1 and monitor.source == "other.monitor"
