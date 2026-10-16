@@ -1793,6 +1793,18 @@ async def test_a_say_with_no_live_response_cancels_nothing(monkeypatch: Any) -> 
     handler.connection.response.cancel.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_a_say_during_a_tools_follow_up_does_not_cancel_it(monkeypatch: Any) -> None:
+    """The follow-up carries the tool's answer: the announcement waits behind it instead."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", AsyncMock())
+    handler._response_done_event.clear()
+    handler._followup_live = True
+    await handler.say("Your timer is up")
+    handler.connection.response.cancel.assert_not_awaited()
+
+
 # --- reliable search (the companion, 2026-10-09) ---------------------------------------------
 
 
@@ -2437,10 +2449,14 @@ def _kinds(sent: list[tuple[str, Any]]) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_an_announcement_during_a_search_is_its_own_reply_after_the_answer(monkeypatch: Any) -> None:
-    """The search's follow-up answers first; the announcement then goes as a second reply."""
+    """2026-10-16, 15:18: a timer's say() during a web_search; the follow-up voiced only the timer.
+
+    The follow-up's create goes before the announcement's user item exists; then the
+    item, then the announcement's own create.
+    """
     kinds = _kinds(await _line_during_a_search(monkeypatch, "say"))
 
-    assert kinds == ["line", "filler", "output", "create", "create"]
+    assert kinds == ["filler", "output", "create", "line", "create"]
 
 
 @pytest.mark.asyncio

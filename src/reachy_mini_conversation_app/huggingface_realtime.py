@@ -68,8 +68,11 @@ logger = logging.getLogger(__name__)
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 _OWED_OUTPUT_TIMEOUT: float = _RESPONSE_DONE_TIMEOUT  # longest hold of an in-band create
-# Marks a queued create as a say() announcement (a timer, a greeting): spoken as its own
-# reply, never merged with another create. Internal: stripped before the create is sent.
+# Carries a say() announcement's text (a timer, a greeting) on its queued create: spoken as
+# its own reply, never merged with another create. The sender adds the text as a user item
+# just before the create, so a tool's follow-up reply never sees it (2026-10-16, 15:18:45:
+# the follow-up voiced only the timer and dropped the search answer). Internal: stripped
+# before the create is sent.
 _ANNOUNCEMENT: Final[str] = "_announcement"
 
 
@@ -572,6 +575,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._owed_outputs: set[str] = set()
         self._no_outputs_owed: asyncio.Event = asyncio.Event()
         self._no_outputs_owed.set()
+        # A tool's follow-up is queued (pending) or is the live response (live): say() does
+        # not cancel it.
+        self._followup_pending = False
+        self._followup_live = False
         # Reliable search: this response's transcript and whether it called a tool; this
         # user turn's guard and filler, each used at most once; the last filler line.
         self._resp_text = ""
@@ -1135,33 +1142,28 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._tool_report_queue.popleft()
 
     async def say(self, text: str) -> None:
-        """Inject ``text`` as a turn and have the model voice it now.
+        """Have the model voice ``text`` as its own reply.
 
-        Mirrors the startup-greeting path: create a user message item, then
-        queue a ``response.create`` through the serial sender. Not verbatim TTS
-        (speech-to-speech may rephrase). Raises if the session is closed.
+        Queues the text with its ``response.create`` through the serial sender, which
+        adds it as a user message item just before that create: at once with nothing
+        else queued, after a running tool's follow-up reply otherwise. Not verbatim
+        TTS (speech-to-speech may rephrase). Raises if the session is closed.
         """
         text = (text or "").strip()
         if not text:
             raise ValueError("say: empty text")
         if not self.connection:
             raise RuntimeError("say: no active session")
-        if not self._response_done_event.is_set():
+        if not self._response_done_event.is_set() and not self._followup_live:
             # The companion's audio audit, A5: a live response would otherwise keep
             # streaming ahead of this say (an announcement behind an old reply).
+            # A tool's follow-up is not cancelled: it carries the tool's answer.
             try:
                 await self.connection.response.cancel()
             except Exception as e:
                 logger.debug("say: could not cancel the live response (%s)", e)
-        await self.connection.conversation.item.create(
-            item={
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": text}],
-            },
-        )
         self._mark_activity("say")
-        await self._safe_response_create(**{_ANNOUNCEMENT: True})
+        await self._safe_response_create(**{_ANNOUNCEMENT: text})
 
     async def end_user_turn(self) -> None:
         """End a half-heard user turn: the microphone was muted or stopped mid-utterance.
@@ -1354,7 +1356,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # An announcement is never merged: it keeps its place in the queue.
             if not kwargs:
                 self._requeue(lambda queued: bool(queued.get(_ANNOUNCEMENT)))
-            announcement = bool(kwargs.pop(_ANNOUNCEMENT, False))
+            announcement: str | None = kwargs.pop(_ANNOUNCEMENT, None)
+            announcement_added = False
 
             sent = False
             max_retries = 5
@@ -1366,8 +1369,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     # lets that follow-up answer first, then goes as its own reply.
                     if self._requeue(bool) and announcement:
                         logger.info("Announcement waits for the tool's follow-up reply")
-                        self._requeue(bool, front={_ANNOUNCEMENT: True})
-                        announcement = False
+                        self._requeue(bool, front={_ANNOUNCEMENT: announcement})
+                        announcement = None
                 try:
                     await asyncio.wait_for(
                         self._response_done_event.wait(),
@@ -1379,6 +1382,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 if not self.connection:
                     break
+
+                if announcement and not announcement_added:
+                    try:
+                        await self.connection.conversation.item.create(
+                            item={
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": announcement}],
+                            },
+                        )
+                    except Exception as e:
+                        logger.warning("Announcement dropped: its item could not be added (%s)", e)
+                        break
+                    announcement_added = True
 
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
@@ -1556,6 +1573,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Parallel tool calls in one turn: respond once every result is in, not per tool.
             if self._tool_batch_needs_response and not self._in_flight_tool_calls:
                 self._tool_batch_needs_response = False
+                self._followup_pending = True
                 await self._safe_response_create()
             if sight_note is not None:
                 # Queued after the spoken answer, so it never delays it.
@@ -1608,6 +1626,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Manage events received from the realtime server.
             self.connection = conn
             self._reset_owed_outputs()
+            self._followup_pending = self._followup_live = False
             # The open counts as speech: the first note waits for a quiet moment.
             self._user_speaking = False
             self._last_speech_at = time.monotonic()
@@ -1672,6 +1691,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._sight_note_in_flight = True
                             logger.debug("Sight note started")
                         else:
+                            if self._followup_pending and _companion_tag(event) is None:
+                                self._followup_pending, self._followup_live = False, True
                             self._response_started()
                             self._gate_start()
                             self._mark_activity("response_created")
@@ -1692,6 +1713,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self.deps.movement_manager.set_speaking(False)
                         self._response_done_event.set()
                         self._response_started_or_rejected_event.set()
+                        if not sight_note and _companion_tag(event) is None:
+                            self._followup_live = False
                         logger.debug("Response done")
                         if not sight_note:
                             self._gate_transcript(self._gate_text)
