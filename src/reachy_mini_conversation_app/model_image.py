@@ -23,12 +23,26 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ModelImageSpec:
-    """Size, quality and cap of an image sent to the model; retune here."""
+    """Size, quality and cap of an image sent to the model; retune here.
 
-    long_side: int = 1280  # pixels; the aspect is kept and frames are never enlarged
+    long_side is 1056 because the hosted model is Gemma 4 31B, whose image processor
+    (transformers gemma4 image_processing_gemma4.py: max_soft_tokens 280, patch 16,
+    pooling 3) rescales every image to about 280 x 9 x 256 pixels of area, sides
+    floored to multiples of 48. A 16:9 image becomes 1056x576 whatever we send, so
+    pixels beyond about 1056 on the long side are discarded by the server.
+    """
+
+    long_side: int = 1056  # pixels; the aspect is kept and frames are never enlarged
     quality: int = 80  # jpegenc quality, 0-100
     max_bytes: int = 400_000  # over this, the image is encoded again at step_down_long_side
-    step_down_long_side: int = 960
+    step_down_long_side: int = 960  # must be below long_side, or the step-down does nothing
+
+    def __post_init__(self) -> None:
+        """Refuse a step-down that is not smaller than the first encode."""
+        if self.step_down_long_side >= self.long_side:
+            raise ValueError(
+                f"step_down_long_side ({self.step_down_long_side}) must be below long_side ({self.long_side})"
+            )
 
 
 MODEL_IMAGE = ModelImageSpec()

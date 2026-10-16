@@ -40,7 +40,7 @@ def _gradient(width: int, height: int) -> np.ndarray:
 
 
 def _textured(width: int, height: int, amplitude: int) -> np.ndarray:
-    """Return a gradient with noise: over the cap at 1280 px, under it at 960 px (measured)."""
+    """Return a gradient with noise: over the cap at 1056 px, under it at 960 px (measured)."""
     rng = np.random.default_rng(0)
     noise = rng.integers(-amplitude, amplitude + 1, (height, width, 3))
     return np.clip(_gradient(width, height).astype(np.int16) + noise, 0, 255).astype(np.uint8)
@@ -48,15 +48,21 @@ def _textured(width: int, height: int, amplitude: int) -> np.ndarray:
 
 def test_the_numbers_live_in_one_spec() -> None:
     """Size, quality and cap are one spec, retuned in one place."""
-    assert MODEL_IMAGE == ModelImageSpec(long_side=1280, quality=80, max_bytes=400_000, step_down_long_side=960)
+    assert MODEL_IMAGE == ModelImageSpec(long_side=1056, quality=80, max_bytes=400_000, step_down_long_side=960)
 
 
-def test_a_full_hd_frame_goes_at_1280_long_side() -> None:
-    """A 1920x1080 frame is sent at 1280x720."""
+def test_a_step_down_at_or_above_the_long_side_is_refused() -> None:
+    """The step-down is the cap guard; it must be smaller than the first encode."""
+    with pytest.raises(ValueError):
+        ModelImageSpec(long_side=960, step_down_long_side=960)
+
+
+def test_a_full_hd_frame_goes_at_1056_long_side() -> None:
+    """A 1920x1080 frame is sent at 1056x594."""
     jpeg = model_image.jpeg_from_frame(_gradient(1920, 1080))
 
     assert jpeg is not None
-    assert _jpeg_size(jpeg) == (1280, 720)
+    assert _jpeg_size(jpeg) == (1056, 594)
 
 
 def test_the_aspect_is_kept() -> None:
@@ -64,11 +70,11 @@ def test_the_aspect_is_kept() -> None:
     jpeg = model_image.jpeg_from_frame(_gradient(1600, 1200))
 
     assert jpeg is not None
-    assert _jpeg_size(jpeg) == (1280, 960)
+    assert _jpeg_size(jpeg) == (1056, 792)
 
 
 def test_a_small_frame_is_not_enlarged() -> None:
-    """A frame under 1280 px keeps its size."""
+    """A frame under 1056 px keeps its size."""
     jpeg = model_image.jpeg_from_frame(_gradient(640, 480))
 
     assert jpeg is not None
@@ -76,7 +82,7 @@ def test_a_small_frame_is_not_enlarged() -> None:
 
 
 def test_a_frame_over_the_cap_steps_down_to_960_and_fits() -> None:
-    """A frame over 400 KB at 1280 px is sent at 960 px, under the cap."""
+    """A frame over 400 KB at 1056 px is sent at 960 px, under the cap."""
     jpeg = model_image.jpeg_from_frame(_textured(1920, 1080, amplitude=32))
 
     assert jpeg is not None
@@ -94,7 +100,7 @@ def test_pure_noise_steps_down_once_and_is_still_sent(caplog: pytest.LogCaptureF
 
     assert jpeg is not None
     assert _jpeg_size(jpeg) == (960, 540)
-    assert "stepped down from 1280x720" in caplog.text
+    assert "stepped down from 1056x594" in caplog.text
     assert any(r.levelno == logging.WARNING and "over the cap" in r.getMessage() for r in caplog.records)
 
 
@@ -108,7 +114,7 @@ def test_jpeg_bytes_are_resized_too() -> None:
     jpeg = model_image.jpeg_from_jpeg(full)
 
     assert jpeg is not None
-    assert _jpeg_size(jpeg) == (1280, 720)
+    assert _jpeg_size(jpeg) == (1056, 594)
 
 
 def test_bytes_that_are_not_a_jpeg_give_nothing() -> None:
@@ -123,11 +129,11 @@ def test_each_image_is_logged_with_size_and_quality(caplog: pytest.LogCaptureFix
 
     assert jpeg is not None
     lines = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
-    assert lines == [f"Image to the model: 1280x720, {round(len(jpeg) / 1000)} KB (q80)"]
+    assert lines == [f"Image to the model: 1056x594, {round(len(jpeg) / 1000)} KB (q80)"]
 
 
 def test_a_failed_step_down_keeps_the_first_jpeg(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Over the cap at 1280 and the 960 encode fails: the first JPEG is still sent, not None."""
+    """Over the cap at 1056 and the 960 encode fails: the first JPEG is still sent, not None."""
     big = b"\xff" * 500_000
     calls: list[tuple[int, int]] = []
 
@@ -137,7 +143,7 @@ def test_a_failed_step_down_keeps_the_first_jpeg(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(model_image, "_encode", encode)
     assert model_image.jpeg_from_frame(np.zeros((1080, 1920, 3), dtype=np.uint8)) == big
-    assert calls == [(1280, 720), (960, 540)]
+    assert calls == [(1056, 594), (960, 540)]
 
 
 def test_an_encode_that_raises_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
