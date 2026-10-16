@@ -244,41 +244,211 @@ def _is_sight_note(event: Any) -> bool:
     return _companion_tag(event) == SIGHT_NOTE_TAG["companion"]
 
 
-# The audio cut (2026-10-16): a reply whose transcript is only a stage direction
-# ("(stops talking)", "*sighs*") or only a tool call leaked into text
-# ("call:stay_quiet{}") is never spoken. A reply that opens with one and goes on
-# ("(Laughs) yes, it leaves at 3") is spoken whole: losing the answer is worse (the
-# owner, 2026-10-16, "for now"). speech-to-speech sends each text part's transcript
-# delta ahead of its audio, so the first delta decides before any audio arrives.
-# Audio that does arrive first is held for at most SPOKEN_ARTIFACT_HOLD_S, then
-# released. The server's copy of the reply is left alone.
+# The audio cut (2026-10-16): a reply whose transcript is only stage directions
+# ("(stops talking)", "*sighs*"), tool-call markup leaked into text ("call:stay_quiet{}",
+# "<call:stay_quiet/>"), or thinking ("<think>...</think>"), plus whitespace and stray
+# ". ! , ;", is never spoken. A reply with any real words outside those shapes ("(Laughs)
+# yes, it leaves at 3") is spoken whole: losing the answer is worse (the owner,
+# 2026-10-16). The shapes cover Gemma 4 (call:name{...}, <|tool_call>...<tool_call|>,
+# malformed <call:name/>, stray special tokens), Qwen3 (<tool_call>{json}</tool_call>),
+# Qwen3.5 / Qwen3-Coder (<function=name>...</function>), Gemma 3 ([name(a=1)], a
+# ```tool_code fence) and generic forms (<function_call>, a JSON {"name", "arguments"}
+# object). speech-to-speech sends each text part's transcript delta ahead of its audio,
+# so the first deltas decide before any audio arrives; while the text so far could still
+# become an artifact (an open bracket, "<" with no ">", a prefix of "call:", an open
+# <think>) the verdict is "undecided", but only under _UNDECIDED_MAX characters. Audio
+# that arrives first is held for at most SPOKEN_ARTIFACT_HOLD_S, then released. The
+# server's copy of the reply is left alone.
+#
+# The same rule, with the same test table, is in the supervisor:
+# reachy-companion src/reachy_companion/supervisor.py, spoken_artifact(). Change both.
 SPOKEN_ARTIFACT_HOLD_S = 0.3
-_LEAKED_CALL_PREFIX: Final[str] = "call:"
 _UNDECIDED: Final[str] = "undecided"
-_DIRECTION_MAX = 80  # the supervisor's stage_direction() allows 80 characters inside
-_CLOSERS: Final[dict[str, str]] = {"(": ")", "*": "*"}
-_LEAKED_CALL = re.compile(r"call:\s*\w+\s*\{.*\}", re.IGNORECASE | re.DOTALL)
+_STAGE: Final[str] = "stage direction"
+_CALL: Final[str] = "leaked tool call"
+_THINKING: Final[str] = "thinking"
+_DIRECTION_MAX = 80  # characters inside a stage direction's brackets
+_UNDECIDED_MAX = 200  # past this much text, an unfinished shape is a reply
+_GEMMA_QUOTE: Final[str] = '<|"|>'
+_DIRECTION_CLOSERS: Final[dict[str, str]] = {"(": ")", "[": "]", "*": "*", "_": "_"}
+_PAIRS: Final[dict[str, str]] = {"(": ")", "[": "]", "{": "}"}
+# Whole special tokens and stray closing tags: <|"|>, <|im_end|>, <|tool_call>, <tool_call|>.
+_TOKEN = re.compile(
+    r"<\|[^<>|\s]{1,40}\|>|<\|\w{1,40}>|<\w{1,40}\|>"
+    r"|</(?:tool_call|function_call|function|think|thinking|call)\s*>",
+    re.IGNORECASE,
+)
+# Wrappers whose whole body is markup: (opener, closer, kind).
+_WRAPPERS = (
+    (re.compile(r"<(think|thinking)>", re.IGNORECASE), "</{}>", _THINKING),
+    (re.compile(r"<(tool_call|function_call)>", re.IGNORECASE), "</{}>", _CALL),
+    (re.compile(r"<function=[\w.-]+>", re.IGNORECASE), "</function>", _CALL),
+)
+_TAG_CALL = re.compile(r"<call:\s*[\w.-]+\s*", re.IGNORECASE)
+_TAG_CALL_END = re.compile(r"[^<>]*?(/?)>")
+_TAG_CALL_CLOSER = re.compile(r"</call(?::[\w.-]*)?\s*>", re.IGNORECASE)
+_BARE_CALL = re.compile(r"call:\s*[\w.-]+\s*", re.IGNORECASE)
+_BARE_CALL_OPEN = re.compile(r"call:\s*[\w.-]*\s*", re.IGNORECASE)
+_CALL_ITEM = r"[A-Za-z_][\w.]*\(.*\)"
+_CALL_LIST = re.compile(rf"\[\s*{_CALL_ITEM}(?:\s*,\s*{_CALL_ITEM})*\s*\]", re.DOTALL)
+_TOOL_CODE = re.compile(r"```\s*tool_code\b.*?```", re.IGNORECASE | re.DOTALL)
+_JSON_CALL_KEYS: Final[frozenset[str]] = frozenset({"name", "arguments", "parameters"})
+
+
+def _skip(text: str, i: int) -> int:
+    """Return the index past any whitespace and stray ". ! , ;" at text[i]."""
+    return i + len(text[i:]) - len(text[i:].lstrip(" \t\r\n.!,;"))
+
+
+def _balanced_end(text: str, i: int) -> int:
+    """Return the index past the bracket closing text[i] ("(", "[" or "{"), or -1 while open.
+
+    Nested brackets count; "..." and Gemma 4 <|"|>...<|"|> strings are skipped.
+    """
+    stack = [_PAIRS[text[i]]]
+    j = i + 1
+    while j < len(text):
+        if text.startswith(_GEMMA_QUOTE, j):
+            quote_end = text.find(_GEMMA_QUOTE, j + len(_GEMMA_QUOTE))
+            if quote_end == -1:
+                return -1
+            j = quote_end + len(_GEMMA_QUOTE)
+            continue
+        c = text[j]
+        if c == '"':
+            j += 1
+            while j < len(text) and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            if j >= len(text):
+                return -1
+        elif c in _PAIRS:
+            stack.append(_PAIRS[c])
+        elif c == stack[-1]:
+            stack.pop()
+            if not stack:
+                return j + 1
+        j += 1
+    return -1
+
+
+def _json_call(body: str) -> bool:
+    """Whether a JSON object is only a tool call: {"name": ..., "arguments"|"parameters": ...}."""
+    try:
+        value = json.loads(body)
+    except ValueError:
+        return False
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("name"), str)
+        and ("arguments" in value or "parameters" in value)
+        and set(value) <= _JSON_CALL_KEYS
+    )
+
+
+def _closed(kind: str, end: int) -> tuple[str, int]:
+    """Return (kind, end) for a closed shape, or ("undecided", -1) when end is -1 (still open)."""
+    return (kind, end) if end != -1 else (_UNDECIDED, -1)
+
+
+def _tag_call_at(text: str, i: int) -> tuple[str, int] | None:
+    """Match a malformed Gemma 4 call at text[i]: <call:name/>, <call:name>...</call> and kin."""
+    opener = _TAG_CALL.match(text, i)
+    if not opener:
+        return None
+    j = opener.end()
+    if j < len(text) and text[j] == "{":
+        j = _balanced_end(text, j)
+        if j == -1:
+            return _UNDECIDED, -1
+    tag_end = _TAG_CALL_END.match(text, j)
+    if not tag_end:
+        return (_UNDECIDED, -1) if ">" not in text[j:] else None
+    if tag_end.group(1):  # self-closing
+        return _CALL, tag_end.end()
+    closer = _TAG_CALL_CLOSER.search(text, tag_end.end())
+    if closer:
+        return _CALL, closer.end()
+    k = _skip(text, tag_end.end())
+    if k < len(text) and text[k] == "{":
+        return _closed(_CALL, _balanced_end(text, k))
+    return _CALL, tag_end.end()
+
+
+def _angle_at(text: str, i: int) -> tuple[str, int] | None:
+    """Match a shape opening with "<" at text[i]: a special token, a wrapper or a tag call."""
+    token = _TOKEN.match(text, i)
+    if token:
+        return _CALL, token.end()
+    for opener, closer, kind in _WRAPPERS:
+        found = opener.match(text, i)
+        if found:
+            close = closer.format(*found.groups()).lower()
+            close_at = text.lower().find(close, found.end())
+            return _closed(kind, close_at + len(close) if close_at != -1 else -1)
+    tag = _tag_call_at(text, i)
+    if tag:
+        return tag
+    return (_UNDECIDED, -1) if ">" not in text[i:] else None
+
+
+def _shape_at(text: str, i: int) -> tuple[str, int] | None:
+    """Match the artifact at text[i]: (kind, end), ("undecided", -1) while open, or None."""
+    rest = text[i:]
+    c = text[i]
+    if c == "<":
+        return _angle_at(text, i)
+    if rest[:5].lower() == "call:":
+        call = _BARE_CALL.match(text, i)
+        if call and call.end() < len(text) and text[call.end()] == "{":
+            return _closed(_CALL, _balanced_end(text, call.end()))
+        return (_UNDECIDED, -1) if _BARE_CALL_OPEN.fullmatch(rest) else None
+    if "call:".startswith(rest.lower()):
+        return _UNDECIDED, -1
+    if c == "`":
+        if not rest.startswith("```"):
+            return (_UNDECIDED, -1) if "```".startswith(rest) else None
+        fence = _TOOL_CODE.match(text, i)
+        if fence:
+            return _CALL, fence.end()
+        return (_UNDECIDED, -1) if rest.find("```", 3) == -1 else None
+    if c == "{":
+        end = _balanced_end(text, i)
+        if end == -1:
+            return _UNDECIDED, -1
+        return (_CALL, end) if _json_call(text[i:end]) else None
+    if c == "[":
+        end = _balanced_end(text, i)
+        if end != -1 and _CALL_LIST.fullmatch(text, i, end):
+            return _CALL, end
+    if c in _DIRECTION_CLOSERS:
+        close_at = text.find(_DIRECTION_CLOSERS[c], i + 1)
+        if close_at == -1:
+            return _UNDECIDED, -1
+        inner = text[i + 1 : close_at]
+        if inner.strip() and len(inner) <= _DIRECTION_MAX and not set(inner) & set("()[]*{}"):
+            return _STAGE, close_at + 1
+    return None
 
 
 def spoken_artifact(text: str) -> str | None:
-    """Return "stage direction", "leaked tool call", None (a reply), or "undecided" (too little text). Pure."""
+    """Return "stage direction", "leaked tool call", "thinking", None (a reply), or "undecided".
+
+    Text made only of artifact shapes, whitespace and stray ". ! , ;" is an artifact,
+    named by its first shape. Pure.
+    """
     head = text.strip()
-    if not head:
-        return _UNDECIDED
-    if head[0] in _CLOSERS:
-        end = head.find(_CLOSERS[head[0]], 1)
-        if end == -1:
-            return _UNDECIDED if len(head) <= _DIRECTION_MAX + 1 else None
-        rest = head[end + 1 :].strip(" .!")
-        return "stage direction" if not rest and 0 < end <= _DIRECTION_MAX + 1 else None
-    opening = head[: len(_LEAKED_CALL_PREFIX)].lower()
-    if opening == _LEAKED_CALL_PREFIX:
-        if "}" not in head:
-            return _UNDECIDED
-        return "leaked tool call" if _LEAKED_CALL.fullmatch(head) else None
-    if _LEAKED_CALL_PREFIX.startswith(opening):
-        return _UNDECIDED
-    return None
+    kinds: list[str] = []
+    i = _skip(head, 0)
+    while i < len(head):
+        shape = _shape_at(head, i)
+        if shape is None:
+            return None
+        kind, end = shape
+        if kind == _UNDECIDED:
+            return _UNDECIDED if len(head) <= _UNDECIDED_MAX else None
+        kinds.append(kind)
+        i = _skip(head, end)
+    return kinds[0] if kinds else _UNDECIDED
 
 
 # The tool-call-log brief (2026-10-11): one /rpc notification per finished (or

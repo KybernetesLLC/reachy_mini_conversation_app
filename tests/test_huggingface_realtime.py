@@ -1950,30 +1950,90 @@ def _reply_events(transcript: str, *, audio_first: bool) -> tuple[Any, ...]:
     )
 
 
-@pytest.mark.parametrize(
-    ("text", "verdict"),
-    [
-        ("(stops talking)", "stage direction"),
-        ("  *sighs*", "stage direction"),
-        ("call:stay_quiet{}", "leaked tool call"),
-        (" CALL:express{}", "leaked tool call"),
-        ("Sure, (I think) yes.", None),
-        ("(Laughs) yes, the flight leaves at 3.", None),
-        ("*waves* Hello there!", None),
-        ("(stops", "undecided"),
-        ("(stops talking).", "stage direction"),
-        ("call:stay_quiet", "undecided"),
-        ("call:stay_quiet{} and then hello", None),
-        ("Calling you now.", None),
-        ("", "undecided"),
-        ("   ", "undecided"),
-        ("ca", "undecided"),
-        ("Cal", "undecided"),
-        ("can", None),
-    ],
-)
+# The shared table: the supervisor's tests/test_supervisor.py has the same cases
+# (reachy-companion, SPOKEN_ARTIFACT_CASES). Change both.
+_S, _C, _T, _U = "stage direction", "leaked tool call", "thinking", "undecided"
+SPOKEN_ARTIFACT_CASES = [
+    # seen on the robot
+    ("call:stay_quiet{}", _C),
+    ("<call:stay_quiet/>", _C),
+    ("(stops talking)", _S),
+    ("(A small, contented tilt of the head)", _S),
+    # Gemma 4
+    (' CALL: express {"mood": "happy"} ', _C),
+    ('call:express{mood:<|"|>happy}<|"|>}', _C),
+    ('<|tool_call>call:express{mood:<|"|>happy<|"|>}<tool_call|>', _C),
+    ("<call:stay_quiet>", _C),
+    ("<call:stay_quiet></call>", _C),
+    ("<call:stay_quiet>{}</call>", _C),
+    ('<call:express {"mood": "happy"}/>', _C),
+    ("<|tool_call>", _C),
+    ("<tool_call|>", _C),
+    ("<|tool_response>", _C),
+    ("<tool_response|>", _C),
+    ('<|"|>', _C),
+    ("<|tool>", _C),
+    ("<tool|>", _C),
+    ("<|im_end|>", _C),
+    # Qwen3, Qwen3.5 / Qwen3-Coder
+    ('<tool_call>{"name": "stay_quiet", "arguments": {}}</tool_call>', _C),
+    ("<tool_call><function=stay_quiet><parameter=x>1</parameter></function></tool_call>", _C),
+    ("<function=stay_quiet><parameter=x>1</parameter></function>", _C),
+    # Gemma 3
+    ("[stay_quiet()]", _C),
+    ('[express(mood="happy"), look(at=[1, 2])]', _C),
+    ("```tool_code\nstay_quiet()\n```", _C),
+    # generic
+    ("<think>the user wants quiet</think>", _T),
+    ('<function_call>{"name": "stay_quiet"}</function_call>', _C),
+    ('{"name": "stay_quiet", "arguments": {}}', _C),
+    ('{"name": "express", "parameters": {"mood": "happy"}}', _C),
+    # stage directions
+    ("  *sighs*", _S),
+    ("_shrugs_", _S),
+    (" [says nothing]. ", _S),
+    ("(stops talking).", _S),
+    # two in a row
+    ("<call:stay_quiet/> (stays silent)", _C),
+    ("(stays silent) call:stay_quiet{};", _S),
+    # replies that play whole
+    ("Sure, (I think) yes.", None),
+    ("(Laughs) yes, the flight leaves at 3.", None),
+    ("(I saw a mug) and a plate", None),
+    ("I'll stay quiet (for now).", None),
+    ("*waves* Hello there!", None),
+    ("I'll call: the vet {maybe}", None),
+    ("Calling you now.", None),
+    ("Call me later.", None),
+    ("can", None),
+    ("call:stay_quiet{} and then hello", None),
+    ("Use <b>bold</b> text", None),
+    ("<b>bold</b> text", None),
+    ('{"name": "Matt", "age": 40}', None),
+    ("```python\nprint(1)\n```", None),
+    ("(" + "x" * 81 + ")", None),
+    # still forming
+    ("", _U),
+    ("   ", _U),
+    ("<", _U),
+    ("<|tool", _U),
+    ("(stops", _U),
+    ("call:stay", _U),
+    ("call:stay_quiet", _U),
+    ("<think>hmm", _U),
+    ("ca", _U),
+    ("Cal", _U),
+    ("<call:express {", _U),
+    ("<tool_call>{", _U),
+    ("```tool_c", _U),
+    ("<call:stay_quiet/> (stays", _U),
+    ("<think>" + "x" * 200, None),
+]
+
+
+@pytest.mark.parametrize(("text", "verdict"), SPOKEN_ARTIFACT_CASES)
 def test_spoken_artifact_rule(text: str, verdict: str | None) -> None:
-    """Only a whole stage direction or a whole leaked call is an artifact; an unfinished one waits."""
+    """Only text made wholly of artifact shapes is an artifact; an unfinished one waits."""
     assert hf_mod.spoken_artifact(text) == verdict
 
 
@@ -1983,6 +2043,7 @@ def test_spoken_artifact_rule(text: str, verdict: str | None) -> None:
     [
         ("(stops talking)", "stage direction"),
         ("call:stay_quiet{}", "leaked tool call"),
+        ("<call:stay_quiet/>", "leaked tool call"),
         ("*sighs*", "stage direction"),
     ],
 )
@@ -2003,6 +2064,27 @@ async def test_a_spoken_artifact_never_reaches_the_player(
     cuts = [r.getMessage() for r in caplog.records if "spoken artifact cut" in r.getMessage()]
     assert cuts == [f"spoken artifact cut ({kind}): {transcript!r}"]
     assert all(r.levelno == logging.WARNING for r in caplog.records if "spoken artifact cut" in r.getMessage())
+
+
+@pytest.mark.asyncio
+async def test_a_tag_call_split_across_deltas_is_cut(monkeypatch: Any) -> None:
+    """14:02:35, 2026-10-16: "<call:stay_quiet/>" slipped through; its first deltas wait."""
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("<"),
+            _audio(1, 2),
+            _said("call:stay"),
+            _said("_quiet/>"),
+            _audio(3, 4),
+        ),
+    )
+    handler._clear_queue = lambda: None
+
+    await handler._run_realtime_session()
+
+    assert _frames(handler) == []
 
 
 @pytest.mark.asyncio
