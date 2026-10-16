@@ -10,8 +10,11 @@ from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 
 
 @pytest.mark.asyncio
-async def test_camera_tool_returns_base64_of_sdk_jpeg() -> None:
-    """The tool base64-encodes the JPEG bytes returned by the SDK."""
+async def test_camera_tool_returns_base64_of_sdk_jpeg(monkeypatch) -> None:
+    """The tool base64-encodes the JPEG bytes returned by the SDK, as fitted for the model."""
+    from reachy_mini_conversation_app import model_image
+
+    monkeypatch.setattr(model_image, "jpeg_from_jpeg", lambda jpeg: b"fitted:" + jpeg)
     jpeg_bytes = b"\xff\xd8jpeg\xff\xd9"
     reachy_mini = MagicMock()
     reachy_mini.media.get_frame_jpeg.return_value = jpeg_bytes
@@ -24,7 +27,7 @@ async def test_camera_tool_returns_base64_of_sdk_jpeg() -> None:
 
     result = await Camera()(deps, question="What color is this?")
 
-    assert result["b64_im"] == base64.b64encode(jpeg_bytes).decode("utf-8")
+    assert result["b64_im"] == base64.b64encode(b"fitted:" + jpeg_bytes).decode("utf-8")
 
 
 @pytest.mark.asyncio
@@ -213,3 +216,22 @@ def test_two_fresh_frames_at_once_never_share_or_leak_a_camera(monkeypatch) -> N
 
     assert open_now["most"] == 1
     assert [c.closed for c in FakeCamera.made[1:-1]] == [True]  # only the newest is left open
+
+
+# --- 2026-10-16: images sent to the model are fitted to one size and a byte cap ---
+
+
+def test_a_fresh_frame_is_encoded_for_the_model(monkeypatch) -> None:
+    """The IPC path encodes the numpy frame it measured with the model's spec."""
+    from reachy_mini_conversation_app import model_image
+
+    seen: list[tuple[int, ...]] = []
+
+    def fake_from_frame(frame):
+        seen.append(frame.shape)
+        return b"for the model"
+
+    monkeypatch.setattr(model_image, "jpeg_from_frame", fake_from_frame)
+
+    assert camera_mod._encode(object(), np.zeros((1080, 1920, 3), dtype=np.uint8)) == b"for the model"
+    assert seen == [(1080, 1920, 3)]

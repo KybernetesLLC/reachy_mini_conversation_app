@@ -347,6 +347,22 @@ async def test_run_realtime_session_passes_allocated_session_query(monkeypatch: 
     assert captured_connect["extra_query"] == {"session_token": "abc123"}
 
 
+@pytest.mark.asyncio
+async def test_run_realtime_session_raises_the_receive_limit(monkeypatch: Any) -> None:
+    """The server echoes image data URLs back; 1 MiB (the websockets default) closed with 1009."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+
+    captured_connect: dict[str, Any] = {}
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(captured_connect=captured_connect)
+
+    await handler._run_realtime_session()
+
+    assert captured_connect["websocket_connection_options"] == {"max_size": 16 * 2**20}
+
+
 @pytest.mark.parametrize(("hf_token", "expected_api_key"), [(None, "DUMMY"), ("hf-secret", "hf-secret")])
 @pytest.mark.asyncio
 async def test_build_realtime_client_local_uses_explicit_hf_token_only(

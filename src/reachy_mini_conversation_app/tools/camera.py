@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
+from reachy_mini_conversation_app import model_image
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
 
 
@@ -62,25 +63,13 @@ _CAMERA_LOCK = threading.Lock()
 
 
 def _encode(camera: Any, frame: Any) -> Optional[bytes]:
-    """Encode this frame, the one measured, with the camera's own JPEG encoder.
+    """Encode this frame, the one measured, as a JPEG for the model.
 
-    The SDK's read_jpeg() reads a second frame from a one-frame buffer the first
-    read just emptied, and often gets none (the review, 2026-10-07). This is its
-    body, given the frame. OpenCV is not in the app's environment on the robot.
+    2026-10-16: no longer the camera's own encoder, at full resolution and its
+    default quality: model_image fits it to one size and a byte cap. The frame
+    goes nowhere else. OpenCV is not in the app's environment on the robot.
     """
-    from gi.repository import Gst
-
-    from reachy_mini.media.gstreamer_utils import get_sample
-
-    height, width = frame.shape[:2]
-    if camera._jpeg_pipeline is None or camera._jpeg_resolution != (width, height):
-        camera._release_jpeg_encoder()
-        camera._build_jpeg_encoder(width, height)
-    camera._jpeg_pipeline.set_state(Gst.State.PLAYING)
-    camera._jpeg_appsrc.push_buffer(Gst.Buffer.new_wrapped(frame.tobytes()))
-    jpeg = get_sample(camera._jpeg_appsink, camera.logger, timeout_ns=Gst.SECOND)
-    camera._jpeg_pipeline.set_state(Gst.State.PAUSED)
-    return jpeg
+    return model_image.jpeg_from_frame(frame)
 
 
 def _fresh_frame(media: Any) -> Tuple[Optional[bytes], Optional[float]]:
@@ -90,14 +79,15 @@ def _fresh_frame(media: Any) -> Tuple[Optional[bytes], Optional[float]]:
 
 
 def _fresh_frame_held(media: Any) -> Tuple[Optional[bytes], Optional[float]]:
-    """Reopen the IPC camera and return (JPEG, the frame's mean luma).
+    """Reopen the IPC camera and return (JPEG for the model, the frame's mean luma).
 
     Runs in a worker thread: opening waits for the pipeline. A camera that is
     not the IPC reader is read as before, with no luma.
     """
     old = getattr(media, "camera", None)
     if not _REOPENABLE or not isinstance(old, _REOPENABLE):
-        return media.get_frame_jpeg(), None
+        jpeg = media.get_frame_jpeg()
+        return (None if jpeg is None else model_image.jpeg_from_jpeg(jpeg)), None
     specs = getattr(old, "camera_specs", None)
     try:
         old.close()

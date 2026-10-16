@@ -185,6 +185,10 @@ GLANCE_CONTEXT_NOTE = (
     "unless the person asks what you see, or it bears on what they asked.)"
 )
 
+# Largest message the client accepts from the server (websockets' max_size); the
+# default, 1 MiB, closed the session with 1009 on an echoed image (2026-10-16).
+REALTIME_MAX_MESSAGE_BYTES = 16 * 2**20
+
 
 # A note waits for a quiet moment: nobody speaking for NOTE_QUIET_SECONDS and no
 # response active, so it never sits between a person's last word and the reply
@@ -1211,6 +1215,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         connect_kwargs: dict[str, Any] = {}
         if self._realtime_connect_query:
             connect_kwargs["extra_query"] = self._realtime_connect_query
+        # 2026-10-16: the server echoes image data URLs back in conversation.item.created;
+        # the websockets default of 1 MiB closed the session with 1009. Upstream's value.
+        connect_kwargs["websocket_connection_options"] = {"max_size": REALTIME_MAX_MESSAGE_BYTES}
         async with self.client.realtime.connect(**connect_kwargs) as conn:
             try:
                 session_config = self._get_session_config(tool_specs)
