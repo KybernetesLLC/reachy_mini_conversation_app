@@ -2255,3 +2255,126 @@ async def test_a_cut_reply_is_never_counted_unheard(monkeypatch: Any) -> None:
     assert "unheard" not in verdicts
     assert verdicts == ["flushed"]
     assert tracker.unheard_in_a_row == 0
+
+
+# --- function call outputs before response.create (2026-10-16) ---------------------
+
+
+def _ordering_client(events: tuple[Any, ...], sent: list[tuple[str, Any]], handler: Any) -> Any:
+    """Build a fake realtime client that records items and response.create calls in order."""
+
+    async def _item_create(**kw: Any) -> None:
+        sent.append(("item", kw["item"]))
+
+    async def _response_create(**kw: Any) -> None:
+        sent.append(("response.create", kw))
+        handler._response_started_or_rejected_event.set()
+
+    class _Conn:
+        session = SimpleNamespace(update=AsyncMock())
+        input_audio_buffer = SimpleNamespace(append=AsyncMock())
+        conversation = SimpleNamespace(item=SimpleNamespace(create=_item_create))
+        response = SimpleNamespace(create=_response_create, cancel=AsyncMock())
+
+        def __init__(self) -> None:
+            self._events = iter(events)
+
+        async def __aenter__(self) -> "_Conn":
+            return self
+
+        async def __aexit__(self, *_args: Any) -> bool:
+            return False
+
+        def __aiter__(self) -> "_Conn":
+            return self
+
+        async def __anext__(self) -> Any:
+            while True:
+                try:
+                    item = next(self._events)
+                except StopIteration:
+                    raise StopAsyncIteration
+                if callable(item):
+                    result = item()
+                    if asyncio.iscoroutine(result):
+                        await result
+                    continue
+                return item
+
+    return SimpleNamespace(realtime=SimpleNamespace(connect=lambda **_kw: _Conn()))
+
+
+@pytest.mark.asyncio
+async def test_no_response_create_while_a_function_call_output_is_owed(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A say() during a running tool waits for that tool's function_call_output.
+
+    The robot's journal, 2026-10-06 to 10-16: "[error] Cannot create a response while
+    function call outputs are pending." The server rejects an in-band response.create
+    while any function call lacks its output.
+    """
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="dance-1"))
+    )
+    done = ToolNotification(
+        id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": True}
+    )
+
+    async def _say() -> None:
+        await handler.say("The timer is done.")
+        await asyncio.sleep(0.05)  # the sender's chance to send too early
+
+    async def _finish_tool() -> None:
+        await handler._handle_tool_result(done)
+        await asyncio.sleep(0.05)
+
+    handler.client = _ordering_client(
+        (
+            _FakeEvent("response.function_call_arguments.done", name="dance", arguments="{}", call_id="c1"),
+            _say,
+            _finish_tool,
+        ),
+        sent,
+        handler,
+    )
+
+    with caplog.at_level(logging.INFO, logger=hf_mod.__name__):
+        await handler._run_realtime_session()
+
+    kinds = [
+        "output" if kind == "item" and payload.get("type") == "function_call_output" else kind
+        for kind, payload in sent
+    ]
+    assert "response.create" in kinds
+    assert kinds.index("output") < kinds.index("response.create")
+    assert "response.create deferred" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_an_out_of_band_create_is_not_held_for_an_owed_output(monkeypatch: Any) -> None:
+    """A filler or sight note is outside the conversation; the server never checks it."""
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="dance-1"))
+    )
+
+    async def _filler() -> None:
+        await handler._safe_response_create(response=hf_mod.sight_note_request("abc"))
+        await asyncio.sleep(0.05)
+
+    handler.client = _ordering_client(
+        (
+            _FakeEvent("response.function_call_arguments.done", name="dance", arguments="{}", call_id="c1"),
+            _filler,
+        ),
+        sent,
+        handler,
+    )
+
+    await handler._run_realtime_session()
+
+    assert [kind for kind, _ in sent] == ["response.create"]

@@ -561,6 +561,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._turn_first_audio_at: float | None = None
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
+        # Function calls whose function_call_output is not yet sent. The server rejects an
+        # in-band response.create while any is owed ("Cannot create a response while function
+        # call outputs are pending", 2026-10-16), so the sender holds those creates until this
+        # empties. Unlike _in_flight_tool_calls, a new user turn does not clear it.
+        self._owed_outputs: set[str] = set()
+        self._no_outputs_owed: asyncio.Event = asyncio.Event()
+        self._no_outputs_owed.set()
         # Reliable search: this response's transcript and whether it called a tool; this
         # user turn's guard and filler, each used at most once; the last filler line.
         self._resp_text = ""
@@ -845,6 +852,37 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 logger.warning("Realtime session restart timed out; continuing in background.")
         except Exception as e:
             logger.warning("_restart_session failed: %s", e)
+
+    def _owe_output(self, call_id: str) -> None:
+        self._owed_outputs.add(call_id)
+        self._no_outputs_owed.clear()
+
+    def _output_settled(self, call_id: str) -> None:
+        """Stop holding creates for a call whose output was sent, or never will be."""
+        self._owed_outputs.discard(call_id)
+        if not self._owed_outputs:
+            self._no_outputs_owed.set()
+
+    def _reset_owed_outputs(self) -> None:
+        self._owed_outputs.clear()
+        self._no_outputs_owed.set()
+
+    async def _wait_for_owed_outputs(self, kwargs: dict[str, Any]) -> None:
+        """Hold an in-band response.create until every function call has its output.
+
+        Out-of-band creates (fillers, sight notes) are not checked by the server and go at once.
+        """
+        if self._no_outputs_owed.is_set() or kwargs.get("response", {}).get("conversation") == "none":
+            return
+        logger.info("response.create deferred: %d function call output(s) owed", len(self._owed_outputs))
+        try:
+            await asyncio.wait_for(self._no_outputs_owed.wait(), timeout=_RESPONSE_DONE_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Function call outputs still owed after %.0f s; sending response.create", _RESPONSE_DONE_TIMEOUT
+            )
+            return
+        logger.debug("response.create released: function call outputs sent")
 
     async def _safe_response_create(self, **kwargs: Any) -> None:
         """Enqueue a response.create() kwargs for the sender worker _response_sender_loop().
@@ -1299,6 +1337,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             max_retries = 5
             attempts = 0
             while not sent and self.connection and attempts < max_retries:
+                await self._wait_for_owed_outputs(kwargs)
                 try:
                     await asyncio.wait_for(
                         self._response_done_event.wait(),
@@ -1429,6 +1468,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         },
                     )
                     model_result_submitted = True
+                    self._output_settled(completed_tool.id)
 
             await self.output_queue.put(
                 AdditionalOutputs(
@@ -1497,6 +1537,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self.connection = None
             self._response_done_event.set()
         finally:
+            if isinstance(completed_tool.id, str):
+                self._output_settled(completed_tool.id)  # dropped or failed: nothing more will be sent
             # Sent after the result reaches the model (or the attempt fails):
             # the report itself is in-memory only and never blocks a tool call.
             self._report_tool_call(report_payload)
@@ -1534,6 +1576,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             # Manage events received from the realtime server.
             self.connection = conn
+            self._reset_owed_outputs()
             # The open counts as speech: the first note waits for a quiet moment.
             self._user_speaking = False
             self._last_speech_at = time.monotonic()
@@ -1725,6 +1768,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             continue
 
                         self._in_flight_tool_calls.add(call_id)
+                        self._owe_output(call_id)
                         self._response_called_a_tool()
                         # The tool-call-log brief: who asked -- the missed-call guard's
                         # nudge, still in force for the rest of this user turn, or an
