@@ -3319,7 +3319,7 @@ async def test_the_playback_watchdog_checks_the_pipeline_each_interval(monkeypat
     stream = LocalStream(handler, robot)
     checked: list[Any] = []
 
-    def check(pipeline: Any, replies: Any = None, audio: Any = None) -> Any:
+    def check(pipeline: Any, replies: Any = None) -> Any:
         assert replies is stream._replies  # the minute line reports the tracker's last lag
         checked.append((pipeline, threading.current_thread() is threading.main_thread()))
         if len(checked) == 3:
@@ -3342,7 +3342,7 @@ async def test_the_playback_watchdog_survives_a_failed_check(monkeypatch: pytest
     stream = LocalStream(MagicMock(), _clocked_robot([]))
     calls: list[int] = []
 
-    def check(pipeline: Any, replies: Any = None, audio: Any = None) -> Any:
+    def check(pipeline: Any, replies: Any = None) -> Any:
         calls.append(1)
         if len(calls) == 2:
             stream._stop_event.set()
