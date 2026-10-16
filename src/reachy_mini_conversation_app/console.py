@@ -995,6 +995,11 @@ class LocalStream:
         if pipeline is None:
             return False
         try:
+            if playback_health.free_capture_from_clock(audio):
+                logger.info("Capture takes frames as they come, off the pipeline clock (microphone appsink sync=False)")
+        except Exception:
+            logger.warning("Could not take capture off the pipeline clock", exc_info=True)
+        try:
             sink = playback_health.speaker_sink(pipeline)
             if playback_health.clock_playback_from_speaker(pipeline, sink):
                 logger.info("Playback clocked from the speaker (%s), not the microphone", sink)

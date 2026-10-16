@@ -123,16 +123,63 @@ def _gst() -> Any:
     return Gst
 
 
-class Rig:
-    """The SDK's GStreamerAudio, built as the robot builds it, plus a way to hear it."""
+class SpeakerClock:
+    """A speaker's clock for the local rig, run as pulsesink's runs: from its first audio, while alive.
+
+    fakesink provides no clock, so without this the speaker's clock was never exercised
+    outside the container. Like pulsesink's, it starts only once the sink renders audio
+    (hence the prime), and it stops while the speaker stream is dead (kill/revive).
+    """
 
     def __init__(self) -> None:
+        """Make the clock; it reads 0 until the sink renders."""
+        gi = pytest.importorskip("gi")
+        gi.require_version("GstAudio", "1.0")
+        from gi.repository import GstAudio
+
+        self._lock = threading.Lock()
+        self._now = 0
+        self._last: int | None = None
+        self.started = False
+        self.alive = True
+        self.clock = GstAudio.AudioClock.new("speakerclock", self._time, None)
+
+    def _time(self, _clock: Any, *_args: Any) -> int:
+        with self._lock:
+            mono = time.monotonic_ns()
+            if self._last is not None and self.started and self.alive:
+                self._now += mono - self._last
+            self._last = mono
+            return self._now
+
+    def kill(self) -> None:
+        """Stop the clock, as a dead speaker stream stops it."""
+        self._time(None)
+        self.alive = False
+
+    def revive(self) -> None:
+        """Run the clock again: the speaker's stream is back."""
+        self._time(None)
+        self.alive = True
+
+
+class Rig:
+    """The SDK's GStreamerAudio, built as the robot builds it, plus a way to hear it.
+
+    With ``clocked`` (local only), the speaker provides a SpeakerClock and the microphone
+    is device-driven: an appsrc fed in real time from its own thread, stamped by sample
+    count, as pulsesrc is fed by the server whatever the pipeline clock does.
+    """
+
+    def __init__(self, clocked: bool = False) -> None:
         """Build the SDK's layout; nothing runs yet."""
         Gst = _gst()
         self.Gst = Gst
         audio_gstreamer = pytest.importorskip("reachy_mini.media.audio_gstreamer")
         self.rendered: list[tuple[float, float]] = []  # (monotonic, peak) heard
         self.mic_buffers: list[float] = []
+        self.clocked = clocked and not USE_SDK_DEVICES
+        self.speaker_clock = SpeakerClock() if self.clocked else None
         rig = self
 
         class Playback(audio_gstreamer.GStreamerAudio):  # type: ignore[misc]
@@ -146,8 +193,14 @@ class Rig:
                 self._webrtcechoprobe = None
                 self._playbin = None
                 self._pipeline = Gst.Pipeline.new("reachymini_audio")
+                source = (
+                    "appsrc name=mic is-live=true format=time do-timestamp=false "
+                    "caps=audio/x-raw,rate=16000,channels=2,format=F32LE,layout=interleaved"
+                    if rig.clocked
+                    else "audiotestsrc is-live=true wave=silence name=mic"
+                )
                 mic = Gst.parse_bin_from_description(
-                    "audiotestsrc is-live=true wave=silence name=mic ! queue ! audioconvert ! audioresample "
+                    f"{source} ! queue ! audioconvert ! audioresample "
                     "! appsink name=micsink caps=audio/x-raw,rate=16000,channels=2,format=F32LE,layout=interleaved "
                     "drop=true max-buffers=200",
                     False,
@@ -174,7 +227,15 @@ class Rig:
         self.pipeline = self.audio._pipeline
         self.speaker = ph.speaker_sink(self.pipeline)
         assert self.speaker is not None
-        self.mic = self._first("pulsesrc") or self._first("audiotestsrc", name="mic")
+        if self.speaker_clock is not None:
+            self.speaker.provided_clock = self.speaker_clock.clock  # read by clock_playback_from_speaker
+            clock = self.speaker_clock
+            self.speaker.get_static_pad("sink").add_probe(
+                Gst.PadProbeType.BUFFER, lambda _p, _i: setattr(clock, "started", True) or Gst.PadProbeReturn.OK
+            )  # the stream has audio: its clock runs
+        self.mic = (
+            self._first("pulsesrc") or self._first("audiotestsrc", name="mic") or self._first("appsrc", name="mic")
+        )
         self.monitor: Any = None
         self._stop = threading.Event()
 
@@ -200,16 +261,19 @@ class Rig:
             buf.unmap(mapped)
         return Gst.PadProbeReturn.OK
 
-    def start(self) -> None:
-        """Start as the app does: the speaker's clock, PLAYING, then the prime."""
+    def start(self, prime: bool = True) -> None:
+        """Start as the app does: capture off the clock, the speaker's clock, PLAYING, then the prime."""
         Gst = self.Gst
-        clocked = ph.clock_playback_from_speaker(self.pipeline, self.speaker)  # as the app does, before PLAYING
-        if USE_SDK_DEVICES and self.speaker.get_factory().get_name() == "pulsesink":
+        ph.free_capture_from_clock(self.audio)  # as the app does, before PLAYING
+        clocked = ph.clock_playback_from_speaker(self.pipeline, self.speaker)
+        if (USE_SDK_DEVICES and self.speaker.get_factory().get_name() == "pulsesink") or self.clocked:
             assert clocked, "the speaker's clock was not applied"  # a silent no-op passed once
         self.pipeline.set_state(Gst.State.PLAYING)
-        if clocked:
+        if clocked and prime:
             ph.prime_speaker(self.audio)
         self.pipeline.get_state(5 * Gst.SECOND)
+        if self.clocked:
+            threading.Thread(target=self._feed_mic, daemon=True).start()
         threading.Thread(target=self._pull_mic, daemon=True).start()
         if USE_SDK_DEVICES:
             self._start_monitor()
@@ -239,6 +303,59 @@ class Rig:
                 self.rendered.append((time.monotonic(), float(np.abs(a).max()) if a.size else 0.0))
 
         threading.Thread(target=pull, daemon=True).start()
+
+    def _feed_mic(self) -> None:
+        """Feed the clocked rig's microphone: 10 ms of silence every 10 ms, stamped by sample count.
+
+        As pulsesrc stamps: the pipeline's running time when capture starts, then sample count.
+        """
+        Gst = self.Gst
+        silence = np.zeros((160, 2), dtype=np.float32).tobytes()
+        clock = self.pipeline.get_clock()
+        first = max(0, clock.get_time() - self.pipeline.get_base_time()) if clock is not None else 0
+        n = 0
+        next_at = time.monotonic()
+        while not self._stop.is_set():
+            next_at += 0.01
+            buf = Gst.Buffer.new_wrapped(silence)
+            buf.pts = first + n * 10 * Gst.MSECOND
+            buf.duration = 10 * Gst.MSECOND
+            self.mic.emit("push-buffer", buf)
+            n += 1
+            time.sleep(max(0.0, next_at - time.monotonic()))
+
+    def mic_gaps(self, since: float) -> float:
+        """Return the longest gap between microphone buffers since ``since``, up to now."""
+        times = [since] + [t for t in list(self.mic_buffers) if t >= since] + [time.monotonic()]
+        return max(b - a for a, b in zip(times, times[1:]))
+
+    def kill_speaker(self) -> None:
+        """Kill the speaker's stream: its clock stops (locally), or its sink goes to NULL (pulsesink)."""
+        if self.speaker_clock is not None:
+            self.speaker_clock.kill()
+            return
+        Gst = self.Gst
+        sinkpad = self.speaker.get_static_pad("sink")
+        self._upstream = sinkpad.get_peer()
+        blocked = threading.Event()
+        self._block = self._upstream.add_probe(
+            Gst.PadProbeType.BLOCK_DOWNSTREAM, lambda _p, _i: blocked.set() or Gst.PadProbeReturn.OK
+        )
+        blocked.wait(2.0)
+        self._upstream.unlink(sinkpad)
+        self.speaker.set_state(Gst.State.NULL)
+
+    def revive_speaker(self) -> None:
+        """Bring the speaker's stream back after kill_speaker."""
+        if self.speaker_clock is not None:
+            self.speaker_clock.revive()
+            return
+        self._upstream.link(self.speaker.get_static_pad("sink"))
+        self.speaker.set_property("async", False)
+        self.speaker.sync_state_with_parent()
+        self.speaker.set_property("async", True)
+        self._upstream.remove_probe(self._block)
+        ph.prime_speaker(self.audio)
 
     def _pull_mic(self) -> None:
         Gst = self.Gst
@@ -334,6 +451,16 @@ def rig() -> Any:
         r.close()
 
 
+@pytest.fixture
+def clocked_rig() -> Any:
+    """Yield a Rig whose speaker provides the clock (the SDK's devices in the container), and close it."""
+    r = Rig(clocked=True)
+    try:
+        yield r
+    finally:
+        r.close()
+
+
 def test_the_speaker_sink_is_found_in_the_sdk_layout(rig: Rig) -> None:
     """The playback branch's sink, not the microphone's or the wobbler's appsink."""
     factory = rig.speaker.get_factory().get_name()
@@ -343,16 +470,16 @@ def test_the_speaker_sink_is_found_in_the_sdk_layout(rig: Rig) -> None:
         assert factory == "fakesink"
 
 
-def test_the_microphone_delivers_from_the_start_before_any_reply(rig: Rig) -> None:
+def test_the_microphone_delivers_from_the_start_before_any_reply(clocked_rig: Rig) -> None:
     """Clocked from the speaker, nothing ran until the speaker's stream had audio.
 
     The trixie container, 2026-10-15: with pulsesink's clock chosen before PLAYING and
     no priming, the pipeline sat in PAUSED and the microphone delivered 0 buffers until
     the first reply was pushed. prime_speaker's 20 ms of silence starts it.
     """
-    rig.start()
-    assert rig.pipeline.get_state(0)[1] == rig.Gst.State.PLAYING
-    assert rig.mic_rate(1.0) > 5, "the microphone delivered nothing before the first reply"
+    clocked_rig.start()
+    assert clocked_rig.pipeline.get_state(0)[1] == clocked_rig.Gst.State.PLAYING
+    assert clocked_rig.mic_rate(1.0) > 5, "the microphone delivered nothing before the first reply"
 
 
 def test_playback_latency_stays_bounded_after_a_stall(rig: Rig) -> None:
@@ -1482,3 +1609,101 @@ def test_play_motif_returns_the_new_playbin() -> None:
     audio = SimpleNamespace(_playbin=None)
     media = SimpleNamespace(play_sound=lambda path: setattr(audio, "_playbin", f"playbin for {path}"))
     assert ph.play_motif(media, audio, "ring.wav") == "playbin for ring.wav"
+
+
+# --- capture off the speaker's clock -------------------------------------------------------
+
+
+def test_the_prime_is_still_needed_with_the_microphone_off_the_clock(clocked_rig: Rig) -> None:
+    """sync=False does not replace the prime: unprimed, the speaker cannot preroll and nothing runs.
+
+    The trixie container, 2026-10-15, microphone sync=False and no prime: the pipeline
+    stayed PAUSED and the microphone delivered 0 buffers/s until the first reply.
+    """
+    clocked_rig.start(prime=False)
+    assert clocked_rig.mic_rate(1.0) == 0
+    ph.prime_speaker(clocked_rig.audio)
+    assert clocked_rig.mic_rate(1.0) > 5
+
+
+def test_the_microphone_appsink_takes_frames_off_the_clock_and_the_wobbler_stays_on_it(rig: Rig) -> None:
+    """The capture sink never waits on the pipeline clock; the playback-side wobbler still does."""
+    rig.start()
+    assert rig.audio._appsink_audio.get_property("sync") is False
+    wobblers = [
+        e
+        for e in ph._iterate(rig.pipeline.iterate_recurse())
+        if e.get_factory() is not None
+        and e.get_factory().get_name() == "appsink"
+        and e is not rig.audio._appsink_audio
+    ]
+    assert wobblers and all(w.get_property("sync") is True for w in wobblers)
+
+
+def test_free_capture_from_clock_without_an_appsink_does_nothing() -> None:
+    """The WebRTC backend and stubs have no capture appsink."""
+    assert ph.free_capture_from_clock(None) is False
+    assert ph.free_capture_from_clock(object()) is False
+
+
+def test_the_microphone_delivers_while_the_speaker_stream_is_dead(clocked_rig: Rig) -> None:
+    """The review's critical (2026-10-15): clocked from the speaker, a synced microphone stops with it.
+
+    A dead speaker stream stops the speaker's clock, and a capture sink that waited on
+    it delivered nothing; only a pushed reply restarted it, and a deaf microphone never
+    produces one. The trixie container, speaker sink NULL for 5 s: 0 buffers/s with
+    sync=True, and still 0 after; 100/s throughout with sync=False.
+    """
+    rig = clocked_rig
+    rig.start()
+    assert rig.mic_rate(1.0) > 5
+    rig.kill_speaker()
+    killed_at = time.monotonic()
+    try:
+        time.sleep(3.0)
+        gap = rig.mic_gaps(killed_at)
+    finally:
+        rig.revive_speaker()
+    assert gap < 0.5, f"the microphone stopped for {gap:.1f} s while the speaker stream was dead"
+    lat = rig.reply_latency(0.6)
+    assert lat is not None and lat < 3.0, lat
+
+
+def test_the_microphone_delivers_through_a_rebuild_with_no_reply(clocked_rig: Rig) -> None:
+    """A rebuild sets the speaker sink to NULL, which stops its clock; capture goes on regardless."""
+    rig = clocked_rig
+    rig.start()
+    assert rig.mic_rate(1.0) > 5
+    since = time.monotonic()
+    assert ph.GOVERNOR.rebuild(rig.audio, "test", "a rebuild with no reply after it")
+    time.sleep(3.0)  # no reply pushed
+    gap = rig.mic_gaps(since)
+    assert gap < 0.5, f"the microphone stopped for {gap:.1f} s after a rebuild with no reply"
+    lat = rig.reply_latency(0.6)
+    assert lat is not None and lat < 1.0, lat
+
+
+def test_the_microphone_delivers_through_a_long_idle(clocked_rig: Rig) -> None:
+    """No reply for REACHY_PLAYBACK_TEST_IDLE_S (15 s here; 300 s in the container run): frames never stop."""
+    rig = clocked_rig
+    rig.start()
+    since = time.monotonic()
+    time.sleep(IDLE_S)
+    gap = rig.mic_gaps(since)
+    assert gap < 0.5, f"the microphone stopped for {gap:.1f} s in a {IDLE_S:.0f} s idle"
+    assert rig.mic_rate(1.0) > 5
+    lat = rig.reply_latency(0.6)
+    assert lat is not None and lat < 1.0, lat
+
+
+def test_a_rebuild_and_a_capture_stall_prime_the_speaker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The speaker's clock runs again only once its stream has audio: both push 20 ms of silence."""
+    primed: list[Any] = []
+    audio = SimpleNamespace(_pipeline=_Pipeline(), push_audio_sample=lambda s: None)
+    monkeypatch.setattr(ph, "prime_speaker", primed.append)
+    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: True)
+    assert ph.RebuildGovernor().rebuild(audio, "test", "test")
+    ph.act_on_capture(ph.capture_stall_decision(3.5, False), audio)
+    assert primed == [audio, audio]
+    assert ph.restart_speaker_clock(SimpleNamespace()) is False  # no player to push to
