@@ -244,6 +244,32 @@ def _is_sight_note(event: Any) -> bool:
     return _companion_tag(event) == SIGHT_NOTE_TAG["companion"]
 
 
+# The audio cut (2026-10-16): a reply whose transcript opens with "(" or "*" (a stage
+# direction, "(stops talking)") or with "call:" (a tool call leaked into text,
+# "call:stay_quiet{}") is never spoken. speech-to-speech sends each text part's
+# transcript delta ahead of its audio, so the first delta decides before any audio
+# arrives. Audio that does arrive first is held for at most SPOKEN_ARTIFACT_HOLD_S,
+# then released. The server's copy of the reply is left alone.
+SPOKEN_ARTIFACT_HOLD_S = 0.3
+_LEAKED_CALL_PREFIX: Final[str] = "call:"
+_UNDECIDED: Final[str] = "undecided"
+
+
+def spoken_artifact(text: str) -> str | None:
+    """Return "stage direction", "leaked tool call", None (a reply), or "undecided" (too little text). Pure."""
+    head = text.lstrip()
+    if not head:
+        return _UNDECIDED
+    if head[0] in "(*":
+        return "stage direction"
+    opening = head[: len(_LEAKED_CALL_PREFIX)].lower()
+    if opening == _LEAKED_CALL_PREFIX:
+        return "leaked tool call"
+    if _LEAKED_CALL_PREFIX.startswith(opening):
+        return _UNDECIDED
+    return None
+
+
 # The tool-call-log brief (2026-10-11): one /rpc notification per finished (or
 # refused) tool call -- console.py's _dispatch_tool_call sends it as
 # "conversation.tool" -- so the supervisor can keep a durable record
@@ -372,6 +398,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # reports, drained through console.py's /rpc dispatch (see set_tool_call_observer).
         self._tool_report_queue: "deque[dict[str, Any]]" = deque(maxlen=TOOL_REPORT_QUEUE_MAX)
         self._tool_reports_dropped = 0
+        # The audio cut: this response's gate ("pass", "hold", "open" or "cut"), its
+        # transcript so far, audio held back, whether any was released, and the timer.
+        self._gate = "pass"
+        self._gate_text = ""
+        self._gate_held: list[Tuple[int, NDArray[np.int16]]] = []
+        self._gate_released = False
+        self._gate_held_at = 0.0
+        self._gate_timer: asyncio.Task[None] | None = None
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -637,6 +671,87 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         This method never blocks the caller.
         """
         await self._pending_responses.put(kwargs)
+
+    # --- the audio cut (2026-10-16) -----------------------------------------------------
+    #
+    # States: "hold" (a response started, nothing decided: audio waits), "open" (released
+    # by the timeout, still undecided: audio plays, a late artifact flushes it), "pass"
+    # (a reply, or no response being tracked: audio plays) and "cut" (audio dropped).
+
+    def _gate_cancel_timer(self) -> None:
+        if self._gate_timer is not None and not self._gate_timer.done():
+            self._gate_timer.cancel()
+        self._gate_timer = None
+
+    def _gate_start(self) -> None:
+        """Hold a new response's audio until its transcript decides."""
+        self._gate_cancel_timer()
+        self._gate = "hold"
+        self._gate_text = ""
+        self._gate_held = []
+        self._gate_released = False
+
+    def _gate_release(self, state: str) -> None:
+        """Queue the held audio in order, in one synchronous burst, and move to ``state``."""
+        self._gate_cancel_timer()
+        if self._gate_held:
+            logger.debug(
+                "reply audio held %.0f ms before its transcript decided",
+                (time.monotonic() - self._gate_held_at) * 1000,
+            )
+            self._gate_released = True
+        for frame in self._gate_held:
+            self.output_queue.put_nowait(frame)
+        self._gate_held = []
+        self._gate = state
+
+    def _gate_drop_held(self) -> None:
+        """Drop audio not yet released (a barge-in or a closed session): it is never played."""
+        self._gate_cancel_timer()
+        self._gate_held = []
+
+    def _gate_cut(self, kind: str) -> None:
+        logger.warning("spoken artifact cut (%s): %r", kind, self._gate_text.strip())
+        self._gate_cancel_timer()
+        self._gate_held = []
+        self._gate = "cut"
+        # Flush only what this response put on the player: a cut of held audio alone
+        # leaves the end of the previous reply playing. The console marks the flushed
+        # reply as dropped (ReplyTracker.flushed), never unheard.
+        if self._gate_released and self._clear_queue:
+            self._clear_queue()
+
+    def _gate_transcript(self, text: str) -> None:
+        """Judge the response's transcript so far: release on a reply, cut an artifact, else wait."""
+        if self._gate not in ("hold", "open"):
+            return
+        self._gate_text = text
+        verdict = spoken_artifact(text)
+        if verdict is None:
+            self._gate_release("pass")
+        elif verdict != _UNDECIDED:
+            self._gate_cut(verdict)
+
+    def _gate_audio(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
+        if self._gate == "cut":
+            return
+        if self._gate == "hold":
+            if not self._gate_held:
+                self._gate_held_at = time.monotonic()
+                self._gate_cancel_timer()
+                self._gate_timer = asyncio.create_task(self._gate_timeout())
+            self._gate_held.append(frame)
+            return
+        self.output_queue.put_nowait(frame)
+        if self._gate == "open":
+            self._gate_released = True
+
+    async def _gate_timeout(self) -> None:
+        await asyncio.sleep(SPOKEN_ARTIFACT_HOLD_S)
+        if self._gate == "hold":
+            logger.info("reply audio released after %.0f ms with no transcript", SPOKEN_ARTIFACT_HOLD_S * 1000)
+            self._gate_timer = None  # this task: not cancelled by the release
+            self._gate_release("open")
 
     # --- reliable search (the companion, 2026-10-09) ------------------------------------
 
@@ -1264,6 +1379,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
+                        self._gate_drop_held()
                         if self._clear_queue:
                             self._clear_queue()
                         self.deps.movement_manager.set_listening(True)
@@ -1302,6 +1418,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             logger.debug("Sight note started")
                         else:
                             self._response_started()
+                            self._gate_start()
                             self._mark_activity("response_created")
                             self.deps.movement_manager.set_speaking(True)
                             if self._turn_user_done_at is not None and self._turn_response_created_at is None:
@@ -1322,6 +1439,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._response_started_or_rejected_event.set()
                         logger.debug("Response done")
                         if not sight_note:
+                            self._gate_transcript(self._gate_text)
+                            if self._gate == "hold":  # no transcript at all: a reply, not an artifact
+                                self._gate_release("pass")
                             await self._response_finished(event)
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
@@ -1369,8 +1489,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._emit_transcript("user", transcript, True)
 
                     # Handle assistant transcription
+                    if event.type == "response.output_audio_transcript.delta":
+                        self._gate_transcript(self._gate_text + (getattr(event, "delta", "") or ""))
+
                     if event.type == "response.output_audio_transcript.done":
                         self._mark_activity("assistant_transcript_done")
+                        self._gate_transcript(event.transcript or "")
                         logger.debug(f"Assistant transcript: {event.transcript}")
                         await self.output_queue.put(
                             AdditionalOutputs({"role": "assistant", "content": event.transcript})
@@ -1393,12 +1517,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 "search answer: first audio %.0f ms after the user's transcript",
                                 (time.perf_counter() - self._turn_user_done_at) * 1000,
                             )
-                        await self.output_queue.put(
-                            (
-                                self.SAMPLE_RATE,
-                                decoded_pcm,
-                            ),
-                        )
+                        self._gate_audio((self.SAMPLE_RATE, decoded_pcm))
                     # ---- tool-calling plumbing ----
                     if event.type == "response.function_call_arguments.done":
                         self._mark_activity("tool_call_received")
@@ -1488,6 +1607,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
             finally:
+                # Audio still held belongs to a response this session will not finish.
+                self._gate_drop_held()
+                self._gate = "pass"
+
                 # Stop the response sender worker.
                 if response_sender_task is not None:
                     response_sender_task.cancel()

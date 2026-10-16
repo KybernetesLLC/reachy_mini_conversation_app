@@ -34,7 +34,7 @@ class _FakeEvent:
 
 def _make_fake_realtime_client(
     *,
-    events: tuple[_FakeEvent, ...] = (),
+    events: tuple[Any, ...] = (),
     captured_update: dict[str, Any] | None = None,
     captured_connect: dict[str, Any] | None = None,
 ) -> Any:
@@ -84,10 +84,17 @@ def _make_fake_realtime_client(
             return self
 
         async def __anext__(self) -> _FakeEvent:
-            try:
-                return next(self._events)
-            except StopIteration:
-                raise StopAsyncIteration
+            while True:
+                try:
+                    item = next(self._events)
+                except StopIteration:
+                    raise StopAsyncIteration
+                if callable(item):  # a probe or pause between events: run it, yield nothing
+                    result = item()
+                    if asyncio.iscoroutine(result):
+                        await result
+                    continue
+                return item
 
     class FakeRealtime:
         def connect(self, **kwargs: Any) -> FakeConn:
@@ -150,7 +157,7 @@ def _plain_handler() -> HuggingFaceRealtimeHandler:
     return HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
 
 
-def _session_handler(monkeypatch: Any, events: tuple[_FakeEvent, ...]) -> HuggingFaceRealtimeHandler:
+def _session_handler(monkeypatch: Any, events: tuple[Any, ...]) -> HuggingFaceRealtimeHandler:
     """Build a handler wired to a fake realtime client yielding `events`, ready to run a session."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
@@ -1907,3 +1914,256 @@ def test_every_tool_result_logs_its_latency(caplog: Any) -> None:
         handler._log_tool_latency(done)
     line = [r.getMessage() for r in caplog.records if "tool latency" in r.getMessage()][0]
     assert line.startswith("tool latency: web_search 1250 ms") and "completed" in line
+
+
+# --- the audio cut for spoken artifacts ------------------------------------------------------
+
+
+def _pcm_delta(*samples: int) -> str:
+    return base64.b64encode(np.array(samples, dtype=np.int16).tobytes()).decode("utf-8")
+
+
+def _frames(handler: HuggingFaceRealtimeHandler) -> list[Any]:
+    return [item for item in _drain(handler) if isinstance(item, tuple)]
+
+
+def _audio(*samples: int) -> _FakeEvent:
+    return _FakeEvent("response.output_audio.delta", delta=_pcm_delta(*samples))
+
+
+def _said(delta: str) -> _FakeEvent:
+    return _FakeEvent("response.output_audio_transcript.delta", delta=delta)
+
+
+def _reply_events(transcript: str, *, audio_first: bool) -> tuple[Any, ...]:
+    """One response as speech-to-speech sends it, or with the audio ahead of the transcript."""
+    created = _FakeEvent("response.created", response=SimpleNamespace(metadata=None))
+    audio = (_audio(1, 2), _audio(3, 4))
+    said = (_said(transcript),)
+    body = audio + said if audio_first else said + audio
+    return (
+        created,
+        *body,
+        _FakeEvent("response.output_audio.done"),
+        _FakeEvent("response.output_audio_transcript.done", transcript=transcript),
+        _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "verdict"),
+    [
+        ("(stops talking)", "stage direction"),
+        ("  *sighs*", "stage direction"),
+        ("call:stay_quiet{}", "leaked tool call"),
+        (" CALL:express{}", "leaked tool call"),
+        ("Sure, (I think) yes.", None),
+        ("Calling you now.", None),
+        ("", "undecided"),
+        ("   ", "undecided"),
+        ("ca", "undecided"),
+        ("Cal", "undecided"),
+        ("can", None),
+    ],
+)
+def test_spoken_artifact_rule(text: str, verdict: str | None) -> None:
+    """A transcript that opens with "(", "*" or "call:" is an artifact; a prefix of "call:" waits."""
+    assert hf_mod.spoken_artifact(text) == verdict
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transcript", "kind"),
+    [
+        ("(stops talking)", "stage direction"),
+        ("call:stay_quiet{}", "leaked tool call"),
+        ("*sighs*", "stage direction"),
+    ],
+)
+@pytest.mark.parametrize("audio_first", [False, True])
+async def test_a_spoken_artifact_never_reaches_the_player(
+    monkeypatch: Any, caplog: Any, transcript: str, kind: str, audio_first: bool
+) -> None:
+    """None of an artifact's audio is queued, nothing is flushed, and the cut is logged."""
+    handler = _session_handler(monkeypatch, _reply_events(transcript, audio_first=audio_first))
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await handler._run_realtime_session()
+
+    assert _frames(handler) == []
+    assert cleared == []  # nothing of it was released, so nothing else is flushed
+    cuts = [r.getMessage() for r in caplog.records if "spoken artifact cut" in r.getMessage()]
+    assert cuts == [f"spoken artifact cut ({kind}): {transcript!r}"]
+    assert all(r.levelno == logging.WARNING for r in caplog.records if "spoken artifact cut" in r.getMessage())
+
+
+@pytest.mark.asyncio
+async def test_a_leaked_tool_call_is_not_executed(monkeypatch: Any) -> None:
+    """Spoken "call:stay_quiet{}" starts no tool."""
+    handler = _session_handler(monkeypatch, _reply_events("call:stay_quiet{}", audio_first=False))
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+
+    await handler._run_realtime_session()
+
+    start_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio_first", [False, True])
+async def test_a_normal_reply_plays_in_full(monkeypatch: Any, caplog: Any, audio_first: bool) -> None:
+    """A reply with a bracket later on is not an artifact: every frame reaches the player, in order."""
+    handler = _session_handler(monkeypatch, _reply_events("Sure, (I think) yes.", audio_first=audio_first))
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await handler._run_realtime_session()
+
+    frames = _frames(handler)
+    assert [list(array.reshape(-1)) for _rate, array in frames] == [[1, 2], [3, 4]]
+    assert not [r for r in caplog.records if "spoken artifact cut" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_audio_before_the_transcript_is_held_then_released(monkeypatch: Any) -> None:
+    """Audio ahead of the first transcript delta waits; the delta that decides releases it."""
+    sizes: list[int] = []
+    handler: HuggingFaceRealtimeHandler
+    events = (
+        _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+        _audio(1, 2),
+        lambda: sizes.append(handler.output_queue.qsize()),  # held
+        _said("Sure"),
+        lambda: sizes.append(handler.output_queue.qsize()),  # released
+        _audio(3, 4),
+        lambda: sizes.append(handler.output_queue.qsize()),  # passes straight through
+    )
+    handler = _session_handler(monkeypatch, events)
+
+    await handler._run_realtime_session()
+
+    assert sizes == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_the_timeout_releases_audio_when_no_transcript_arrives(monkeypatch: Any) -> None:
+    """With no transcript delta, held audio goes to the player after the hold timeout."""
+    monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
+    sizes: list[int] = []
+    handler: HuggingFaceRealtimeHandler
+    events = (
+        _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+        _audio(1, 2),
+        lambda: sizes.append(handler.output_queue.qsize()),  # held
+        lambda: asyncio.sleep(0.15),
+        lambda: sizes.append(handler.output_queue.qsize()),  # released by the timeout
+        _audio(3, 4),
+        lambda: sizes.append(handler.output_queue.qsize()),  # passes straight through
+    )
+    handler = _session_handler(monkeypatch, events)
+
+    await handler._run_realtime_session()
+
+    assert sizes == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_an_artifact_found_after_release_flushes_the_player(monkeypatch: Any, caplog: Any) -> None:
+    """Audio released by the timeout, then a stage direction: the player is flushed, later audio dropped."""
+    monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _audio(1, 2),
+            lambda: asyncio.sleep(0.15),
+            _said("(stops talking)"),
+            _audio(3, 4),
+        ),
+    )
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await handler._run_realtime_session()
+
+    assert cleared == [True]
+    assert [list(a.reshape(-1)) for _r, a in _frames(handler)] == [[1, 2]]  # the fake flush drained nothing
+    assert "spoken artifact cut (stage direction): '(stops talking)'" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_done_transcript_decides_when_no_delta_came(monkeypatch: Any) -> None:
+    """A done-only backend: the terminal transcript cuts a stage direction still held."""
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _audio(1, 2),
+            _FakeEvent("response.output_audio.done"),
+            _FakeEvent("response.output_audio_transcript.done", transcript="(stays silent)"),
+        ),
+    )
+
+    await handler._run_realtime_session()
+
+    assert _frames(handler) == []
+
+
+@pytest.mark.asyncio
+async def test_a_barge_in_drops_held_audio(monkeypatch: Any) -> None:
+    """Audio still held when the user starts speaking is never released afterwards."""
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _audio(1, 2),
+            _FakeEvent("input_audio_buffer.speech_started"),
+            _said("Sure"),
+        ),
+    )
+    handler._clear_queue = lambda: None
+
+    await handler._run_realtime_session()
+
+    assert _frames(handler) == []
+
+
+@pytest.mark.asyncio
+async def test_a_cut_reply_is_never_counted_unheard(monkeypatch: Any) -> None:
+    """A cut reply is either never pushed or flushed like a barge-in: the unheard count stands."""
+    from reachy_mini_conversation_app import playback_health as ph
+
+    monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
+    tracker = ph.ReplyTracker(rebuilt_at=lambda: None)
+    clock = {"now": 100.0}
+
+    def push_released() -> None:
+        # what the console does with each frame it takes from the queue
+        for _rate, array in _frames(handler):
+            tracker.pushed(clock["now"], array.size / handler.SAMPLE_RATE + 1.0, 1.0)
+
+    handler: HuggingFaceRealtimeHandler
+    handler = _session_handler(
+        monkeypatch,
+        (
+            # held, then cut: never pushed
+            *_reply_events("(stops talking)", audio_first=True),
+            push_released,
+            # released by the timeout, then cut: flushed
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _audio(1, 2),
+            lambda: asyncio.sleep(0.15),
+            push_released,
+            _said("call:stay_quiet{}"),
+        ),
+    )
+    handler._clear_queue = lambda: tracker.flushed(clock["now"] + 0.1)
+
+    await handler._run_realtime_session()
+
+    verdicts = [v.action for v in tracker.tick(clock["now"] + ph.UNHEARD_WINDOW_S + 1)]
+    assert "unheard" not in verdicts
+    assert verdicts == ["flushed"]
+    assert tracker.unheard_in_a_row == 0
