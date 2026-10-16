@@ -2380,9 +2380,8 @@ async def test_an_out_of_band_create_is_not_held_for_an_owed_output(monkeypatch:
     assert [kind for kind, _ in sent] == ["response.create"]
 
 
-@pytest.mark.asyncio
-async def test_a_say_held_behind_a_long_tool_gives_exactly_one_response(monkeypatch: Any) -> None:
-    """The held say and the tool's follow-up merge: one response.create, after the output."""
+async def _line_during_a_search(monkeypatch: Any, speak: str) -> list[tuple[str, Any]]:
+    """Run a session where `speak` ("say" or "type_text") lands while a web search runs."""
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
     monkeypatch.setattr(
@@ -2396,8 +2395,8 @@ async def test_a_say_held_behind_a_long_tool_gives_exactly_one_response(monkeypa
         result={"answer": "sunny"},
     )
 
-    async def _say() -> None:
-        await handler.say("The timer is done.")
+    async def _line() -> None:
+        await getattr(handler, speak)("The timer is done.")
         await asyncio.sleep(0.05)
 
     async def _finish_tool() -> None:
@@ -2407,25 +2406,66 @@ async def test_a_say_held_behind_a_long_tool_gives_exactly_one_response(monkeypa
     handler.client = _ordering_client(
         (
             _FakeEvent("response.function_call_arguments.done", name="test__web_search", arguments="{}", call_id="c1"),
-            _say,
+            _line,
             _finish_tool,
         ),
         sent,
         handler,
     )
+    await handler._run_realtime_session()
+    return sent
 
+
+def _kinds(sent: list[tuple[str, Any]]) -> list[str]:
+    """Name each sent event: output, line (the user item), filler, create, or item."""
+    kinds = []
+    for kind, payload in sent:
+        if kind == "item":
+            if payload.get("type") == "function_call_output":
+                kinds.append("output")
+            elif payload.get("role") == "user":
+                kinds.append("line")
+            else:
+                kinds.append("item")
+        elif payload.get("response", {}).get("conversation") == "none":
+            kinds.append("filler")
+        else:
+            assert "_announcement" not in payload  # the marker never reaches the server
+            kinds.append("create")
+    return kinds
+
+
+@pytest.mark.asyncio
+async def test_an_announcement_during_a_search_is_its_own_reply_after_the_answer(monkeypatch: Any) -> None:
+    """The search's follow-up answers first; the announcement then goes as a second reply."""
+    kinds = _kinds(await _line_during_a_search(monkeypatch, "say"))
+
+    assert kinds == ["line", "filler", "output", "create", "create"]
+
+
+@pytest.mark.asyncio
+async def test_a_typed_line_during_a_search_merges_with_the_answer(monkeypatch: Any) -> None:
+    """A typed question and the search's result are answered together: one reply."""
+    kinds = _kinds(await _line_during_a_search(monkeypatch, "type_text"))
+
+    assert kinds == ["line", "filler", "output", "create"]
+
+
+@pytest.mark.asyncio
+async def test_a_say_with_no_tool_running_is_one_reply(monkeypatch: Any) -> None:
+    """The plain announce path: the user item, then one create, nothing held."""
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+
+    async def _say() -> None:
+        await handler.say("The timer is done.")
+        await asyncio.sleep(0.05)
+
+    handler.client = _ordering_client((_say,), sent, handler)
     await handler._run_realtime_session()
 
-    kinds = [
-        "output" if kind == "item" and payload.get("type") == "function_call_output" else kind
-        for kind, payload in sent
-    ]
-    # The search's filler is out of band and goes at once; the in-band create waits.
-    assert kinds.count("response.create") == 2
-    assert sent[kinds.index("response.create")][1]["response"]["conversation"] == "none"
-    in_band = [i for i, (kind, payload) in enumerate(sent) if kind == "response.create" and not payload]
-    assert len(in_band) == 1
-    assert kinds.index("output") < in_band[0]
+    assert _kinds(sent) == ["line", "create"]
+    assert sent[1][1] == {}
 
 
 @pytest.mark.asyncio

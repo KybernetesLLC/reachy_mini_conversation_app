@@ -6,7 +6,7 @@ import base64
 import random
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Final, Tuple, Optional
+from typing import TYPE_CHECKING, Any, Final, Tuple, Callable, Optional
 from collections import deque
 
 import httpx
@@ -68,6 +68,9 @@ logger = logging.getLogger(__name__)
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 _OWED_OUTPUT_TIMEOUT: float = _RESPONSE_DONE_TIMEOUT  # longest hold of an in-band create
+# Marks a queued create as a say() announcement (a timer, a greeting): spoken as its own
+# reply, never merged with another create. Internal: stripped before the create is sent.
+_ANNOUNCEMENT: Final[str] = "_announcement"
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -886,24 +889,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         logger.debug("response.create released: function call outputs sent")
         return True
 
-    def _coalesce_queued_creates(self) -> None:
-        """Merge queued plain creates into the one just released: one reply, not two.
+    def _requeue(self, keep: Callable[[dict[str, Any]], bool], front: dict[str, Any] | None = None) -> int:
+        """Drain the queue and put back `front`, then the entries `keep` accepts, in order.
 
-        A say held behind a tool and that tool's own follow-up both ask the model to
-        answer the same conversation. Other queued creates keep their order.
+        Returns how many entries were dropped (merged into the create being sent).
         """
-        kept: list[dict[str, Any]] = []
-        merged = 0
+        kept: list[dict[str, Any]] = [] if front is None else [front]
+        dropped = 0
         while not self._pending_responses.empty():
             queued = self._pending_responses.get_nowait()
-            if queued:
+            if keep(queued):
                 kept.append(queued)
             else:
-                merged += 1
+                dropped += 1
         for queued in kept:
             self._pending_responses.put_nowait(queued)
-        if merged:
-            logger.debug("response.create: merged %d queued create(s) into the released one", merged)
+        if dropped:
+            logger.debug("response.create: merged %d queued create(s) into the one being sent", dropped)
+        return dropped
 
     async def _safe_response_create(self, **kwargs: Any) -> None:
         """Enqueue a response.create() kwargs for the sender worker _response_sender_loop().
@@ -1158,7 +1161,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             },
         )
         self._mark_activity("say")
-        await self._safe_response_create()
+        await self._safe_response_create(**{_ANNOUNCEMENT: True})
 
     async def end_user_turn(self) -> None:
         """End a half-heard user turn: the microphone was muted or stopped mid-utterance.
@@ -1348,18 +1351,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 return
 
             # Parallel tool calls enqueue duplicate empty requests; coalesce to one.
-            while not kwargs and not self._pending_responses.empty():
-                try:
-                    self._pending_responses.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+            # An announcement is never merged: it keeps its place in the queue.
+            if not kwargs:
+                self._requeue(lambda queued: bool(queued.get(_ANNOUNCEMENT)))
+            announcement = bool(kwargs.pop(_ANNOUNCEMENT, False))
 
             sent = False
             max_retries = 5
             attempts = 0
             while not sent and self.connection and attempts < max_retries:
                 if await self._wait_for_owed_outputs(kwargs) and not kwargs:
-                    self._coalesce_queued_creates()
+                    # Released behind a tool: the tool's plain follow-up, queued just
+                    # before the release, merges with a plain create. An announcement
+                    # lets that follow-up answer first, then goes as its own reply.
+                    if self._requeue(bool) and announcement:
+                        logger.info("Announcement waits for the tool's follow-up reply")
+                        self._requeue(bool, front={_ANNOUNCEMENT: True})
+                        announcement = False
                 try:
                     await asyncio.wait_for(
                         self._response_done_event.wait(),
