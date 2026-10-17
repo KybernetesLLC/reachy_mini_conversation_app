@@ -125,6 +125,24 @@ def fresh_jpeg(media: Any) -> Tuple[Optional[bytes], Optional[float], Optional[s
     return jpeg, luma, None
 
 
+# 2026-10-17: with no frame the tool said only "No frame available", and the model
+# described a view it never saw ("city lights and a few tall buildings"). The owner:
+# "he shouldn't respond like a machine but it should be clearly logged that no frame
+# came thru". So the result tells the model it has no picture and leaves the words to
+# it, and every miss is a WARNING the stats count.
+NO_PICTURE = (
+    "You have no picture right now ({reason}), so you cannot see anything. Do not describe "
+    "the scene or guess what is there. Tell the person briefly, in your own words, that you "
+    "can't see right now."
+)
+
+
+def no_picture(source: str, reason: str) -> Dict[str, Any]:
+    """Log the miss and return the tool result that tells the model it has no picture."""
+    logger.warning("camera: no frame for %s/%s", source, reason)
+    return {"no_picture": True, "instruction": NO_PICTURE.format(reason=reason)}
+
+
 class Camera(Tool):
     """Take a picture with the camera to see what is in front of the robot."""
 
@@ -162,18 +180,9 @@ class Camera(Tool):
         logger.info("Tool call: camera question=%s", question[:120])
 
         if not deps.camera_enabled:
-            logger.error("Camera is disabled")
-            return {"error": "Camera is disabled"}
+            return no_picture("camera", "camera disabled")
 
         jpeg_bytes, _luma, why_not = await asyncio.to_thread(fresh_jpeg, deps.reachy_mini.media)
-        if why_not == "dark frame in a lit room":
-            return {
-                "error": (
-                    "The camera returned a dark frame although the room is lit, so there is "
-                    "nothing to describe. Say the camera isn't working right now."
-                )
-            }
         if jpeg_bytes is None:
-            logger.error("No frame available from camera")
-            return {"error": "No frame available"}
+            return no_picture("camera", why_not or "no frame")
         return {"b64_im": base64.b64encode(jpeg_bytes).decode("utf-8")}

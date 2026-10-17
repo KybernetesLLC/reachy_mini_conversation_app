@@ -2675,8 +2675,8 @@ async def test_a_glance_at_open_without_a_frame_is_a_warning(
     _fake_frames(monkeypatch, (None, None, "no frame"))
     with caplog.at_level(logging.INFO):
         await stream._glance_at_open()
-    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert warning.getMessage() == "No glance at open: no frame"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == ["camera: no frame for glance/no frame", "No glance at open: no frame"]
     assert handler.glances_in == 0
 
 

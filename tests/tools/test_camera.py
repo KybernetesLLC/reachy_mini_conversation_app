@@ -31,8 +31,9 @@ async def test_camera_tool_returns_base64_of_sdk_jpeg(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_camera_tool_reports_error_when_no_frame() -> None:
-    """With no frame available the tool returns an error."""
+async def test_camera_tool_reports_error_when_no_frame(caplog) -> None:
+    """With no frame the result tells the model it has no picture and must not describe
+    a scene, in its own words; the miss is a WARNING (2026-10-17)."""
     reachy_mini = MagicMock()
     reachy_mini.media.get_frame_jpeg.return_value = None
 
@@ -42,9 +43,13 @@ async def test_camera_tool_reports_error_when_no_frame() -> None:
         camera_enabled=True,
     )
 
-    result = await Camera()(deps, question="What color is this?")
+    with caplog.at_level("WARNING"):
+        result = await Camera()(deps, question="What color is this?")
 
-    assert "error" in result
+    assert "b64_im" not in result and result["no_picture"] is True
+    text = result["instruction"]
+    assert "no picture" in text and "Do not describe" in text and "own words" in text
+    assert "camera: no frame for camera/no frame" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -59,7 +64,7 @@ async def test_camera_tool_reports_error_when_camera_disabled() -> None:
 
     result = await Camera()(deps, question="What color is this?")
 
-    assert "error" in result
+    assert result["no_picture"] is True and "camera disabled" in result["instruction"]
     reachy_mini.media.get_frame_jpeg.assert_not_called()
 
 
@@ -147,7 +152,8 @@ async def test_a_dark_frame_in_a_lit_room_is_tried_again_then_refused(monkeypatc
     result = await Camera()(deps, question="what do you see")
 
     assert "b64_im" not in result
-    assert "dark" in result["error"] and "lit" in result["error"]
+    assert result["no_picture"] is True
+    assert "dark frame in a lit room" in result["instruction"]
     assert len(FakeCamera.made) == 3  # the stale one, and two fresh tries
 
 

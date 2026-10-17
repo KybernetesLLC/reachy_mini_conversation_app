@@ -706,7 +706,10 @@ class LocalStream:
         session = getattr(self.handler, "connection", None)
         jpeg, luma, why_not = await asyncio.to_thread(camera_tool.fresh_jpeg, self._robot.media)
         if jpeg is None:
-            return {"glanced": False, "reason": why_not or "no frame"}
+            reason = why_not or "no frame"
+            # Nothing reaches the model, so there is nothing to tell it; logged for the stats.
+            logger.warning("camera: no frame for glance/%s", reason)
+            return {"glanced": False, "reason": reason}
         b64 = base64.b64encode(jpeg).decode("ascii")
         handler = self.handler
 
