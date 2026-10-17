@@ -1258,8 +1258,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._startup_greeting_sent or not self.connection:
             return
         if getattr(self, "skip_next_greeting", False):
-            # This open was asked for without one (Type to Reachy, 2026-10-08).
-            self.skip_next_greeting = False
+            # This open was asked for without one (Type to Reachy, 2026-10-08; every open
+            # since 2026-10-17). Not cleared here: the console sets it at each open, so a
+            # reconnect within the conversation stays silent too (the review, 2026-10-17).
             logger.info("Startup greeting skipped for this session")
             return
 

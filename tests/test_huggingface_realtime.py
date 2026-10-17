@@ -1717,8 +1717,12 @@ async def test_typed_text_is_a_user_turn_answered_and_reported() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_skipped_greeting_sends_nothing_once(monkeypatch: Any) -> None:
-    """Skip the greeting for one open only (Type to Reachy, 2026-10-08)."""
+async def test_a_skipped_greeting_stays_skipped_on_a_reconnect(monkeypatch: Any) -> None:
+    """Skip the greeting until the next open says otherwise.
+
+    The review (2026-10-17): a reconnect within a conversation, on the same handler and
+    with no new open, spoke "Go ahead." once the skip had been used up.
+    """
     import reachy_mini_conversation_app.huggingface_realtime as hr
 
     monkeypatch.setattr(hr, "get_session_greeting_prompt", lambda: "Greet them.")
@@ -1727,8 +1731,9 @@ async def test_a_skipped_greeting_sends_nothing_once(monkeypatch: Any) -> None:
     handler._safe_response_create = AsyncMock()
     handler.skip_next_greeting = True
     await handler._send_startup_greeting_prompt()
+    await handler._send_startup_greeting_prompt()  # the reconnect
     handler.connection.conversation.item.create.assert_not_awaited()
-    assert handler.skip_next_greeting is False and handler._startup_greeting_sent is False
+    assert handler.skip_next_greeting is True and handler._startup_greeting_sent is False
 
 
 @pytest.mark.asyncio
