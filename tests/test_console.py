@@ -2663,6 +2663,45 @@ async def test_a_glance_also_hands_its_frame_over_for_a_sight_note(monkeypatch: 
     assert events == [f"image:{b64}", f"note:glance:{b64}"] * 2
 
 
+@pytest.mark.asyncio
+async def test_a_glance_at_open_without_a_frame_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The review (2026-10-17): no frame, no judgement of the first reply, so say so."""
+    handler = _GlanceHandler([])
+    handler.deps = SimpleNamespace(camera_enabled=True)
+    handler.connection = object()
+    stream = LocalStream(handler, SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))
+    _fake_frames(monkeypatch, (None, None, "no frame"))
+    with caplog.at_level(logging.INFO):
+        await stream._glance_at_open()
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning.getMessage() == "No glance at open: no frame"
+    assert handler.glances_in == 0
+
+
+@pytest.mark.asyncio
+async def test_a_glance_never_lands_in_a_session_opened_during_its_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The review (2026-10-17): a close and reopen during the ~1 s capture."""
+    from reachy_mini_conversation_app.tools import camera as camera_mod
+
+    events: list[str] = []
+    handler = _GlanceHandler(events)
+    handler.deps = SimpleNamespace(camera_enabled=True)
+    handler.connection = object()
+
+    def reopened_meanwhile(media: Any) -> tuple:
+        handler.connection = object()
+        return (b"jpg", 91.0, None)
+
+    monkeypatch.setattr(camera_mod, "fresh_jpeg", reopened_meanwhile)
+    stream = LocalStream(handler, SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))
+    assert await stream.glance(at_open=True) == {"glanced": False, "reason": "the session changed"}
+    assert events == [] and handler.glances_in == 0
+
+
 def test_a_sight_frame_is_a_notification_and_needs_a_companion_attached() -> None:
     """conversation.sight: never a call the app waits on; nobody attached, sent nowhere."""
     sent: list[tuple[str, dict]] = []

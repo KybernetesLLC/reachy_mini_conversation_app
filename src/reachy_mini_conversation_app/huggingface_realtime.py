@@ -1588,6 +1588,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._last_speech_at = time.monotonic()
             self._session_images = self._session_image_bytes = self._session_creates = 0
             self._open_glance_at = self._first_reply_at = None
+            # A turn left open by the session before is not this session's first turn
+            # (the review: its greeting would be judged as the first reply).
+            self._turn_user_done_at = self._turn_response_created_at = None
             try:
                 self._connected_event.set()
             except Exception:

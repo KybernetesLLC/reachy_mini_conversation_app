@@ -1539,6 +1539,25 @@ async def test_only_the_first_reply_to_a_person_is_judged_and_each_session_start
 
 
 @pytest.mark.asyncio
+async def test_a_turn_left_open_by_the_session_before_does_not_make_the_greeting_first(
+    monkeypatch: Any,
+) -> None:
+    """The review (2026-10-17): a transcript with no reply before a close; the next
+    session's greeting would have been judged as its first reply (a false rollback warning)."""
+    from types import SimpleNamespace
+
+    spoken = SimpleNamespace(metadata=None, conversation_id="conv_1")
+    handler = _session_handler(
+        monkeypatch,
+        events=(_FakeEvent("response.created", response=spoken), _FakeEvent("response.done", response=spoken)),
+    )
+    handler._turn_user_done_at = time.perf_counter()
+    handler._turn_response_created_at = None
+    await handler._run_realtime_session()
+    assert handler._first_reply_at is None
+
+
+@pytest.mark.asyncio
 async def test_a_session_logs_what_it_sent_the_voice_service(monkeypatch: Any, caplog: Any) -> None:
     """Images, their bytes and response.create calls per session (the brief's measure)."""
     sent: list[tuple[str, Any]] = []

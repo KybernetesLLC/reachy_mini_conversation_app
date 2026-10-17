@@ -701,13 +701,18 @@ class LocalStream:
         add_image = getattr(self.handler, "add_image", None)
         if add_image is None:
             return {"glanced": False, "reason": "the handler takes no images"}
+        # The capture takes about 1 s: a session closed and reopened meanwhile does not
+        # get this one's frame (the review, 2026-10-17).
+        session = getattr(self.handler, "connection", None)
         jpeg, luma, why_not = await asyncio.to_thread(camera_tool.fresh_jpeg, self._robot.media)
         if jpeg is None:
             return {"glanced": False, "reason": why_not or "no frame"}
         b64 = base64.b64encode(jpeg).decode("ascii")
         handler = self.handler
 
-        async def send() -> None:
+        async def send() -> bool:
+            if getattr(handler, "connection", None) is not session:
+                return False
             await add_image(b64)
             logger.info("Glance: a frame added to the session (luma %s)", luma)
             if at_open and callable(getattr(handler, "open_glance_in", None)):
@@ -717,9 +722,11 @@ class LocalStream:
                 # The inner monologue (2026-10-07): a note to itself of the same frame,
                 # written by the companion since 2026-10-17.
                 note_image(b64, "glance")
+            return True
 
         # The sends go on the handler's loop: this runs on the RPC server's.
-        await self._on_handler_loop(send())
+        if not await self._on_handler_loop(send()):
+            return {"glanced": False, "reason": "the session changed"}
         return {"glanced": True}
 
     async def close_session(self, timeout: float = 15.0) -> bool:
@@ -1552,11 +1559,20 @@ class LocalStream:
             self._reset_preroll()
 
     async def _glance_at_open(self) -> None:
+        """Glance at a wake's open, beside the pre-roll flush.
+
+        Without its frame the first reply is never judged, so a miss is a warning of
+        its own (the review, 2026-10-17).
+        """
         try:
             result = await self.glance(at_open=True)
-            logger.info("Glance at open: %s", result)
         except Exception:
-            logger.exception("Glance at open failed")
+            logger.exception("No glance at open: it failed")
+            return
+        if result.get("glanced"):
+            logger.info("Glance at open: %s", result)
+        else:
+            logger.warning("No glance at open: %s", result.get("reason"))
 
     async def _run_handler_startup_loop(self) -> None:
         """Start the realtime handler and keep settings UI alive after backend failures."""
