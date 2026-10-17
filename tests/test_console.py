@@ -2531,6 +2531,11 @@ class _GlanceHandler(_FakeSessionHandler):
     async def add_image(self, b64: str) -> None:
         self.events.append(f"image:{b64}")
 
+    glances_in = 0
+
+    def open_glance_in(self) -> None:
+        self.glances_in += 1
+
 
 def _fake_frames(monkeypatch: pytest.MonkeyPatch, result: tuple) -> None:
     from reachy_mini_conversation_app.tools import camera as camera_mod
@@ -2539,9 +2544,20 @@ def _fake_frames(monkeypatch: pytest.MonkeyPatch, result: tuple) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_glance_at_open_goes_in_before_the_preroll(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_the_preroll_goes_in_before_the_glance_at_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cold-open brief (2026-10-17): the person's words reach the server first.
+
+    The glance's frame (a camera grab of about 1 s on the robot) follows beside them.
+    """
+    from reachy_mini_conversation_app.tools import camera as camera_mod
+
     monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
-    _fake_frames(monkeypatch, (b"jpg", 91.0, None))
+
+    def slow_frame(media: Any) -> tuple:
+        time.sleep(0.05)
+        return (b"jpg", 91.0, None)
+
+    monkeypatch.setattr(camera_mod, "fresh_jpeg", slow_frame)
     events: list[str] = []
     handler = _GlanceHandler(events)
     handler.deps = SimpleNamespace(camera_enabled=True)
@@ -2554,8 +2570,10 @@ async def test_a_glance_at_open_goes_in_before_the_preroll(monkeypatch: pytest.M
     loop_task = asyncio.create_task(stream._run_handler_startup_loop())
     try:
         await stream.open_session(preroll=True, glance=True)
-        await _wait_until(lambda: "audio" in events)
-        assert events[0] == "image:" + base64.b64encode(b"jpg").decode()
+        image = "image:" + base64.b64encode(b"jpg").decode()
+        await _wait_until(lambda: image in events)
+        assert events[0] == "audio"
+        assert handler.glances_in == 1  # judged against the first reply
     finally:
         await _stop_fake_session_loop(stream, handler, loop_task)
 
@@ -2617,14 +2635,18 @@ def test_the_cue_loads_the_library_off_the_apps_loop(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
-async def test_a_glance_also_asks_for_a_sight_note(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The inner monologue (2026-10-07): the same frame, a note to itself."""
+async def test_a_glance_also_hands_its_frame_over_for_a_sight_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The inner monologue (2026-10-07): the same frame, a note to itself.
+
+    Written by the companion since 2026-10-17. Only the glance at open is judged
+    against the first reply.
+    """
     events: list[str] = []
     handler = _GlanceHandler(events)
     handler.deps = SimpleNamespace(camera_enabled=True)
 
-    async def note_image(b64: str) -> None:
-        events.append(f"note:{b64}")
+    def note_image(b64: str, source: str) -> None:
+        events.append(f"note:{source}:{b64}")
 
     handler.note_image = note_image
     handler.connection = object()
@@ -2633,9 +2655,27 @@ async def test_a_glance_also_asks_for_a_sight_note(monkeypatch: pytest.MonkeyPat
     _fake_frames(monkeypatch, (b"jpg", 91.0, None))
 
     assert (await stream.glance())["glanced"] is True
+    assert handler.glances_in == 0
+    assert (await stream.glance(at_open=True))["glanced"] is True
+    assert handler.glances_in == 1
 
     b64 = base64.b64encode(b"jpg").decode()
-    assert events == [f"image:{b64}", f"note:{b64}"]
+    assert events == [f"image:{b64}", f"note:glance:{b64}"] * 2
+
+
+def test_a_sight_frame_is_a_notification_and_needs_a_companion_attached() -> None:
+    """conversation.sight: never a call the app waits on; nobody attached, sent nowhere."""
+    sent: list[tuple[str, dict]] = []
+    rpc = SimpleNamespace(_clients=set(), broadcast_threadsafe=lambda m, p: sent.append((m, p)))
+    stream = LocalStream(_FakeSessionHandler(), SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))
+    stream._rpc = rpc
+    stream._dispatch_sight("abc", "glance")
+    assert sent == []
+    rpc._clients.add(object())
+    stream._dispatch_sight("abc", "camera")
+    [(method, params)] = sent
+    assert method == "conversation.sight"
+    assert (params["jpeg"], params["source"]) == ("abc", "camera") and isinstance(params["at"], float)
 
 
 # --- the crash of 2026-10-07: sends from an RPC handler go on the handler's loop ----
@@ -2667,7 +2707,7 @@ async def test_a_glance_sends_on_the_handlers_loop_from_another_loop(monkeypatch
         seen.append(asyncio.get_running_loop())
         events.append(f"image:{b64}")
 
-    async def note_image(b64: str) -> None:
+    def note_image(b64: str, source: str) -> None:
         seen.append(asyncio.get_running_loop())
         events.append(f"note:{b64}")
 

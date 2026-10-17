@@ -1387,78 +1387,51 @@ async def test_handler_reopens_a_session_after_closing_a_live_connection(monkeyp
     assert greetings == ["greeted"]
 
 
-# --- the inner monologue (2026-10-07): sight notes ---------------------------------
+# --- the inner monologue: sight notes, written by the companion since 2026-10-17 -----
 
 
-@pytest.mark.asyncio
-async def test_a_sight_note_is_out_of_band_text_only_and_tagged(monkeypatch: Any) -> None:
-    """A note is a response the backend never threads into the conversation."""
+def test_a_frame_is_handed_over_and_nothing_is_asked_of_the_voice_service(monkeypatch: Any) -> None:
+    """The cold-open brief: the supervisor writes the note with Claude Haiku."""
     handler = _plain_handler()
     handler.connection = AsyncMock()
     create = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create)
-
-    await handler.note_image("abc")
-    await handler._wait_notes()
-
-    (request,) = [c.kwargs["response"] for c in create.await_args_list]
-    assert request["conversation"] == "none" and request["output_modalities"] == ["text"]
-    assert request["metadata"] == {"companion": "sight-note"} and request["tool_choice"] == "none"
-    assert request["input"][0]["content"][0] == {
-        "type": "input_image",
-        "image_url": "data:image/jpeg;base64,abc",
-    }
-    assert "beginning 'I saw'" in request["instructions"]
+    handler.note_image("abc", "glance")  # nobody to hand it to: nothing, and no error
+    got: list[tuple[str, str]] = []
+    handler.on_sight = lambda b64, source: got.append((b64, source))
+    handler.note_image("abc", "glance")
+    assert got == [("abc", "glance")]
+    create.assert_not_awaited()
+    handler.connection.conversation.item.create.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_a_sight_note_needs_a_session() -> None:
-    """Without a session there is nothing to note into."""
+def test_a_failing_hand_over_is_logged_not_raised(caplog: Any) -> None:
+    """A broken hand-over never reaches the conversation."""
     handler = _plain_handler()
-    handler.connection = None
-    with pytest.raises(RuntimeError):
-        await handler.note_image("abc")
+
+    def broken(b64: str, source: str) -> None:
+        raise RuntimeError("no rpc")
+
+    handler.on_sight = broken
+    with caplog.at_level(logging.WARNING):
+        handler.note_image("abc", "camera")
+    assert "not handed over for its sight note" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_a_sight_notes_text_goes_to_the_observer_as_inner_and_moves_nothing(monkeypatch: Any) -> None:
-    """The note's text is an inner transcript; only speech moves the body."""
-    from types import SimpleNamespace
+async def test_a_camera_picture_is_handed_over_and_asks_only_for_the_reply(monkeypatch: Any) -> None:
+    """The camera tool's picture goes into the conversation and to the companion.
 
-    note = SimpleNamespace(metadata={"companion": "sight-note"}, conversation_id=None)
-    spoken = SimpleNamespace(metadata=None, conversation_id="conv_1")
-    handler = _session_handler(
-        monkeypatch,
-        events=(
-            _FakeEvent("response.created", response=note),
-            _FakeEvent("response.output_text.done", text="I saw a red mug on the table. "),
-            _FakeEvent("response.done", response=note),
-            _FakeEvent("response.created", response=spoken),
-            _FakeEvent("response.output_text.done", text="a spoken response's text is only logged"),
-            _FakeEvent("response.done", response=spoken),
-        ),
-    )
-    seen: list[tuple[str, str, bool]] = []
-    handler.set_transcript_observer(lambda role, text, final: seen.append((role, text, final)))
-
-    await handler._run_realtime_session()
-
-    assert seen == [("inner", "I saw a red mug on the table.", True)]
-    speaking = [c.args[0] for c in handler.deps.movement_manager.set_speaking.call_args_list]
-    assert speaking == [True, False]  # only the spoken response moved the body
-
-
-@pytest.mark.asyncio
-async def test_a_camera_picture_is_noted_after_the_spoken_answer(monkeypatch: Any) -> None:
-    """The camera tool's picture is noted too, queued behind the spoken answer."""
-    from reachy_mini_conversation_app.huggingface_realtime import sight_note_request
-
+    The only response.create is the spoken follow-up.
+    """
     handler = _plain_handler()
     handler.connection = AsyncMock()
     handler.output_queue = asyncio.Queue()
     monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
     create = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create)
+    got: list[tuple[str, str]] = []
+    handler.on_sight = lambda b64, source: got.append((b64, source))
     handler._in_flight_tool_calls = {"cam"}
 
     await handler._handle_tool_result(
@@ -1471,52 +1444,31 @@ async def test_a_camera_picture_is_noted_after_the_spoken_answer(monkeypatch: An
         )
     )
 
-    await handler._wait_notes()
     items = [c.kwargs["item"] for c in handler.connection.conversation.item.create.await_args_list]
     assert items[-1]["content"] == [{"type": "input_image", "image_url": "data:image/jpeg;base64,abc"}]
-    assert [c.kwargs for c in create.await_args_list] == [{}, {"response": sight_note_request("abc")}]
+    assert [c.kwargs for c in create.await_args_list] == [{}]
+    assert got == [("abc", "camera")]
+    assert handler._session_images == 1
 
 
 @pytest.mark.asyncio
-async def test_a_sight_note_waits_for_a_quiet_moment(monkeypatch: Any) -> None:
-    """Never between a person's last word and the reply: two quiet seconds, no response active."""
-    handler = _plain_handler()
-    handler.connection = AsyncMock()
-    create = AsyncMock()
-    monkeypatch.setattr(handler, "_safe_response_create", create)
-    monkeypatch.setattr(hf_mod, "_NOTE_POLL_SECONDS", 0.01)
-    handler._user_speaking = True
-    handler._last_speech_at = time.monotonic()
+async def test_a_text_response_is_never_an_inner_note(monkeypatch: Any) -> None:
+    """With notes off the voice service, the app writes no inner transcript at all."""
+    from types import SimpleNamespace
 
-    await handler.note_image("abc")
-    await asyncio.sleep(0.05)
-    assert create.await_count == 0  # someone is speaking
-    handler._user_speaking = False
-    await asyncio.sleep(0.05)
-    assert create.await_count == 0  # they stopped less than two seconds ago
-    handler._last_speech_at = time.monotonic() - 3.0
-    handler._response_done_event.clear()
-    await asyncio.sleep(0.05)
-    assert create.await_count == 0  # a response is active
-    handler._response_done_event.set()
-    await handler._wait_notes()
-    assert create.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_a_sight_note_held_too_long_is_dropped(monkeypatch: Any) -> None:
-    """A minute without a quiet moment: the frame is stale, the note is dropped."""
-    handler = _plain_handler()
-    handler.connection = AsyncMock()
-    create = AsyncMock()
-    monkeypatch.setattr(handler, "_safe_response_create", create)
-    monkeypatch.setattr(hf_mod, "_NOTE_POLL_SECONDS", 0.01)
-    monkeypatch.setattr(hf_mod, "NOTE_WAIT_MAX_SECONDS", 0.05)
-    handler._user_speaking = True
-
-    await handler.note_image("abc")
-    await handler._wait_notes()
-    assert create.await_count == 0 and not handler._note_tasks
+    tagged = SimpleNamespace(metadata={"companion": "sight-note"}, conversation_id=None)
+    handler = _session_handler(
+        monkeypatch,
+        events=(
+            _FakeEvent("response.created", response=tagged),
+            _FakeEvent("response.output_text.done", text="I saw a red mug on the table."),
+            _FakeEvent("response.done", response=tagged),
+        ),
+    )
+    seen: list[tuple[str, str, bool]] = []
+    handler.set_transcript_observer(lambda role, text, final: seen.append((role, text, final)))
+    await handler._run_realtime_session()
+    assert [s for s in seen if s[0] == "inner"] == []
 
 
 @pytest.mark.asyncio
@@ -1534,41 +1486,74 @@ async def test_speech_marks_the_moment_for_the_notes(monkeypatch: Any) -> None:
     assert handler._user_speaking is False and handler._last_speech_at >= before
 
 
-def test_a_sight_note_carries_the_standing_scene(monkeypatch: Any, tmp_path: Any) -> None:
-    """Carry the window's standing scene, which sits beside the memory block.
+# --- the cold-open brief (2026-10-17): the glance at open against the first reply ----
 
-    The companion, 2026-10-08: a note never describes it again, and a white roof is never snow.
-    """
-    from reachy_mini_conversation_app.huggingface_realtime import sight_note_request
 
-    memory = tmp_path / "session-memory.md"
-    monkeypatch.setenv("REACHY_COMPANION_SESSION_MEMORY", str(memory))
-    bare = sight_note_request("abc")["instructions"]
-    assert "NOTHING" in bare and "already known" not in bare
-    (tmp_path / "standing-scene.md").write_text("- a white flat roof below; it is white, not snow\n")
-    text = sight_note_request("abc")["instructions"]
-    assert "- a white flat roof below; it is white, not snow" in text
-    assert "snow only when snow is visibly falling" in text
+def test_a_glance_in_before_the_first_reply_logs_its_margin(caplog: Any) -> None:
+    """The ordinary path: the frame is in, the reply sees it."""
+    handler = _plain_handler()
+    with caplog.at_level(logging.INFO):
+        handler.open_glance_in()
+        handler._first_reply_created()
+    assert "Glance in 0.0 s before the first reply" in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_a_first_reply_before_the_glance_is_a_warning(caplog: Any) -> None:
+    """The pre-agreed rollback trigger: the reply may not have seen the frame."""
+    handler = _plain_handler()
+    with caplog.at_level(logging.INFO):
+        handler._first_reply_created()
+        handler.open_glance_in()
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning.getMessage().startswith("First reply created 0.0 s before the glance")
+    assert "Glance in" not in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_a_sight_note_of_nothing_is_not_passed_on(monkeypatch: Any) -> None:
-    """A NOTHING answer is not a note."""
+async def test_only_the_first_reply_to_a_person_is_judged_and_each_session_starts_fresh(
+    monkeypatch: Any,
+) -> None:
+    """Not the startup greeting, not a later turn; nothing carried over from a session before."""
     from types import SimpleNamespace
 
-    note = SimpleNamespace(metadata={"companion": "sight-note"}, conversation_id=None)
-    handler = _session_handler(
-        monkeypatch,
-        events=(
-            _FakeEvent("response.created", response=note),
-            _FakeEvent("response.output_text.done", text="NOTHING"),
-            _FakeEvent("response.done", response=note),
-        ),
+    spoken = SimpleNamespace(metadata=None, conversation_id="conv_1")
+    turn = (
+        _FakeEvent("conversation.item.input_audio_transcription.completed", transcript="hi", item_id="u1"),
+        _FakeEvent("response.created", response=spoken),
+        _FakeEvent("response.done", response=spoken),
     )
-    seen: list[tuple[str, str, bool]] = []
-    handler.set_transcript_observer(lambda role, text, final: seen.append((role, text, final)))
+    greeting = (_FakeEvent("response.created", response=spoken), _FakeEvent("response.done", response=spoken))
+    handler = _session_handler(monkeypatch, events=greeting + turn + turn)
+    calls: list[float | None] = []
+    real = handler._first_reply_created
+
+    def counted() -> None:
+        calls.append(handler._open_glance_at)
+        real()
+
+    monkeypatch.setattr(handler, "_first_reply_created", counted)
+    handler._open_glance_at = handler._first_reply_at = 1.0  # left over from a session before
     await handler._run_realtime_session()
-    assert seen == []
+    assert calls == [None]  # once, for the person's turn, not the greeting; the old glance cleared
+
+
+@pytest.mark.asyncio
+async def test_a_session_logs_what_it_sent_the_voice_service(monkeypatch: Any, caplog: Any) -> None:
+    """Images, their bytes and response.create calls per session (the brief's measure)."""
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    handler._session_images = 7  # from a session before: reset at the open
+
+    async def _traffic() -> None:
+        await handler.add_image("A" * 4096)
+        await handler._safe_response_create()
+        await asyncio.sleep(0.05)
+
+    handler.client = _ordering_client((_traffic,), sent, handler)
+    with caplog.at_level(logging.INFO):
+        await handler._run_realtime_session()
+    assert "Session to the voice service: 1 images, 3 KB, 1 response.create" in caplog.text
 
 
 # --- the companion note (task 11, person recognition): who has joined, who left view --
@@ -2367,7 +2352,7 @@ async def test_no_response_create_while_a_function_call_output_is_owed(
 
 @pytest.mark.asyncio
 async def test_an_out_of_band_create_is_not_held_for_an_owed_output(monkeypatch: Any) -> None:
-    """A filler or sight note is outside the conversation; the server never checks it."""
+    """A filler is outside the conversation; the server never checks it."""
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
     monkeypatch.setattr(
@@ -2375,7 +2360,9 @@ async def test_an_out_of_band_create_is_not_held_for_an_owed_output(monkeypatch:
     )
 
     async def _filler() -> None:
-        await handler._safe_response_create(response=hf_mod.sight_note_request("abc"))
+        await handler._safe_response_create(
+            response=hf_mod._out_of_band_request(hf_mod.FILLER_TAG, ["audio"], "Say: One moment.", [])
+        )
         await asyncio.sleep(0.05)
 
     handler.client = _ordering_client(

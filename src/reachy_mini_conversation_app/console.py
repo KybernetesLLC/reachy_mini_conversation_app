@@ -338,7 +338,7 @@ class LocalStream:
         # peak when the opener said when it was, else None (the connect).
         self._preroll_anchor: float | None = None
         # The companion's glance at a session's open: one fresh frame added at
-        # connect, before the pre-roll, so the first response sees the room.
+        # connect, beside the pre-roll flush, so the first response sees the room.
         self._glance_on_connect = False
         # Set whenever _session_wanted changes, so the retry sleep can wake on a
         # close the way it already wakes on a restart request. Separate from
@@ -386,6 +386,8 @@ class LocalStream:
         tool_call_setter = getattr(self.handler, "set_tool_call_observer", None)
         if callable(tool_call_setter):
             tool_call_setter(self._dispatch_tool_call)
+        if hasattr(self.handler, "on_sight"):
+            self.handler.on_sight = self._dispatch_sight
 
     def _dispatch_transcript(self, role: str, text: str, final: bool) -> None:
         """Push a conversation.transcript notification to JSON-RPC clients."""
@@ -394,6 +396,21 @@ class LocalStream:
                 "conversation.transcript",
                 {"role": role, "text": text, "final": final},
             )
+
+    def _dispatch_sight(self, b64_jpeg: str, source: str) -> None:
+        """Push a conversation.sight notification for the companion's sight note.
+
+        The frame was just added to the conversation; the companion writes the note
+        with Claude Haiku (the cold-open brief, 2026-10-17). A notification, never a call: nothing waits for the note. With nobody attached
+        the frame is not sent anywhere, and no note is written.
+        """
+        if self._rpc is None or not self._rpc._clients:
+            logger.info("Sight frame (%s) not handed over: no companion attached", source)
+            return
+        self._rpc.broadcast_threadsafe(
+            "conversation.sight",
+            {"jpeg": b64_jpeg, "source": source, "at": time.time()},
+        )
 
     def _dispatch_tool_call(self, payload: dict[str, object]) -> bool:
         """Push a conversation.tool notification (the tool-call-log brief, 2026-10-11).
@@ -665,12 +682,14 @@ class LocalStream:
             return await coro
         return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, loop))
 
-    async def glance(self) -> dict[str, object]:
+    async def glance(self, *, at_open: bool = False) -> dict[str, object]:
         """Add one fresh camera frame to the live session, with no response.
 
         The companion asks for it at a conversation's open and when its presence
         sees the scene change (the owner, 2026-10-06). Words come back only from
-        the model's own reply; the frame is never stored here.
+        the model's own reply; the frame is never stored here. ``at_open``: the
+        glance at a session's open, judged against the first reply (the cold-open
+        brief, 2026-10-17).
         """
         from reachy_mini_conversation_app.tools import camera as camera_tool
 
@@ -686,14 +705,18 @@ class LocalStream:
         if jpeg is None:
             return {"glanced": False, "reason": why_not or "no frame"}
         b64 = base64.b64encode(jpeg).decode("ascii")
-        note_image = getattr(self.handler, "note_image", None)
+        handler = self.handler
 
         async def send() -> None:
             await add_image(b64)
             logger.info("Glance: a frame added to the session (luma %s)", luma)
+            if at_open and callable(getattr(handler, "open_glance_in", None)):
+                handler.open_glance_in()
+            note_image = getattr(handler, "note_image", None)
             if callable(note_image):
-                # The inner monologue (2026-10-07): a note to itself of the same frame.
-                await note_image(b64)
+                # The inner monologue (2026-10-07): a note to itself of the same frame,
+                # written by the companion since 2026-10-17.
+                note_image(b64, "glance")
 
         # The sends go on the handler's loop: this runs on the RPC server's.
         await self._on_handler_loop(send())
@@ -1499,12 +1522,14 @@ class LocalStream:
                 await asyncio.sleep(_PREROLL_POLL_INTERVAL_S)
 
             if self._glance_on_connect:
+                # The cold-open brief (2026-10-17): the glance runs beside the pre-roll
+                # flush, not ahead of it, so the person's words reach the server about
+                # 1.1 s sooner. Its frame lands long before the first reply can be
+                # created; the handler logs the margin either way.
                 self._glance_on_connect = False
-                try:
-                    result = await self.glance()
-                    logger.info("Glance at open: %s", result)
-                except Exception:
-                    logger.exception("Glance at open failed")
+                glance = asyncio.ensure_future(self._glance_at_open())
+                self._background.add(glance)
+                glance.add_done_callback(self._background.discard)
 
             if not self._preroll_flush_pending:
                 return
@@ -1525,6 +1550,13 @@ class LocalStream:
                     break
         finally:
             self._reset_preroll()
+
+    async def _glance_at_open(self) -> None:
+        try:
+            result = await self.glance(at_open=True)
+            logger.info("Glance at open: %s", result)
+        except Exception:
+            logger.exception("Glance at open failed")
 
     async def _run_handler_startup_loop(self) -> None:
         """Start the realtime handler and keep settings UI alive after backend failures."""

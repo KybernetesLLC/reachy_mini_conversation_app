@@ -124,12 +124,10 @@ def _build_openai_compatible_client_from_realtime_url(
     return client, parsed.connect_query
 
 
-# The inner monologue (the companion, 2026-10-07): a sight note is an out-of-band,
-# text-only response the backend never threads into the conversation (verified on
-# the hosted backend: conversation_id null, no audio, the chat untouched). It is
-# tagged so the receiver knows it from speech, and its text goes to the transcript
-# observer as "inner", never to the speaker. The frame is one already taken.
-SIGHT_NOTE_TAG = {"companion": "sight-note"}
+# The inner monologue: since 2026-10-17 the supervisor writes sight notes with Claude
+# Haiku. The app hands it each frame it adds (`on_sight`) and asks the voice service for
+# nothing more: before, every glance cost a second upload and a vision pass there,
+# serialised against the household's turn (the cold-open brief).
 
 # Reliable search (the companion, 2026-10-09). At 09:50:26 "Let me check." was spoken
 # as a response of its own and no call followed, twice. The app now speaks the filler
@@ -149,41 +147,6 @@ MISSED_CALL_NOTE = (
     "You said you would look that up but called no tool. Call the tool you meant now "
     "(web_search for facts from the web) with the person's question."
 )
-SIGHT_NOTE_INSTRUCTIONS = (
-    "You are Reachy, a small companion robot. This is a private note to yourself, not speech. "
-    "In one or two short sentences, first person, past tense, beginning 'I saw', say what is "
-    "notable in the picture: people (never named), what they hold or do, objects, a vessel or a "
-    "plane, the weather. Never describe the standing scene below, and never write that something "
-    "is the same as before or still there; mention a part of it only if it changed. If nothing "
-    "beyond the standing scene is worth noting, answer exactly NOTHING. Say snow only when snow "
-    "is visibly falling, or covers several surfaces including the sill or the towers' ledges. "
-    "No preamble."
-)
-# The window's standing scene (the companion, 2026-10-08): the supervisor writes it
-# from household.json beside the memory block, so its directory comes from the same
-# environment variable and needs no new one.
-STANDING_SCENE_FILE = "standing-scene.md"
-
-
-def sight_note_instructions() -> str:
-    """Return the note's instructions, with the standing scene when the supervisor wrote one."""
-    import os
-    from pathlib import Path
-
-    from reachy_mini_conversation_app.prompts import COMPANION_MEMORY_ENV
-
-    memory = os.environ.get(COMPANION_MEMORY_ENV)
-    if not memory:
-        return SIGHT_NOTE_INSTRUCTIONS
-    try:
-        scene = (Path(memory).parent / STANDING_SCENE_FILE).read_text(encoding="utf-8").strip()
-    except OSError:
-        return SIGHT_NOTE_INSTRUCTIONS
-    if not scene:
-        return SIGHT_NOTE_INSTRUCTIONS
-    return f"{SIGHT_NOTE_INSTRUCTIONS}\n\nThe standing scene, already known:\n{scene}"
-
-
 # A glance's frame is context, not a question (the companion, 2026-10-08): after a
 # song, with nothing left to say, the model described the frame taken as the
 # conversation opened.
@@ -197,17 +160,14 @@ GLANCE_CONTEXT_NOTE = (
 REALTIME_MAX_MESSAGE_BYTES = 16 * 2**20
 
 
-# A note waits for a quiet moment: nobody speaking for NOTE_QUIET_SECONDS and no
-# response active, so it never sits between a person's last word and the reply
-# (the backend takes one response at a time). Held longer than NOTE_WAIT_MAX_SECONDS,
-# it is dropped: the frame is stale by then, and the reply's latency matters more.
+# A companion note waits for a quiet moment: nobody speaking for NOTE_QUIET_SECONDS and
+# no response active, so it never sits between a person's last word and the reply (the
+# backend takes one response at a time).
 NOTE_QUIET_SECONDS = 2.0
-NOTE_WAIT_MAX_SECONDS = 60.0
 _NOTE_POLL_SECONDS = 0.25
 
 # A companion note (person recognition, task 11: who has joined, who is no longer
-# in view) is dropped after this long without a quiet moment, not NOTE_WAIT_MAX_SECONDS's
-# 60 s.
+# in view) is dropped after this long without a quiet moment.
 COMPANION_NOTE_WAIT_S = 30.0
 
 NOTE_TEXT = "[Companion note, not spoken: {text}]"
@@ -216,7 +176,7 @@ NOTE_TEXT = "[Companion note, not spoken: {text}]"
 def _out_of_band_request(
     tag: dict[str, str], modalities: list[str], instructions: str, content: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Build a tagged response.create body outside the conversation (a sight note, a filler)."""
+    """Build a tagged response.create body outside the conversation (a filler)."""
     return {
         "conversation": "none",
         "output_modalities": modalities,
@@ -227,28 +187,10 @@ def _out_of_band_request(
     }
 
 
-def sight_note_request(b64_jpeg: str) -> dict[str, Any]:
-    """Build the response.create body for a sight note of `b64_jpeg`."""
-    return _out_of_band_request(
-        SIGHT_NOTE_TAG,
-        ["text"],
-        sight_note_instructions(),
-        [
-            {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64_jpeg}"},
-            {"type": "input_text", "text": "What do you see?"},
-        ],
-    )
-
-
 def _companion_tag(event: Any) -> str | None:
     """Return the companion tag of a response.created/done event's response, if any."""
     metadata = getattr(getattr(event, "response", None), "metadata", None)
     return metadata.get("companion") if isinstance(metadata, dict) else None
-
-
-def _is_sight_note(event: Any) -> bool:
-    """Whether a response.created/done event is a sight note's (its metadata tag)."""
-    return _companion_tag(event) == SIGHT_NOTE_TAG["companion"]
 
 
 # The audio cut (2026-10-16): a reply whose transcript is only stage directions
@@ -589,7 +531,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_answer_pending = False
         self._filler_tasks: set[asyncio.Task[None]] = set()
         self._tool_batch_needs_response = False
-        self._sight_note_in_flight = False
+        # Each frame added to the conversation, handed to the companion for its sight
+        # note (Claude Haiku, 2026-10-17): (base64 JPEG, source). Set by the console.
+        self.on_sight: Callable[[str, str], None] | None = None
+        # The cold-open brief (2026-10-17), per session: what went to the voice service,
+        # and the glance at open against the first reply to a person's turn (monotonic).
+        self._session_images = 0
+        self._session_image_bytes = 0
+        self._session_creates = 0
+        self._open_glance_at: float | None = None
+        self._first_reply_at: float | None = None
         self._user_speaking = False
         self._last_speech_at = 0.0  # monotonic; the session's open counts as speech
         self._note_tasks: set[asyncio.Task[None]] = set()
@@ -881,7 +832,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _wait_for_owed_outputs(self, kwargs: dict[str, Any]) -> bool:
         """Hold an in-band response.create until every function call has its output; True if held.
 
-        Out-of-band creates (fillers, sight notes) are not checked by the server and go at once.
+        Out-of-band creates (fillers) are not checked by the server and go at once.
         """
         if self._no_outputs_owed.is_set() or kwargs.get("response", {}).get("conversation") == "none":
             return False
@@ -1025,7 +976,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         The missed-call guard. True when it nudged.
         """
         if _companion_tag(event) == FILLER_TAG["companion"]:
-            return False  # the app's own line (a sight note never reaches here)
+            return False  # the app's own line
         text = self._resp_text.strip()
         if self._resp_called or self._turn_guarded or not LOOKUP_PROMISE.search(text):
             return False
@@ -1209,6 +1160,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """
         if not self.connection:
             raise RuntimeError("add_image: no active session")
+        self._count_image(b64_jpeg)
         await self.connection.conversation.item.create(
             item={
                 "type": "message",
@@ -1220,36 +1172,39 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             },
         )
 
-    async def note_image(self, b64_jpeg: str) -> None:
-        """Ask for a sight note of a frame already in the session, at the next quiet moment.
+    def note_image(self, b64_jpeg: str, source: str) -> None:
+        """Hand a frame just added to the conversation to the companion, for its sight note.
 
-        The frame is the companion's glance or the camera tool's picture. The note is
-        queued through the serial sender, so it waits behind, and never interrupts, a
-        spoken response.
+        `source`: "glance" or "camera". The supervisor writes the note with Claude Haiku,
+        off the voice service (the cold-open brief, 2026-10-17); nothing here waits on it.
         """
-        if not self.connection:
-            raise RuntimeError("note_image: no active session")
-        task = asyncio.create_task(self._note_when_quiet(b64_jpeg), name="sight-note")
-        self._note_tasks.add(task)
-        task.add_done_callback(self._note_tasks.discard)
-
-    async def _note_when_quiet(self, b64_jpeg: str) -> None:
-        started = time.monotonic()
-        while True:
-            now = time.monotonic()
-            quiet = not self._user_speaking and now - self._last_speech_at >= NOTE_QUIET_SECONDS
-            if quiet and self._response_done_event.is_set():
-                break
-            if now - started >= NOTE_WAIT_MAX_SECONDS:
-                logger.info("Sight note dropped: no quiet moment in %.0f s", NOTE_WAIT_MAX_SECONDS)
-                return
-            await asyncio.sleep(_NOTE_POLL_SECONDS)
-        if not self.connection:
+        sink = self.on_sight
+        if sink is None:
             return
-        await self._safe_response_create(response=sight_note_request(b64_jpeg))
+        try:
+            sink(b64_jpeg, source)
+        except Exception:
+            logger.warning("A frame was not handed over for its sight note", exc_info=True)
+
+    def _count_image(self, b64_jpeg: str) -> None:
+        self._session_images += 1
+        self._session_image_bytes += (len(b64_jpeg) * 3) // 4
+
+    def open_glance_in(self) -> None:
+        """Mark the glance at a session's open as in, and judge it against the first reply."""
+        now = time.monotonic()
+        self._open_glance_at = now
+        if self._first_reply_at is not None:
+            logger.warning("First reply created %.1f s before the glance", now - self._first_reply_at)
+
+    def _first_reply_created(self) -> None:
+        now = time.monotonic()
+        self._first_reply_at = now
+        if self._open_glance_at is not None:
+            logger.info("Glance in %.1f s before the first reply", now - self._open_glance_at)
 
     async def _wait_notes(self) -> None:
-        """Wait for the pending sight notes to be queued or dropped (the tests)."""
+        """Wait for the pending companion notes to be queued or dropped (the tests)."""
         if self._note_tasks:
             await asyncio.gather(*list(self._note_tasks), return_exceptions=True)
 
@@ -1401,6 +1356,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._response_started_or_rejected_event.clear()
                 try:
                     await self.connection.response.create(**kwargs)
+                    self._session_creates += 1
                 except Exception as e:
                     logger.debug("_response_sender_loop: send failed: %s", e)
                     self._response_done_event.set()
@@ -1537,6 +1493,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 image_height = tool_result.get("image_height")
                 jpeg_bytes_value = tool_result.get("jpeg_bytes")
                 jpeg_bytes = jpeg_bytes_value if isinstance(jpeg_bytes_value, int) else (len(b64_im) * 3) // 4
+                self._count_image(b64_im)
                 await self.connection.conversation.item.create(
                     item={
                         "type": "message",
@@ -1576,8 +1533,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._followup_pending = True
                 await self._safe_response_create()
             if sight_note is not None:
-                # Queued after the spoken answer, so it never delays it.
-                await self.note_image(sight_note)
+                self.note_image(sight_note, "camera")
 
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
@@ -1630,6 +1586,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # The open counts as speech: the first note waits for a quiet moment.
             self._user_speaking = False
             self._last_speech_at = time.monotonic()
+            self._session_images = self._session_image_bytes = self._session_creates = 0
+            self._open_glance_at = self._first_reply_at = None
             try:
                 self._connected_event.set()
             except Exception:
@@ -1674,53 +1632,38 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("response text delta")
 
                     if event.type == "response.output_text.done":
-                        if self._sight_note_in_flight:
-                            # The note's text: to the observer as "inner", never spoken.
-                            note_text = (getattr(event, "text", "") or "").strip()
-                            if note_text and not note_text.upper().startswith("NOTHING"):
-                                self._emit_transcript("inner", note_text)
-                            logger.info("Sight note: %s", note_text)
-                        else:
-                            logger.debug("response text done: %s", event.text)
+                        logger.debug("response text done: %s", event.text)
 
                     if event.type == "response.created":
                         self._response_done_event.clear()
                         self._response_started_or_rejected_event.set()
-                        if _is_sight_note(event):
-                            # A note moves nothing and is not conversation activity.
-                            self._sight_note_in_flight = True
-                            logger.debug("Sight note started")
-                        else:
-                            if self._followup_pending and _companion_tag(event) is None:
-                                self._followup_pending, self._followup_live = False, True
-                            self._response_started()
-                            self._gate_start()
-                            self._mark_activity("response_created")
-                            self.deps.movement_manager.set_speaking(True)
-                            if self._turn_user_done_at is not None and self._turn_response_created_at is None:
-                                self._turn_response_created_at = time.perf_counter()
-                                delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
-                                logger.info("Turn latency: response.created %.0f ms after user transcript", delta_ms)
-                            logger.debug("Response created (active)")
+                        if self._followup_pending and _companion_tag(event) is None:
+                            self._followup_pending, self._followup_live = False, True
+                        self._response_started()
+                        self._gate_start()
+                        self._mark_activity("response_created")
+                        self.deps.movement_manager.set_speaking(True)
+                        if self._turn_user_done_at is not None and self._turn_response_created_at is None:
+                            self._turn_response_created_at = time.perf_counter()
+                            delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
+                            logger.info("Turn latency: response.created %.0f ms after user transcript", delta_ms)
+                            if self._first_reply_at is None:
+                                self._first_reply_created()
+                        logger.debug("Response created (active)")
 
                     if event.type == "response.done":
                         # Doesn't mean the audio is done playing
                         # Resume tracking for responses that emit no audio (text-only / tool-only).
-                        sight_note = self._sight_note_in_flight
-                        if sight_note:
-                            self._sight_note_in_flight = False
-                        else:
-                            self.deps.movement_manager.set_speaking(False)
+                        self.deps.movement_manager.set_speaking(False)
                         self._response_done_event.set()
                         self._response_started_or_rejected_event.set()
-                        if not sight_note and _companion_tag(event) is None:
+                        if _companion_tag(event) is None:
                             self._followup_live = False
                         logger.debug("Response done")
-                        if not sight_note:
-                            self._gate_transcript(self._gate_text)
-                            if self._gate == "hold":  # no transcript at all: a reply, not an artifact
-                                self._gate_release("pass")
-                            await self._response_finished(event)
+                        self._gate_transcript(self._gate_text)
+                        if self._gate == "hold":  # no transcript at all: a reply, not an artifact
+                            self._gate_release("pass")
+                        await self._response_finished(event)
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
                         self._mark_activity("user_transcription_delta")
@@ -1886,6 +1829,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
             finally:
+                logger.info(
+                    "Session to the voice service: %d images, %d KB, %d response.create",
+                    self._session_images,
+                    self._session_image_bytes // 1024,
+                    self._session_creates,
+                )
                 # Audio still held belongs to a response this session will not finish.
                 self._gate_drop_held()
                 self._gate = "pass"
