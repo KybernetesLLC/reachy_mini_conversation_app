@@ -371,6 +371,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # leaked calls of leak_safe tools still running.
         self._gate_tools = ToolNames()
         self._gate_cut_kind: str | None = None
+        # Whether this response's transcript.done came, and whether it had any audio: the
+        # response.done fallback is logged when a reply had none (the owner, 2026-10-17).
+        self._gate_transcript_done = False
+        self._gate_had_audio = False
         self._leak_tasks: set[asyncio.Task[None]] = set()
 
     @staticmethod
@@ -706,6 +710,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._gate = "hold"
         self._gate_text = ""
         self._gate_cut_kind = None
+        self._gate_transcript_done = False
+        self._gate_had_audio = False
         self._gate_held = []
         self._gate_released = False
 
@@ -807,6 +813,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._report_tool_call(self._leak_report(name, status, (time.monotonic() - started) * 1000, error))
 
     def _gate_audio(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
+        self._gate_had_audio = True
         if self._gate == "cut":
             return
         if self._gate == "hold":
@@ -1541,6 +1548,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if _companion_tag(event) is None:
                             self._followup_live = False
                         logger.debug("Response done")
+                        if not self._gate_transcript_done and (self._gate_text or self._gate_had_audio):
+                            # Parsed by counting: keep the wording. Measuring only; the
+                            # fallback below is unchanged.
+                            logger.warning(
+                                "output gate: reply judged at response.done with no transcript.done "
+                                "(%d chars, audio=%s, gate=%s)",
+                                len(self._gate_text),
+                                self._gate_had_audio,
+                                self._gate,
+                            )
                         self._gate_transcript(self._gate_text)
                         if self._gate == "hold":  # no transcript at all: a reply, not an artifact
                             self._gate_release("pass")
@@ -1596,6 +1613,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     if event.type == "response.output_audio_transcript.done":
                         self._mark_activity("assistant_transcript_done")
+                        self._gate_transcript_done = True
                         self._gate_transcript(event.transcript or "", final=True)
                         logger.debug(f"Assistant transcript: {event.transcript}")
                         await self.output_queue.put(

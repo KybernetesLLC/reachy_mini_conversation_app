@@ -2228,6 +2228,37 @@ async def test_a_spoken_name_split_across_deltas_waits_for_the_whole_reply(monke
 
 
 @pytest.mark.asyncio
+async def test_a_reply_with_no_transcript_done_is_logged_and_still_falls_back(monkeypatch: Any, caplog: Any) -> None:
+    """Measuring (c): the response.done fallback logs once, and plays as it always did."""
+    handler, _tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("Hello there."),
+            _audio(1, 2),
+            _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    assert [list(array.reshape(-1)) for _rate, array in _frames(handler)] == [[1, 2]]
+    fallbacks = [m for m in caplog.messages if m.startswith("output gate: reply judged at response.done")]
+    assert fallbacks == ["output gate: reply judged at response.done with no transcript.done (12 chars, audio=True, gate=pass)"]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_with_its_transcript_done_logs_no_fallback(monkeypatch: Any, caplog: Any) -> None:
+    handler, _tools = _leak_session(monkeypatch, _reply_events("Hello there.", audio_first=True))
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    assert not [m for m in caplog.messages if m.startswith("output gate:")]
+
+
+@pytest.mark.asyncio
 async def test_a_sentence_that_starts_like_a_name_plays_whole(monkeypatch: Any) -> None:
     handler, _tools = _leak_session(
         monkeypatch,
