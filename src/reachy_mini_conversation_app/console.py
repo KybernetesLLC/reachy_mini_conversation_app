@@ -333,6 +333,9 @@ class LocalStream:
         # The unheard-reply trigger: replies pushed, judged against the speaker's monitor.
         self._replies = playback_health.ReplyTracker()
         self._speaker_monitor = playback_health.SpeakerMonitor(self._replies.monitored)
+        # The idle refresh: when the speaker stream last started (here, or capture on).
+        self._speaker_started_at: float | None = self._now()
+        self._refresh_idle_s = playback_health.refresh_idle_s_from_env()
         self._preroll_clock = preroll_clock
         # Where the pre-roll counts back from, on _preroll_clock: the wake word's
         # peak when the opener said when it was, else None (the connect).
@@ -660,8 +663,28 @@ class LocalStream:
                 # and everything after it, wherever the connect lands.
                 self._preroll_anchor = self._preroll_clock() - anchor_ago
         logger.info("Realtime session open requested.")
+        self._refresh_speaker_if_idle()
         self._session_wanted.set()
         self._session_gate_changed.set()
+
+    def _refresh_speaker_if_idle(self) -> None:
+        """Rebuild the speaker stream, off the event loop, if nothing has played on it for long.
+
+        Through GOVERNOR, so it shares the unheard-reply trigger's cooldown. Not awaited:
+        the rebuild (about 40 ms, at most its 2 s block wait) runs while the session
+        connects, and a reply pushed meanwhile only completes the block early.
+        """
+        verdict = playback_health.refresh_decision(
+            self._now(),
+            (self._replies.last_pushed_at, playback_health.GOVERNOR.last_rebuild_at, self._speaker_started_at),
+            self._refresh_idle_s,
+        )
+        if verdict.action != "refresh":
+            return
+        audio = getattr(getattr(self._robot, "media", None), "audio", None)
+        if audio is None:
+            return
+        self._run_off_loop(playback_health.refresh_after_idle, audio, verdict.cause)
 
     async def _on_handler_loop(self, coro: Any) -> Any:
         """Run `coro` on the handler's own loop, from any loop.
@@ -1261,6 +1284,7 @@ class LocalStream:
                     if wanted:
                         media.start_recording()
                         media.start_playing()
+                        self._speaker_started_at = self._now()  # a new stream: no idle refresh due
                     else:
                         media.stop_recording()
                         media.stop_playing()

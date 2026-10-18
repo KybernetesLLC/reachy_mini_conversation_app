@@ -3676,3 +3676,116 @@ def test_a_drop_probe_that_removed_itself_is_not_removed_again(monkeypatch: pyte
     del pad.active[probe_id]  # GStreamer removes it on REMOVE
     _drop_until(pad, 30)  # must not try to remove the gone probe
     assert len(pad.active) == 1
+
+
+# The idle refresh at session open (2026-10-18).
+
+
+def _refresh_stream(monkeypatch: pytest.MonkeyPatch, started_at: float, now: float) -> tuple[LocalStream, list[Any]]:
+    """Return a closed-gate stream whose speaker started at ``started_at``, read at ``now``."""
+    from reachy_mini_conversation_app import playback_health
+
+    stream = _gate_stream()
+    stream._session_wanted.clear()
+    stream._robot.media.audio = SimpleNamespace(_pipeline="pipeline")
+    stream._now = lambda: now
+    stream._speaker_started_at = started_at
+    stream._refresh_idle_s = 600.0
+    monkeypatch.setattr(playback_health.GOVERNOR, "last_rebuild_at", None)
+    refreshed: list[Any] = []
+    return stream, refreshed
+
+
+@pytest.mark.asyncio
+async def test_an_open_after_long_idle_refreshes_the_speaker_off_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """75 minutes with nothing pushed: the open rebuilds the stream in a worker thread."""
+    from reachy_mini_conversation_app import playback_health
+
+    stream, refreshed = _refresh_stream(monkeypatch, started_at=0.0, now=4500.0)
+    monkeypatch.setattr(
+        playback_health,
+        "refresh_after_idle",
+        lambda audio, cause: refreshed.append((audio, cause, threading.current_thread() is threading.main_thread())),
+    )
+    await stream.open_session()
+    await asyncio.gather(*stream._background)
+    assert refreshed == [(stream._robot.media.audio, "75 min idle", False)]
+    assert stream._session_wanted.is_set()
+
+
+@pytest.mark.asyncio
+async def test_pair_idle_refresh_and_the_cold_open_never_waits_for_the_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refresh x the cold open: the open returns, and the connect is asked for, while the rebuild still runs."""
+    from reachy_mini_conversation_app import playback_health
+
+    stream, _ = _refresh_stream(monkeypatch, started_at=0.0, now=4500.0)
+    release = threading.Event()
+    monkeypatch.setattr(playback_health, "refresh_after_idle", lambda audio, cause: release.wait(5.0))
+    await asyncio.wait_for(stream.open_session(preroll=True, glance=True), timeout=1.0)
+    assert stream._session_wanted.is_set()
+    assert stream._background  # the rebuild, still running
+    release.set()
+    await asyncio.gather(*stream._background)
+
+
+@pytest.mark.asyncio
+async def test_an_open_after_a_recent_reply_does_not_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reply pushed 500 s ago: the stream is in use, and the open leaves it."""
+    from reachy_mini_conversation_app import playback_health
+
+    stream, refreshed = _refresh_stream(monkeypatch, started_at=0.0, now=4500.0)
+    stream._replies.pushed(4000.0, 1.0, 1.0)
+    monkeypatch.setattr(playback_health, "refresh_after_idle", lambda audio, cause: refreshed.append(cause))
+    await stream.open_session()
+    await asyncio.gather(*stream._background)
+    assert refreshed == []
+
+
+@pytest.mark.asyncio
+async def test_pair_idle_refresh_and_a_usb_recovery_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refresh x a USB recovery restart: the restarted app's first open does not rebuild.
+
+    The restarted app's stream is new, so its first open leaves it; so does an open just
+    after capture was raised again, which starts a new stream too.
+    """
+    from reachy_mini_conversation_app import playback_health
+
+    refreshed: list[str] = []
+    monkeypatch.setattr(playback_health, "refresh_after_idle", lambda audio, cause: refreshed.append(cause))
+    monkeypatch.setattr(playback_health.GOVERNOR, "last_rebuild_at", None)
+    restarted = _gate_stream()  # a fresh app: its stream started now
+    restarted._session_wanted.clear()
+    restarted._robot.media.audio = SimpleNamespace(_pipeline="pipeline")
+    await restarted.open_session()
+
+    app = FastAPI()
+    robot = _audio_robot(start_recording=MagicMock(), start_playing=MagicMock())
+    robot.media.audio = SimpleNamespace(_pipeline="pipeline")
+    handler = MagicMock()
+    handler.last_activity_time = time.monotonic()
+    stream = LocalStream(handler, robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    stream._session_wanted.clear()
+    stream._refresh_idle_s = 600.0
+    stream._speaker_started_at = 0.0
+    stream._now = lambda: 4500.0
+    stream._capture_on = False
+    _rpc_call(app, "conversation.capture", {"on": True})
+    assert stream._speaker_started_at == 4500.0
+    await stream.open_session()
+    await asyncio.gather(*restarted._background, *stream._background)
+    assert refreshed == []
+
+
+@pytest.mark.asyncio
+async def test_an_open_on_an_open_session_does_not_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only an open that opens the gate refreshes."""
+    from reachy_mini_conversation_app import playback_health
+
+    stream, refreshed = _refresh_stream(monkeypatch, started_at=0.0, now=4500.0)
+    stream._session_wanted.set()
+    monkeypatch.setattr(playback_health, "refresh_after_idle", lambda audio, cause: refreshed.append(cause))
+    await stream.open_session()
+    assert refreshed == []

@@ -25,6 +25,7 @@ the watchdog logs the last measured lag and its age.
 """
 
 from __future__ import annotations
+import os
 import math
 import time
 import logging
@@ -256,6 +257,51 @@ class RebuildGovernor:
 
 GOVERNOR = RebuildGovernor()
 
+# The idle refresh (2026-10-18, 18:40): after 75 minutes with nothing played, the
+# first four replies of a wake were pushed but not heard, until the unheard-reply
+# trigger rebuilt the stream 33 s in. So a session that opens after this long with
+# nothing pushed rebuilds the speaker stream first, through GOVERNOR. 0 turns it off.
+REFRESH_IDLE_ENV = "REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S"
+REFRESH_IDLE_S = 600.0
+
+
+def refresh_idle_s_from_env(environ: Any = os.environ) -> float:
+    """Return the idle refresh threshold in seconds from the environment; 0 means off."""
+    raw = str(environ.get(REFRESH_IDLE_ENV, "")).strip()
+    if not raw:
+        return REFRESH_IDLE_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not math.isfinite(value) or value < 0:
+        logger.warning("%s=%r is not a number of seconds >= 0; using %.0f", REFRESH_IDLE_ENV, raw, REFRESH_IDLE_S)
+        return REFRESH_IDLE_S
+    return value
+
+
+def refresh_decision(now: float, fresh_at: Sequence[float | None], idle_s: float = REFRESH_IDLE_S) -> Verdict:
+    """Decide whether a session opening at ``now`` rebuilds the speaker stream first. Pure.
+
+    ``fresh_at``: when the stream last carried a reply, was rebuilt, or was started;
+    None for what has not happened.
+    """
+    known = [t for t in fresh_at if t is not None]
+    if idle_s <= 0 or not known:
+        return Verdict("ok", "the idle refresh is off" if idle_s <= 0 else "nothing known about the stream")
+    idle = now - max(known)
+    if idle > idle_s:
+        return Verdict("refresh", f"{idle / 60:.0f} min idle")
+    return Verdict("ok", f"{idle:.0f} s idle, under {idle_s:.0f} s")
+
+
+def refresh_after_idle(audio: Any, cause: str, governor: RebuildGovernor | None = None) -> bool:
+    """Rebuild the speaker stream for the idle refresh, and log whether it was refreshed."""
+    ok = (governor or GOVERNOR).rebuild(audio, "idle refresh", cause)
+    if ok:
+        logger.info("Speaker stream refreshed after %s", cause)
+    return ok
+
 
 def lag_report(last: tuple[float, float] | None, now: float) -> str:
     """Say what the minute line reports: the last measured lag and its age, or that none was. Pure."""
@@ -468,10 +514,12 @@ class ReplyTracker:
         self._last_lag: tuple[float, float] | None = None  # (lag, measured at)
         self.unheard_in_a_row = 0
         self.armed = False
+        self.last_pushed_at: float | None = None
 
     def pushed(self, now: float, seconds: float, speech_s: float) -> None:
         """Note audio pushed to the speaker at ``now``."""
         with self._lock:
+            self.last_pushed_at = now
             current = self._replies[-1] if self._replies else None
             if current is None or current["flushed"] or now - current["last"] > REPLY_GAP_S:
                 current = {

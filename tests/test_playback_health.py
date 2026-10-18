@@ -1433,3 +1433,97 @@ def test_play_motif_returns_the_new_playbin() -> None:
     audio = SimpleNamespace(_playbin=None)
     media = SimpleNamespace(play_sound=lambda path: setattr(audio, "_playbin", f"playbin for {path}"))
     assert ph.play_motif(media, audio, "ring.wav") == "playbin for ring.wav"
+
+
+# The idle refresh (2026-10-18): a session opening after REFRESH_IDLE_S with nothing
+# pushed rebuilds the speaker stream first.
+
+
+@pytest.mark.parametrize(
+    ("fresh_at", "idle_s", "action"),
+    [
+        ((None, None, 0.0), 600.0, "refresh"),  # 1000 s since the stream started, nothing since
+        ((500.0, None, 0.0), 600.0, "ok"),  # a reply pushed 500 s ago
+        ((None, 450.0, 0.0), 600.0, "ok"),  # a rebuild 550 s ago
+        ((399.0, None, 0.0), 600.0, "refresh"),  # 601 s since the last push
+        ((None, None, None), 600.0, "ok"),  # nothing known
+        ((None, None, 0.0), 0.0, "ok"),  # off
+    ],
+)
+def test_the_idle_refresh_counts_from_the_latest_of_push_rebuild_and_start(
+    fresh_at: tuple[float | None, ...], idle_s: float, action: str
+) -> None:
+    """Idle counts from the latest push, rebuild or start; past the threshold, a refresh."""
+    assert ph.refresh_decision(1000.0, fresh_at, idle_s).action == action
+
+
+def test_the_idle_refresh_cause_is_in_minutes() -> None:
+    """The cause reads as the log line's "N min idle"."""
+    assert ph.refresh_decision(4500.0, (0.0,), 600.0).cause == "75 min idle"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 600.0), ("", 600.0), ("900", 900.0), ("0", 0.0), ("-5", 600.0), ("soon", 600.0), ("nan", 600.0)],
+)
+def test_the_idle_refresh_threshold_comes_from_the_environment(raw: str | None, expected: float) -> None:
+    """REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S, 0 for off; anything invalid keeps the default."""
+    environ = {} if raw is None else {ph.REFRESH_IDLE_ENV: raw}
+    assert ph.refresh_idle_s_from_env(environ) == expected
+
+
+def test_the_reply_tracker_keeps_the_last_push_time() -> None:
+    """The open reads when a reply was last pushed."""
+    tracker = ph.ReplyTracker(rebuilt_at=lambda: None)
+    assert tracker.last_pushed_at is None
+    tracker.pushed(10.0, 0.1, 0.1)
+    tracker.pushed(12.5, 0.1, 0.1)
+    assert tracker.last_pushed_at == 12.5
+
+
+def test_the_idle_refresh_rebuilds_through_the_governor_and_logs_it(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The refresh is the governor's rebuild, with its own trigger, then the "refreshed" line."""
+    audio = SimpleNamespace(_pipeline=_Pipeline())
+    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: True)
+    governor = ph.RebuildGovernor(clock=lambda: 100.0)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        assert ph.refresh_after_idle(audio, "75 min idle", governor) is True
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("trigger: idle refresh" in m for m in messages)
+    assert "Speaker stream refreshed after 75 min idle" in messages
+
+
+def test_an_idle_refresh_that_did_not_run_is_not_logged_as_refreshed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Capture off: the governor skips, and no "refreshed" line claims otherwise."""
+    audio = SimpleNamespace(_pipeline=_Pipeline(playing=False))
+    governor = ph.RebuildGovernor(clock=lambda: 100.0)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        assert ph.refresh_after_idle(audio, "75 min idle", governor) is False
+    assert not any("refreshed" in r.getMessage() for r in caplog.records)
+
+
+def test_pair_idle_refresh_and_the_unheard_trigger_share_one_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refresh x the watchdog's cooldown: the unheard trigger rebuilds 30 s after a refresh.
+
+    A refresh that did not help leaves the unheard trigger its rebuild 30 s later, not
+    sooner; and a watchdog rebuild makes the stream fresh for the next open.
+    """
+    now = [100.0]
+    rebuilt: list[str] = []
+    audio = SimpleNamespace(_pipeline=_Pipeline())
+    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: rebuilt.append(sink) or True)
+    governor = ph.RebuildGovernor(clock=lambda: now[0])
+    assert ph.refresh_after_idle(audio, "75 min idle", governor)
+    now[0] = 120.0  # 3 unheard replies can not come sooner than this after an open
+    assert governor.rebuild(audio, "unheard replies", "3 in a row") is False
+    now[0] = 131.0
+    assert governor.rebuild(audio, "unheard replies", "3 in a row") is True
+    assert rebuilt == ["sink", "sink"]
+    # The next open, 5 minutes on with nothing pushed: the watchdog's rebuild counts as fresh.
+    assert ph.refresh_decision(431.0, (None, governor.last_rebuild_at, 0.0)).action == "ok"
