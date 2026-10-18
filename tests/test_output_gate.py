@@ -124,10 +124,16 @@ def test_a_single_plain_word_tool_plays_and_is_logged(text: str) -> None:
     assert verdict.tool == text.strip(".!?").lower()
 
 
-@pytest.mark.parametrize("text", ["s", "St", "stay", "stay ", "stay_", "stay qu", "look at", "web"])
+@pytest.mark.parametrize("text", ["Sta", "stay", "stay ", "stay_", "stay qu", "look at", "web", "Why"])
 def test_the_start_of_a_multi_word_name_waits(text: str) -> None:
     assert gate.judge(text, TOOLS).action == gate.UNDECIDED
     assert gate.judge(text, TOOLS, final=True).action in (gate.PLAY, gate.PLAY_AND_LOG)
+
+
+@pytest.mark.parametrize("text", ["I", "I'm", "He", "We", "St", "Go"])
+def test_a_reply_never_waits_on_a_short_start(text: str) -> None:
+    """ "I" starts a fifth of his replies; it would otherwise wait for idle_do_nothing."""
+    assert gate.judge(text, TOOLS).action == gate.PLAY
 
 
 def test_an_unregistered_call_is_still_an_artifact_with_no_tool() -> None:

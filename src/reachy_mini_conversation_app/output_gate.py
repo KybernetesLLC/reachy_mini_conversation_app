@@ -263,6 +263,7 @@ class Verdict:
 # logged as a possible leak; a sentence with a tool's word in it plays. A cut leak runs
 # its tool only when the tool is `leak_safe` (stay_quiet, idle_do_nothing: doing nothing
 # is what they do); every other leak is cut and logged, never run.
+_MIN_WAIT = 3  # characters before the start of a reply can wait to become a name
 _WORD_EDGES: Final[str] = " \t\r\n.!,;?:'\"`*"
 _PLAIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\s-]{0,79}")
 _CALLED_NAME = (
@@ -301,7 +302,12 @@ class ToolNames:
         return self._forms.get(normal)
 
     def could_become(self, normal: str) -> bool:
-        """Whether more words could make this a multi-word name ("stay" -> "stay quiet")."""
+        """Whether more words could make this a multi-word name ("stay" -> "stay quiet").
+
+        Under _MIN_WAIT characters it never waits: "I" starts 133 of 659 replies in 10
+        days and would wait for idle_do_nothing (the replay, 2026-10-17)."""
+        if len(normal) < _MIN_WAIT:
+            return False
         return any(form != normal and "_" in form and form.startswith(normal) for form in self._forms)
 
 
