@@ -2314,6 +2314,17 @@ def test_rpc_transcript_notification_broadcast() -> None:
     assert msg["params"] == {"role": "assistant", "text": "hello there", "final": True}
 
 
+def test_rpc_transcript_of_a_cut_reply_carries_its_artifact_mark() -> None:
+    """The output gate's verdict travels with the reply: the supervisor never re-judges it."""
+    app = FastAPI()
+    stream = LocalStream(MagicMock(), _rpc_robot(), settings_app=app)
+    stream._init_settings_ui_if_needed()
+    with TestClient(app).websocket_connect("/rpc") as ws:
+        stream._dispatch_transcript("assistant", "stay_quiet", True, "leaked tool call")
+        msg = ws.receive_json()
+    assert msg["params"] == {"role": "assistant", "text": "stay_quiet", "final": True, "artifact": "leaked tool call"}
+
+
 def test_rpc_tool_call_notification_broadcast() -> None:
     """The handler's tool-call observer pushes conversation.tool events, and reports delivery."""
     app = FastAPI()

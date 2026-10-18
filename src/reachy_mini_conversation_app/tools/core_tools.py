@@ -65,10 +65,14 @@ class Tool(abc.ABC):
 
     Tools may override:
       - needs_response: bool = True  # set False to skip the spoken follow-up after this tool runs
+      - leak_safe: bool = False  # set True to run it when the model writes its call as text
     """
 
     _auto_register: ClassVar[bool] = True
     needs_response: ClassVar[bool] = True
+    # The output gate cuts a reply that is only this tool's name or call markup; it runs
+    # the tool too only when this is True. Opt in only for tools whose effect is nothing.
+    leak_safe: ClassVar[bool] = False
 
     name: str
     description: str

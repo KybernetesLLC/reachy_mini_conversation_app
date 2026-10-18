@@ -25,6 +25,7 @@ class IdleDoNothing(Tool):
         },
         "required": [],
     }
+    leak_safe = True  # it does nothing: run when its call leaks into the reply's text
 
     async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> Dict[str, Any]:
         """Stay still and silent for the current idle turn."""

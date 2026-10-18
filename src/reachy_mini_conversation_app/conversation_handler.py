@@ -50,20 +50,21 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         """Attach or detach an activity observer. Pass None to clear."""
         self._activity_observer = observer
 
-    def set_transcript_observer(self, observer: Callable[[str, str, bool], None] | None) -> None:
-        """Attach/detach a transcript observer, called (role, text, final)."""
+    def set_transcript_observer(self, observer: Callable[[str, str, bool, str | None], None] | None) -> None:
+        """Attach/detach a transcript observer, called (role, text, final, artifact): artifact
+        is the output gate's cut kind for a reply that was not spoken, else None."""
         self._transcript_observer = observer
 
     def set_tool_call_observer(self, observer: Callable[[dict[str, Any]], bool] | None) -> None:
         """Attach/detach the tool-call-report observer. Pass None to clear."""
         self._tool_call_observer = observer
 
-    def _emit_transcript(self, role: str, text: str, final: bool = True) -> None:
+    def _emit_transcript(self, role: str, text: str, final: bool = True, artifact: str | None = None) -> None:
         """Forward one transcript chunk to the observer, if attached."""
         observer = self._transcript_observer
         if observer is not None and text:
             try:
-                observer(role, text, final)
+                observer(role, text, final, artifact)
             except Exception:
                 logger.debug("transcript observer raised (ignored)", exc_info=True)
 

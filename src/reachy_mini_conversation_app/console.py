@@ -389,13 +389,14 @@ class LocalStream:
         if hasattr(self.handler, "on_sight"):
             self.handler.on_sight = self._dispatch_sight
 
-    def _dispatch_transcript(self, role: str, text: str, final: bool) -> None:
-        """Push a conversation.transcript notification to JSON-RPC clients."""
+    def _dispatch_transcript(self, role: str, text: str, final: bool, artifact: str | None = None) -> None:
+        """Push a conversation.transcript notification to JSON-RPC clients. A reply the
+        output gate cut carries its kind as "artifact": the supervisor never keeps it."""
         if self._rpc is not None:
-            self._rpc.broadcast_threadsafe(
-                "conversation.transcript",
-                {"role": role, "text": text, "final": final},
-            )
+            params: dict[str, Any] = {"role": role, "text": text, "final": final}
+            if artifact:
+                params["artifact"] = artifact
+            self._rpc.broadcast_threadsafe("conversation.transcript", params)
 
     def _dispatch_sight(self, b64_jpeg: str, source: str) -> None:
         """Push a conversation.sight notification for the companion's sight note.

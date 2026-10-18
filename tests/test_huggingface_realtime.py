@@ -1466,7 +1466,7 @@ async def test_a_text_response_is_never_an_inner_note(monkeypatch: Any) -> None:
         ),
     )
     seen: list[tuple[str, str, bool]] = []
-    handler.set_transcript_observer(lambda role, text, final: seen.append((role, text, final)))
+    handler.set_transcript_observer(lambda role, text, final, artifact=None: seen.append((role, text, final)))
     await handler._run_realtime_session()
     assert [s for s in seen if s[0] == "inner"] == []
 
@@ -1632,7 +1632,7 @@ async def test_a_notes_text_never_reaches_the_transcript_observer() -> None:
     handler = _plain_handler()
     handler.connection = AsyncMock()
     seen: list[tuple[str, str, bool]] = []
-    handler.set_transcript_observer(lambda role, text, final: seen.append((role, text, final)))
+    handler.set_transcript_observer(lambda role, text, final, artifact=None: seen.append((role, text, final)))
 
     handler.add_note("x")
     await handler._wait_notes()
@@ -1708,7 +1708,7 @@ async def test_typed_text_is_a_user_turn_answered_and_reported() -> None:
     create = AsyncMock()
     handler._safe_response_create = create
     seen: list[tuple[str, str, bool]] = []
-    handler.set_transcript_observer(lambda role, text, final: seen.append((role, text, final)))
+    handler.set_transcript_observer(lambda role, text, final, artifact=None: seen.append((role, text, final)))
     await handler.type_text("  play it again ")
     item = handler.connection.conversation.item.create.await_args.kwargs["item"]
     assert item["role"] == "user" and item["content"] == [{"type": "input_text", "text": "play it again"}]
@@ -1971,8 +1971,8 @@ def _reply_events(transcript: str, *, audio_first: bool) -> tuple[Any, ...]:
     )
 
 
-# The shared table: the supervisor's tests/test_supervisor.py has the same cases
-# (reachy-companion, SPOKEN_ARTIFACT_CASES). Change both.
+# The artifact rule's table (output_gate.spoken_artifact). The supervisor keeps no copy
+# since 2026-10-17: it stores what the transcript notification's "artifact" mark says.
 _S, _C, _T, _U = "stage direction", "leaked tool call", "thinking", "undecided"
 SPOKEN_ARTIFACT_CASES = [
     # seen on the robot
@@ -2118,6 +2118,133 @@ async def test_a_leaked_tool_call_is_not_executed(monkeypatch: Any) -> None:
     await handler._run_realtime_session()
 
     start_tool.assert_not_awaited()
+
+
+class _FakeTool:
+    """A registry entry for the tool-name leak tests: counts its runs."""
+
+    def __init__(self, leak_safe: bool) -> None:
+        self.leak_safe = leak_safe
+        self.runs = 0
+
+    async def __call__(self, deps: Any, **kwargs: Any) -> dict[str, Any]:
+        self.runs += 1
+        return {"status": "quiet"}
+
+
+def _leak_session(monkeypatch: Any, events: tuple[Any, ...]) -> tuple[HuggingFaceRealtimeHandler, dict[str, _FakeTool]]:
+    """A session whose live registry is stay_quiet (leak_safe), web_search and dance."""
+    handler = _session_handler(monkeypatch, events)
+    tools = {"stay_quiet": _FakeTool(True), "web_search": _FakeTool(False), "dance": _FakeTool(False)}
+    specs = [{"type": "function", "name": name, "description": "", "parameters": {}} for name in tools]
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: specs)
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: dict(tools))
+    handler._clear_queue = lambda: None
+    return handler, tools
+
+
+async def _run_with_leaks(handler: HuggingFaceRealtimeHandler) -> None:
+    await handler._run_realtime_session()
+    if handler._leak_tasks:
+        await asyncio.gather(*handler._leak_tasks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio_first", [False, True])
+async def test_a_bare_leak_safe_name_is_cut_run_reported_and_marked(
+    monkeypatch: Any, caplog: Any, audio_first: bool
+) -> None:
+    """20:44:56, 2026-10-17: "stay_quiet" was heard. Now none of it plays; the tool runs
+    locally (never start_tool, which owes the server an output); the report says
+    "leaked"; and the supervisor is told not to keep it."""
+    handler, tools = _leak_session(monkeypatch, _reply_events("stay_quiet", audio_first=audio_first))
+    reports = _capture_tool_reports(handler)
+    seen: list[tuple[Any, ...]] = []
+    handler.set_transcript_observer(lambda *args: seen.append(args))
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert "leaked tool call: stay_quiet (underscore name) cut; executed=True" in caplog.messages
+    assert tools["stay_quiet"].runs == 1
+    start_tool.assert_not_awaited()
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("stay_quiet", "ok", "leaked")]
+    assert seen == [("assistant", "stay_quiet", True, "leaked tool call")]
+
+
+@pytest.mark.asyncio
+async def test_a_leaked_tool_that_is_not_leak_safe_is_cut_and_never_run(monkeypatch: Any, caplog: Any) -> None:
+    handler, tools = _leak_session(monkeypatch, _reply_events("Web search.", audio_first=True))
+    reports = _capture_tool_reports(handler)
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert "leaked tool call: web_search (spoken name) cut; executed=False" in caplog.messages
+    assert tools["web_search"].runs == 0
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("web_search", "cut", "leaked")]
+
+
+@pytest.mark.asyncio
+async def test_a_single_plain_word_name_plays_whole_and_is_logged(monkeypatch: Any, caplog: Any) -> None:
+    handler, tools = _leak_session(monkeypatch, _reply_events("Dance!", audio_first=False))
+    reports = _capture_tool_reports(handler)
+    seen: list[tuple[Any, ...]] = []
+    handler.set_transcript_observer(lambda *args: seen.append(args))
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    assert [list(array.reshape(-1)) for _rate, array in _frames(handler)] == [[1, 2], [3, 4]]
+    assert "possible leaked tool call: dance (plain word) played" in caplog.messages
+    assert tools["dance"].runs == 0
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("dance", "played", "leaked")]
+    assert seen == [("assistant", "Dance!", True, None)]
+
+
+@pytest.mark.asyncio
+async def test_a_spoken_name_split_across_deltas_waits_for_the_whole_reply(monkeypatch: Any) -> None:
+    handler, tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("Stay"),
+            _audio(1, 2),
+            _said(" quiet."),
+            _audio(3, 4),
+            _FakeEvent("response.output_audio_transcript.done", transcript="Stay quiet."),
+            _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+        ),
+    )
+
+    await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert tools["stay_quiet"].runs == 1
+
+
+@pytest.mark.asyncio
+async def test_a_sentence_that_starts_like_a_name_plays_whole(monkeypatch: Any) -> None:
+    handler, _tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("Stay"),
+            _audio(1, 2),
+            _said(" warm tonight."),
+            _audio(3, 4),
+            _FakeEvent("response.output_audio_transcript.done", transcript="Stay warm tonight."),
+            _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+        ),
+    )
+
+    await _run_with_leaks(handler)
+
+    assert [list(array.reshape(-1)) for _rate, array in _frames(handler)] == [[1, 2], [3, 4]]
 
 
 @pytest.mark.asyncio
