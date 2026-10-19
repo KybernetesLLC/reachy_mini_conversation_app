@@ -1772,6 +1772,17 @@ async def test_ending_a_user_turn_clears_the_input_and_the_listening_pose() -> N
 
 
 @pytest.mark.asyncio
+async def test_shutdown_releases_the_listening_pose() -> None:
+    """The companion, 2026-10-19: a session closed between speech_started and
+    speech_stopped left listening on, so breathing and every idle body turn stopped."""
+    handler = _plain_handler()
+    handler._user_speaking = True
+    await handler.shutdown()
+    assert handler._user_speaking is False
+    handler.deps.movement_manager.set_listening.assert_called_with(False)
+
+
+@pytest.mark.asyncio
 async def test_ending_a_turn_with_no_session_is_harmless() -> None:
     """With no session there is no input buffer to clear; the flags still reset."""
     handler = _plain_handler()

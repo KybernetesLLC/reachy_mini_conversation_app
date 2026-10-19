@@ -1789,6 +1789,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
+        # A session that closes between speech_started and speech_stopped never hears the
+        # stop: release the listening pose here, or breathing (and every idle body turn,
+        # which waits for it) stays off with no session open (the companion, 2026-10-19).
+        await self.end_user_turn()
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()
 

@@ -862,3 +862,70 @@ def test_a_sequence_frame_without_a_body_yaw_keeps_the_starting_yaw() -> None:
     manager._update_primary_motion(0.0)
     _, _, yaw = manager.state.current_move.evaluate(0.2)
     assert yaw == pytest.approx(0.4)
+
+
+def test_a_listening_change_inside_the_debounce_is_deferred_not_dropped() -> None:
+    """The companion, 2026-10-19: speech_started then speech_stopped within 0.15 s dropped
+    the stop; listening stayed on with no session, and breathing never resumed."""
+    manager = MovementManager(MagicMock())
+    now = manager._now()
+    manager._last_listening_toggle_time = now - 1.0
+    manager._handle_command("set_listening", True, now)
+    assert manager._is_listening is True
+    manager._handle_command("set_listening", False, now)  # inside the debounce
+    assert manager._is_listening is True and manager._pending_listening is False
+    manager._last_listening_toggle_time = manager._now() - manager._listening_debounce_s
+    manager._poll_signals(manager._now())
+    assert manager._is_listening is False and manager._pending_listening is None
+
+
+def test_a_later_change_replaces_a_deferred_one() -> None:
+    manager = MovementManager(MagicMock())
+    now = manager._now()
+    manager._last_listening_toggle_time = now  # every change below is inside the debounce
+    manager._handle_command("set_listening", True, now)
+    manager._handle_command("set_listening", False, now)
+    assert manager._pending_listening is None and manager._is_listening is False  # cancelled
+    manager._last_listening_toggle_time = manager._now() - manager._listening_debounce_s
+    manager._poll_signals(manager._now())
+    assert manager._is_listening is False  # the last word wins: no freeze left behind
+
+
+def test_breathing_resumes_once_a_deferred_stop_applies() -> None:
+    manager = MovementManager(MagicMock())
+    manager.current_robot.get_current_joint_positions.return_value = ([0.0] * 7, (0.0, 0.0))
+    manager.current_robot.get_current_head_pose.return_value = create_head_pose(
+        0, 0, 0, 0, 0, 0, degrees=True
+    )
+    now = manager._now()
+    manager._last_listening_toggle_time = now - 1.0
+    manager._handle_command("set_listening", True, now)
+    manager._handle_command("set_listening", False, now)
+    manager.state.last_activity_time = now - 10.0
+    manager._manage_breathing(now)
+    assert manager._breathing_active is False  # still listening: no breathing
+    manager._last_listening_toggle_time = manager._now() - manager._listening_debounce_s
+    later = manager._now()
+    manager._poll_signals(later)
+    manager.state.last_activity_time = later - 10.0
+    manager._manage_breathing(later)
+    assert manager._breathing_active is True
+
+
+@pytest.mark.parametrize("sequence", [(False, True, False), (True, False, True)])
+def test_the_last_listening_request_wins_through_the_public_api(sequence) -> None:
+    """The review: start applied, a stop deferred, then a start again was dropped by the
+    shortcut (it matched the applied state), and the stale deferred stop applied later."""
+    manager = MovementManager(MagicMock())
+    first, *rest = sequence
+    manager._last_listening_toggle_time = manager._now() - 1.0
+    manager.set_listening(first)
+    manager._poll_signals(manager._now())
+    manager._publish_shared_state()
+    for value in rest:  # both inside the debounce
+        manager.set_listening(value)
+        manager._poll_signals(manager._now())
+        manager._publish_shared_state()
+    manager._last_listening_toggle_time = manager._now() - manager._listening_debounce_s
+    manager._poll_signals(manager._now())
+    assert manager._is_listening is sequence[-1] and manager._pending_listening is None

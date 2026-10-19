@@ -1324,7 +1324,14 @@ class LocalStream:
                 return {"holding": False, "body_yaw": turn_yaw}
 
             if not params:
-                return {"holding": manager.is_holding()}
+                # The companion (2026-10-19): what holds breathing off, readable without a
+                # debugger (listening stuck on stopped every idle body turn for 20 min).
+                status = manager.get_status()
+                return {
+                    "holding": manager.is_holding(),
+                    "listening": bool(status["is_listening"]),
+                    "breathing": bool(status["breathing_active"]),
+                }
 
             antennas_raw = params.get("antennas")
             if not isinstance(antennas_raw, (list, tuple)) or len(antennas_raw) != 2:

@@ -439,7 +439,7 @@ def test_pose_read_only_reports_without_changing_anything() -> None:
     _stream, manager, app = _pose_stream()
 
     resp = _rpc_call(app, "conversation.pose", {})
-    assert resp["result"] == {"holding": False}
+    assert resp["result"] == {"holding": False, "listening": False, "breathing": False}
     assert manager._command_queue.empty()
 
     _rpc_call(app, "conversation.pose", {"antennas": [0.1, -0.1], "duration": 0.5})
@@ -447,9 +447,11 @@ def test_pose_read_only_reports_without_changing_anything() -> None:
     assert manager.is_holding() is True
 
     resp = _rpc_call(app, "conversation.pose", {})
-    assert resp["result"] == {"holding": True}
+    assert resp["result"] == {"holding": True, "listening": False, "breathing": False}
     assert manager._command_queue.empty()
     assert manager.is_holding() is True
+    manager._is_listening = True  # the companion, 2026-10-19: readable without a debugger
+    assert _rpc_call(app, "conversation.pose", {})["result"]["listening"] is True
 
 
 @pytest.mark.parametrize(

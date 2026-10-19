@@ -454,6 +454,10 @@ class MovementManager:
         self._pending_turn: Tuple[float, float] | None = None
         self._listening_debounce_s = 0.15
         self._last_listening_toggle_time = self._now()
+        # A listening change inside the debounce, applied once it has passed (the companion,
+        # 2026-10-19: dropped, a speech_stopped left listening on with no session, and
+        # breathing, which every idle body turn waits for, never resumed).
+        self._pending_listening: bool | None = None
         self._last_set_target_err = 0.0
         self._set_target_err_interval = 1.0  # seconds between error logs
         self._set_target_err_suppressed = 0
@@ -557,11 +561,10 @@ class MovementManager:
         - Blending is reset so that upon unfreezing the antennas return smoothly.
         - Idle breathing is suppressed.
 
-        Thread-safe: the change is posted to the worker command queue.
+        Thread-safe: the change is posted to the worker command queue. Always posted, even
+        when it matches the applied state: it may have to cancel a deferred change (the
+        companion's review, 2026-10-19).
         """
-        with self._shared_state_lock:
-            if self._shared_is_listening == listening:
-                return
         self._command_queue.put(("set_listening", listening))
 
     def set_head_tracking(self, enabled: bool) -> None:
@@ -585,6 +588,33 @@ class MovementManager:
             except Empty:
                 break
             self._handle_command(command, payload, current_time)
+        pending = self._pending_listening
+        if pending is not None:
+            now = self._now()
+            if now - self._last_listening_toggle_time >= self._listening_debounce_s:
+                self._pending_listening = None
+                self._apply_listening(pending, now)
+
+    def _apply_listening(self, desired_state: bool, now: float) -> None:
+        """Enter or leave the listening pose now (the debounce has already passed)."""
+        self._last_listening_toggle_time = now
+
+        if self._is_listening == desired_state:
+            return
+
+        self._is_listening = desired_state
+        self._last_listening_blend_time = now
+        if desired_state:
+            # Freeze: snapshot current commanded antennas and reset blend
+            self._listening_antennas = (
+                float(self._last_commanded_pose[1][0]),
+                float(self._last_commanded_pose[1][1]),
+            )
+            self._antenna_unfreeze_blend = 0.0
+        else:
+            # Unfreeze: restart blending from frozen pose
+            self._antenna_unfreeze_blend = 0.0
+        self.state.update_activity()
 
     def _handle_command(self, command: str, payload: Any, current_time: float) -> None:
         """Handle a single cross-thread command."""
@@ -697,25 +727,12 @@ class MovementManager:
             desired_state = bool(payload)
             now = self._now()
             if now - self._last_listening_toggle_time < self._listening_debounce_s:
+                # Deferred, never dropped; a change back to the applied state cancels it.
+                pending = desired_state if desired_state != self._is_listening else None
+                self._pending_listening = pending
                 return
-            self._last_listening_toggle_time = now
-
-            if self._is_listening == desired_state:
-                return
-
-            self._is_listening = desired_state
-            self._last_listening_blend_time = now
-            if desired_state:
-                # Freeze: snapshot current commanded antennas and reset blend
-                self._listening_antennas = (
-                    float(self._last_commanded_pose[1][0]),
-                    float(self._last_commanded_pose[1][1]),
-                )
-                self._antenna_unfreeze_blend = 0.0
-            else:
-                # Unfreeze: restart blending from frozen pose
-                self._antenna_unfreeze_blend = 0.0
-            self.state.update_activity()
+            self._pending_listening = None
+            self._apply_listening(desired_state, now)
         elif command == "set_head_tracking":
             enabled = bool(payload)
             if self._head_tracking == enabled:
