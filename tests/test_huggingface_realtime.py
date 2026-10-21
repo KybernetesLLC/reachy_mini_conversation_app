@@ -2951,3 +2951,41 @@ async def test_a_tool_with_no_output_owed_and_no_refusal_sends_no_extra_reply(mo
     )
     await handler._run_realtime_session()
     assert [kind for kind, _ in sent].count("response.create") == 0
+
+
+
+def _recovery_spy(monkeypatch: Any) -> tuple[HuggingFaceRealtimeHandler, list[dict[str, Any]]]:
+    handler = _plain_handler()
+    creates: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> None:
+        creates.append(kwargs)
+
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    return handler, creates
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_with_no_output_owed_is_never_retried(monkeypatch: Any) -> None:
+    """Never retry a refusal when no output is owed here.
+
+    The review of 444305c: an output the app dropped (or never owed) leaves the server refusing
+    every create; retrying each refusal looped for the rest of the session.
+    """
+    handler, creates = _recovery_spy(monkeypatch)
+    for _ in range(3):
+        await handler._recover_refused_reply()
+    assert creates == []
+
+
+@pytest.mark.asyncio
+async def test_at_most_one_refused_reply_is_recovered_per_user_turn(monkeypatch: Any) -> None:
+    """A tool longer than the 30 s hold: each held create was refused and queued again."""
+    handler, creates = _recovery_spy(monkeypatch)
+    handler._owe_output("c1")
+    for _ in range(3):
+        await handler._recover_refused_reply()
+    assert len(creates) == 1
+    handler._new_user_turn()
+    await handler._recover_refused_reply()
+    assert len(creates) == 2

@@ -369,6 +369,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._owed_outputs: set[str] = set()
         self._no_outputs_owed: asyncio.Event = asyncio.Event()
         self._no_outputs_owed.set()
+        # One refused reply recovered per user turn at most (_recover_refused_reply).
+        self._reply_recovered_this_turn = False
         # A tool's follow-up is queued (pending) or is the live response (live): say() does
         # not cancel it.
         self._followup_pending = False
@@ -677,6 +679,26 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 logger.warning("Realtime session restart timed out; continuing in background.")
         except Exception as e:
             logger.warning("_restart_session failed: %s", e)
+
+    async def _recover_refused_reply(self) -> None:
+        """Send a reply the server refused while a tool's output was owed, once the outputs are in.
+
+        2026-10-21 11:26: "Absolutely." in an express wait went unanswered. The sender holds the
+        create, and a tool's own follow-up merges with it. Only while an output is owed, and once per
+        user turn: a dropped output, or a tool past the 30 s hold, made every retry be refused again.
+        """
+        if not self._owed_outputs:
+            logger.info("a reply the server refused with no tool output owed here: not retried")
+            return
+        if self._reply_recovered_this_turn:
+            logger.info("a reply the server refused again this turn: not retried")
+            return
+        self._reply_recovered_this_turn = True
+        logger.info("a reply the server refused while tool outputs were owed: sending it once they are in")
+        await self._safe_response_create()
+
+    def _new_user_turn(self) -> None:
+        self._reply_recovered_this_turn = False
 
     def _owe_output(self, call_id: str) -> None:
         self._owed_outputs.add(call_id)
@@ -1550,6 +1572,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "input_audio_buffer.speech_started":
+                        self._new_user_turn()
                         self._user_speaking = True
                         self._last_speech_at = time.monotonic()
                         self._mark_activity("user_speech_started")
@@ -1780,15 +1803,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._response_started_or_rejected_event.set()
                             logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
                             if "function call outputs are pending" in str(msg):
-                                # The server's own reply to a user turn, refused while a tool's
-                                # output was owed (2026-10-21 11:26: "Absolutely." in an express
-                                # wait went unanswered). The sender holds this create until the
-                                # outputs are in; a tool's own follow-up merges with it.
-                                logger.info(
-                                    "a reply the server refused while tool outputs were owed: "
-                                    "sending it once they are in"
-                                )
-                                await self._safe_response_create()
+                                await self._recover_refused_reply()
 
                         if code == "input_audio_buffer_commit_empty":
                             self.deps.movement_manager.set_listening(False)
