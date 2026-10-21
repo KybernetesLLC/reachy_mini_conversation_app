@@ -1320,11 +1320,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._session_creates += 1
                     # 2026-10-21 16:51: a tool's follow-up after a say was never answered, and
                     # these steps logged only at debug. One line per create sent.
-                    logger.info(
-                        "response.create sent (%s, attempt %d)",
-                        "announcement" if announcement_added else "follow-up" if self._followup_pending else "plain",
-                        attempts + 1,
-                    )
+                    if kwargs.get("response", {}).get("conversation") == "none":
+                        kind = "filler"  # out of band: never a follow-up (the review of eea54bb)
+                    elif announcement_added:
+                        kind = "announcement"
+                    else:
+                        kind = "follow-up" if self._followup_pending else "plain"
+                    logger.info("response.create sent (%s, attempt %d)", kind, attempts + 1)
                 except Exception as e:
                     logger.info("_response_sender_loop: send failed: %s", e)
                     self._response_done_event.set()
