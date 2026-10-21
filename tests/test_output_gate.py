@@ -156,3 +156,40 @@ def test_with_no_registry_the_artifact_rule_alone_decides() -> None:
 def test_tools_opt_in_to_running_when_leaked() -> None:
     assert core_tools.Tool.leak_safe is False
     assert IdleDoNothing.leak_safe is True
+
+
+# 2026-10-20 evening: 4 of 19 replies leaked Gemma call markup. The whole-reply leaks had
+# no closing "/>" and stayed undecided, so they were spoken and kept; the leading ones were
+# spoken (real words follow) and kept markup and all, and his word-for-word memory taught
+# him to do it again.
+Q = '<|"|>'
+OPEN_IDLE = f"<call:idle_do_nothing{{reason:{Q}Acknowledging Matt's comment.{Q}}}"
+LEADING = f"<call:express{{feeling:{Q}shy{Q},intensity:0.4}}/>I'm sorry I'm being glitchy."
+
+
+def test_a_call_left_open_at_the_end_of_the_reply_is_cut() -> None:
+    assert gate.judge(OPEN_IDLE, TOOLS, final=False).action == gate.UNDECIDED
+    verdict = gate.judge(OPEN_IDLE, TOOLS, final=True)
+    assert (verdict.action, verdict.tool, verdict.shape) == (gate.CUT_AND_EXECUTE, "idle_do_nothing", "markup")
+
+
+def test_an_open_call_before_words_ends_at_its_arguments() -> None:
+    text = f"<call:express{{feeling:{Q}oops{Q},intensity:0.5}} I'm still here, Matt!"
+    assert gate.judge(text, TOOLS, final=True).action == gate.PLAY
+    assert gate.without_calls(text) == "I'm still here, Matt!"
+
+
+@pytest.mark.parametrize(
+    "text, kept",
+    [
+        (LEADING, "I'm sorry I'm being glitchy."),
+        ("Sure. <call:look_at_me/> There you are.", "Sure. There you are."),
+        ("call:express{} Hello!", "Hello!"),
+        ("I'll recall: the ferry left at 3.", "I'll recall: the ferry left at 3."),
+        ("(Laughs) yes, it leaves at 3", "(Laughs) yes, it leaves at 3"),
+        ("Plain reply.", "Plain reply."),
+    ],
+)
+def test_a_played_reply_is_kept_without_its_call_markup(text: str, kept: str) -> None:
+    assert gate.judge(text, TOOLS, final=True).action == gate.PLAY
+    assert gate.without_calls(text) == kept

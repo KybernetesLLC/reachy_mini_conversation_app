@@ -55,6 +55,7 @@ from reachy_mini_conversation_app.output_gate import (  # noqa: F401  (spoken_ar
     ToolNames,
     judge,
     spoken_artifact,
+    without_calls,
 )
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolSpec,
@@ -1619,7 +1620,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         await self.output_queue.put(
                             AdditionalOutputs({"role": "assistant", "content": event.transcript})
                         )
-                        self._emit_transcript("assistant", event.transcript or "", True, artifact=self._gate_cut_kind)
+                        said = event.transcript or ""
+                        kept = said if self._gate_cut_kind else without_calls(said)  # 2026-10-20
+                        self._emit_transcript("assistant", kept, True, artifact=self._gate_cut_kind)
                         self._response_transcript(event.transcript or "")
 
                     # Handle audio delta

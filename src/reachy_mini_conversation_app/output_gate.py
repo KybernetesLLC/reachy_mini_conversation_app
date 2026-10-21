@@ -122,18 +122,24 @@ def _closed(kind: str, end: int) -> tuple[str, int]:
     return (kind, end) if end != -1 else (_UNDECIDED, -1)
 
 
-def _tag_call_at(text: str, i: int) -> tuple[str, int] | None:
-    """Match a malformed Gemma 4 call at text[i]: <call:name/>, <call:name>...</call> and kin."""
+def _tag_call_at(text: str, i: int, final: bool = False) -> tuple[str, int] | None:
+    """Match a malformed Gemma 4 call at text[i]: <call:name/>, <call:name>...</call> and kin.
+
+    At the end of the reply (`final`), a call whose arguments closed but whose tag never did
+    ("<call:idle_do_nothing{reason:...}", 2026-10-20) ends at its arguments."""
     opener = _TAG_CALL.match(text, i)
     if not opener:
         return None
     j = opener.end()
-    if j < len(text) and text[j] == "{":
+    braced = j < len(text) and text[j] == "{"
+    if braced:
         j = _balanced_end(text, j)
         if j == -1:
             return _UNDECIDED, -1
     tag_end = _TAG_CALL_END.match(text, j)
     if not tag_end:
+        if final and braced:
+            return _CALL, j
         return (_UNDECIDED, -1) if ">" not in text[j:] else None
     if tag_end.group(1):  # self-closing
         return _CALL, tag_end.end()
@@ -146,7 +152,7 @@ def _tag_call_at(text: str, i: int) -> tuple[str, int] | None:
     return _CALL, tag_end.end()
 
 
-def _angle_at(text: str, i: int) -> tuple[str, int] | None:
+def _angle_at(text: str, i: int, final: bool = False) -> tuple[str, int] | None:
     """Match a shape opening with "<" at text[i]: a special token, a wrapper or a tag call."""
     token = _TOKEN.match(text, i)
     if token:
@@ -157,18 +163,18 @@ def _angle_at(text: str, i: int) -> tuple[str, int] | None:
             close = closer.format(*found.groups()).lower()
             close_at = text.lower().find(close, found.end())
             return _closed(kind, close_at + len(close) if close_at != -1 else -1)
-    tag = _tag_call_at(text, i)
+    tag = _tag_call_at(text, i, final)
     if tag:
         return tag
     return (_UNDECIDED, -1) if ">" not in text[i:] else None
 
 
-def _shape_at(text: str, i: int) -> tuple[str, int] | None:
+def _shape_at(text: str, i: int, final: bool = False) -> tuple[str, int] | None:
     """Match the artifact at text[i]: (kind, end), ("undecided", -1) while open, or None."""
     rest = text[i:]
     c = text[i]
     if c == "<":
-        return _angle_at(text, i)
+        return _angle_at(text, i, final)
     if rest[:5].lower() == "call:":
         call = _BARE_CALL.match(text, i)
         if call and call.end() < len(text) and text[call.end()] == "{":
@@ -202,7 +208,7 @@ def _shape_at(text: str, i: int) -> tuple[str, int] | None:
     return None
 
 
-def _shapes(text: str) -> list[tuple[str, str]] | str | None:
+def _shapes(text: str, final: bool = False) -> list[tuple[str, str]] | str | None:
     """The artifact shapes `text` is made of, as (kind, the shape's own text);
     "undecided" while one is still open; None when there are real words outside them.
     """
@@ -210,7 +216,7 @@ def _shapes(text: str) -> list[tuple[str, str]] | str | None:
     found: list[tuple[str, str]] = []
     i = _skip(head, 0)
     while i < len(head):
-        shape = _shape_at(head, i)
+        shape = _shape_at(head, i, final)
         if shape is None:
             return None
         kind, end = shape
@@ -221,14 +227,34 @@ def _shapes(text: str) -> list[tuple[str, str]] | str | None:
     return found if found else _UNDECIDED
 
 
-def spoken_artifact(text: str) -> str | None:
+def spoken_artifact(text: str, final: bool = False) -> str | None:
     """Return "stage direction", "leaked tool call", "thinking", None (a reply), or "undecided".
 
     Text made only of artifact shapes, whitespace and stray ". ! , ;" is an artifact,
     named by its first shape. Pure.
     """
-    shapes = _shapes(text)
+    shapes = _shapes(text, final)
     return shapes[0][0] if isinstance(shapes, list) else shapes
+
+
+def without_calls(text: str) -> str:
+    """A played reply's text with its call markup taken out: what the supervisor keeps.
+
+    The audio is untouched (a reply with real words plays whole, the owner, 2026-10-16),
+    but kept markup reached his word-for-word memory and he copied it (2026-10-20). Pure.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        at_word_start = i == 0 or not text[i - 1].isalnum()
+        if text[i] == "<" or (at_word_start and text[i : i + 5].lower() == "call:"):
+            shape = _shape_at(text, i, final=True)
+            if shape is not None and shape[0] == _CALL:
+                i = shape[1]
+                continue
+        out.append(text[i])
+        i += 1
+    return re.sub(r"\s{2,}", " ", "".join(out)).strip()
 
 
 # --- the gate ------------------------------------------------------------------------
@@ -325,7 +351,7 @@ def _leak(tool: LeakTool, shape: str) -> Verdict:
 
 def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None:
     """Rule 1: a reply that is only a registered tool's name."""
-    shapes = _shapes(text)
+    shapes = _shapes(text, final)
     if isinstance(shapes, list):
         for kind, body in shapes:
             name = _called_name(body) if kind == _CALL else None
@@ -352,7 +378,7 @@ def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None
 
 def artifact_shape(text: str, tools: ToolNames, final: bool) -> Verdict | None:
     """Rule 2: a reply made only of stage directions, call markup or thinking."""
-    kind = spoken_artifact(text)
+    kind = spoken_artifact(text, final)
     if kind is None:
         return None
     if kind == _UNDECIDED:

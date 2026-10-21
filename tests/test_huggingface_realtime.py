@@ -2707,3 +2707,20 @@ async def test_owed_outputs_reset_on_reconnect(monkeypatch: Any) -> None:
 
     assert seen == [set()]
     assert handler._no_outputs_owed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a_played_reply_reaches_the_supervisor_without_its_call_markup(monkeypatch: Any) -> None:
+    """2026-10-20: "<call:express{...}/>I'm sorry I'm being glitchy." plays whole, but the
+    markup kept in his word-for-word memory taught him to leak more."""
+    q = '<|"|>'
+    text = f"<call:express{{feeling:{q}shy{q},intensity:0.4}}/>I'm sorry I'm being glitchy."
+    handler = _session_handler(monkeypatch, _reply_events(text, audio_first=False))
+    handler._clear_queue = lambda: None
+    seen: list = []
+    handler.set_transcript_observer(lambda role, said, final, artifact=None: seen.append((role, said, artifact)))
+
+    await handler._run_realtime_session()
+
+    assert _frames(handler) != []  # the audio plays as before
+    assert seen == [("assistant", "I'm sorry I'm being glitchy.", None)]
