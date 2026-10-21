@@ -199,6 +199,35 @@ def _out_of_band_request(
     }
 
 
+def session_size(session: Any) -> str:
+    """What a session.update sends, sized: instructions and tool definitions, with a rough
+    token count (4 characters a token). The owner, 2026-10-20: leaks grew with the context."""
+    instructions = str(session.get("instructions") or "")
+    tools = list(session.get("tools") or [])
+    tools_chars = len(json.dumps(tools, default=str))
+    return (
+        f"instructions {len(instructions)} chars, {len(tools)} tools {tools_chars} chars, "
+        f"~{(len(instructions) + tools_chars) // 4} tokens"
+    )
+
+
+def usage_line(usage: Any, *, images: int, image_bytes: int) -> str | None:
+    """The server's token counts for one response, or None when it sent none."""
+    if usage is None:
+        return None
+    details = getattr(usage, "input_token_details", None)
+    parts = [
+        f"{key} {value}"
+        for key in ("text", "audio", "image", "cached")
+        if (value := getattr(details, f"{key}_tokens", None)) is not None
+    ]
+    breakdown = f" ({', '.join(parts)})" if parts else ""
+    return (
+        f"Context: {getattr(usage, 'input_tokens', '?')} input tokens{breakdown}, "
+        f"{getattr(usage, 'output_tokens', '?')} output; {images} images ({image_bytes // 1024} KiB) in this session"
+    )
+
+
 def _companion_tag(event: Any) -> str | None:
     """Return the companion tag of a response.created/done event's response, if any."""
     metadata = getattr(getattr(event, "response", None), "metadata", None)
@@ -1067,6 +1096,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except Exception:
             logger.warning("A frame was not handed over for its sight note", exc_info=True)
 
+    def _log_usage(self, usage: Any) -> None:
+        line = usage_line(usage, images=self._session_images, image_bytes=self._session_image_bytes)
+        if line is not None:
+            logger.info(line)
+        elif not getattr(self, "_usage_missing_logged", False):
+            self._usage_missing_logged = True
+            logger.info("Context: the server reported no token usage")
+
     def _count_image(self, b64_jpeg: str) -> None:
         self._session_images += 1
         self._session_image_bytes += (len(b64_jpeg) * 3) // 4
@@ -1461,6 +1498,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 raise
 
             logger.info("Realtime session updated successfully")
+            logger.info("Realtime session size: %s", session_size(session_config))
 
             # Reset the partial-transcript accumulator for each new session
             self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
@@ -1549,6 +1587,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if _companion_tag(event) is None:
                             self._followup_live = False
                         logger.debug("Response done")
+                        self._log_usage(getattr(getattr(event, "response", None), "usage", None))
                         if not self._gate_transcript_done and (self._gate_text or self._gate_had_audio):
                             # Parsed by counting: keep the wording. Measuring only; the
                             # fallback below is unchanged.

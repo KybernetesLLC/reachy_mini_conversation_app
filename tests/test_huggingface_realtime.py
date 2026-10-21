@@ -2724,3 +2724,38 @@ async def test_a_played_reply_reaches_the_supervisor_without_its_call_markup(mon
 
     assert _frames(handler) != []  # the audio plays as before
     assert seen == [("assistant", "I'm sorry I'm being glitchy.", None)]
+
+
+# --- context size (the owner, 2026-10-20: leaks grew with the day's context) -----------------
+
+
+def test_the_session_size_line_counts_instructions_and_tools() -> None:
+    session = {"instructions": "x" * 400, "tools": [{"type": "function", "name": "look"}]}
+    tools_chars = len(json.dumps(session["tools"]))
+    assert hf_mod.session_size(session) == (
+        f"instructions 400 chars, 1 tools {tools_chars} chars, ~{(400 + tools_chars) // 4} tokens"
+    )
+
+
+def test_the_usage_line_reads_the_servers_counts() -> None:
+    usage = SimpleNamespace(
+        input_tokens=9100,
+        output_tokens=40,
+        input_token_details=SimpleNamespace(text_tokens=8000, audio_tokens=300, image_tokens=800, cached_tokens=7000),
+    )
+    assert hf_mod.usage_line(usage, images=2, image_bytes=150_000) == (
+        "Context: 9100 input tokens (text 8000, audio 300, image 800, cached 7000), 40 output; "
+        "2 images (146 KiB) in this session"
+    )
+    assert hf_mod.usage_line(None, images=0, image_bytes=0) is None
+
+
+@pytest.mark.asyncio
+async def test_a_reply_logs_the_context_or_says_once_that_none_came(monkeypatch: Any, caplog: Any) -> None:
+    handler = _session_handler(monkeypatch, _reply_events("Hello there.", audio_first=False))
+    handler._clear_queue = lambda: None
+    with caplog.at_level(logging.INFO, logger=hf_mod.logger.name):
+        await handler._run_realtime_session()
+    said = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("Realtime session size: instructions ") for m in said)
+    assert said.count("Context: the server reported no token usage") == 1
