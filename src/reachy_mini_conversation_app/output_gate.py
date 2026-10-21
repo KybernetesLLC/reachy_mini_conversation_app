@@ -61,6 +61,8 @@ _TAG_CALL_END = re.compile(r"[^<>]*?(/?)>")
 _TAG_CALL_CLOSER = re.compile(r"</call(?::[\w.-]*)?\s*>", re.IGNORECASE)
 _BARE_CALL = re.compile(r"call:\s*[\w.-]+\s*", re.IGNORECASE)
 _BARE_CALL_OPEN = re.compile(r"call:\s*[\w.-]*\s*", re.IGNORECASE)
+# A name with its arguments and no "call:" at all: "idle_do_nothing{reason:...}" (2026-10-17).
+_NAMED_ARGS = re.compile(r"[A-Za-z_][\w.-]*(?=\{)")
 _CALL_ITEM = r"[A-Za-z_][\w.]*\(.*\)"
 _CALL_LIST = re.compile(rf"\[\s*{_CALL_ITEM}(?:\s*,\s*{_CALL_ITEM})*\s*\]", re.DOTALL)
 _TOOL_CODE = re.compile(r"```\s*tool_code\b.*?```", re.IGNORECASE | re.DOTALL)
@@ -198,6 +200,9 @@ def _shape_at(text: str, i: int, final: bool = False) -> tuple[str, int] | None:
         end = _balanced_end(text, i)
         if end != -1 and _CALL_LIST.fullmatch(text, i, end):
             return _CALL, end
+    named = _NAMED_ARGS.match(text, i)
+    if named:
+        return _closed(_CALL, _balanced_end(text, named.end()))
     if c in _DIRECTION_CLOSERS:
         close_at = text.find(_DIRECTION_CLOSERS[c], i + 1)
         if close_at == -1:
@@ -247,7 +252,7 @@ def without_calls(text: str) -> str:
     i = 0
     while i < len(text):
         at_word_start = i == 0 or not text[i - 1].isalnum()
-        if text[i] == "<" or (at_word_start and text[i : i + 5].lower() == "call:"):
+        if text[i] == "<" or (at_word_start and (text[i : i + 5].lower() == "call:" or _NAMED_ARGS.match(text, i))):
             shape = _shape_at(text, i, final=True)
             if shape is not None and shape[0] == _CALL:
                 i = shape[1]
@@ -298,6 +303,7 @@ _CALLED_NAME = (
     re.compile(r'"name"\s*:\s*"([^"]+)"'),
     re.compile(r"^\[\s*([A-Za-z_][\w.]*)\("),
     re.compile(r"tool_code\s*([A-Za-z_][\w.]*)\(", re.IGNORECASE),
+    re.compile(r"^([A-Za-z_][\w.-]*)\{"),
 )
 
 

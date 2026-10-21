@@ -54,6 +54,8 @@ MARKUP_SHAPES = (
     '{{"name": "{n}", "arguments": {{}}}}',
     "[{n}()]",
     "```tool_code\n{n}()\n```",
+    "{n}{{}}",  # bare, no "call:" (2026-10-17, 2026-10-18)
+    '{n}{{reason:<|"|>Conversational acknowledgement.<|"|>}}',
 )
 
 
@@ -185,6 +187,8 @@ def test_an_open_call_before_words_ends_at_its_arguments() -> None:
         (LEADING, "I'm sorry I'm being glitchy."),
         ("Sure. <call:look_at_me/> There you are.", "Sure. There you are."),
         ("call:express{} Hello!", "Hello!"),
+        (f"express{{feeling:{Q}shy{Q}}} Am I?", "Am I?"),
+        ("Use {curly} braces.", "Use {curly} braces."),
         ("I'll recall: the ferry left at 3.", "I'll recall: the ferry left at 3."),
         ("(Laughs) yes, it leaves at 3", "(Laughs) yes, it leaves at 3"),
         ("Plain reply.", "Plain reply."),
