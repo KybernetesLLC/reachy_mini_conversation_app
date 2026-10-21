@@ -2859,3 +2859,16 @@ def test_a_loaded_tool_keeps_its_own_entry_over_a_retired_one() -> None:
     """A retired name that is loaded again is listed once, from the registry."""
     names = hf_mod.gate_tool_names([{"name": "idle_do_nothing"}], {})
     assert names.find("idle_do_nothing") is not None
+
+
+@pytest.mark.asyncio
+async def test_a_leaked_retired_name_is_cut_and_never_run_or_reported(monkeypatch: Any) -> None:
+    """The review of 2026-10-21: run against a missing tool, it was reported as a failed call."""
+    handler = _plain_handler()
+    reports: list[dict[str, Any]] = []
+    monkeypatch.setattr(handler, "_report_tool_call", reports.append)
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {})
+
+    await handler._run_leaked_tool("idle_do_nothing")
+
+    assert reports == []

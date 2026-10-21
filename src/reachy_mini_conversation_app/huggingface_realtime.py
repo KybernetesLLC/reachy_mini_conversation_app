@@ -848,6 +848,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         nothing goes back to the server.
         """
         tool = core_tools.get_tools().get(name)
+        if tool is None and name in RETIRED_LEAK_SAFE:
+            logger.debug("leaked tool call: %s is retired; cut, not run", name)
+            return
         started = time.monotonic()
         status, error = "ok", None
         try:
