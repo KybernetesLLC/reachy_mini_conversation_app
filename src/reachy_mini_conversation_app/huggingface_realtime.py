@@ -95,6 +95,18 @@ class InputTranscriptChunksByItem(BaseModel):
     deltas: list[str] = Field(default_factory=list)
 
 
+# Tools taken off the list whose leaked names the gate still cuts, as leak-safe (2026-10-21: idle_do_nothing
+# left the list, but the model leaked it 8 times in the week before and may say it from habit).
+RETIRED_LEAK_SAFE = ("idle_do_nothing",)
+
+
+def gate_tool_names(tool_specs: list[ToolSpec], registry: dict[str, Any]) -> ToolNames:
+    """Build the output gate's names: the session's tools, leak_safe from each tool's class, then the retired ones."""
+    loaded = [(spec["name"], bool(getattr(registry.get(spec["name"]), "leak_safe", False))) for spec in tool_specs]
+    names = {name for name, _ in loaded}
+    return ToolNames(loaded + [(name, True) for name in RETIRED_LEAK_SAFE if name not in names])
+
+
 def to_realtime_tools_config(tool_specs: list[ToolSpec]) -> RealtimeToolsConfigParam:
     """Convert app tool specs to the OpenAI-compatible realtime session shape."""
     realtime_tools: RealtimeToolsConfigParam = []
@@ -1479,10 +1491,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             "Tools to be used in conversation: %s",
             [tool["name"] for tool in tool_specs],
         )
-        registry = core_tools.get_tools()
-        self._gate_tools = ToolNames(
-            (spec["name"], bool(getattr(registry.get(spec["name"]), "leak_safe", False))) for spec in tool_specs
-        )
+        self._gate_tools = gate_tool_names(tool_specs, core_tools.get_tools())
         connect_kwargs: dict[str, Any] = {}
         if self._realtime_connect_query:
             connect_kwargs["extra_query"] = self._realtime_connect_query

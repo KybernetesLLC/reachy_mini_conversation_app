@@ -433,6 +433,10 @@ def initialize_tools(instance_path: str | Path | None = None, *, force: bool = F
             loaded_tool_classes,
             extra_tools=remote_tools,
         )
+        excluded = sorted(set(tools) & config.EXCLUDED_TOOLS)
+        if excluded:
+            logger.info("REACHY_MINI_EXCLUDED_TOOLS: not registering %s", excluded)
+            tools = {name: tool for name, tool in tools.items() if name not in config.EXCLUDED_TOOLS}
         ALL_TOOLS = tools
         _TOOLS_SIGNATURE = signature
 

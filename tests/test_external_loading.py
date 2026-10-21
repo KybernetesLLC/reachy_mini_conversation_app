@@ -247,3 +247,29 @@ def test_tool_registry_reads_wait_for_forced_reload(
     assert "move_head" in spec_names
     assert "sweep_look" not in spec_names
     assert spec_names == set(core_tools_mod.get_tools())
+
+
+def test_excluded_tools_never_reach_the_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """REACHY_MINI_EXCLUDED_TOOLS removes tools by name, system tools included (the companion, 2026-10-21)."""
+    profile_name = "excluding_profile"
+    external_profiles_root = tmp_path / "external_profiles"
+    write_profile(profile_name, external_profiles_root / profile_name, "hello", ["dance", "move_head"])
+
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", profile_name)
+    monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", external_profiles_root)
+    monkeypatch.setattr(config_mod.config, "TOOLS_DIRECTORY", None)
+    monkeypatch.setattr(config_mod.config, "AUTOLOAD_EXTERNAL_TOOLS", False)
+    monkeypatch.setattr(config_mod.config, "EXCLUDED_TOOLS", frozenset({"dance", "task_status", "task_cancel"}))
+
+    core_tools_mod = _reload_core_tools()
+
+    assert "move_head" in core_tools_mod.ALL_TOOLS
+    assert not {"dance", "task_status", "task_cancel"} & set(core_tools_mod.ALL_TOOLS)
+
+
+def test_excluded_tools_parse_from_a_comma_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spaces and empty entries are ignored."""
+    monkeypatch.setenv("REACHY_MINI_EXCLUDED_TOOLS", " dance, ,task_status ")
+    assert config_mod.excluded_tools() == frozenset({"dance", "task_status"})
+    monkeypatch.delenv("REACHY_MINI_EXCLUDED_TOOLS")
+    assert config_mod.excluded_tools() == frozenset()

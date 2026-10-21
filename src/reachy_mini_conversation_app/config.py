@@ -101,6 +101,16 @@ def _warn_on_obsolete_backend_env() -> None:
         )
 
 
+def excluded_tools() -> frozenset[str]:
+    """Read REACHY_MINI_EXCLUDED_TOOLS: tool names never registered, comma-separated.
+
+    The companion, 2026-10-21: unused tools cost every session about a quarter of its tool list.
+    System tools can be excluded too.
+    """
+    raw = os.getenv("REACHY_MINI_EXCLUDED_TOOLS", "")
+    return frozenset(name.strip() for name in raw.split(",") if name.strip())
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     """Parse a boolean environment flag.
 
@@ -333,6 +343,9 @@ class Config:
     _tools_directory_env = os.getenv("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY")
     TOOLS_DIRECTORY = Path(_tools_directory_env) if _tools_directory_env else None
     AUTOLOAD_EXTERNAL_TOOLS = _env_flag("AUTOLOAD_EXTERNAL_TOOLS", default=False)
+    EXCLUDED_TOOLS = excluded_tools()
+    # Off: the app never runs its own idle tool (the companion's supervisor draws idle moments itself).
+    IDLE_BEHAVIOR = _env_flag("REACHY_MINI_IDLE_BEHAVIOR", default=True)
     REACHY_MINI_CUSTOM_PROFILE = LOCKED_PROFILE or os.getenv("REACHY_MINI_CUSTOM_PROFILE")
 
     logger.debug(f"Custom Profile: {REACHY_MINI_CUSTOM_PROFILE}")

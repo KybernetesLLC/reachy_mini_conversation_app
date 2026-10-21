@@ -9,6 +9,7 @@ from collections.abc import Callable
 import numpy as np
 from numpy.typing import NDArray
 
+from reachy_mini_conversation_app.config import config
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, AsyncStreamHandler, wait_for_item
 from reachy_mini_conversation_app.idle_policy import start_idle_tool_call
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, get_tool_specs
@@ -88,7 +89,8 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         idle_duration = now - self.last_activity_time
         idle_behavior_duration = now - self.last_idle_behavior_time
         if (
-            idle_duration > self.IDLE_BEHAVIOR_THRESHOLD_S
+            config.IDLE_BEHAVIOR
+            and idle_duration > self.IDLE_BEHAVIOR_THRESHOLD_S
             and idle_behavior_duration > self.IDLE_BEHAVIOR_THRESHOLD_S
             and self._idle_behavior_ready()
             and self.deps.movement_manager.is_idle()

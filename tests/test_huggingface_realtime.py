@@ -2828,3 +2828,34 @@ async def test_a_played_reply_of_only_markup_reaches_the_supervisor_marked(monke
     handler.set_transcript_observer(lambda role, said, final, artifact=None: seen.append((role, said, artifact)))
     await handler._run_realtime_session()
     assert seen == [("assistant", "Hello there.", "leaked tool call")]
+
+
+@pytest.mark.asyncio
+async def test_emit_never_runs_idle_behavior_when_switched_off(monkeypatch: Any) -> None:
+    """REACHY_MINI_IDLE_BEHAVIOR=off: the companion's supervisor owns idle (2026-10-21)."""
+    handler = _plain_handler()
+    handler.last_activity_time = time.monotonic() - (handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0)
+    handler.last_idle_behavior_time = handler.last_activity_time
+    handler.deps.movement_manager.is_idle.return_value = True
+    handler._response_done_event.set()
+    send_idle_signal = AsyncMock()
+    monkeypatch.setattr(handler, "send_idle_signal", send_idle_signal)
+    monkeypatch.setattr(conv_mod, "wait_for_item", AsyncMock(return_value=None))
+    monkeypatch.setattr(conv_mod.config, "IDLE_BEHAVIOR", False)
+
+    await handler.emit()
+
+    send_idle_signal.assert_not_awaited()
+
+
+def test_a_retired_leak_safe_name_stays_known_to_the_gate() -> None:
+    """idle_do_nothing left the tool list on 2026-10-21; a leaked one is still cut as a safe name."""
+    names = hf_mod.gate_tool_names([{"name": "stay_quiet"}], {"stay_quiet": SimpleNamespace(leak_safe=True)})
+    assert names.find("idle_do_nothing") is not None
+    assert names.find("stay_quiet") is not None
+
+
+def test_a_loaded_tool_keeps_its_own_entry_over_a_retired_one() -> None:
+    """A retired name that is loaded again is listed once, from the registry."""
+    names = hf_mod.gate_tool_names([{"name": "idle_do_nothing"}], {})
+    assert names.find("idle_do_nothing") is not None
