@@ -346,13 +346,14 @@ class ToolNames:
         return self._forms.get(normal)
 
     def could_become(self, normal: str) -> bool:
-        """Whether more words could make this a multi-word name ("stay" -> "stay quiet").
+        """Whether more characters could make this a tool's name ("stay" -> "stay quiet",
+        "expr" -> "express": a one-word name was released before its "{", 2026-10-20 22:59).
 
         Under _MIN_WAIT characters it never waits: "I" starts 133 of 659 replies in 10
         days and would wait for idle_do_nothing (the replay, 2026-10-17)."""
         if len(normal) < _MIN_WAIT:
             return False
-        return any(form != normal and "_" in form and form.startswith(normal) for form in self._forms)
+        return any(form != normal and form.startswith(normal) for form in self._forms)
 
 
 def _called_name(markup: str) -> str | None:
@@ -370,6 +371,8 @@ def _leak(tool: LeakTool, shape: str) -> Verdict:
 def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None:
     """Rule 1: a reply that is only a registered tool's name."""
     shapes = _shapes(text, final, tools)
+    if shapes == _UNDECIDED and not final:
+        return Verdict(UNDECIDED)  # a registered name's open arguments: "express{feel"
     if isinstance(shapes, list):
         for kind, body in shapes:
             name = _called_name(body) if kind == _CALL else None
@@ -383,7 +386,9 @@ def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None
     normal = _normal(word)
     tool = tools.find(normal)
     if not final:
-        named = tool is not None and "_" in normal
+        # A tool's name, or the start of one, waits for what follows: "{" makes it a
+        # call, a space and a word make it a sentence (the owner, 2026-10-20).
+        named = tool is not None and len(normal) >= _MIN_WAIT
         return Verdict(UNDECIDED) if named or tools.could_become(normal) else None
     if tool is None:
         return None

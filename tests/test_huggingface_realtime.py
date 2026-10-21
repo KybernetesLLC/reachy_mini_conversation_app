@@ -2201,6 +2201,45 @@ async def test_a_leaked_tool_that_is_not_leak_safe_is_cut_and_never_run(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_a_bare_one_word_call_streamed_in_pieces_is_never_heard(monkeypatch: Any) -> None:
+    """2026-10-20 22:59: "express{...}" was heard: "dance" went out before its "{"."""
+    said = "dance{x:1}"
+    events = (
+        _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+        _audio(1, 2),
+        _said("dan"),
+        _said("ce"),
+        _audio(3, 4),
+        _said("{x:1}"),
+        _FakeEvent("response.output_audio.done"),
+        _FakeEvent("response.output_audio_transcript.done", transcript=said),
+        _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+    )
+    handler, tools = _leak_session(monkeypatch, events)
+    reports = _capture_tool_reports(handler)
+
+    await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("dance", "cut", "leaked")]
+
+
+def test_a_call_heard_before_the_gate_could_judge_it_is_reported_as_played(monkeypatch: Any, caplog: Any) -> None:
+    """The gate's own count missed the 22:59 leaks: judged only after the audio went out."""
+    handler, _tools = _leak_session(monkeypatch, ())
+    reports = _capture_tool_reports(handler)
+    handler._gate_tools = hf_mod.ToolNames([("dance", False)])
+    handler._gate = "pass"
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        handler._gate_transcript("dance{x:1}", final=True)
+
+    assert "possible leaked tool call: dance (markup) played" in caplog.messages
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("dance", "played", "leaked")]
+    assert handler._gate == "pass"
+
+
+@pytest.mark.asyncio
 async def test_a_single_plain_word_name_plays_whole_and_is_logged(monkeypatch: Any, caplog: Any) -> None:
     handler, tools = _leak_session(monkeypatch, _reply_events("Dance!", audio_first=False))
     reports = _capture_tool_reports(handler)

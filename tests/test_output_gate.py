@@ -233,3 +233,24 @@ def test_an_open_tag_call_waits_while_streaming_and_ends_at_its_arguments_once_w
     assert gate.spoken_artifact(head + " /") == gate.UNDECIDED
     assert gate.spoken_artifact(head + " />") == "leaked tool call"
     assert gate.spoken_artifact(head + " Hello") is None  # words: a reply
+
+
+# 2026-10-20 22:59: "express{feeling:<|"|>delight<|"|>}" was heard. A one-word tool name was
+# released before its "{" arrived; now the name, and the start of it, waits (the owner).
+BARE_EXPRESS = f"express{{feeling:{Q}delight{Q}}}"
+
+
+@pytest.mark.parametrize("cut_at", [3, 5, 7, 8, 12, len(BARE_EXPRESS) - 1])
+def test_a_one_word_tool_name_waits_for_what_follows(cut_at: int) -> None:
+    assert gate.judge(BARE_EXPRESS[:cut_at], TOOLS).action == gate.UNDECIDED
+
+
+def test_the_2259_bare_express_is_cut_once_its_arguments_close() -> None:
+    verdict = gate.judge(BARE_EXPRESS, TOOLS)
+    assert (verdict.action, verdict.tool, verdict.shape) == (gate.CUT, "express", "markup")
+    assert gate.judge(BARE_EXPRESS, TOOLS, final=True).action == gate.CUT
+
+
+@pytest.mark.parametrize("text", ["Express yourself", "Expressive", "Music is nice", "Looking good"])
+def test_a_sentence_that_starts_like_a_tool_name_plays_at_the_next_word(text: str) -> None:
+    assert gate.judge(text, TOOLS).action == gate.PLAY

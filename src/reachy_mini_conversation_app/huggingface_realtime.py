@@ -790,6 +790,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         verdict = judge(text, self._gate_tools, final=final)
         if verdict.action == PLAY_AND_LOG:
             self._gate_leak(verdict)
+        elif self._gate == "pass" and verdict.tool and verdict.action in (CUT, CUT_AND_EXECUTE):
+            # Already heard, so too late to cut: counted as played, never run (10-20 22:59:
+            # a bare express{...} left no gate event at all).
+            self._gate_leak(Verdict(PLAY_AND_LOG, kind=verdict.kind, tool=verdict.tool, shape=verdict.shape))
         if self._gate not in ("hold", "open"):
             return
         if verdict.action in (CUT, CUT_AND_EXECUTE):
