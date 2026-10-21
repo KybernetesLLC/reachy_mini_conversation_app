@@ -2872,3 +2872,82 @@ async def test_a_leaked_retired_name_is_cut_and_never_run_or_reported(monkeypatc
     await handler._run_leaked_tool("idle_do_nothing")
 
     assert reports == []
+
+
+_PENDING = "Cannot generate a response while function call outputs are pending."
+
+
+@pytest.mark.asyncio
+async def test_a_reply_the_server_refused_for_an_owed_output_is_sent_once_it_is_in(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Send the server's refused reply once the owed output is in.
+
+    2026-10-21 11:26: "Absolutely." said during an express wait got no reply. The server's
+    own reply to the turn was refused while express's output was owed.
+    """
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="express-1"))
+    )
+    quiet_tool = SimpleNamespace(needs_response=False, leak_safe=False)
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"express": quiet_tool})
+    done = ToolNotification(
+        id="c1", tool_name="express", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": True}
+    )
+
+    async def _finish_tool() -> None:
+        await handler._handle_tool_result(done)
+        await asyncio.sleep(0.05)
+
+    handler.client = _ordering_client(
+        (
+            _FakeEvent("response.function_call_arguments.done", name="express", arguments="{}", call_id="c1"),
+            _FakeEvent("error", error=SimpleNamespace(message=_PENDING, type="response_failed", code=None)),
+            _finish_tool,
+        ),
+        sent,
+        handler,
+    )
+
+    with caplog.at_level(logging.INFO, logger=hf_mod.__name__):
+        await handler._run_realtime_session()
+
+    kinds = [
+        "output" if kind == "item" and payload.get("type") == "function_call_output" else kind
+        for kind, payload in sent
+    ]
+    assert kinds.count("response.create") == 1
+    assert kinds.index("output") < kinds.index("response.create")
+    assert "a reply the server refused while tool outputs were owed: sending it once they are in" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_tool_with_no_output_owed_and_no_refusal_sends_no_extra_reply(monkeypatch: Any) -> None:
+    """A quiet tool's output alone never makes a reply: the recovery answers only a refusal."""
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="express-1"))
+    )
+    quiet_tool = SimpleNamespace(needs_response=False, leak_safe=False)
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"express": quiet_tool})
+    done = ToolNotification(
+        id="c1", tool_name="express", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": True}
+    )
+
+    async def _finish_tool() -> None:
+        await handler._handle_tool_result(done)
+        await asyncio.sleep(0.05)
+
+    handler.client = _ordering_client(
+        (
+            _FakeEvent("response.function_call_arguments.done", name="express", arguments="{}", call_id="c1"),
+            _finish_tool,
+        ),
+        sent,
+        handler,
+    )
+    await handler._run_realtime_session()
+    assert [kind for kind, _ in sent].count("response.create") == 0

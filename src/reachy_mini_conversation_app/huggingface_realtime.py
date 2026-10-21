@@ -1779,6 +1779,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         else:
                             self._response_started_or_rejected_event.set()
                             logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
+                            if "function call outputs are pending" in str(msg):
+                                # The server's own reply to a user turn, refused while a tool's
+                                # output was owed (2026-10-21 11:26: "Absolutely." in an express
+                                # wait went unanswered). The sender holds this create until the
+                                # outputs are in; a tool's own follow-up merges with it.
+                                logger.info(
+                                    "a reply the server refused while tool outputs were owed: "
+                                    "sending it once they are in"
+                                )
+                                await self._safe_response_create()
 
                         if code == "input_audio_buffer_commit_empty":
                             self.deps.movement_manager.set_listening(False)
