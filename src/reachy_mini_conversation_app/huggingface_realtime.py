@@ -729,7 +729,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 "Function call outputs still owed after %.0f s; sending response.create", _OWED_OUTPUT_TIMEOUT
             )
             return True
-        logger.debug("response.create released: function call outputs sent")
+        logger.info("response.create released: function call outputs sent")
         return True
 
     def _requeue(self, keep: Callable[[dict[str, Any]], bool], front: dict[str, Any] | None = None) -> int:
@@ -748,7 +748,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         for queued in kept:
             self._pending_responses.put_nowait(queued)
         if dropped:
-            logger.debug("response.create: merged %d queued create(s) into the one being sent", dropped)
+            logger.info("response.create: merged %d queued create(s) into the one being sent", dropped)
         return dropped
 
     async def _safe_response_create(self, **kwargs: Any) -> None:
@@ -1293,7 +1293,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         timeout=_RESPONSE_DONE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.debug("Timed out waiting for previous response to finish; forcing ahead")
+                    logger.info("Timed out waiting for previous response to finish; forcing ahead")
                     self._response_done_event.set()
 
                 if not self.connection:
@@ -1318,8 +1318,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 try:
                     await self.connection.response.create(**kwargs)
                     self._session_creates += 1
+                    # 2026-10-21 16:51: a tool's follow-up after a say was never answered, and
+                    # these steps logged only at debug. One line per create sent.
+                    logger.info(
+                        "response.create sent (%s, attempt %d)",
+                        "announcement" if announcement_added else "follow-up" if self._followup_pending else "plain",
+                        attempts + 1,
+                    )
                 except Exception as e:
-                    logger.debug("_response_sender_loop: send failed: %s", e)
+                    logger.info("_response_sender_loop: send failed: %s", e)
                     self._response_done_event.set()
                     break
 
@@ -1329,15 +1336,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         timeout=_RESPONSE_DONE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.debug("Timed out waiting for response.created or response rejection")
+                    logger.info("Timed out waiting for response.created or response rejection")
 
                 # Check if the receiver loop observed an asynchronous rejection.
                 if self._last_response_rejected:
                     attempts += 1
                     if attempts >= max_retries:
-                        logger.debug("response.create rejected %d times; giving up", attempts)
+                        logger.info("response.create rejected %d times; giving up", attempts)
                         break
-                    logger.debug("response.create was rejected; retrying (%d/%d)", attempts, max_retries)
+                    logger.info("response.create was rejected; retrying (%d/%d)", attempts, max_retries)
                     await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
                     continue
 
@@ -1347,7 +1354,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         timeout=_RESPONSE_DONE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.debug("Timed out waiting for response.done; assuming response completed")
+                    logger.info("Timed out waiting for response.done; assuming response completed")
                     self._response_done_event.set()
                     break
 
@@ -1492,6 +1499,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             if self._tool_batch_needs_response and not self._in_flight_tool_calls:
                 self._tool_batch_needs_response = False
                 self._followup_pending = True
+                logger.info("follow-up reply queued after %s", completed_tool.tool_name)
                 await self._safe_response_create()
             if sight_note is not None:
                 self.note_image(sight_note, "camera")
@@ -1617,7 +1625,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             logger.info("Turn latency: response.created %.0f ms after user transcript", delta_ms)
                             if self._first_reply_at is None:
                                 self._first_reply_created()
-                        logger.debug("Response created (active)")
+                        logger.info("Response created (active)")
 
                     if event.type == "response.done":
                         # Doesn't mean the audio is done playing
@@ -1798,7 +1806,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             # response finishes it will wake up and see this flag.
                             self._last_response_rejected = True
                             self._response_started_or_rejected_event.set()
-                            logger.debug("response.create rejected; worker will retry after active response finishes")
+                            logger.info("response.create rejected; worker will retry after active response finishes")
                         else:
                             self._response_started_or_rejected_event.set()
                             logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
