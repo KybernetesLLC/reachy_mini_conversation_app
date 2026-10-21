@@ -377,6 +377,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # The cold-open brief (2026-10-17), per session: what went to the voice service,
         # and the glance at open against the first reply to a person's turn (monotonic).
         self._session_images = 0
+        self._usage_missing_logged = False
         self._session_image_bytes = 0
         self._session_creates = 0
         self._open_glance_at: float | None = None
@@ -1100,7 +1101,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         line = usage_line(usage, images=self._session_images, image_bytes=self._session_image_bytes)
         if line is not None:
             logger.info(line)
-        elif not getattr(self, "_usage_missing_logged", False):
+        elif not self._usage_missing_logged:
             self._usage_missing_logged = True
             logger.info("Context: the server reported no token usage")
 
@@ -1511,6 +1512,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._user_speaking = False
             self._last_speech_at = time.monotonic()
             self._session_images = self._session_image_bytes = self._session_creates = 0
+            self._usage_missing_logged = False  # each session says once whether usage comes
             self._open_glance_at = self._first_reply_at = None
             # A turn left open by the session before is not this session's first turn
             # (the review: its greeting would be judged as the first reply).
@@ -1598,7 +1600,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 self._gate_had_audio,
                                 self._gate,
                             )
-                        self._gate_transcript(self._gate_text)
+                        # With no transcript.done this is the whole reply: judged as final (the review).
+                        self._gate_transcript(self._gate_text, final=not self._gate_transcript_done)
                         if self._gate == "hold":  # no transcript at all: a reply, not an artifact
                             self._gate_release("pass")
                         await self._response_finished(event)
@@ -1660,8 +1663,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             AdditionalOutputs({"role": "assistant", "content": event.transcript})
                         )
                         said = event.transcript or ""
-                        kept = said if self._gate_cut_kind else without_calls(said)  # 2026-10-20
-                        self._emit_transcript("assistant", kept, True, artifact=self._gate_cut_kind)
+                        kept = said if self._gate_cut_kind else without_calls(said, self._gate_tools)  # 2026-10-20
+                        if kept or not said:
+                            self._emit_transcript("assistant", kept, True, artifact=self._gate_cut_kind)
+                        else:  # played, but only markup: logged by the supervisor, never kept (the review)
+                            self._emit_transcript("assistant", said, True, artifact="leaked tool call")
                         self._response_transcript(event.transcript or "")
 
                     # Handle audio delta

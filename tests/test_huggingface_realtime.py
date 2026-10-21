@@ -2759,3 +2759,33 @@ async def test_a_reply_logs_the_context_or_says_once_that_none_came(monkeypatch:
     said = [r.getMessage() for r in caplog.records]
     assert any(m.startswith("Realtime session size: instructions ") for m in said)
     assert said.count("Context: the server reported no token usage") == 1
+
+
+@pytest.mark.asyncio
+async def test_an_open_call_with_no_transcript_done_is_judged_whole_and_cut(monkeypatch: Any) -> None:
+    """The review: response.done with no transcript.done judged the reply as unfinished."""
+    q = '<|"|>'
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said(f"<call:idle_do_nothing{{reason:{q}ok{q}}}"),
+            _audio(1, 2),
+            _FakeEvent("response.done", response=SimpleNamespace(metadata=None, usage=None)),
+        ),
+    )
+    handler._clear_queue = lambda: None
+    await handler._run_realtime_session()
+    assert _frames(handler) == []
+
+
+@pytest.mark.asyncio
+async def test_a_played_reply_of_only_markup_reaches_the_supervisor_marked(monkeypatch: Any) -> None:
+    """The review: cleaned to nothing, it vanished; now the supervisor logs it, never keeps it."""
+    handler = _session_handler(monkeypatch, _reply_events("Hello there.", audio_first=False))
+    handler._clear_queue = lambda: None
+    monkeypatch.setattr(hf_mod, "without_calls", lambda text, tools=None: "")
+    seen: list = []
+    handler.set_transcript_observer(lambda role, said, final, artifact=None: seen.append((role, said, artifact)))
+    await handler._run_realtime_session()
+    assert seen == [("assistant", "Hello there.", "leaked tool call")]

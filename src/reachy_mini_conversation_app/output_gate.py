@@ -127,8 +127,10 @@ def _closed(kind: str, end: int) -> tuple[str, int]:
 def _tag_call_at(text: str, i: int, final: bool = False) -> tuple[str, int] | None:
     """Match a malformed Gemma 4 call at text[i]: <call:name/>, <call:name>...</call> and kin.
 
-    At the end of the reply (`final`), a call whose arguments closed but whose tag never did
-    ("<call:idle_do_nothing{reason:...}", 2026-10-20) ends at its arguments."""
+    A call whose arguments closed but whose tag never did ("<call:idle_do_nothing{reason:...}",
+    2026-10-20) ends at its arguments: once words follow them, or at the end of the reply
+    (`final`). Only "/>" or ">" right after the arguments close the tag, so a later ">" in
+    the spoken words is never taken for it (the review)."""
     opener = _TAG_CALL.match(text, i)
     if not opener:
         return None
@@ -138,10 +140,15 @@ def _tag_call_at(text: str, i: int, final: bool = False) -> tuple[str, int] | No
         j = _balanced_end(text, j)
         if j == -1:
             return _UNDECIDED, -1
+    if braced:
+        after = text[j:].lstrip()
+        if after.startswith(("/>", ">")):
+            return _CALL, j + (len(text) - j - len(after)) + (2 if after[0] == "/" else 1)
+        if after in ("", "/"):
+            return (_CALL, j) if final else (_UNDECIDED, -1)
+        return _CALL, j
     tag_end = _TAG_CALL_END.match(text, j)
     if not tag_end:
-        if final and braced:
-            return _CALL, j
         return (_UNDECIDED, -1) if ">" not in text[j:] else None
     if tag_end.group(1):  # self-closing
         return _CALL, tag_end.end()
@@ -171,7 +178,13 @@ def _angle_at(text: str, i: int, final: bool = False) -> tuple[str, int] | None:
     return (_UNDECIDED, -1) if ">" not in text[i:] else None
 
 
-def _shape_at(text: str, i: int, final: bool = False) -> tuple[str, int] | None:
+def _named_call(name: str, tools: ToolNames | None) -> bool:
+    """A bare name{...} is a call when the name has an underscore or is a registered tool:
+    "x{1}" in a reply is not (the review)."""
+    return "_" in name or (tools is not None and tools.find(_normal(name)) is not None)
+
+
+def _shape_at(text: str, i: int, final: bool = False, tools: ToolNames | None = None) -> tuple[str, int] | None:
     """Match the artifact at text[i]: (kind, end), ("undecided", -1) while open, or None."""
     rest = text[i:]
     c = text[i]
@@ -201,7 +214,7 @@ def _shape_at(text: str, i: int, final: bool = False) -> tuple[str, int] | None:
         if end != -1 and _CALL_LIST.fullmatch(text, i, end):
             return _CALL, end
     named = _NAMED_ARGS.match(text, i)
-    if named:
+    if named and _named_call(named.group(), tools):
         return _closed(_CALL, _balanced_end(text, named.end()))
     if c in _DIRECTION_CLOSERS:
         close_at = text.find(_DIRECTION_CLOSERS[c], i + 1)
@@ -213,7 +226,7 @@ def _shape_at(text: str, i: int, final: bool = False) -> tuple[str, int] | None:
     return None
 
 
-def _shapes(text: str, final: bool = False) -> list[tuple[str, str]] | str | None:
+def _shapes(text: str, final: bool = False, tools: ToolNames | None = None) -> list[tuple[str, str]] | str | None:
     """The artifact shapes `text` is made of, as (kind, the shape's own text);
     "undecided" while one is still open; None when there are real words outside them.
     """
@@ -221,7 +234,7 @@ def _shapes(text: str, final: bool = False) -> list[tuple[str, str]] | str | Non
     found: list[tuple[str, str]] = []
     i = _skip(head, 0)
     while i < len(head):
-        shape = _shape_at(head, i, final)
+        shape = _shape_at(head, i, final, tools)
         if shape is None:
             return None
         kind, end = shape
@@ -242,7 +255,7 @@ def spoken_artifact(text: str, final: bool = False) -> str | None:
     return shapes[0][0] if isinstance(shapes, list) else shapes
 
 
-def without_calls(text: str) -> str:
+def without_calls(text: str, tools: ToolNames | None = None) -> str:
     """A played reply's text with its call markup taken out: what the supervisor keeps.
 
     The audio is untouched (a reply with real words plays whole, the owner, 2026-10-16),
@@ -251,10 +264,9 @@ def without_calls(text: str) -> str:
     out: list[str] = []
     i = 0
     while i < len(text):
-        at_word_start = i == 0 or not text[i - 1].isalnum()
-        if text[i] == "<" or (at_word_start and (text[i : i + 5].lower() == "call:" or _NAMED_ARGS.match(text, i))):
-            shape = _shape_at(text, i, final=True)
-            if shape is not None and shape[0] == _CALL:
+        if text[i] == "<" or i == 0 or not text[i - 1].isalnum():
+            shape = _shape_at(text, i, final=True, tools=tools)
+            if shape is not None and shape[0] in (_CALL, _THINKING):
                 i = shape[1]
                 continue
         out.append(text[i])
@@ -298,12 +310,12 @@ _MIN_WAIT = 3  # characters before the start of a reply can wait to become a nam
 _WORD_EDGES: Final[str] = " \t\r\n.!,;?:'\"`*"
 _PLAIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\s-]{0,79}")
 _CALLED_NAME = (
+    re.compile(r"^([A-Za-z_][\w.-]*)\{"),  # first: a name inside the arguments is not it (the review)
     re.compile(r"call:\s*([\w.-]+)", re.IGNORECASE),
     re.compile(r"<function=([\w.-]+)>", re.IGNORECASE),
     re.compile(r'"name"\s*:\s*"([^"]+)"'),
     re.compile(r"^\[\s*([A-Za-z_][\w.]*)\("),
     re.compile(r"tool_code\s*([A-Za-z_][\w.]*)\(", re.IGNORECASE),
-    re.compile(r"^([A-Za-z_][\w.-]*)\{"),
 )
 
 
@@ -357,7 +369,7 @@ def _leak(tool: LeakTool, shape: str) -> Verdict:
 
 def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None:
     """Rule 1: a reply that is only a registered tool's name."""
-    shapes = _shapes(text, final)
+    shapes = _shapes(text, final, tools)
     if isinstance(shapes, list):
         for kind, body in shapes:
             name = _called_name(body) if kind == _CALL else None

@@ -196,4 +196,40 @@ def test_an_open_call_before_words_ends_at_its_arguments() -> None:
 )
 def test_a_played_reply_is_kept_without_its_call_markup(text: str, kept: str) -> None:
     assert gate.judge(text, TOOLS, final=True).action == gate.PLAY
-    assert gate.without_calls(text) == kept
+    assert gate.without_calls(text, TOOLS) == kept
+
+
+# The /code-review of 2026-10-20.
+
+
+def test_the_name_before_the_arguments_is_the_leaked_tool() -> None:
+    verdict = gate.judge('remember{"name":"Alli","fact":"x"}', TOOLS, final=True)
+    assert (verdict.tool, verdict.action) == ("remember", gate.CUT)
+    verdict = gate.judge('stay_quiet{reason:"call: later"}', TOOLS, final=True)
+    assert (verdict.tool, verdict.action) == ("stay_quiet", gate.CUT_AND_EXECUTE)
+
+
+@pytest.mark.parametrize(
+    "text, kept",
+    [
+        ("Sure! <call:express{emotion:happy} That's great, 5 > 3 right?", "Sure! That's great, 5 > 3 right?"),
+        ("I set x{1} to two and y{2}", "I set x{1} to two and y{2}"),
+        ('Okay {"name": "stay_quiet", "arguments": {}} fine', "Okay fine"),
+        ("Okay ```tool_code\nstay_quiet()\n``` fine", "Okay fine"),
+        ("Okay. <think>hmm</think> Hello", "Okay. Hello"),
+    ],
+)
+def test_review_cases_keep_the_spoken_words_and_only_them(text: str, kept: str) -> None:
+    assert gate.without_calls(text, TOOLS) == kept
+
+
+def test_a_word_with_braces_that_is_no_tool_is_a_reply() -> None:
+    assert gate.judge("Hi{there}", TOOLS, final=True).action == gate.PLAY
+
+
+def test_an_open_tag_call_waits_while_streaming_and_ends_at_its_arguments_once_words_follow() -> None:
+    head = f"<call:express{{feeling:{Q}shy{Q}}}"
+    assert gate.spoken_artifact(head) == gate.UNDECIDED
+    assert gate.spoken_artifact(head + " /") == gate.UNDECIDED
+    assert gate.spoken_artifact(head + " />") == "leaked tool call"
+    assert gate.spoken_artifact(head + " Hello") is None  # words: a reply
