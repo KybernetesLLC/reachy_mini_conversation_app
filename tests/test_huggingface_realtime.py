@@ -2989,3 +2989,49 @@ async def test_at_most_one_refused_reply_is_recovered_per_user_turn(monkeypatch:
     handler._new_user_turn()
     await handler._recover_refused_reply()
     assert len(creates) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_tool_called_inside_an_announcement_gets_its_follow_up(monkeypatch: Any) -> None:
+    """A greeting's say() that makes the model call a tool still gets the tool's follow-up.
+
+    2026-10-21 16:51: the weather tool completed and its output was sent, but no follow-up
+    reply went out. This passes: the app's sequence is sound, so the loss is not here.
+    """
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="w-1"))
+    )
+    done = ToolNotification(
+        id="c1",
+        tool_name="test__get_weather",  # not a registered tool: its follow-up is always asked for
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"weather": "clear"},
+    )
+
+    async def _say() -> None:
+        await handler.say("Greet Alli.")
+        await asyncio.sleep(0.05)
+
+    async def _finish_tool() -> None:
+        await handler._handle_tool_result(done)
+        await asyncio.sleep(0.05)
+
+    handler.client = _ordering_client(
+        (
+            _say,
+            _FakeEvent("response.created"),
+            _FakeEvent(
+                "response.function_call_arguments.done", name="test__get_weather", arguments="{}", call_id="c1"
+            ),
+            _FakeEvent("response.done"),
+            _finish_tool,
+        ),
+        sent,
+        handler,
+    )
+    await handler._run_realtime_session()
+
+    assert _kinds(sent) == ["line", "create", "output", "create"]
