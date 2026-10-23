@@ -162,6 +162,9 @@ FILLER_LINES = ("Let me check.", "One moment.", "Let me look that up.", "Just a 
 FILLER_AFTER_S = 1.0  # a lookup tool still running this long gets a filler
 SEARCH_TOOLS = ("search_web", "web_search")  # by name ending: always slow enough
 LOOKUP_TOOLS = ("flights", "boats", "transit", "events", "why_lit", "get_weather")
+# Tools that only move the body. A response that already spoke and called only these gets
+# no follow-up: on 2026-10-23 08:42 the greeting's follow-up read its context aloud.
+GESTURE_TOOLS = frozenset({"express"})
 LOOKUP_PROMISE = re.compile(
     r"\b(let me (check|look|find out|search)(?! at you)|let me see (what|if|whether)"
     r"|(looking|look) (it|that|this) up|i'?ll (check|find out|look (it|that|this) up))\b",
@@ -385,6 +388,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._search_answer_pending = False
         self._filler_tasks: set[asyncio.Task[None]] = set()
         self._tool_batch_needs_response = False
+        # Whether every tool in this batch so far is a gesture whose response already spoke.
+        self._tool_batch_only_gestured = True
+        # Whether this response spoke; the recent responses that did, by id (2026-10-23).
+        self._resp_spoke = False
+        self._spoken_responses: "deque[str]" = deque(maxlen=64)
         # Each frame added to the conversation, handed to the companion for its sight
         # note (Claude Haiku, 2026-10-17): (base64 JPEG, source). Set by the console.
         self.on_sight: Callable[[str, str], None] | None = None
@@ -915,6 +923,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _response_started(self) -> None:
         self._resp_text = ""
         self._resp_called = False
+        self._resp_spoke = False
+
+    def _response_spoke(self) -> None:
+        self._resp_spoke = True
+
+    def _record_spoken_response(self, event: Any) -> None:
+        """Remember a finished response that was heard, for its tools' follow-up."""
+        response_id = getattr(getattr(event, "response", None), "id", None)
+        # A cut response was never heard: its tools keep their follow-up.
+        if self._resp_spoke and self._gate != "cut" and isinstance(response_id, str):
+            self._spoken_responses.append(response_id)
+
+    def _spoke_and_only_gestured(self, completed_tool: ToolNotification) -> bool:
+        return (
+            completed_tool.tool_name in GESTURE_TOOLS
+            and completed_tool.error is None
+            and completed_tool.turn_id in self._spoken_responses
+        )
 
     def _response_transcript(self, text: str) -> None:
         self._resp_text += " " + (text or "")
@@ -1496,13 +1522,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Always surface errors, skip the spoken follow-up for tools that opt out.
             if model_result_submitted and (completed_tool.error is not None or tool is None or tool.needs_response):
                 self._tool_batch_needs_response = True
+                if not self._spoke_and_only_gestured(completed_tool):
+                    self._tool_batch_only_gestured = False
 
             # Parallel tool calls in one turn: respond once every result is in, not per tool.
             if self._tool_batch_needs_response and not self._in_flight_tool_calls:
                 self._tool_batch_needs_response = False
-                self._followup_pending = True
-                logger.info("follow-up reply queued after %s", completed_tool.tool_name)
-                await self._safe_response_create()
+                if self._tool_batch_only_gestured:
+                    # 2026-10-23: the greeting spoke and called express; its follow-up, with
+                    # nothing left to say, read the context aloud. Counted by the express trial.
+                    logger.info(
+                        "tool follow-up skipped: the response already spoke and only gestured (%s)",
+                        completed_tool.tool_name,
+                    )
+                else:
+                    self._followup_pending = True
+                    logger.info("follow-up reply queued after %s", completed_tool.tool_name)
+                    await self._safe_response_create()
+                self._tool_batch_only_gestured = True
             if sight_note is not None:
                 self.note_image(sight_note, "camera")
 
@@ -1607,6 +1644,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("response completed")
 
                     if event.type == "response.output_text.delta":
+                        self._response_spoke()
                         logger.debug("response text delta")
 
                     if event.type == "response.output_text.done":
@@ -1653,6 +1691,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._gate_transcript(self._gate_text, final=not self._gate_transcript_done)
                         if self._gate == "hold":  # no transcript at all: a reply, not an artifact
                             self._gate_release("pass")
+                        # Before the first await: a finished tool waits on this response's done.
+                        self._record_spoken_response(event)
                         await self._response_finished(event)
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
@@ -1694,6 +1734,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._turn_first_audio_at = None
                         self._in_flight_tool_calls.clear()
                         self._tool_batch_needs_response = False
+                        self._tool_batch_only_gestured = True
                         self._start_user_turn()
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
@@ -1701,6 +1742,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.delta":
+                        if getattr(event, "delta", ""):
+                            self._response_spoke()
                         self._gate_transcript(self._gate_text + (getattr(event, "delta", "") or ""))
 
                     if event.type == "response.output_audio_transcript.done":
@@ -1724,6 +1767,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         decoded_pcm_bytes = base64.b64decode(event.delta)
                         decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
                         self._mark_activity("assistant_audio_delta")
+                        self._response_spoke()
                         if self._turn_user_done_at is not None and self._turn_first_audio_at is None:
                             self._turn_first_audio_at = time.perf_counter()
                             delta_ms = (self._turn_first_audio_at - self._turn_user_done_at) * 1000

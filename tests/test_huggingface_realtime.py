@@ -3035,3 +3035,137 @@ async def test_a_tool_called_inside_an_announcement_gets_its_follow_up(monkeypat
     await handler._run_realtime_session()
 
     assert _kinds(sent) == ["line", "create", "output", "create"]
+
+
+# --- 2026-10-23 08:41: a gesture in a reply that already spoke gets no follow-up ---------
+#
+# The welcome greeting spoke and called express in one response; express's result says
+# "now say your reply", and the follow-up read the context aloud. A response that already
+# spoke and only gestured gets no follow-up. Lookups, camera, errors and mixed batches do.
+
+
+def _done_tool(call_id: str, name: str, response_id: str, error: str | None = None) -> ToolNotification:
+    return ToolNotification(
+        id=call_id,
+        tool_name=name,
+        is_idle_tool_call=False,
+        status=ToolState.FAILED if error else ToolState.COMPLETED,
+        result=None if error else {"ok": True},
+        error=error,
+        turn_id=response_id,
+    )
+
+
+def _response(response_id: str, spoken: str = "", calls: tuple[tuple[str, str], ...] = ()) -> tuple[Any, ...]:
+    """One response's events: created, `spoken` as transcript deltas, each (call_id, name), done."""
+    events: list[Any] = [_FakeEvent("response.created", response=SimpleNamespace(id=response_id))]
+    if spoken:
+        events.append(_FakeEvent("response.output_audio_transcript.delta", delta=spoken, response_id=response_id))
+    for call_id, name in calls:
+        events.append(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name=name,
+                arguments="{}",
+                call_id=call_id,
+                response_id=response_id,
+            )
+        )
+    events.append(_FakeEvent("response.done", response=SimpleNamespace(id=response_id)))
+    return tuple(events)
+
+
+async def _run_with_tools(
+    monkeypatch: Any, events: tuple[Any, ...], done: tuple[ToolNotification, ...], say: str | None = None
+) -> list[str]:
+    """Run a session: an optional say(), `events`, then each finished tool; return the kinds sent."""
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="t-1"))
+    )
+
+    async def _say() -> None:
+        if say is not None:
+            await handler.say(say)
+        await asyncio.sleep(0.05)
+
+    def _finisher(tool: ToolNotification) -> Any:
+        async def _finish() -> None:
+            await handler._handle_tool_result(tool)
+            await asyncio.sleep(0.05)
+
+        return _finish
+
+    handler.client = _ordering_client((_say, *events, *(_finisher(t) for t in done)), sent, handler)
+    await handler._run_realtime_session()
+    return _kinds(sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("say", [None, "Greet Matt and Alli."])
+async def test_express_in_a_response_that_already_spoke_gets_no_follow_up(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture, say: str | None
+) -> None:
+    """A plain reply and the announcement path: speech plus express, then no second create."""
+    events = _response("r1", "Hello, you two! Good to see you both.", (("c1", "express"),))
+
+    with caplog.at_level(logging.INFO, logger=hf_mod.__name__):
+        kinds = await _run_with_tools(monkeypatch, events, (_done_tool("c1", "express", "r1"),), say)
+
+    assert kinds == (["line", "create", "output"] if say else ["output"])
+    assert "tool follow-up skipped: the response already spoke and only gestured" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_express_in_a_silent_response_still_gets_its_follow_up(monkeypatch: Any) -> None:
+    """A gesture with no speech is the normal case: its spoken answer comes in the follow-up."""
+    events = _response("r1", "", (("c1", "express"),))
+
+    kinds = await _run_with_tools(monkeypatch, events, (_done_tool("c1", "express", "r1"),))
+
+    assert kinds == ["output", "create"]
+
+
+@pytest.mark.asyncio
+async def test_a_lookup_after_let_me_check_still_gets_its_follow_up(monkeypatch: Any) -> None:
+    """2026-10-09 09:49:19: "Let me check." and search_web in one response; the answer is the follow-up."""
+    events = _response("r1", "Let me check.", (("c1", "test__web_search"),))
+
+    kinds = await _run_with_tools(monkeypatch, events, (_done_tool("c1", "test__web_search", "r1"),))
+
+    assert [k for k in kinds if k != "filler"] == ["output", "create"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_tool_after_speech_still_gets_its_follow_up(monkeypatch: Any) -> None:
+    """A failed gesture after speech keeps its follow-up, so the model can report the error."""
+    events = _response("r1", "Hello there!", (("c1", "express"),))
+
+    kinds = await _run_with_tools(monkeypatch, events, (_done_tool("c1", "express", "r1", error="no motors"),))
+
+    assert kinds == ["output", "create"]
+
+
+@pytest.mark.asyncio
+async def test_a_gesture_with_a_lookup_in_one_batch_keeps_the_follow_up(monkeypatch: Any) -> None:
+    """The lookup's answer still has to be spoken, so the batch keeps its one follow-up."""
+    events = _response("r1", "Good morning!", (("c1", "express"), ("c2", "test__get_weather")))
+    done = (_done_tool("c1", "express", "r1"), _done_tool("c2", "test__get_weather", "r1"))
+
+    kinds = await _run_with_tools(monkeypatch, events, done)
+
+    assert kinds == ["output", "output", "create"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("first", "second", "expected"), [("", "Hi!", ["output", "create"]), ("Hi!", "", ["output"])])
+async def test_a_newer_response_starting_does_not_change_the_calling_responses_flag(
+    monkeypatch: Any, first: str, second: str, expected: list[str]
+) -> None:
+    """The tool finishes after a second response: the follow-up depends on the response that called it."""
+    events = _response("r1", first, (("c1", "express"),)) + _response("r2", second)
+
+    kinds = await _run_with_tools(monkeypatch, events, (_done_tool("c1", "express", "r1"),))
+
+    assert kinds == expected
