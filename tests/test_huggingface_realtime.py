@@ -3535,3 +3535,36 @@ async def test_markup_leaks_still_behave_as_before(
     assert line in caplog.messages
     assert tools[name].runs == runs
     assert [(r["name"], r["source"]) for r in reports] == [(name, "leaked")]
+
+
+@pytest.mark.asyncio
+async def test_a_json_call_that_closes_after_the_timer_released_its_audio_flushes_the_player(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """The review of 9ec8ab9: audio released by the 0.3 s hold, then the object closes as a call."""
+    monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
+    handler, tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said('{\n  "tool_calls": [{"function": "rec'),
+            _audio(1, 2),
+            lambda: asyncio.sleep(0.15),
+            _said('all", "parameters": {"query": "Tony"}}]\n}'),
+            _audio(3, 4),
+            _FakeEvent("response.output_audio.done"),
+            _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+        ),
+    )
+    reports = _capture_tool_reports(handler)
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    assert cleared == [True]
+    assert [list(a.reshape(-1)) for _r, a in _frames(handler)] == [[1, 2]]  # the fake flush drained nothing
+    assert "leaked tool call: recall (json) cut; executed=False" in caplog.messages
+    assert tools["recall"].runs == 0
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("recall", "cut", "leaked")]

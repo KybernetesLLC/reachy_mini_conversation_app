@@ -265,6 +265,16 @@ JSON_SHAPES = (
     '{{"tool_calls": [{{"type": "function", "function": {{"name": "{n}", "arguments": "{{}}"}}}}]}}',
     '{{"function": "{n}", "parameters": {{}}}}',
     '{{"function": {{"name": "{n}"}}, "arguments": {{}}}}',
+    # the review of 9ec8ab9: no arguments key, null arguments, a ```json fence, a bare list
+    '{{"function": "{n}"}}',
+    '{{"name": "{n}"}}',
+    '{{"tool_calls": [{{"function": "{n}"}}]}}',
+    '{{"name": "{n}", "arguments": null}}',
+    '{{"tool_calls": [{{"function": "{n}", "parameters": null}}]}}',
+    '```json\n{{"function": "{n}", "parameters": {{"q": "x"}}}}\n```',
+    '```json\n{{"tool_calls": [{{"name": "{n}", "arguments": {{}}}}]}}\n```',
+    '[{{"function": "{n}", "parameters": {{"items": [1, 2]}}}}]',
+    '[\n  {{"name": "{n}"}}\n]',
 )
 
 
@@ -325,3 +335,43 @@ def test_a_long_json_call_still_waits_past_the_markup_limit() -> None:
 def test_a_played_reply_is_kept_without_its_json_call(text: str, kept: str) -> None:
     assert gate.judge(text, TOOLS, final=True).action == gate.PLAY
     assert gate.without_calls(text, TOOLS) == kept
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"name": "Matt"}',
+        '{"function": "teleport"}',
+        '[{"name": "Matt"}]',
+        '{"name": "Matt", "arguments": null, "age": 3}',
+        "```json\n{\"name\": \"Matt\"}\n```",
+    ],
+)
+def test_a_json_object_with_no_arguments_is_a_call_only_for_a_known_tool(text: str) -> None:
+    assert gate.judge(text, TOOLS, final=True).action == gate.PLAY
+
+
+def test_a_wrapped_call_with_no_arguments_is_cut_even_when_unknown() -> None:
+    assert gate.judge('{"tool_calls": [{"function": "teleport"}]}', TOOLS, final=True) == gate.Verdict(
+        gate.CUT, kind="leaked tool call"
+    )
+
+
+@pytest.mark.parametrize("text", ['{"name" is how you write it', '{"function"s are', '{"name" ,'])
+def test_a_closed_first_key_with_no_colon_is_released_at_once(text: str) -> None:
+    assert gate.judge(text, TOOLS).action == gate.PLAY
+
+
+@pytest.mark.parametrize(
+    "text", ['{"name"', '{"name" ', '{"name":', '{"name" :', "[", "[{", '[\n  {"func', "```js", '```json\n{"tool_ca']
+)
+def test_the_start_of_a_new_json_shape_waits(text: str) -> None:
+    assert gate.judge(text, TOOLS).action == gate.UNDECIDED
+
+
+def test_a_bare_list_with_a_nested_list_is_still_a_call() -> None:
+    text = '[{"function": "remember", "parameters": {"facts": ["a", "b"]}}]'
+    assert gate.judge(text[:40], TOOLS).action == gate.UNDECIDED  # past the inner "]"? not yet
+    assert gate.judge(text[:-1], TOOLS).action == gate.UNDECIDED  # the inner "]" is not the end
+    verdict = gate.judge(text, TOOLS)
+    assert (verdict.action, verdict.tool, verdict.shape) == (gate.CUT, "remember", "json")

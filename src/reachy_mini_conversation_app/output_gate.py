@@ -69,11 +69,15 @@ _CALL_LIST = re.compile(rf"\[\s*{_CALL_ITEM}(?:\s*,\s*{_CALL_ITEM})*\s*\]", re.D
 _TOOL_CODE = re.compile(r"```\s*tool_code\b.*?```", re.IGNORECASE | re.DOTALL)
 # A tool call spoken as JSON (2026-10-23 11:13:21, a pretty-printed recall call): a
 # {"tool_calls": [...]} list, or one call object, {"function"|"name": ..., "arguments"|
-# "parameters": ...}. The function may be an object with a name (and its arguments). While
-# open it waits only if its first key could be a call's; anything else is released at once.
+# "parameters": ...}. The function may be an object with a name (and its arguments). The
+# review of 9ec8ab9 added a bare [...] list, a ```json fence and null arguments; a call with
+# no arguments key counts inside {"tool_calls": ...}, and elsewhere only when it names a
+# known tool ({"name": "Matt"} is speech). While open it waits only if its first key could
+# be a call's and is followed by ":"; anything else is released at once.
 _JSON_CALL_KEYS: Final[frozenset[str]] = frozenset({"name", "function", "arguments", "parameters", "type", "id"})
 _JSON_FIRST_KEYS: Final[frozenset[str]] = _JSON_CALL_KEYS | {"tool_calls"}
 _JSON_OPEN = re.compile(r'\{\s*(?:"([^"\\]*)("?))?')
+_JSON_FENCE = re.compile(r"```\s*json\b(.*?)```", re.IGNORECASE | re.DOTALL)
 
 
 def _skip(text: str, i: int) -> int:
@@ -113,7 +117,9 @@ def _balanced_end(text: str, i: int) -> int:
 
 
 def _json_arguments(value: object) -> bool:
-    """Return whether `value` is arguments: an object, or a JSON string of one."""
+    """Return whether `value` is arguments: an object, a JSON string of one, or null."""
+    if value is None:
+        return True
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -122,8 +128,11 @@ def _json_arguments(value: object) -> bool:
     return isinstance(value, dict)
 
 
-def _json_call_name(item: object) -> str | None:
-    """Return the tool name of one JSON call object, or None when it is not only a call."""
+def _json_call_name(item: object, tools: ToolNames | None, wrapped: bool) -> str | None:
+    """Return the tool name of one JSON call object, or None when it is not only a call.
+
+    With no arguments key it is a call inside {"tool_calls": ...} (`wrapped`), and
+    elsewhere only when it names a known tool."""
     if not isinstance(item, dict) or not set(item) <= _JSON_CALL_KEYS:
         return None
     function = item.get("function", item.get("name"))
@@ -139,23 +148,26 @@ def _json_call_name(item: object) -> str | None:
         for key in ("arguments", "parameters"):
             if key in holder:
                 return function if _json_arguments(holder[key]) else None
-    return None
+    known = wrapped or (tools is not None and tools.find(_normal(function)) is not None)
+    return function if known else None
 
 
-def _json_call_names(body: str) -> list[str] | None:
-    """Return the tool names of a JSON object that is only tool calls, in order; else None."""
+def _json_call_names(body: str, tools: ToolNames | None = None) -> list[str] | None:
+    """Return the tool names of JSON that is only tool calls, in order; else None.
+
+    The JSON is a {"tool_calls": [...]} object, a bare list of calls or one call, alone
+    or in a ```json fence."""
+    fence = _JSON_FENCE.fullmatch(body)
     try:
-        value = json.loads(body)
+        value = json.loads(fence.group(1) if fence else body)
     except ValueError:
         return None
-    if isinstance(value, dict) and set(value) == {"tool_calls"}:
-        items = value["tool_calls"]
-        if not isinstance(items, list) or not items:
-            return None
-        names = [_json_call_name(item) for item in items]
-        return names if all(names) else None  # type: ignore[return-value]
-    name = _json_call_name(value)
-    return [name] if name else None
+    wrapped = isinstance(value, dict) and set(value) == {"tool_calls"}
+    items = value["tool_calls"] if wrapped else value if isinstance(value, list) else [value]
+    if not isinstance(items, list) or not items:
+        return None
+    names = [_json_call_name(item, tools, wrapped) for item in items]
+    return names if all(names) else None  # type: ignore[return-value]
 
 
 def _could_be_json_call(rest: str) -> bool:
@@ -169,7 +181,16 @@ def _could_be_json_call(rest: str) -> bool:
         return after == ""  # "{" and whitespace so far
     if not closed:
         return after == "" and any(first.startswith(key) for first in _JSON_FIRST_KEYS)
-    return key in _JSON_FIRST_KEYS
+    return key in _JSON_FIRST_KEYS and after.lstrip()[:1] in ("", ":")
+
+
+def _json_opening(rest: str) -> bool:
+    """Return whether an open shape is a JSON call's start, which may wait past _UNDECIDED_MAX."""
+    if rest.startswith("["):
+        rest = rest[1:].lstrip()
+    elif rest[:7].lower() == "```json":
+        rest = rest[7:].lstrip()
+    return _could_be_json_call(rest)
 
 
 def _closed(kind: str, end: int) -> tuple[str, int]:
@@ -256,16 +277,22 @@ def _shape_at(text: str, i: int, final: bool = False, tools: ToolNames | None = 
         fence = _TOOL_CODE.match(text, i)
         if fence:
             return _CALL, fence.end()
+        fence = _JSON_FENCE.match(text, i)
+        if fence:
+            return (_CALL, fence.end()) if _json_call_names(fence.group(), tools) else None
         return (_UNDECIDED, -1) if rest.find("```", 3) == -1 else None
     if c == "{":
         end = _balanced_end(text, i)
         if end == -1:
             return (_UNDECIDED, -1) if _could_be_json_call(rest) else None
-        return (_CALL, end) if _json_call_names(text[i:end]) else None
+        return (_CALL, end) if _json_call_names(text[i:end], tools) else None
     if c == "[":
         end = _balanced_end(text, i)
-        if end != -1 and _CALL_LIST.fullmatch(text, i, end):
+        if end != -1 and (_CALL_LIST.fullmatch(text, i, end) or _json_call_names(text[i:end], tools)):
             return _CALL, end
+        inner = text[i + 1 :].lstrip()
+        if end == -1 and inner.startswith("{"):  # a bare list of JSON calls: an inner "]" is not its end
+            return (_UNDECIDED, -1) if _could_be_json_call(inner) else None
     named = _NAMED_ARGS.match(text, i)
     if named and _named_call(named.group(), tools):
         return _closed(_CALL, _balanced_end(text, named.end()))
@@ -292,7 +319,7 @@ def _shapes(text: str, final: bool = False, tools: ToolNames | None = None) -> l
             return None
         kind, end = shape
         if kind == _UNDECIDED:
-            limit = _JSON_UNDECIDED_MAX if head[i] == "{" else _UNDECIDED_MAX
+            limit = _JSON_UNDECIDED_MAX if _json_opening(head[i:]) else _UNDECIDED_MAX
             return _UNDECIDED if len(head) <= limit else None
         found.append((kind, head[i:end]))
         i = _skip(head, end)
@@ -433,7 +460,7 @@ def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None
         for kind, body in shapes:
             if kind != _CALL:
                 continue
-            json_names = _json_call_names(body) if body.startswith("{") else None
+            json_names = _json_call_names(body, tools) if body.startswith(("{", "[", "`")) else None
             names = json_names if json_names is not None else [_called_name(body)]
             shape = "json" if json_names is not None else "markup"
             found = [tools.find(_normal(name)) for name in names if name]
