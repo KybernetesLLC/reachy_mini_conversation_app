@@ -51,7 +51,6 @@ MARKUP_SHAPES = (
     "<|tool_call>call:{n}{{}}<tool_call|>",
     '<tool_call>{{"name": "{n}", "arguments": {{}}}}</tool_call>',
     "<function={n}><parameter=x>1</parameter></function>",
-    '{{"name": "{n}", "arguments": {{}}}}',
     "[{n}()]",
     "```tool_code\n{n}()\n```",
     "{n}{{}}",  # bare, no "call:" (2026-10-17, 2026-10-18)
@@ -254,3 +253,75 @@ def test_the_2259_bare_express_is_cut_once_its_arguments_close() -> None:
 @pytest.mark.parametrize("text", ["Express yourself", "Expressive", "Music is nice", "Looking good"])
 def test_a_sentence_that_starts_like_a_tool_name_plays_at_the_next_word(text: str) -> None:
     assert gate.judge(text, TOOLS).action == gate.PLAY
+
+
+# 2026-10-23 11:13:21: a recall call spoken as JSON. A JSON call is its own shape, "json"
+# (the {"name", "arguments"} object was listed with the markup shapes before).
+JSON_SHAPES = (
+    '{{"name": "{n}", "arguments": {{}}}}',
+    '{{"tool_calls": [{{"function": "{n}", "parameters": {{"query": "how we met"}}}}]}}',
+    '{{\n  "tool_calls": [\n    {{\n      "function": "{n}",\n      "parameters": {{}}\n    }}\n  ]\n}}',
+    '{{"tool_calls": [{{"name": "{n}", "arguments": "{{\\"x\\": 1}}"}}]}}',
+    '{{"tool_calls": [{{"type": "function", "function": {{"name": "{n}", "arguments": "{{}}"}}}}]}}',
+    '{{"function": "{n}", "parameters": {{}}}}',
+    '{{"function": {{"name": "{n}"}}, "arguments": {{}}}}',
+)
+
+
+@pytest.mark.parametrize("name", REGISTRY)
+@pytest.mark.parametrize("shape", JSON_SHAPES)
+def test_every_tool_in_every_json_shape_is_cut(name: str, shape: str) -> None:
+    verdict = gate.judge(shape.format(n=name), TOOLS, final=True)
+    assert (verdict.action, verdict.tool, verdict.shape) == (_expected_cut(name), name, "json")
+
+
+def test_a_json_call_list_names_each_of_its_tools() -> None:
+    text = '{"tool_calls": [{"function": "stay_quiet", "parameters": {}}, {"name": "dance", "arguments": {}}]}'
+    verdict = gate.judge(text, TOOLS, final=True)
+    assert (verdict.action, verdict.tool) == (gate.CUT_AND_EXECUTE, "stay_quiet")
+    assert [(more.action, more.tool, more.shape) for more in verdict.more] == [(gate.CUT, "dance", "json")]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"tool_calls": [{"function": "teleport", "parameters": {}}]}',
+        '{"function": "teleport", "parameters": {}}',
+    ],
+)
+def test_an_unknown_json_call_is_an_artifact_with_no_tool(text: str) -> None:
+    assert gate.judge(text, TOOLS, final=True) == gate.Verdict(gate.CUT, kind="leaked tool call")
+
+
+@pytest.mark.parametrize("cut_at", [1, 2, 5, 9, 14, 20, 30, 45, 60])
+def test_the_start_of_a_json_call_waits(cut_at: int) -> None:
+    text = '{\n  "tool_calls": [{"function": "recall", "parameters": {"query": "how we met"}}]}'
+    assert gate.judge(text[:cut_at], TOOLS).action == gate.UNDECIDED
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["{a", "{ a, b", '{"query"', '{"quer"y', '{"tool_calls": 3}', '{"name": "x", "colour": "red"}', "{}"],
+)
+def test_braces_that_cannot_be_a_call_are_released_at_once(text: str) -> None:
+    assert gate.judge(text, TOOLS).action == gate.PLAY
+
+
+def test_a_long_json_call_still_waits_past_the_markup_limit() -> None:
+    text = '{"tool_calls": [{"function": "recall", "parameters": {"query": "' + "a" * 300
+    tools = gate.ToolNames([("recall", False)])  # added to the companion's list after 10-17
+    assert gate.judge(text, tools).action == gate.UNDECIDED
+    verdict = gate.judge(text + '"}}]}', tools)
+    assert (verdict.action, verdict.tool, verdict.shape) == (gate.CUT, "recall", "json")
+
+
+@pytest.mark.parametrize(
+    "text, kept",
+    [
+        ('Let me check. {"tool_calls": [{"function": "recall", "parameters": {}}]} Hmm.', "Let me check. Hmm."),
+        ("the set {a, b}", "the set {a, b}"),
+    ],
+)
+def test_a_played_reply_is_kept_without_its_json_call(text: str, kept: str) -> None:
+    assert gate.judge(text, TOOLS, final=True).action == gate.PLAY
+    assert gate.without_calls(text, TOOLS) == kept

@@ -838,7 +838,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         elif self._gate == "pass" and verdict.tool and verdict.action in (CUT, CUT_AND_EXECUTE):
             # Already heard, so too late to cut: counted as played, never run (10-20 22:59:
             # a bare express{...} left no gate event at all).
-            self._gate_leak(Verdict(PLAY_AND_LOG, kind=verdict.kind, tool=verdict.tool, shape=verdict.shape))
+            for heard in (verdict, *verdict.more):
+                self._gate_leak(Verdict(PLAY_AND_LOG, kind=heard.kind, tool=heard.tool, shape=heard.shape))
         if self._gate not in ("hold", "open"):
             return
         if verdict.action in (CUT, CUT_AND_EXECUTE):
@@ -847,7 +848,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._gate_release("pass")
 
     def _gate_leak(self, verdict: Verdict) -> None:
-        """Log a leaked tool name, report it (source "leaked"), and run it if leak_safe."""
+        """Log, report (source "leaked") and run if leak_safe each leaked call of a verdict."""
+        self._gate_leak_one(verdict)
+        for more in verdict.more:
+            self._gate_leak_one(more)
+
+    def _gate_leak_one(self, verdict: Verdict) -> None:
         name = verdict.tool or ""
         if verdict.action == PLAY_AND_LOG:
             logger.warning("possible leaked tool call: %s (%s) played", name, verdict.shape)

@@ -2167,9 +2167,14 @@ class _FakeTool:
 
 
 def _leak_session(monkeypatch: Any, events: tuple[Any, ...]) -> tuple[HuggingFaceRealtimeHandler, dict[str, _FakeTool]]:
-    """A session whose live registry is stay_quiet (leak_safe), web_search and dance."""
+    """A session whose live registry is stay_quiet (leak_safe), web_search, dance and recall."""
     handler = _session_handler(monkeypatch, events)
-    tools = {"stay_quiet": _FakeTool(True), "web_search": _FakeTool(False), "dance": _FakeTool(False)}
+    tools = {
+        "stay_quiet": _FakeTool(True),
+        "web_search": _FakeTool(False),
+        "dance": _FakeTool(False),
+        "recall": _FakeTool(False),  # the companion's recall is not leak_safe
+    }
     specs = [{"type": "function", "name": name, "description": "", "parameters": {}} for name in tools]
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: specs)
     monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: dict(tools))
@@ -3317,3 +3322,216 @@ async def test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next(
     assert sent == []
     assert "dropped a tool result from a closed session: express (c1)" in caplog.text
     assert [(r["name"], r["status"], r["session"]) for r in reports] == [("express", "cancelled", False)]
+
+
+# --- a tool call spoken as JSON (the 10-23 recall leak) ------------------------------
+#
+# 2026-10-23 11:13:21: Gemma spoke a recall call as pretty-printed JSON; the gate knew only
+# call markup, so it was heard and recall never ran.
+JSON_RECALL = (
+    "{\n"
+    '  "tool_calls": [\n'
+    "    {\n"
+    '      "function": "recall",\n'
+    '      "parameters": {\n'
+    '        "query": "how Matt and Alli met Tony and Roseanne"\n'
+    "      }\n"
+    "    }\n"
+    "  ]\n"
+    "}"
+)
+JSON_RECALL_ONE_LINE = (
+    '{"tool_calls": [{"function": "recall", "parameters": {"query": "how Matt and Alli met Tony and Roseanne"}}]}'
+)
+
+
+def _streamed(*deltas: str, audio_between: bool = True) -> tuple[Any, ...]:
+    """One response whose transcript arrives in `deltas`, with audio after each."""
+    body: list[Any] = []
+    for n, delta in enumerate(deltas):
+        body.append(_said(delta))
+        if audio_between:
+            body.append(_audio(n, n))
+    return (
+        _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+        *body,
+        _FakeEvent("response.output_audio.done"),
+        _FakeEvent("response.output_audio_transcript.done", transcript="".join(deltas)),
+        _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", [JSON_RECALL, JSON_RECALL_ONE_LINE])
+@pytest.mark.parametrize("audio_first", [False, True])
+async def test_a_json_tool_calls_leak_is_cut_from_speech(
+    monkeypatch: Any, caplog: Any, text: str, audio_first: bool
+) -> None:
+    handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=audio_first))
+    reports = _capture_tool_reports(handler)
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert "leaked tool call: recall (json) cut; executed=False" in caplog.messages
+    assert tools["recall"].runs == 0  # recall is not leak_safe: cut, never run
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("recall", "cut", "leaked")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        # mid-key and mid-string
+        (
+            '{"tool_ca',
+            'lls": [{"func',
+            'tion": "rec',
+            'all", "parameters": {"query": "how Matt an',
+            'd Alli met Tony and Roseanne"}}]}',
+        ),
+        # the pretty-printed form, split at and across its newlines
+        tuple(line + "\n" for line in JSON_RECALL.split("\n")[:-1]) + ("}",),
+        (
+            "{",
+            "\n  ",
+            '"tool_calls": [\n    {\n      "fun',
+            'ction": "recall",\n      "param',
+            JSON_RECALL[JSON_RECALL.index('eters"') :],
+        ),
+    ],
+)
+async def test_a_json_tool_call_split_across_deltas_is_cut(monkeypatch: Any, deltas: tuple[str, ...]) -> None:
+    assert "".join(deltas) in (JSON_RECALL, JSON_RECALL_ONE_LINE)
+    handler, tools = _leak_session(monkeypatch, _streamed(*deltas))
+    reports = _capture_tool_reports(handler)
+
+    await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert tools["recall"].runs == 0
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("recall", "cut", "leaked")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"function": "dance", "parameters": {"move": "wiggle"}}',
+        '{"name": "dance", "arguments": {"move": "wiggle"}}',
+        '{"name": "dance", "arguments": "{\\"move\\": \\"wiggle\\"}"}',
+        '{"function": {"name": "dance"}, "arguments": {}}',
+        '{"type": "function", "function": {"name": "dance", "arguments": "{}"}}',
+    ],
+)
+async def test_a_bare_json_function_object_is_cut(monkeypatch: Any, caplog: Any, text: str) -> None:
+    handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=True))
+    reports = _capture_tool_reports(handler)
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert "leaked tool call: dance (json) cut; executed=False" in caplog.messages
+    assert tools["dance"].runs == 0
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("dance", "cut", "leaked")]
+
+
+@pytest.mark.asyncio
+async def test_a_leaked_json_call_to_a_leak_safe_tool_runs_like_markup(monkeypatch: Any, caplog: Any) -> None:
+    text = '{"tool_calls": [{"function": "stay_quiet", "parameters": {"reason": "not addressed to me"}}]}'
+    handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=True))
+    reports = _capture_tool_reports(handler)
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert "leaked tool call: stay_quiet (json) cut; executed=True" in caplog.messages
+    assert tools["stay_quiet"].runs == 1
+    start_tool.assert_not_awaited()
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("stay_quiet", "ok", "leaked")]
+
+
+@pytest.mark.asyncio
+async def test_each_json_call_in_a_list_goes_through_the_leaked_call_path(monkeypatch: Any, caplog: Any) -> None:
+    text = (
+        '{"tool_calls": [{"function": "stay_quiet", "parameters": {}}, '
+        '{"function": "teleport", "parameters": {}}, {"name": "dance", "arguments": "{}"}]}'
+    )
+    handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=True))
+    reports = _capture_tool_reports(handler)
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert (tools["stay_quiet"].runs, tools["dance"].runs) == (1, 0)
+    assert sorted((r["name"], r["status"]) for r in reports) == [("dance", "cut"), ("stay_quiet", "ok")]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_json_tool_is_cut_but_not_run(monkeypatch: Any, caplog: Any) -> None:
+    text = '{"tool_calls": [{"function": "teleport", "parameters": {"to": "Paris"}}]}'
+    handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=True))
+    reports = _capture_tool_reports(handler)
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert all(tool.runs == 0 for tool in tools.values())
+    assert reports == []  # as with markup: an unregistered name is cut, with no tool to report
+    assert any(m.startswith("spoken artifact cut (leaked tool call)") for m in caplog.messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        ("the set {a, b}", " has two members."),
+        ("{a, b}", " is a set."),
+        ("{", "a, b} is a set."),
+        ('{"quoted"', " is how you write it."),
+    ],
+)
+async def test_speech_with_braces_that_is_not_a_tool_call_is_spoken(monkeypatch: Any, deltas: tuple[str, ...]) -> None:
+    handler, tools = _leak_session(monkeypatch, _streamed(*deltas))
+    reports = _capture_tool_reports(handler)
+
+    await _run_with_leaks(handler)
+
+    assert len(_frames(handler)) == len(deltas)
+    assert reports == []
+    # Released as soon as it cannot be a call, not at the end of the reply:
+    first = "".join(deltas)[: len(deltas[0]) + (2 if deltas[0] == "{" else 0)]
+    assert hf_mod.judge(first, handler._gate_tools).action == "play"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, line, runs",
+    [
+        ("<call:stay_quiet/>", "leaked tool call: stay_quiet (markup) cut; executed=True", 1),
+        ("call:dance{}", "leaked tool call: dance (markup) cut; executed=False", 0),
+        ('<call:recall{query:<|"|>Tony<|"|>}/>', "leaked tool call: recall (markup) cut; executed=False", 0),
+        ('{"name": "dance", "arguments": {}}', "leaked tool call: dance (json) cut; executed=False", 0),
+    ],
+)
+async def test_markup_leaks_still_behave_as_before(
+    monkeypatch: Any, caplog: Any, text: str, line: str, runs: int
+) -> None:
+    handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=True))
+    reports = _capture_tool_reports(handler)
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    name = line.split(": ")[1].split(" ")[0]
+    assert _frames(handler) == []
+    assert line in caplog.messages
+    assert tools[name].runs == runs
+    assert [(r["name"], r["source"]) for r in reports] == [(name, "leaked")]
