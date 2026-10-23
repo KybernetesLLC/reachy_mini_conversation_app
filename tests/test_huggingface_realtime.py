@@ -801,6 +801,29 @@ def test_tool_report_status_refused_via_result_marker() -> None:
     assert hf_mod._tool_report_status_and_reason(refused) == ("refused", "quiet hours")
 
 
+def test_a_result_with_ok_false_is_reported_refused_with_its_why() -> None:
+    """`ok: False` is a refusal; the text comes from "why", else "reason", else ""; error still wins."""
+
+    def done(result):
+        return ToolNotification(
+            id="1", tool_name="t", is_idle_tool_call=False, status=ToolState.COMPLETED, result=result
+        )
+
+    assert hf_mod._tool_report_status_and_reason(done({"ok": False, "why": "no such timer"})) == (
+        "refused",
+        "no such timer",
+    )
+    assert hf_mod._tool_report_status_and_reason(done({"ok": False, "reason": "busy"})) == ("refused", "busy")
+    assert hf_mod._tool_report_status_and_reason(done({"ok": False, "why": "a", "reason": "b"})) == ("refused", "a")
+    assert hf_mod._tool_report_status_and_reason(done({"ok": False})) == ("refused", "")
+    assert hf_mod._tool_report_status_and_reason(done({"ok": True, "why": "x"})) == ("ok", None)
+    assert hf_mod._tool_report_status_and_reason(done({"why": "x"})) == ("ok", None)
+    failed = ToolNotification(
+        id="1", tool_name="t", is_idle_tool_call=False, status=ToolState.FAILED, error="boom", result={"ok": False}
+    )
+    assert hf_mod._tool_report_status_and_reason(failed) == ("error", "boom")
+
+
 def test_tool_report_status_ok_result_without_marker_stays_ok() -> None:
     """A successful result with no refusal marker stays 'ok' (no tool sets one today)."""
     ok = ToolNotification(

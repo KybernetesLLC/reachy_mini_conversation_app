@@ -300,20 +300,23 @@ def _tool_report_status_and_reason(completed: ToolNotification) -> Tuple[str, Op
     """Map a finished call to the conversation.tool report's status + a short reason.
 
     A tool that refuses (the companion's stay_quiet, express, or a quiet-hours
-    gate) returns an ordinary successful result today, not an error -- the
-    generic dispatcher in core_tools.py has no way to tell a refusal from a
-    success by itself. A tool may opt in to `status: "refused"` by putting
-    `"refused": True` in its result (with an optional "reason" or "why" for the
-    short text); no tool does this today, so this status cannot fire yet. That
-    is a gap for the supervisor-side task to know about, not something invented
-    here: fabricating a per-tool-name or per-wording guess would couple this
-    generic reporter to another repo's tool semantics.
+    gate) returns an ordinary successful result, not an error -- the generic
+    dispatcher in core_tools.py cannot tell a refusal from a success by itself.
+    A dict result is reported as `status: "refused"` when it has `"ok": False`
+    or `"refused": True`. The short text is its "why", else its "reason" (""
+    for `ok: False` with neither). An error still wins; a result without `ok`
+    stays "ok".
     """
     status = _TOOL_REPORT_STATUS.get(completed.status, "error")
     reason = completed.error
-    if status == "ok" and isinstance(completed.result, dict) and completed.result.get("refused") is True:
-        status = "refused"
-        reason = completed.result.get("reason") or completed.result.get("why")
+    result = completed.result
+    if status == "ok" and isinstance(result, dict):
+        if result.get("ok") is False:
+            status = "refused"
+            reason = result.get("why") or result.get("reason") or ""
+        elif result.get("refused") is True:
+            status = "refused"
+            reason = result.get("why") or result.get("reason")
     return status, reason
 
 
