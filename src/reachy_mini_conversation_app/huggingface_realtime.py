@@ -1530,7 +1530,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._tool_batch_needs_response = False
                 if self._tool_batch_only_gestured:
                     # 2026-10-23: the greeting spoke and called express; its follow-up, with
-                    # nothing left to say, read the context aloud. Counted by the express trial.
+                    # nothing left to say, read the context aloud. A skipped follow-up no longer
+                    # adds a stored assistant reply, which the express trial counts.
                     logger.info(
                         "tool follow-up skipped: the response already spoke and only gestured (%s)",
                         completed_tool.tool_name,
@@ -1593,6 +1594,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self.connection = conn
             self._reset_owed_outputs()
             self._followup_pending = self._followup_live = False
+            # The last session's tools were cancelled with it: its batch is over.
+            self._in_flight_tool_calls.clear()
+            self._tool_batch_needs_response = False
+            self._tool_batch_only_gestured = True
             # The open counts as speech: the first note waits for a quiet moment.
             self._user_speaking = False
             self._last_speech_at = time.monotonic()
@@ -1675,7 +1680,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._response_started_or_rejected_event.set()
                         if _companion_tag(event) is None:
                             self._followup_live = False
-                        logger.debug("Response done")
+                        # Checked against the function call's response_id on the robot (2026-10-23).
+                        logger.debug("Response done: id=%s", getattr(getattr(event, "response", None), "id", None))
                         self._log_usage(getattr(getattr(event, "response", None), "usage", None))
                         if not self._gate_transcript_done and (self._gate_text or self._gate_had_audio):
                             # Parsed by counting: keep the wording. Measuring only; the

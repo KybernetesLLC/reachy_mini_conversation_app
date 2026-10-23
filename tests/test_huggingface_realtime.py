@@ -3169,3 +3169,83 @@ async def test_a_newer_response_starting_does_not_change_the_calling_responses_f
     kinds = await _run_with_tools(monkeypatch, events, (_done_tool("c1", "express", "r1"),))
 
     assert kinds == expected
+
+
+@pytest.mark.asyncio
+async def test_express_finishing_before_response_done_is_still_skipped(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The tool waits for its response's done; the spoken record is written before it resumes."""
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="t-1"))
+    )
+    tasks: list[asyncio.Task[None]] = []
+    order: list[str] = []
+    real_handle = handler._handle_tool_result
+
+    async def _handle(tool: ToolNotification) -> None:
+        await handler._wait_for_response_done_before_tool_result()
+        order.append("tool resumed, r1 recorded" if "r1" in handler._spoken_responses else "tool resumed first")
+        await real_handle(tool)
+
+    async def _finish_early() -> None:
+        tasks.append(asyncio.create_task(_handle(_done_tool("c1", "express", "r1"))))
+        await asyncio.sleep(0.05)
+
+    async def _settle() -> None:
+        await asyncio.sleep(0.05)
+
+    created, spoken, call, done = _response("r1", "Hello, you two!", (("c1", "express"),))
+    handler.client = _ordering_client((created, spoken, call, _finish_early, done, _settle), sent, handler)
+
+    with caplog.at_level(logging.INFO, logger=hf_mod.__name__):
+        await handler._run_realtime_session()
+
+    assert order == ["tool resumed, r1 recorded"]
+    assert _kinds(sent) == ["output"]
+    assert "tool follow-up skipped: the response already spoke and only gestured" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_closed_session_leaves_no_stale_batch_for_the_next(monkeypatch: Any) -> None:
+    """A lookup finished while express still ran, then the connection closed.
+
+    The next session's batches start clean: a spoken gesture is skipped, a silent one followed up.
+    """
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="t-1"))
+    )
+
+    def _finisher(tool: ToolNotification) -> Any:
+        async def _finish() -> None:
+            await handler._handle_tool_result(tool)
+            await asyncio.sleep(0.05)
+
+        return _finish
+
+    def _close() -> None:
+        raise ConnectionClosedError(None, None)
+
+    first = _response("r1", "", (("c1", "express"), ("c2", "test__get_weather")))
+    handler.client = _ordering_client(
+        (*first, _finisher(_done_tool("c2", "test__get_weather", "r1")), _close), sent, handler
+    )
+    with pytest.raises(ConnectionClosedError):
+        await handler._run_realtime_session()
+    assert _kinds(sent) == ["output"]  # express (c1) was still running: no follow-up yet
+
+    sent.clear()
+    second = (
+        *_response("r2", "Welcome back!", (("c3", "express"),)),
+        _finisher(_done_tool("c3", "express", "r2")),
+        *_response("r3", "", (("c4", "express"),)),
+        _finisher(_done_tool("c4", "express", "r3")),
+    )
+    handler.client = _ordering_client(second, sent, handler)
+    await handler._run_realtime_session()
+
+    assert _kinds(sent) == ["output", "output", "create"]
