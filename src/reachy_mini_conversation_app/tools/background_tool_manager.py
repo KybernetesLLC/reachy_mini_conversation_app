@@ -296,7 +296,11 @@ class BackgroundToolManager(BaseModel):
 
         return False
 
-    def start_up(self, tool_callbacks: list[Callable[[ToolNotification], Coroutine[Any, Any, None]]]) -> None:
+    def start_up(
+        self,
+        tool_callbacks: list[Callable[[ToolNotification], Coroutine[Any, Any, None]]],
+        dropped_callbacks: Optional[list[Callable[[ToolNotification], None]]] = None,
+    ) -> None:
         """Start the background tool manager.
 
         This method starts two concurrent tasks:
@@ -305,6 +309,8 @@ class BackgroundToolManager(BaseModel):
 
         Args:
             tool_callbacks: A list of async or sync callables that receive the completed BackgroundTool notifications.
+            dropped_callbacks: Callables that receive a notification from an earlier session, which is
+                dropped instead of handled (so it can still be reported).
 
         """
         self.set_loop()
@@ -316,7 +322,13 @@ class BackgroundToolManager(BaseModel):
             while True:
                 background_tool = await self._notification_queue.get()
                 if background_tool.session_index != self._session_index:
-                    logger.info("dropped a tool result from a closed session: %s", background_tool.tool_name)
+                    logger.info(
+                        "dropped a tool result from a closed session: %s (%s)",
+                        background_tool.tool_name,
+                        background_tool.id,
+                    )
+                    for dropped in dropped_callbacks or []:
+                        dropped(background_tool)
                     continue
                 for callback in tool_callbacks:
                     await callback(background_tool)

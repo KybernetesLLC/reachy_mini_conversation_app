@@ -3257,8 +3257,11 @@ async def test_a_closed_session_leaves_no_stale_batch_for_the_next(monkeypatch: 
 async def test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next(
     monkeypatch: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The real cancel path: shutdown cancels a running express, whose "Tool cancelled" result
-    is still queued. The next session drops it: no function_call_output, no create.
+    """A cancelled express's result never reaches the next session, but is still reported.
+
+    The real cancel path: shutdown cancels the running express, whose "Tool cancelled" result is
+    still queued. The next session drops it: no function_call_output, no create. It is reported
+    as cancelled with no session, so the supervisor's counts keep it.
     """
 
     class _SlowExpress:
@@ -3274,6 +3277,7 @@ async def test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next(
     monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
     monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"express": _SlowExpress()})
     handler = _plain_handler()
+    reports = _capture_tool_reports(handler)
     sent: list[tuple[str, Any]] = []
 
     async def _settle() -> None:
@@ -3288,4 +3292,5 @@ async def test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next(
         await handler._run_realtime_session()
 
     assert sent == []
-    assert "dropped a tool result from a closed session: express" in caplog.text
+    assert "dropped a tool result from a closed session: express (c1)" in caplog.text
+    assert [(r["name"], r["status"], r["session"]) for r in reports] == [("express", "cancelled", False)]

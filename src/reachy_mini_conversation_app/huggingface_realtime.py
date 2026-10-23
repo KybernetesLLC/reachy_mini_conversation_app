@@ -1035,6 +1035,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             "turn_id": completed_tool.turn_id,
         }
 
+    def _report_dropped_tool(self, completed_tool: ToolNotification) -> None:
+        """Report a result from a closed session as cancelled; nothing goes to the model."""
+        payload = self._build_tool_report(completed_tool)
+        payload["status"] = "cancelled"
+        payload["session"] = False
+        self._report_tool_call(payload)
+
     def _report_tool_call(self, payload: dict[str, Any]) -> None:
         """Queue one tool-call report and flush it; never blocks or slows a tool call."""
         queue = self._tool_report_queue
@@ -1616,7 +1623,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             response_sender_task: asyncio.Task[None] | None = None
             try:
                 # Start the background tool manager
-                self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
+                self.tool_manager.start_up(
+                    tool_callbacks=[self._handle_tool_result], dropped_callbacks=[self._report_dropped_tool]
+                )
 
                 # Start the response sender worker
                 response_sender_task = asyncio.create_task(self._response_sender_loop(), name="response-sender")
