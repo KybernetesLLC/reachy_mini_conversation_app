@@ -84,6 +84,9 @@ class ToolNotification(BaseModel):
     args: Dict[str, Any] = Field(default_factory=dict)
     source: str = "turn"
     turn_id: Optional[str] = None
+    # The manager's session (counted by start_up) the call started in. A result from an
+    # earlier session is dropped: that session's connection is gone (2026-10-23).
+    session_index: int = 0
 
 
 class BackgroundTool(ToolNotification):
@@ -112,6 +115,7 @@ class BackgroundTool(ToolNotification):
             args=self.args,
             source=self.source,
             turn_id=self.turn_id,
+            session_index=self.session_index,
         )
 
 
@@ -131,6 +135,7 @@ class BackgroundToolManager(BaseModel):
     _lifecycle_tasks: list[asyncio.Task[None]] = PrivateAttr(default_factory=list)
     _max_tool_duration_seconds: float = PrivateAttr(default=86400)  # 1 day
     _max_tool_memory_seconds: float = PrivateAttr(default=3600)  # 1 hour
+    _session_index: int = PrivateAttr(default=0)
 
     def set_loop(
         self,
@@ -189,6 +194,7 @@ class BackgroundToolManager(BaseModel):
             args=_safe_load_args(tool_call_routine.args_json_str),
             source=source,
             turn_id=turn_id,
+            session_index=self._session_index,
         )
         self._tools[background_tool.tool_id] = background_tool
 
@@ -302,10 +308,16 @@ class BackgroundToolManager(BaseModel):
 
         """
         self.set_loop()
+        # shutdown() cancels running tools, but each still queues its "Tool cancelled"
+        # result, possibly after this start_up. Tagging beats draining the queue here.
+        self._session_index += 1
 
         async def _listener() -> None:
             while True:
                 background_tool = await self._notification_queue.get()
+                if background_tool.session_index != self._session_index:
+                    logger.info("dropped a tool result from a closed session: %s", background_tool.tool_name)
+                    continue
                 for callback in tool_callbacks:
                     await callback(background_tool)
 

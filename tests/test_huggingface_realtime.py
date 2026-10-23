@@ -3212,7 +3212,9 @@ async def test_express_finishing_before_response_done_is_still_skipped(
 async def test_a_closed_session_leaves_no_stale_batch_for_the_next(monkeypatch: Any) -> None:
     """A lookup finished while express still ran, then the connection closed.
 
-    The next session's batches start clean: a spoken gesture is skipped, a silent one followed up.
+    Session-state hygiene: the next session's batch state starts clean, so a spoken gesture is
+    skipped and a silent one followed up. Cancelled tools' results are a separate path, dropped
+    by the tool manager (see test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next).
     """
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
@@ -3249,3 +3251,41 @@ async def test_a_closed_session_leaves_no_stale_batch_for_the_next(monkeypatch: 
     await handler._run_realtime_session()
 
     assert _kinds(sent) == ["output", "output", "create"]
+
+
+@pytest.mark.asyncio
+async def test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The real cancel path: shutdown cancels a running express, whose "Tool cancelled" result
+    is still queued. The next session drops it: no function_call_output, no create.
+    """
+
+    class _SlowExpress:
+        needs_response = True
+
+        async def __call__(self, deps: Any, **kwargs: Any) -> dict[str, Any]:
+            await asyncio.sleep(60)
+            return {"status": "done"}
+
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"express": _SlowExpress()})
+    handler = _plain_handler()
+    sent: list[tuple[str, Any]] = []
+
+    async def _settle() -> None:
+        await asyncio.sleep(0.1)
+
+    handler.client = _ordering_client((*_response("r1", "", (("c1", "express"),)), _settle), sent, handler)
+    await handler._run_realtime_session()
+    assert sent == []  # express was still running when the session closed
+
+    with caplog.at_level(logging.INFO):
+        handler.client = _ordering_client((_settle, _settle), sent, handler)
+        await handler._run_realtime_session()
+
+    assert sent == []
+    assert "dropped a tool result from a closed session: express" in caplog.text

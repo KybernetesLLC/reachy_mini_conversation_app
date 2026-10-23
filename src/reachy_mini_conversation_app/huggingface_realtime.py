@@ -1594,7 +1594,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self.connection = conn
             self._reset_owed_outputs()
             self._followup_pending = self._followup_live = False
-            # The last session's tools were cancelled with it: its batch is over.
+            # Session-state hygiene: the last session's batch is over. Its cancelled tools'
+            # results are dropped by the tool manager, never handled here.
             self._in_flight_tool_calls.clear()
             self._tool_batch_needs_response = False
             self._tool_batch_only_gestured = True
