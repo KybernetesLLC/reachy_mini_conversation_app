@@ -814,8 +814,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         kind = verdict.kind or "leaked tool call"
         logger.warning("spoken artifact cut (%s): %r", kind, self._gate_text.strip())
         self._gate_cut_kind = kind
-        if verdict.tool is not None:
-            self._gate_leak(verdict)
+        for call in verdict.calls:
+            self._gate_leak(call)
         self._gate_cancel_timer()
         self._gate_held = []
         self._gate = "cut"
@@ -834,11 +834,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._gate_text = text
         verdict = judge(text, self._gate_tools, final=final)
         if verdict.action == PLAY_AND_LOG:
-            self._gate_leak(verdict)
-        elif self._gate == "pass" and verdict.tool and verdict.action in (CUT, CUT_AND_EXECUTE):
+            for call in verdict.calls:
+                self._gate_leak(call)
+        elif self._gate == "pass" and verdict.action in (CUT, CUT_AND_EXECUTE):
             # Already heard, so too late to cut: counted as played, never run (10-20 22:59:
             # a bare express{...} left no gate event at all).
-            for heard in (verdict, *verdict.more):
+            for heard in verdict.calls:
                 self._gate_leak(Verdict(PLAY_AND_LOG, kind=heard.kind, tool=heard.tool, shape=heard.shape))
         if self._gate not in ("hold", "open"):
             return
@@ -848,12 +849,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._gate_release("pass")
 
     def _gate_leak(self, verdict: Verdict) -> None:
-        """Log, report (source "leaked") and run if leak_safe each leaked call of a verdict."""
-        self._gate_leak_one(verdict)
-        for more in verdict.more:
-            self._gate_leak_one(more)
-
-    def _gate_leak_one(self, verdict: Verdict) -> None:
+        """Log one leaked call, report it (source "leaked"), and run it if leak_safe."""
         name = verdict.tool or ""
         if verdict.action == PLAY_AND_LOG:
             logger.warning("possible leaked tool call: %s (%s) played", name, verdict.shape)

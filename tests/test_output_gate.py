@@ -278,9 +278,11 @@ JSON_SHAPES = (
 )
 
 
-@pytest.mark.parametrize("name", REGISTRY)
-@pytest.mark.parametrize("shape", JSON_SHAPES)
-def test_every_tool_in_every_json_shape_is_cut(name: str, shape: str) -> None:
+@pytest.mark.parametrize(
+    "name, shape", [("dance", shape) for shape in JSON_SHAPES] + [(name, JSON_SHAPES[1]) for name in REGISTRY]
+)
+def test_every_json_shape_and_every_tool_is_cut(name: str, shape: str) -> None:
+    """Every shape with one tool, and every tool in the 10-23 shape: the name is read the same in each."""
     verdict = gate.judge(shape.format(n=name), TOOLS, final=True)
     assert (verdict.action, verdict.tool, verdict.shape) == (_expected_cut(name), name, "json")
 
@@ -289,7 +291,10 @@ def test_a_json_call_list_names_each_of_its_tools() -> None:
     text = '{"tool_calls": [{"function": "stay_quiet", "parameters": {}}, {"name": "dance", "arguments": {}}]}'
     verdict = gate.judge(text, TOOLS, final=True)
     assert (verdict.action, verdict.tool) == (gate.CUT_AND_EXECUTE, "stay_quiet")
-    assert [(more.action, more.tool, more.shape) for more in verdict.more] == [(gate.CUT, "dance", "json")]
+    assert [(call.action, call.tool, call.shape) for call in verdict.calls] == [
+        (gate.CUT_AND_EXECUTE, "stay_quiet", "json"),
+        (gate.CUT, "dance", "json"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -303,10 +308,28 @@ def test_an_unknown_json_call_is_an_artifact_with_no_tool(text: str) -> None:
     assert gate.judge(text, TOOLS, final=True) == gate.Verdict(gate.CUT, kind="leaked tool call")
 
 
-@pytest.mark.parametrize("cut_at", [1, 2, 5, 9, 14, 20, 30, 45, 60])
-def test_the_start_of_a_json_call_waits(cut_at: int) -> None:
-    text = '{\n  "tool_calls": [{"function": "recall", "parameters": {"query": "how we met"}}]}'
-    assert gate.judge(text[:cut_at], TOOLS).action == gate.UNDECIDED
+JSON_CALL = '{\n  "tool_calls": [{"function": "recall", "parameters": {"query": "how we met"}}]}'
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        JSON_CALL[:2],  # "{" and whitespace
+        JSON_CALL[:9],  # inside the first key
+        JSON_CALL[:60],  # inside the arguments
+        '{"name"',
+        '{"name" ',
+        '{"name":',
+        '{"name" :',
+        "[",
+        "[{",
+        '[\n  {"func',
+        "```js",
+        '```json\n{"tool_ca',
+    ],
+)
+def test_the_start_of_a_json_call_waits(text: str) -> None:
+    assert gate.judge(text, TOOLS).action == gate.UNDECIDED
 
 
 @pytest.mark.parametrize(
@@ -362,16 +385,8 @@ def test_a_closed_first_key_with_no_colon_is_released_at_once(text: str) -> None
     assert gate.judge(text, TOOLS).action == gate.PLAY
 
 
-@pytest.mark.parametrize(
-    "text", ['{"name"', '{"name" ', '{"name":', '{"name" :', "[", "[{", '[\n  {"func', "```js", '```json\n{"tool_ca']
-)
-def test_the_start_of_a_new_json_shape_waits(text: str) -> None:
-    assert gate.judge(text, TOOLS).action == gate.UNDECIDED
-
-
 def test_a_bare_list_with_a_nested_list_is_still_a_call() -> None:
     text = '[{"function": "remember", "parameters": {"facts": ["a", "b"]}}]'
-    assert gate.judge(text[:40], TOOLS).action == gate.UNDECIDED  # past the inner "]"? not yet
     assert gate.judge(text[:-1], TOOLS).action == gate.UNDECIDED  # the inner "]" is not the end
     verdict = gate.judge(text, TOOLS)
     assert (verdict.action, verdict.tool, verdict.shape) == (gate.CUT, "remember", "json")

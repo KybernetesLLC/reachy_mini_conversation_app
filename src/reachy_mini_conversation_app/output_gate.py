@@ -16,7 +16,7 @@ kind, and a marked reply is never stored.
 from __future__ import annotations
 import re
 import json
-from typing import Final, Callable, Iterable
+from typing import Any, Final, Callable, Iterable
 from dataclasses import replace, dataclass
 
 
@@ -66,7 +66,9 @@ _BARE_CALL_OPEN = re.compile(r"call:\s*[\w.-]*\s*", re.IGNORECASE)
 _NAMED_ARGS = re.compile(r"[A-Za-z_][\w.-]*(?=\{)")
 _CALL_ITEM = r"[A-Za-z_][\w.]*\(.*\)"
 _CALL_LIST = re.compile(rf"\[\s*{_CALL_ITEM}(?:\s*,\s*{_CALL_ITEM})*\s*\]", re.DOTALL)
-_TOOL_CODE = re.compile(r"```\s*tool_code\b.*?```", re.IGNORECASE | re.DOTALL)
+# A fenced block, ```tool_code (Gemma 3) or ```json: its tag, its body, and its closing
+# fence, empty while it is still open.
+_FENCE = re.compile(r"```\s*(tool_code|json)\b(.*?)(```|\Z)", re.IGNORECASE | re.DOTALL)
 # A tool call spoken as JSON (2026-10-23 11:13:21, a pretty-printed recall call): a
 # {"tool_calls": [...]} list, or one call object, {"function"|"name": ..., "arguments"|
 # "parameters": ...}. The function may be an object with a name (and its arguments). The
@@ -77,7 +79,6 @@ _TOOL_CODE = re.compile(r"```\s*tool_code\b.*?```", re.IGNORECASE | re.DOTALL)
 _JSON_CALL_KEYS: Final[frozenset[str]] = frozenset({"name", "function", "arguments", "parameters", "type", "id"})
 _JSON_FIRST_KEYS: Final[frozenset[str]] = _JSON_CALL_KEYS | {"tool_calls"}
 _JSON_OPEN = re.compile(r'\{\s*(?:"([^"\\]*)("?))?')
-_JSON_FENCE = re.compile(r"```\s*json\b(.*?)```", re.IGNORECASE | re.DOTALL)
 
 
 def _skip(text: str, i: int) -> int:
@@ -128,46 +129,60 @@ def _json_arguments(value: object) -> bool:
     return isinstance(value, dict)
 
 
-def _json_call_name(item: object, tools: ToolNames | None, wrapped: bool) -> str | None:
-    """Return the tool name of one JSON call object, or None when it is not only a call.
+def _calls(value: Any) -> list[dict[str, object]]:
+    """Return decoded JSON's calls, each {"name": ..., "arguments": ...}; [] when it is not only calls.
 
-    With no arguments key it is a call inside {"tool_calls": ...} (`wrapped`), and
-    elsewhere only when it names a known tool."""
-    if not isinstance(item, dict) or not set(item) <= _JSON_CALL_KEYS:
+    The JSON is a {"tool_calls": [...]} object, a bare list of calls or one call, whose keys
+    are all call keys. A "function" object's name and arguments count as the call's own, the
+    call's first; inside {"tool_calls": ...} a call with no arguments has null ones.
+    """
+    wrapped = isinstance(value, dict) and set(value) == {"tool_calls"}
+    items = value["tool_calls"] if wrapped else value if isinstance(value, list) else [value]
+    if not isinstance(items, list):
+        return []
+    calls: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict) or not set(item) <= _JSON_CALL_KEYS:
+            return []
+        function = item.get("function", item.get("name"))
+        holders = [item]
+        if isinstance(function, dict):
+            if not set(function) <= _JSON_CALL_KEYS:
+                return []
+            holders.append(function)
+            function = function.get("name")
+        call: dict[str, object] = {"name": function}
+        arguments = [holder[key] for holder in holders for key in ("arguments", "parameters") if key in holder]
+        if arguments or wrapped:
+            call["arguments"] = arguments[0] if arguments else None
+        calls.append(call)
+    return calls
+
+
+def _json_call_name(call: dict[str, object], tools: ToolNames | None) -> str | None:
+    """Return a call's tool name, or None when it is not only a call.
+
+    With no arguments it must name a known tool ({"name": "Matt"} is speech).
+    """
+    name = call["name"]
+    if not isinstance(name, str) or not name:
         return None
-    function = item.get("function", item.get("name"))
-    holders = [item]
-    if isinstance(function, dict):
-        if not set(function) <= _JSON_CALL_KEYS:
-            return None
-        holders.append(function)
-        function = function.get("name")
-    if not isinstance(function, str) or not function:
-        return None
-    for holder in holders:
-        for key in ("arguments", "parameters"):
-            if key in holder:
-                return function if _json_arguments(holder[key]) else None
-    known = wrapped or (tools is not None and tools.find(_normal(function)) is not None)
-    return function if known else None
+    if "arguments" in call:
+        return name if _json_arguments(call["arguments"]) else None
+    return name if tools is not None and tools.find(_normal(name)) is not None else None
 
 
 def _json_call_names(body: str, tools: ToolNames | None = None) -> list[str] | None:
-    """Return the tool names of JSON that is only tool calls, in order; else None.
+    """Return the tool names of JSON text that is only tool calls, in order; else None.
 
-    The JSON is a {"tool_calls": [...]} object, a bare list of calls or one call, alone
-    or in a ```json fence."""
-    fence = _JSON_FENCE.fullmatch(body)
+    The one place a JSON block is decoded: a fence is stripped before it gets here.
+    """
     try:
-        value = json.loads(fence.group(1) if fence else body)
+        value = json.loads(body)
     except ValueError:
         return None
-    wrapped = isinstance(value, dict) and set(value) == {"tool_calls"}
-    items = value["tool_calls"] if wrapped else value if isinstance(value, list) else [value]
-    if not isinstance(items, list) or not items:
-        return None
-    names = [_json_call_name(item, tools, wrapped) for item in items]
-    return names if all(names) else None  # type: ignore[return-value]
+    names = [_json_call_name(call, tools) for call in _calls(value)]
+    return names if names and all(names) else None  # type: ignore[return-value]
 
 
 def _could_be_json_call(rest: str) -> bool:
@@ -186,10 +201,11 @@ def _could_be_json_call(rest: str) -> bool:
 
 def _json_opening(rest: str) -> bool:
     """Return whether an open shape is a JSON call's start, which may wait past _UNDECIDED_MAX."""
+    fence = _FENCE.match(rest)
     if rest.startswith("["):
         rest = rest[1:].lstrip()
-    elif rest[:7].lower() == "```json":
-        rest = rest[7:].lstrip()
+    elif fence and fence.group(1).lower() == "json":
+        rest = fence.group(2).lstrip()
     return _could_be_json_call(rest)
 
 
@@ -258,70 +274,85 @@ def _named_call(name: str, tools: ToolNames | None) -> bool:
     return "_" in name or (tools is not None and tools.find(_normal(name)) is not None)
 
 
-def _shape_at(text: str, i: int, final: bool = False, tools: ToolNames | None = None) -> tuple[str, int] | None:
-    """Match the artifact at text[i]: (kind, end), ("undecided", -1) while open, or None."""
+def _shape_at(
+    text: str, i: int, final: bool = False, tools: ToolNames | None = None
+) -> tuple[str, int, list[str] | None] | None:
+    """Match the artifact at text[i]: (kind, end, names), ("undecided", -1, None) while open, or None.
+
+    `names` are a JSON call's tools, decoded once here; None for any other shape.
+    """
     rest = text[i:]
     c = text[i]
     if c == "<":
-        return _angle_at(text, i, final)
+        angle = _angle_at(text, i, final)
+        return None if angle is None else (*angle, None)
     if rest[:5].lower() == "call:":
         call = _BARE_CALL.match(text, i)
         if call and call.end() < len(text) and text[call.end()] == "{":
-            return _closed(_CALL, _balanced_end(text, call.end()))
-        return (_UNDECIDED, -1) if _BARE_CALL_OPEN.fullmatch(rest) else None
+            return (*_closed(_CALL, _balanced_end(text, call.end())), None)
+        return (_UNDECIDED, -1, None) if _BARE_CALL_OPEN.fullmatch(rest) else None
     if "call:".startswith(rest.lower()):
-        return _UNDECIDED, -1
+        return _UNDECIDED, -1, None
     if c == "`":
         if not rest.startswith("```"):
-            return (_UNDECIDED, -1) if "```".startswith(rest) else None
-        fence = _TOOL_CODE.match(text, i)
-        if fence:
-            return _CALL, fence.end()
-        fence = _JSON_FENCE.match(text, i)
-        if fence:
-            return (_CALL, fence.end()) if _json_call_names(fence.group(), tools) else None
-        return (_UNDECIDED, -1) if rest.find("```", 3) == -1 else None
+            return (_UNDECIDED, -1, None) if "```".startswith(rest) else None
+        fence = _FENCE.match(text, i)
+        if fence and fence.group(3):
+            if fence.group(1).lower() == "tool_code":
+                return _CALL, fence.end(), None
+            names = _json_call_names(fence.group(2), tools)
+            return (_CALL, fence.end(), names) if names else None
+        return (_UNDECIDED, -1, None) if rest.find("```", 3) == -1 else None
     if c == "{":
         end = _balanced_end(text, i)
         if end == -1:
-            return (_UNDECIDED, -1) if _could_be_json_call(rest) else None
-        return (_CALL, end) if _json_call_names(text[i:end], tools) else None
+            return (_UNDECIDED, -1, None) if _could_be_json_call(rest) else None
+        names = _json_call_names(text[i:end], tools)
+        return (_CALL, end, names) if names else None
     if c == "[":
         end = _balanced_end(text, i)
-        if end != -1 and (_CALL_LIST.fullmatch(text, i, end) or _json_call_names(text[i:end], tools)):
-            return _CALL, end
+        if end != -1:
+            if _CALL_LIST.fullmatch(text, i, end):
+                return _CALL, end, None
+            names = _json_call_names(text[i:end], tools)
+            if names:
+                return _CALL, end, names
         inner = text[i + 1 :].lstrip()
         if end == -1 and inner.startswith("{"):  # a bare list of JSON calls: an inner "]" is not its end
-            return (_UNDECIDED, -1) if _could_be_json_call(inner) else None
+            return (_UNDECIDED, -1, None) if _could_be_json_call(inner) else None
     named = _NAMED_ARGS.match(text, i)
     if named and _named_call(named.group(), tools):
-        return _closed(_CALL, _balanced_end(text, named.end()))
+        return (*_closed(_CALL, _balanced_end(text, named.end())), None)
     if c in _DIRECTION_CLOSERS:
         close_at = text.find(_DIRECTION_CLOSERS[c], i + 1)
         if close_at == -1:
-            return _UNDECIDED, -1
+            return _UNDECIDED, -1, None
         inner = text[i + 1 : close_at]
         if inner.strip() and len(inner) <= _DIRECTION_MAX and not set(inner) & set("()[]*{}"):
-            return _STAGE, close_at + 1
+            return _STAGE, close_at + 1, None
     return None
 
 
-def _shapes(text: str, final: bool = False, tools: ToolNames | None = None) -> list[tuple[str, str]] | str | None:
-    """The artifact shapes `text` is made of, as (kind, the shape's own text);
-    "undecided" while one is still open; None when there are real words outside them.
+def _shapes(
+    text: str, final: bool = False, tools: ToolNames | None = None
+) -> list[tuple[str, str, list[str] | None]] | str | None:
+    """Return the artifact shapes `text` is made of, as (kind, text, JSON call names).
+
+    The text is the shape's own; the names are a JSON call's tools, else None. "undecided"
+    while a shape is still open; None when there are real words outside them.
     """
     head = text.strip()
-    found: list[tuple[str, str]] = []
+    found: list[tuple[str, str, list[str] | None]] = []
     i = _skip(head, 0)
     while i < len(head):
         shape = _shape_at(head, i, final, tools)
         if shape is None:
             return None
-        kind, end = shape
+        kind, end, names = shape
         if kind == _UNDECIDED:
             limit = _JSON_UNDECIDED_MAX if _json_opening(head[i:]) else _UNDECIDED_MAX
             return _UNDECIDED if len(head) <= limit else None
-        found.append((kind, head[i:end]))
+        found.append((kind, head[i:end], names))
         i = _skip(head, end)
     return found if found else _UNDECIDED
 
@@ -368,15 +399,16 @@ UNDECIDED: Final[str] = _UNDECIDED
 class Verdict:
     """What to do with a reply. `kind` names what a cut removes ("stage direction",
     "leaked tool call", "thinking"); `tool` and `shape` name a leaked tool and how it
-    leaked ("markup", "json", "underscore name", "spoken name", "plain word"). `more`
-    holds the other calls of a JSON call list, each its own verdict.
+    leaked ("markup", "json", "underscore name", "spoken name", "plain word"). `calls`
+    holds every leaked call as its own verdict, this one's first: a JSON call list leaks
+    several. It is empty when no tool leaked.
     """
 
     action: str
     kind: str | None = None
     tool: str | None = None
     shape: str | None = None
-    more: tuple[Verdict, ...] = ()
+    calls: tuple[Verdict, ...] = ()
 
 
 # The tool-name leak guard (the planning session, 2026-10-17): the hosted model said
@@ -451,22 +483,26 @@ def _leak(tool: LeakTool, shape: str) -> Verdict:
     return Verdict(CUT_AND_EXECUTE if tool.leak_safe else CUT, kind=_CALL, tool=tool.name, shape=shape)
 
 
+def _leaked(*calls: Verdict) -> Verdict:
+    """Return the verdict on a reply of leaked calls: the first call's, with every call in `calls`."""
+    return replace(calls[0], calls=calls)
+
+
 def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None:
     """Rule 1: a reply that is only a registered tool's name."""
     shapes = _shapes(text, final, tools)
     if shapes == _UNDECIDED and not final:
         return Verdict(UNDECIDED)  # a registered name's open arguments: "express{feel"
     if isinstance(shapes, list):
-        for kind, body in shapes:
+        for kind, body, json_names in shapes:
             if kind != _CALL:
                 continue
-            json_names = _json_call_names(body, tools) if body.startswith(("{", "[", "`")) else None
             names = json_names if json_names is not None else [_called_name(body)]
             shape = "json" if json_names is not None else "markup"
             found = [tools.find(_normal(name)) for name in names if name]
             leaks = [_leak(tool, shape) for tool in found if tool is not None]
             if leaks:
-                return replace(leaks[0], more=tuple(leaks[1:]))
+                return _leaked(*leaks)
         return None
     word = text.strip().strip(_WORD_EDGES).strip()
     if not _PLAIN.fullmatch(word):
@@ -481,10 +517,10 @@ def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None
     if tool is None:
         return None
     if "_" in word:
-        return _leak(tool, "underscore name")
+        return _leaked(_leak(tool, "underscore name"))
     if "_" in normal:
-        return _leak(tool, "spoken name")
-    return Verdict(PLAY_AND_LOG, tool=tool.name, shape="plain word")
+        return _leaked(_leak(tool, "spoken name"))
+    return _leaked(Verdict(PLAY_AND_LOG, tool=tool.name, shape="plain word"))
 
 
 def artifact_shape(text: str, tools: ToolNames, final: bool) -> Verdict | None:

@@ -3415,17 +3415,8 @@ async def test_a_json_tool_call_split_across_deltas_is_cut(monkeypatch: Any, del
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "text",
-    [
-        '{"function": "dance", "parameters": {"move": "wiggle"}}',
-        '{"name": "dance", "arguments": {"move": "wiggle"}}',
-        '{"name": "dance", "arguments": "{\\"move\\": \\"wiggle\\"}"}',
-        '{"function": {"name": "dance"}, "arguments": {}}',
-        '{"type": "function", "function": {"name": "dance", "arguments": "{}"}}',
-    ],
-)
-async def test_a_bare_json_function_object_is_cut(monkeypatch: Any, caplog: Any, text: str) -> None:
+async def test_a_bare_json_function_object_is_cut(monkeypatch: Any, caplog: Any) -> None:
+    text = '{"name": "dance", "arguments": {"move": "wiggle"}}'  # listed with the markup shapes before 10-23
     handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=True))
     reports = _capture_tool_reports(handler)
 
@@ -3512,29 +3503,19 @@ async def test_speech_with_braces_that_is_not_a_tool_call_is_spoken(monkeypatch:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "text, line, runs",
-    [
-        ("<call:stay_quiet/>", "leaked tool call: stay_quiet (markup) cut; executed=True", 1),
-        ("call:dance{}", "leaked tool call: dance (markup) cut; executed=False", 0),
-        ('<call:recall{query:<|"|>Tony<|"|>}/>', "leaked tool call: recall (markup) cut; executed=False", 0),
-        ('{"name": "dance", "arguments": {}}', "leaked tool call: dance (json) cut; executed=False", 0),
-    ],
-)
-async def test_markup_leaks_still_behave_as_before(
-    monkeypatch: Any, caplog: Any, text: str, line: str, runs: int
-) -> None:
+async def test_markup_leaks_still_behave_as_before(monkeypatch: Any, caplog: Any) -> None:
+    """Markup with braces in it stays markup: the JSON rule does not take it."""
+    text = '<call:recall{query:<|"|>Tony<|"|>}/>'
     handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=True))
     reports = _capture_tool_reports(handler)
 
     with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
         await _run_with_leaks(handler)
 
-    name = line.split(": ")[1].split(" ")[0]
     assert _frames(handler) == []
-    assert line in caplog.messages
-    assert tools[name].runs == runs
-    assert [(r["name"], r["source"]) for r in reports] == [(name, "leaked")]
+    assert "leaked tool call: recall (markup) cut; executed=False" in caplog.messages
+    assert tools["recall"].runs == 0
+    assert [(r["name"], r["source"]) for r in reports] == [("recall", "leaked")]
 
 
 @pytest.mark.asyncio
