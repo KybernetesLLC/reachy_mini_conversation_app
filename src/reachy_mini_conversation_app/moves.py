@@ -968,7 +968,6 @@ class MovementManager:
                         interpolation_start_antennas=current_antennas,
                         body_yaw=float(head_joints[0]),  # joint 0 is the body yaw
                     )
-                    self.apply_breathing_feel(breathing_move)
                     self.move_queue.append(breathing_move)
                     logger.debug("Started breathing after %.1fs of inactivity", idle_for)
                 except Exception as e:
