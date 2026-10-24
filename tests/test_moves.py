@@ -1106,3 +1106,48 @@ def test_breathing_pitch_ease_starts_from_rest() -> None:
     pitches = [_z_and_pitch(move, 1.0 + i * 0.02)[1] for i in range(4)]
     first_step = pitches[1] - pitches[0]
     assert first_step < 0.05 / 0.7 * 0.02 * 0.2  # well under the full-speed first step
+
+
+def test_a_depth_change_near_a_peak_moves_no_further_than_the_default_motion_per_tick() -> None:
+    """Depth eases in: z and the antennas step no more than the unscaled motion's own largest step."""
+
+    def series(move: BreathingMove, start: float, end: float, switch_at: float | None, to: float) -> tuple[list, list]:
+        zs, ants, t = [], [], start
+        while t <= end + 1e-9:
+            if switch_at is not None and t >= switch_at:
+                move.depth_scale = to
+            head, antennas, _ = move.evaluate(t)
+            zs.append(float(head[2, 3]))
+            ants.append(float(antennas[0]))
+            t += 0.02
+        return zs, ants
+
+    def worst(xs: list) -> float:
+        return max(abs(b - a) for a, b in zip(xs, xs[1:]))
+
+    base_z, base_a = series(_breather(), 1.0, 31.0, None, 1.0)
+    for peak_bt in (2.5, 1.0):  # a peak of the z breath, a peak of the antenna sway
+        for to in (1.3, 0.7):
+            move = _breather()
+            move.depth_scale = 1.3 if to == 0.7 else 0.7
+            z, a = series(move, 1.0, 31.0, 1.0 + 20.0 + peak_bt, to)
+            assert worst(z) <= worst(base_z) * 1.3 * 1.01
+            assert worst(a) <= worst(base_a) * 1.3 * 1.01
+            # the jump itself: the one-step version moves z ~1 mm; the eased one stays far under it
+            assert worst(z) < 0.0003 and worst(a) < 0.01
+
+
+def test_a_set_that_lands_after_a_breathing_move_is_queued_still_reaches_it() -> None:
+    manager = MovementManager(MagicMock())
+    manager.current_robot.get_current_joint_positions.return_value = ([0.0] * 7, (0.0, 0.0))
+    manager.current_robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+    now = manager._now()
+    manager.state.last_activity_time = now - 100.0
+    manager._manage_breathing(now)  # queues the move
+    assert any(isinstance(m, BreathingMove) for m in manager.move_queue)
+    manager.set_breathing(0.8, 1.2, 0.04)
+    manager._poll_signals(now)  # the next tick: the set lands before the pop
+    manager._update_primary_motion(now)
+    move = manager.state.current_move
+    assert isinstance(move, BreathingMove)
+    assert (move.rate_scale, move.depth_scale, move.pitch_offset) == (0.8, 1.2, 0.04)

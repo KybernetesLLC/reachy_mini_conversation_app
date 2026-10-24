@@ -124,6 +124,15 @@ def ease_seconds(
 _PITCH_EASE_RATE = 2.4
 
 
+def _damped_step(x: float, v: float, target: float, dt: float) -> tuple[float, float]:
+    """One exact step of a critically damped ease toward `target`."""
+    w = _PITCH_EASE_RATE
+    e = float(np.exp(-w * dt))
+    d = x - target
+    c = v + w * d
+    return target + (d + c * dt) * e, (v - w * c * dt) * e
+
+
 class BreathingMove(Move):  # type: ignore
     """Breathing move with interpolation to neutral and then continuous breathing patterns."""
 
@@ -183,6 +192,8 @@ class BreathingMove(Move):  # type: ignore
         self._antenna_phase = 0.0
         self._pitch_now = 0.0
         self._pitch_velocity = 0.0
+        self._depth_now = 1.0
+        self._depth_velocity = 0.0
         # The pitch offset at the first sample: the phase-1 target and the start of the
         # phase-2 ease, so a restart at a lowered head does not lift and nod.
         self._rest_pitch: float | None = None
@@ -224,14 +235,14 @@ class BreathingMove(Move):  # type: ignore
             return self.neutral_head_pose
         return create_head_pose(0, 0, 0, 0, self._rest_pitch, 0, degrees=False)
 
-    def _ease_pitch(self, dt: float) -> None:
-        """Move the pitch toward the offset, critically damped: it starts from rest."""
-        w = _PITCH_EASE_RATE
-        e = np.exp(-w * dt)
-        d = self._pitch_now - float(self.pitch_offset)
-        c = self._pitch_velocity + w * d
-        self._pitch_now = float(self.pitch_offset) + (d + c * dt) * e
-        self._pitch_velocity = float((self._pitch_velocity - w * c * dt) * e)
+    def _ease(self, dt: float) -> None:
+        """Ease the pitch and the depth toward their set values, critically damped: from rest."""
+        self._pitch_now, self._pitch_velocity = _damped_step(
+            self._pitch_now, self._pitch_velocity, float(self.pitch_offset), dt
+        )
+        self._depth_now, self._depth_velocity = _damped_step(
+            self._depth_now, self._depth_velocity, float(self.depth_scale), dt
+        )
 
     def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
         """Evaluate breathing move at time t.
@@ -260,28 +271,28 @@ class BreathingMove(Move):  # type: ignore
             # Phase 2: breathing patterns from the neutral base, facing the body's way.
             breathing_time = t - self.interpolation_duration
             rate = float(self.rate_scale)
-            depth = float(self.depth_scale)
             if self._last_breath_t is None:
                 # First sample: start the phases from time, the pitch at its rest.
                 self._breath_phase = self.breathing_frequency * breathing_time
                 self._antenna_phase = self.antenna_frequency * breathing_time
                 self._pitch_now = self._rest_pitch
+                self._depth_now = float(self.depth_scale)
             else:
                 dt = max(0.0, t - self._last_breath_t)
                 self._breath_phase += self.breathing_frequency * rate * dt
                 self._antenna_phase += self.antenna_frequency * rate * dt
-                self._ease_pitch(dt)
+                self._ease(dt)
             self._last_breath_t = t
 
             # Gentle z-axis breathing
-            z_offset = self.breathing_z_amplitude * depth * np.sin(2 * np.pi * self._breath_phase)
+            z_offset = self.breathing_z_amplitude * self._depth_now * np.sin(2 * np.pi * self._breath_phase)
             head_pose = _turned(
                 create_head_pose(x=0, y=0, z=z_offset, roll=0, pitch=self._pitch_now, yaw=0, degrees=False, mm=False),
                 yaw,
             )
 
             # Antenna sway (opposite directions)
-            antenna_sway = self.antenna_sway_amplitude * depth * np.sin(2 * np.pi * self._antenna_phase)
+            antenna_sway = self.antenna_sway_amplitude * self._depth_now * np.sin(2 * np.pi * self._antenna_phase)
             antennas = np.array([antenna_sway, -antenna_sway], dtype=np.float64)
 
         # Return in official Move interface format: (head_pose, antennas_array, body_yaw)
@@ -926,6 +937,8 @@ class MovementManager:
                     self._move_yaw_offset = float(last[2]) if last is not None else 0.0
                 # Any real move cancels breathing mode flag
                 self._breathing_active = isinstance(self.state.current_move, BreathingMove)
+                if isinstance(self.state.current_move, BreathingMove):
+                    self.apply_breathing_feel(self.state.current_move)  # a set may have landed while queued
                 if self._breathing_active and self._pending_turn is not None:
                     self.state.current_move.turn_body(*self._pending_turn, 0.0)
                     self._pending_turn = None
