@@ -161,7 +161,8 @@ FILLER_TAG = {"companion": "filler"}
 FILLER_LINES = ("Let me check.", "One moment.", "Let me look that up.", "Just a second.")
 FILLER_AFTER_S = 1.0  # a lookup tool still running this long gets a filler
 SEARCH_TOOLS = ("search_web", "web_search")  # by name ending: always slow enough
-LOOKUP_TOOLS = ("flights", "boats", "transit", "events", "why_lit", "get_weather")
+# Matched by name ending: "weather" is the companion's tool (2026-10-24) and Pollen's get_weather.
+LOOKUP_TOOLS = ("flights", "boats", "transit", "events", "why_lit", "weather")
 # Tools that only move the body. A response that already spoke and called only these gets
 # no follow-up: on 2026-10-23 08:42 the greeting's follow-up read its context aloud.
 GESTURE_TOOLS = frozenset({"express"})

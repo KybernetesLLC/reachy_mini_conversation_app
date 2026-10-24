@@ -1955,6 +1955,17 @@ async def test_a_slow_lookup_gets_a_filler_a_quick_one_and_a_song_do_not(monkeyp
     assert create.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_the_companion_weather_tool_is_a_lookup(monkeypatch: Any) -> None:
+    """The companion's own weather tool (2026-10-24) replaced Pollen's get_weather."""
+    monkeypatch.setattr(hf_mod, "FILLER_AFTER_S", 0.05)
+    handler, create = _search_handler(monkeypatch)
+    handler._in_flight_tool_calls.add("slow")
+    await handler._tool_started("weather", "slow")
+    await asyncio.sleep(0.1)
+    assert create.await_count == 1
+
+
 def test_every_tool_result_logs_its_latency(caplog: Any) -> None:
     handler = _plain_handler()
     done = ToolNotification(
