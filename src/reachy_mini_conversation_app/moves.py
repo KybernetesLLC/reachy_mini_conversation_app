@@ -120,8 +120,8 @@ def ease_seconds(
     return min(seconds, EASE_MAX_SECONDS)
 
 
-# Time constant of the resting-pitch ease: 95% of the way in about 2 s.
-_PITCH_EASE_TAU = 0.7
+# Natural rate of the resting-pitch ease (critically damped): 95% of the way in about 2 s.
+_PITCH_EASE_RATE = 2.4
 
 
 class BreathingMove(Move):  # type: ignore
@@ -170,8 +170,8 @@ class BreathingMove(Move):  # type: ignore
         self.antenna_frequency = _idle_setting("REACHY_BREATHING_ANTENNA_HZ", 0.25)
         self.breathing_frequency = 0.1  # Hz (6 breaths per minute)
 
-        # The companion's mood (task 8.2): read each cycle, set from other threads
-        # (plain float stores). Defaults give the unscaled motion. Rate and depth
+        # The companion's mood (task 8.2): read each cycle (the movement
+        # manager sets them from its control loop). Defaults give the unscaled motion. Rate and depth
         # scale the breath; the pitch offset (radians, positive downward) shifts the
         # resting head pitch, eased in over about 2 s.
         self.rate_scale = 1.0
@@ -182,6 +182,10 @@ class BreathingMove(Move):  # type: ignore
         self._breath_phase = 0.0
         self._antenna_phase = 0.0
         self._pitch_now = 0.0
+        self._pitch_velocity = 0.0
+        # The pitch offset at the first sample: the phase-1 target and the start of the
+        # phase-2 ease, so a restart at a lowered head does not lift and nod.
+        self._rest_pitch: float | None = None
 
         # The companion (decision 026): breathing holds the body where it was
         # when breathing began, instead of returning body yaw 0 -- that was a
@@ -214,9 +218,29 @@ class BreathingMove(Move):  # type: ignore
         self._yaw_t0 = float(t)
         self._yaw_duration = max(float(duration), 1e-3)
 
+    def _phase1_target(self) -> NDArray[np.float64]:
+        """The neutral pose to ease to, at the resting pitch."""
+        if not self._rest_pitch:
+            return self.neutral_head_pose
+        return create_head_pose(0, 0, 0, 0, self._rest_pitch, 0, degrees=False)
+
+    def _ease_pitch(self, dt: float) -> None:
+        """Move the pitch toward the offset, critically damped: it starts from rest."""
+        w = _PITCH_EASE_RATE
+        e = np.exp(-w * dt)
+        d = self._pitch_now - float(self.pitch_offset)
+        c = self._pitch_velocity + w * d
+        self._pitch_now = float(self.pitch_offset) + (d + c * dt) * e
+        self._pitch_velocity = float((self._pitch_velocity - w * c * dt) * e)
+
     def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
-        """Evaluate breathing move at time t."""
+        """Evaluate breathing move at time t.
+
+        Stateful (phases, pitch ease): call it from one thread, with t not going backwards.
+        """
         yaw = self.body_yaw_at(t)
+        if self._rest_pitch is None:
+            self._rest_pitch = float(self.pitch_offset)
         if t < self.interpolation_duration:
             # Phase 1: interpolate to the neutral base. The start pose is in the
             # world frame, turned with the body as it was when breathing began:
@@ -224,7 +248,7 @@ class BreathingMove(Move):  # type: ignore
             # Min-jerk, so the ease starts and ends at rest (the companion).
             interpolation_t = time_trajectory(t / self.interpolation_duration, InterpolationTechnique.MIN_JERK)
             start = _turned(self.interpolation_start_pose, -self.start_body_yaw)
-            head_pose = _turned(linear_pose_interpolation(start, self.neutral_head_pose, interpolation_t), yaw)
+            head_pose = _turned(linear_pose_interpolation(start, self._phase1_target(), interpolation_t), yaw)
 
             # Interpolate antennas
             antennas_interp = (
@@ -237,17 +261,16 @@ class BreathingMove(Move):  # type: ignore
             breathing_time = t - self.interpolation_duration
             rate = float(self.rate_scale)
             depth = float(self.depth_scale)
-            if self._last_breath_t is None or t < self._last_breath_t:
-                # First sample (or time ran backwards): start the phases from time.
+            if self._last_breath_t is None:
+                # First sample: start the phases from time, the pitch at its rest.
                 self._breath_phase = self.breathing_frequency * breathing_time
                 self._antenna_phase = self.antenna_frequency * breathing_time
-                if self._last_breath_t is None:
-                    self._pitch_now = 0.0
+                self._pitch_now = self._rest_pitch
             else:
-                dt = t - self._last_breath_t
+                dt = max(0.0, t - self._last_breath_t)
                 self._breath_phase += self.breathing_frequency * rate * dt
                 self._antenna_phase += self.antenna_frequency * rate * dt
-                self._pitch_now += (float(self.pitch_offset) - self._pitch_now) * (1.0 - np.exp(-dt / _PITCH_EASE_TAU))
+                self._ease_pitch(dt)
             self._last_breath_t = t
 
             # Gentle z-axis breathing
@@ -258,7 +281,7 @@ class BreathingMove(Move):  # type: ignore
             )
 
             # Antenna sway (opposite directions)
-            antenna_sway = self.antenna_sway_amplitude * np.sin(2 * np.pi * self._antenna_phase)
+            antenna_sway = self.antenna_sway_amplitude * depth * np.sin(2 * np.pi * self._antenna_phase)
             antennas = np.array([antenna_sway, -antenna_sway], dtype=np.float64)
 
         # Return in official Move interface format: (head_pose, antennas_array, body_yaw)
@@ -666,11 +689,7 @@ class MovementManager:
         """Handle a single cross-thread command."""
         if command == "play_sequence":
             head, antennas, body_yaw = self._last_commanded_pose
-            start = (
-                np.asarray(head, dtype=np.float64).copy(),
-                (float(antennas[0]), float(antennas[1])),
-                float(body_yaw),
-            )
+            start = (np.asarray(head, dtype=np.float64).copy(), (float(antennas[0]), float(antennas[1])), float(body_yaw))
             # A frame without a body yaw keeps the yaw the sequence starts from.
             frames = [(h, a, start[2] if y is None else y, m, p) for h, a, y, m, p in payload]
             move = PoseSequenceMove(frames, start)
@@ -767,6 +786,8 @@ class MovementManager:
         elif command == "set_breathing":
             try:
                 rate, depth, pitch = (float(v) for v in payload)
+                if not all(math.isfinite(v) for v in (rate, depth, pitch)):
+                    raise ValueError("not finite")
             except (TypeError, ValueError):
                 logger.warning("Ignored set_breathing command with invalid payload: %s", payload)
                 return

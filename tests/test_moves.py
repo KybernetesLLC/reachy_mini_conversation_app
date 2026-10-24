@@ -800,6 +800,7 @@ def test_a_recorded_move_turns_with_the_body_it_starts_on() -> None:
     assert yaw == pytest.approx(0.7, abs=1e-6)  # the head turns with the body
 
 
+
 # --- the companion's micro-moves as one queued move (2026-10-10) ------------------------
 
 
@@ -893,7 +894,9 @@ def test_a_later_change_replaces_a_deferred_one() -> None:
 def test_breathing_resumes_once_a_deferred_stop_applies() -> None:
     manager = MovementManager(MagicMock())
     manager.current_robot.get_current_joint_positions.return_value = ([0.0] * 7, (0.0, 0.0))
-    manager.current_robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+    manager.current_robot.get_current_head_pose.return_value = create_head_pose(
+        0, 0, 0, 0, 0, 0, degrees=True
+    )
     now = manager._now()
     manager._last_listening_toggle_time = now - 1.0
     manager._handle_command("set_listening", True, now)
@@ -996,6 +999,7 @@ def test_breathing_pitch_offset_eases_in_over_about_two_seconds() -> None:
     """The resting pitch moves toward the offset smoothly: not at once, nearly there in 2 s."""
     pitches = []
     fresh = _breather()
+    fresh.evaluate(0.5)  # under way; the mood then asks for a new resting pitch
     fresh.pitch_offset = 0.04
     t = 1.0
     while t <= 8.0:
@@ -1021,6 +1025,84 @@ def test_manager_hands_the_breathing_feel_to_the_current_and_to_a_new_breathing_
     manager._poll_signals(manager._now())
     assert (current.rate_scale, current.depth_scale, current.pitch_offset) == (1.1, 0.9, 0.02)
 
-    fresh = _breather()
-    manager.apply_breathing_feel(fresh)
-    assert (fresh.rate_scale, fresh.depth_scale, fresh.pitch_offset) == (1.1, 0.9, 0.02)
+
+def _idle_manager_breathing(manager: MovementManager) -> BreathingMove:
+    """Idle the manager past its inactivity delay and return the BreathingMove it starts."""
+    manager.current_robot.get_current_joint_positions.return_value = ([0.0] * 7, (0.0, 0.0))
+    manager.current_robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+    now = manager._now()
+    manager.state.last_activity_time = now - 100.0
+    manager._manage_breathing(now)
+    manager._update_primary_motion(now)
+    manager._update_primary_motion(now)
+    move = manager.state.current_move
+    assert isinstance(move, BreathingMove)
+    return move
+
+
+def test_a_breathing_move_the_manager_starts_takes_the_stored_feel() -> None:
+    manager = MovementManager(MagicMock())
+    manager.set_breathing(0.8, 1.2, -0.03)
+    manager._poll_signals(manager._now())
+    move = _idle_manager_breathing(manager)
+    assert (move.rate_scale, move.depth_scale, move.pitch_offset) == (0.8, 1.2, -0.03)
+
+
+def test_set_breathing_ignores_a_non_finite_value() -> None:
+    manager = MovementManager(MagicMock())
+    manager.set_breathing(1.1, 0.9, 0.02)
+    manager._poll_signals(manager._now())
+    for bad in ((float("nan"), 1.0, 0.0), (1.0, float("inf"), 0.0), (1.0, 1.0, float("nan"))):
+        manager.set_breathing(*bad)
+        manager._poll_signals(manager._now())
+    assert manager.breathing_feel == (1.1, 0.9, 0.02)
+
+
+def test_breathing_depth_scales_the_antenna_sway() -> None:
+    move = _breather()
+    move.depth_scale = 1.3
+    _, antennas, _ = move.evaluate(1.0 + 1.0)  # a quarter cycle of the 0.25 Hz sway: the peak
+    assert antennas[0] == pytest.approx(move.antenna_sway_amplitude * 1.3, rel=1e-6)
+
+
+def test_breathing_antennas_are_continuous_when_the_rate_changes_mid_cycle() -> None:
+    def antenna_series(move: BreathingMove, t0: float, t1: float) -> list[float]:
+        out, t = [], t0
+        while t <= t1 + 1e-9:
+            out.append(float(move.evaluate(t)[1][0]))
+            t += 0.02
+        return out
+
+    base = antenna_series(_breather(), 1.0, 61.0)
+    base_max = max(abs(b - a) for a, b in zip(base, base[1:]))
+    move = _breather()
+    first = antenna_series(move, 1.0, 30.3)
+    move.rate_scale = 0.7
+    series = first + antenna_series(move, 30.32, 61.0)
+    assert max(abs(b - a) for a, b in zip(series, series[1:])) <= base_max * 1.01
+
+
+def test_breathing_restarts_without_a_nod_when_the_resting_pitch_is_nonzero() -> None:
+    """The head lowered at the offset stays there when breathing restarts: pitch never dips."""
+    move = BreathingMove(
+        interpolation_start_pose=create_head_pose(0, 0, 0, 0, 0.04, 0, degrees=False),
+        interpolation_start_antennas=(0.0, 0.0),
+        interpolation_duration=1.0,
+    )
+    move.pitch_offset = 0.04
+    pitches = []
+    t = 0.0
+    while t <= 8.0:
+        pitches.append(_z_and_pitch(move, t)[1])
+        t += 0.02
+    assert all(b >= a - 1e-9 for a, b in zip(pitches, pitches[1:]))
+    assert min(pitches) == pytest.approx(0.04, abs=1e-6)
+
+
+def test_breathing_pitch_ease_starts_from_rest() -> None:
+    move = _breather()
+    move.evaluate(0.5)
+    move.pitch_offset = 0.05
+    pitches = [_z_and_pitch(move, 1.0 + i * 0.02)[1] for i in range(4)]
+    first_step = pitches[1] - pitches[0]
+    assert first_step < 0.05 / 0.7 * 0.02 * 0.2  # well under the full-speed first step

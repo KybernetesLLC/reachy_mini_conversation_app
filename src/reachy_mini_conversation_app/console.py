@@ -1187,9 +1187,13 @@ class LocalStream:
             manager = self._movement_manager()
             if manager is None:
                 raise JsonRpcError("movement manager unavailable", reason="not_running")
-            rate = _clamp(_finite_float(params.get("rate_scale", 1.0), "rate_scale must be numeric"), 0.7, 1.3)
-            depth = _clamp(_finite_float(params.get("depth_scale", 1.0), "depth_scale must be numeric"), 0.7, 1.3)
-            pitch = _clamp(_finite_float(params.get("pitch_offset", 0.0), "pitch_offset must be numeric"), -0.05, 0.05)
+            # A field the call leaves out keeps its stored value.
+            kept_rate, kept_depth, kept_pitch = manager.breathing_feel
+            rate = _clamp(_finite_float(params.get("rate_scale", kept_rate), "rate_scale must be numeric"), 0.7, 1.3)
+            depth = _clamp(_finite_float(params.get("depth_scale", kept_depth), "depth_scale must be numeric"), 0.7, 1.3)
+            pitch = _clamp(
+                _finite_float(params.get("pitch_offset", kept_pitch), "pitch_offset must be numeric"), -0.05, 0.05
+            )
             manager.set_breathing(rate, depth, pitch)
             return {"rate_scale": rate, "depth_scale": depth, "pitch_offset": pitch}
 
@@ -1423,9 +1427,7 @@ class LocalStream:
                     raise JsonRpcError("micro frames must be objects", reason="invalid_params", code=-32602)
                 antennas_raw = item.get("antennas")
                 if not isinstance(antennas_raw, (list, tuple)) or len(antennas_raw) != 2:
-                    raise JsonRpcError(
-                        "micro frames need 'antennas' as [right, left]", reason="invalid_params", code=-32602
-                    )
+                    raise JsonRpcError("micro frames need 'antennas' as [right, left]", reason="invalid_params", code=-32602)
                 head = item.get("head_pose") or {}
                 if not isinstance(head, dict):
                     raise JsonRpcError("micro head_pose must be an object", reason="invalid_params", code=-32602)
@@ -1433,9 +1435,7 @@ class LocalStream:
                 move = _finite_float(item.get("move", 0.0), error)
                 pause = _finite_float(item.get("pause", 0.0), error)
                 if move <= 0 or pause < 0:
-                    raise JsonRpcError(
-                        "micro frames need move > 0 and pause >= 0", reason="invalid_params", code=-32602
-                    )
+                    raise JsonRpcError("micro frames need move > 0 and pause >= 0", reason="invalid_params", code=-32602)
                 pose = create_head_pose(
                     *(_finite_float(head.get(k, 0.0), error) for k in ("x", "y", "z", "roll", "pitch", "yaw")),
                     degrees=False,
