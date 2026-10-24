@@ -1250,29 +1250,15 @@ async def test_handler_reopens_a_session_after_shutdown(monkeypatch: Any) -> Non
     """A handler that has been shut down can run a second session on the same object.
 
     Session control closes the realtime session and later reopens it without
-    rebuilding the handler, because a rebuilt handler greets again. Nothing
+    rebuilding the handler (a rebuild once meant a second greeting). Nothing
     upstream exercises shutdown() followed by start_up() on one instance:
     _shutdown_active_handler's callers always rebuild. This pins it down.
     """
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
-    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "hello there")
 
     handler = _plain_handler()
-    greetings: list[str] = []
-
-    # Capture the original BEFORE patching. Reaching for it through type(handler)
-    # inside the wrapper would find the wrapper, and recurse forever.
-    original_greeting = type(handler)._send_startup_greeting_prompt
-
-    async def _count_greeting(self: Any) -> None:
-        before = self._startup_greeting_sent
-        await original_greeting(self)
-        if not before and self._startup_greeting_sent:
-            greetings.append("greeted")
-
-    monkeypatch.setattr(type(handler), "_send_startup_greeting_prompt", _count_greeting)
 
     def _fresh_client() -> Any:
         return _make_fake_realtime_client(events=(_FakeEvent("response.created"),))
@@ -1282,9 +1268,8 @@ async def test_handler_reopens_a_session_after_shutdown(monkeypatch: Any) -> Non
 
     monkeypatch.setattr(type(handler), "_build_realtime_client", _build)
 
-    # First session: opens, greets, and ends when the fake connection runs dry.
+    # First session: opens and ends when the fake connection runs dry.
     await handler.start_up()
-    assert greetings == ["greeted"]
     assert handler.connection is None
 
     # Close it the way the close verb will.
@@ -1295,8 +1280,6 @@ async def test_handler_reopens_a_session_after_shutdown(monkeypatch: Any) -> Non
 
     # It tore down cleanly a second time.
     assert handler.tool_manager._lifecycle_tasks == []
-    # And it did not greet, which is what closes the plan 3 defect.
-    assert greetings == ["greeted"]
 
 
 class _LiveFakeConn:
@@ -1355,19 +1338,8 @@ async def test_handler_reopens_a_session_after_closing_a_live_connection(monkeyp
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
-    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "hello there")
 
     handler = _plain_handler()
-    greetings: list[str] = []
-    original_greeting = type(handler)._send_startup_greeting_prompt
-
-    async def _count_greeting(self: Any) -> None:
-        before = self._startup_greeting_sent
-        await original_greeting(self)
-        if not before and self._startup_greeting_sent:
-            greetings.append("greeted")
-
-    monkeypatch.setattr(type(handler), "_send_startup_greeting_prompt", _count_greeting)
 
     live_conns: list[_LiveFakeConn] = []
     build_calls = {"n": 0}
@@ -1391,7 +1363,6 @@ async def test_handler_reopens_a_session_after_closing_a_live_connection(monkeyp
     task = asyncio.create_task(handler.start_up())
     await asyncio.wait_for(handler._connected_event.wait(), timeout=1.0)
     assert handler.connection is not None
-    assert greetings == ["greeted"]
 
     # Close it the way the close verb will, while the session is still live.
     await asyncio.wait_for(handler.shutdown(), timeout=1.0)
@@ -1406,8 +1377,145 @@ async def test_handler_reopens_a_session_after_closing_a_live_connection(monkeyp
 
     # It tore down cleanly a second time.
     assert handler.tool_manager._lifecycle_tasks == []
-    # And it did not greet, which is what closes the plan 3 defect.
-    assert greetings == ["greeted"]
+
+
+# --- the startup greeting: only when an open asks, and only into silence (2026-10-24) ---
+
+GREETING_PROMPT = 'Start the conversation by saying exactly this, and nothing else: "Mm?"'
+
+
+class _ScriptedConn(_LiveFakeConn):
+    """A live connection whose events the test pushes while it is open."""
+
+    def __init__(self) -> None:
+        """Build a live connection with an empty event queue."""
+        super().__init__()
+        self._events: asyncio.Queue[Any] = asyncio.Queue()
+
+    def push(self, event: Any) -> None:
+        """Deliver one server event to the session."""
+        self._events.put_nowait(event)
+
+    async def close(self) -> None:
+        """End the session, as a real close does."""
+        self._closed.set()
+        self._events.put_nowait(None)
+
+    async def __anext__(self) -> Any:
+        """Return the next pushed event, or end at close."""
+        event = await self._events.get()
+        if event is None:
+            raise StopAsyncIteration
+        return event
+
+    def greeted(self) -> bool:
+        """Whether the greeting prompt went into this session, with a response asked for."""
+        sent = [c.kwargs["item"]["content"][0]["text"] for c in self.conversation.item.create.await_args_list]
+        return GREETING_PROMPT in sent and self.response.create.await_count > 0
+
+
+def _greeting_handler(monkeypatch: Any) -> tuple[HuggingFaceRealtimeHandler, list[_ScriptedConn]]:
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: GREETING_PROMPT)
+    monkeypatch.setattr(hf_mod, "GREETING_HOLD_S", 0.1, raising=False)
+    monkeypatch.setattr(hf_mod, "GREETING_SETTLE_WAIT_S", 0.1, raising=False)
+    handler = _plain_handler()
+    conns: list[_ScriptedConn] = []
+
+    async def _build(self: Any) -> Any:
+        conn = _ScriptedConn()
+        conns.append(conn)
+        return SimpleNamespace(realtime=SimpleNamespace(connect=lambda **_kw: conn))
+
+    monkeypatch.setattr(type(handler), "_build_realtime_client", _build)
+    return handler, conns
+
+
+async def _connect(handler: HuggingFaceRealtimeHandler, greet: bool | None) -> asyncio.Task[None]:
+    """One connect; `greet` is what LocalStream.open_session sets (None: a reconnect, no open)."""
+    if greet is not None:
+        handler.greet_at_open = greet
+    task = asyncio.create_task(handler.start_up())
+    await asyncio.wait_for(handler._connected_event.wait(), timeout=1.0)
+    return task
+
+
+async def _disconnect(handler: HuggingFaceRealtimeHandler, task: asyncio.Task[None]) -> None:
+    await asyncio.wait_for(handler.shutdown(), timeout=1.0)
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_an_open_that_asks_greets_after_a_quiet_hold(monkeypatch: Any) -> None:
+    """The greeting waits out the hold for the person's first words, then plays."""
+    handler, conns = _greeting_handler(monkeypatch)
+    task = await _connect(handler, greet=True)
+    await asyncio.sleep(0.05)
+    assert not conns[0].greeted()  # not at connect: the hold comes first
+    await asyncio.sleep(0.4)
+    assert conns[0].greeted()
+    await _disconnect(handler, task)
+
+
+@pytest.mark.asyncio
+async def test_an_open_that_does_not_ask_never_greets(monkeypatch: Any) -> None:
+    """Never greet unless an open asked (the review, I1, 2026-10-24).
+
+    An open that leaves greet out, the app's own start and a say's session never greet,
+    whatever the companion's setting.
+    """
+    handler, conns = _greeting_handler(monkeypatch)
+    task = await _connect(handler, greet=None)  # a fresh handler, nobody asked
+    await asyncio.sleep(0.4)
+    assert not conns[0].greeted()
+    conns[0].conversation.item.create.assert_not_awaited()
+    await _disconnect(handler, task)
+
+
+@pytest.mark.asyncio
+async def test_a_person_already_speaking_gets_no_greeting(monkeypatch: Any) -> None:
+    """The review, I2: speech within the hold skips the greeting; his body shows he listens."""
+    handler, conns = _greeting_handler(monkeypatch)
+    task = await _connect(handler, greet=True)
+    conns[0].push(_FakeEvent("input_audio_buffer.speech_started"))
+    await asyncio.sleep(0.4)
+    assert not conns[0].greeted()
+    await _disconnect(handler, task)
+
+
+@pytest.mark.asyncio
+async def test_speech_in_the_pre_roll_gets_no_greeting(monkeypatch: Any) -> None:
+    """Skip the greeting when the pre-roll carries speech (the review, I2).
+
+    A wake's flush carries the person's words and the name; the server hears speech in it
+    and answers, so no greeting goes before that answer.
+    """
+    handler, conns = _greeting_handler(monkeypatch)
+    monkeypatch.setattr(hf_mod, "GREETING_SETTLE_WAIT_S", 1.0)
+    task = await _connect(handler, greet=True)
+    await asyncio.sleep(0.2)  # the flush is still draining: the hold has not begun
+    conns[0].push(_FakeEvent("input_audio_buffer.speech_started"))
+    await asyncio.sleep(0.05)
+    handler.open_settled()  # the console: the pre-roll is flushed
+    await asyncio.sleep(0.3)
+    assert not conns[0].greeted()
+    await _disconnect(handler, task)
+
+
+@pytest.mark.asyncio
+async def test_each_asking_open_greets_once_and_a_reconnect_does_not(monkeypatch: Any) -> None:
+    """Greet exactly where an open asked for it (the review, M3).
+
+    Across open, close and open on one handler, and a reconnect within the conversation.
+    """
+    handler, conns = _greeting_handler(monkeypatch)
+    for greet in (True, False, True, None):  # None: the same conversation reconnects
+        task = await _connect(handler, greet=greet)
+        await asyncio.sleep(0.4)
+        await _disconnect(handler, task)
+    assert [c.greeted() for c in conns] == [True, False, True, False]
 
 
 # --- the inner monologue: sight notes, written by the companion since 2026-10-17 -----
@@ -1737,26 +1845,6 @@ async def test_typed_text_is_a_user_turn_answered_and_reported() -> None:
     assert item["role"] == "user" and item["content"] == [{"type": "input_text", "text": "play it again"}]
     create.assert_awaited_once()
     assert seen == [("user", "play it again", True)]
-
-
-@pytest.mark.asyncio
-async def test_a_skipped_greeting_stays_skipped_on_a_reconnect(monkeypatch: Any) -> None:
-    """Skip the greeting until the next open says otherwise.
-
-    The review (2026-10-17): a reconnect within a conversation, on the same handler and
-    with no new open, spoke "Go ahead." once the skip had been used up.
-    """
-    import reachy_mini_conversation_app.huggingface_realtime as hr
-
-    monkeypatch.setattr(hr, "get_session_greeting_prompt", lambda: "Greet them.")
-    handler = _plain_handler()
-    handler.connection = AsyncMock()
-    handler._safe_response_create = AsyncMock()
-    handler.skip_next_greeting = True
-    await handler._send_startup_greeting_prompt()
-    await handler._send_startup_greeting_prompt()  # the reconnect
-    handler.connection.conversation.item.create.assert_not_awaited()
-    assert handler.skip_next_greeting is True and handler._startup_greeting_sent is False
 
 
 @pytest.mark.asyncio

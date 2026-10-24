@@ -6,6 +6,7 @@ import base64
 import random
 import asyncio
 import logging
+import contextlib
 from typing import TYPE_CHECKING, Any, Final, Tuple, Callable, Optional
 from collections import deque
 
@@ -199,6 +200,11 @@ _NOTE_POLL_SECONDS = 0.25
 COMPANION_NOTE_WAIT_S = 30.0
 
 NOTE_TEXT = "[Companion note, not spoken: {text}]"
+# The startup greeting (the companion, 2026-10-24): only when an open asks for it, and only
+# into silence. It waits for the console to finish the open (the pre-roll flush), at most
+# GREETING_SETTLE_WAIT_S, then GREETING_HOLD_S more; speech or a reply by then skips it.
+GREETING_HOLD_S = 0.8
+GREETING_SETTLE_WAIT_S = 2.0
 
 
 def _out_of_band_request(
@@ -367,7 +373,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
         self._turn_first_audio_at: float | None = None
-        self._startup_greeting_sent = False
+        # Set by LocalStream.open_session for an open that asked for the greeting; spent
+        # when the greeting is sent or skipped, so a reconnect within it stays quiet.
+        self.greet_at_open = False
+        self._spoke_since_open = False
+        self._open_settled: asyncio.Event = asyncio.Event()
         self._in_flight_tool_calls: set[str] = set()
         # Function calls whose function_call_output is not yet sent. The server rejects an
         # in-band response.create while any is owed ("Cannot create a response while function
@@ -1252,20 +1262,33 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except Exception as exc:
             logger.info("Companion note dropped: %s", exc)
 
-    async def _send_startup_greeting_prompt(self) -> None:
-        """Prompt the model to open the conversation once the session is ready."""
-        if self._startup_greeting_sent or not self.connection:
-            return
-        if getattr(self, "skip_next_greeting", False):
-            # This open was asked for without one (Type to Reachy, 2026-10-08; every open
-            # since 2026-10-17). Not cleared here: the console sets it at each open, so a
-            # reconnect within the conversation stays silent too (the review, 2026-10-17).
-            logger.info("Startup greeting skipped for this session")
-            return
+    def open_settled(self) -> None:
+        """Start the greeting's hold: the console has finished this open, its pre-roll sent."""
+        self._open_settled.set()
 
+    async def _greet_into_silence(self) -> None:
+        """Greet once the open has settled and the person has stayed quiet.
+
+        A wake's pre-roll carries the name and often the request; the server hears it
+        and answers, so a greeting then would talk over the person or queue a second
+        reply. Skipped silently: his body already shows he is listening.
+        """
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._open_settled.wait(), GREETING_SETTLE_WAIT_S)
+        await asyncio.sleep(GREETING_HOLD_S)
+        if self._spoke_since_open or not self._response_done_event.is_set():
+            self.greet_at_open = False
+            logger.info("Startup greeting skipped: the person has started speaking")
+            return
+        await self._send_startup_greeting_prompt()
+
+    async def _send_startup_greeting_prompt(self) -> None:
+        """Prompt the model to open the conversation, once, for an open that asked."""
+        if not self.greet_at_open or not self.connection:
+            return
+        self.greet_at_open = False
         greeting_prompt = get_session_greeting_prompt().strip()
         if not greeting_prompt:
-            self._startup_greeting_sent = True
             return
 
         try:
@@ -1281,7 +1304,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     ],
                 },
             )
-            self._startup_greeting_sent = True
             self._mark_activity("startup_greeting_prompt")
             await self._safe_response_create()
             logger.info("Queued startup greeting prompt")
@@ -1603,7 +1625,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Reset the partial-transcript accumulator for each new session
             self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
 
-            # Manage events received from the realtime server.
+            # Manage events received from the realtime server. The greeting's hold is
+            # this open's: reset before the console can see the connection.
+            self._spoke_since_open = False
+            self._open_settled.clear()
             self.connection = conn
             self._reset_owed_outputs()
             self._followup_pending = self._followup_live = False
@@ -1627,6 +1652,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 pass
 
             response_sender_task: asyncio.Task[None] | None = None
+            greeting_task: asyncio.Task[None] | None = None
             try:
                 # Start the background tool manager
                 self.tool_manager.start_up(
@@ -1635,11 +1661,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 # Start the response sender worker
                 response_sender_task = asyncio.create_task(self._response_sender_loop(), name="response-sender")
-                await self._send_startup_greeting_prompt()
+                if self.greet_at_open:
+                    greeting_task = asyncio.create_task(self._greet_into_silence(), name="startup-greeting")
 
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "input_audio_buffer.speech_started":
+                        self._spoke_since_open = True
                         self._new_user_turn()
                         self._user_speaking = True
                         self._last_speech_at = time.monotonic()
@@ -1902,6 +1930,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 # Audio still held belongs to a response this session will not finish.
                 self._gate_drop_held()
                 self._gate = "pass"
+
+                if greeting_task is not None:
+                    greeting_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await greeting_task
 
                 # Stop the response sender worker.
                 if response_sender_task is not None:

@@ -376,10 +376,8 @@ class LocalStream:
         """Set the active handler and wire LocalStream-owned helpers into it."""
         self.handler = handler
         self.handler._clear_queue = self.clear_audio_queue
-        # The companion's audio audit, A7: a handler rebuilt before connect keeps the
-        # open's greeting choice (a typed line's session opens without one).
-        if getattr(self, "_skip_greeting", False):
-            self.handler.skip_next_greeting = True
+        # A rebuilt handler is never armed to greet (the companion's audio audit, A7;
+        # the review, 2026-10-24): losing a greeting is the safe side.
         self._attach_observers_to_handler()
 
     def _attach_observers_to_handler(self) -> None:
@@ -580,9 +578,8 @@ class LocalStream:
         Waking on the session gate cuts a deliberate close from about 5.3 s to
         about the 0.65 s the connection actually takes, which is what a
         voice-operated microphone switch needs. It deliberately does NOT set
-        _restart_requested to get there: that path rebuilds the handler, and
-        _startup_greeting_sent is per-instance and never reset, so a rebuilt
-        handler greets again.
+        _restart_requested to get there: that path rebuilds the handler, which
+        drops the handler's session state (a rebuilt handler once greeted again).
         """
         if self._restart_requested.is_set() or not self._session_wanted.is_set():
             return
@@ -602,8 +599,8 @@ class LocalStream:
         """Park the startup loop while the realtime session is closed on request.
 
         Deliberately does not touch _restart_requested. That path rebuilds the
-        handler, and a fresh handler has _startup_greeting_sent False, so it greets
-        again — which is the defect session control exists to close.
+        handler, which session control exists to avoid (a rebuilt handler once
+        greeted again: the plan 3 defect).
         """
         if self._session_wanted.is_set():
             return
@@ -628,7 +625,7 @@ class LocalStream:
         preroll: bool = False,
         anchor_ago: float | None = None,
         glance: bool = False,
-        greet: bool = True,
+        greet: bool = False,
     ) -> None:
         """Let the startup loop open a realtime session, and wake it now.
 
@@ -655,14 +652,9 @@ class LocalStream:
         if self._session_wanted.is_set():
             return
         self._glance_on_connect = glance
-        # ``greet=False``: no greeting at this open (Type to Reachy, the companion,
-        # 2026-10-08), so a typed line is answered at once.
-        self._skip_greeting = not greet
-        self.handler.skip_next_greeting = self._skip_greeting
-        if greet:
-            # The handler greets once per instance; an open that asks for the greeting
-            # (the companion's setting, 2026-10-24) gets one. A reconnect within it does not.
-            self.handler._startup_greeting_sent = False
+        # The greeting only when this open asks for it (the companion's setting, the
+        # review, 2026-10-24); the handler plays it only into silence, once.
+        self.handler.greet_at_open = greet
         if preroll:
             self._preroll_flush_pending = True
             if anchor_ago is not None:
@@ -1194,9 +1186,7 @@ class LocalStream:
             # A field the call leaves out keeps its stored value.
             kept_rate, kept_depth, kept_pitch = manager.breathing_feel
             rate = _clamp(_finite_float(params.get("rate_scale", kept_rate), "rate_scale must be numeric"), 0.7, 1.3)
-            depth = _clamp(
-                _finite_float(params.get("depth_scale", kept_depth), "depth_scale must be numeric"), 0.7, 1.3
-            )
+            depth = _clamp(_finite_float(params.get("depth_scale", kept_depth), "depth_scale must be numeric"), 0.7, 1.3)
             pitch = _clamp(
                 _finite_float(params.get("pitch_offset", kept_pitch), "pitch_offset must be numeric"), -0.05, 0.05
             )
@@ -1282,7 +1272,7 @@ class LocalStream:
                         preroll=bool(params.get("preroll", False)),
                         anchor_ago=_anchor_ago(params.get("preroll_anchor_ago")),
                         glance=params.get("glance") is True,
-                        greet=params.get("greet") is not False,
+                        greet=params.get("greet") is True,
                     )
                 else:
                     await self.close_session()
@@ -1433,9 +1423,7 @@ class LocalStream:
                     raise JsonRpcError("micro frames must be objects", reason="invalid_params", code=-32602)
                 antennas_raw = item.get("antennas")
                 if not isinstance(antennas_raw, (list, tuple)) or len(antennas_raw) != 2:
-                    raise JsonRpcError(
-                        "micro frames need 'antennas' as [right, left]", reason="invalid_params", code=-32602
-                    )
+                    raise JsonRpcError("micro frames need 'antennas' as [right, left]", reason="invalid_params", code=-32602)
                 head = item.get("head_pose") or {}
                 if not isinstance(head, dict):
                     raise JsonRpcError("micro head_pose must be an object", reason="invalid_params", code=-32602)
@@ -1443,9 +1431,7 @@ class LocalStream:
                 move = _finite_float(item.get("move", 0.0), error)
                 pause = _finite_float(item.get("pause", 0.0), error)
                 if move <= 0 or pause < 0:
-                    raise JsonRpcError(
-                        "micro frames need move > 0 and pause >= 0", reason="invalid_params", code=-32602
-                    )
+                    raise JsonRpcError("micro frames need move > 0 and pause >= 0", reason="invalid_params", code=-32602)
                 pose = create_head_pose(
                     *(_finite_float(head.get(k, 0.0), error) for k in ("x", "y", "z", "roll", "pitch", "yaw")),
                     degrees=False,
@@ -1622,6 +1608,12 @@ class LocalStream:
                     break
         finally:
             self._reset_preroll()
+            if self._backend_connected():
+                # The open is settled, its pre-roll (if any) sent: the greeting's hold
+                # for the person's first words starts now (2026-10-24).
+                settled = getattr(self.handler, "open_settled", None)
+                if callable(settled):
+                    settled()
 
     async def _glance_at_open(self) -> None:
         """Glance at a wake's open, beside the pre-roll flush.
