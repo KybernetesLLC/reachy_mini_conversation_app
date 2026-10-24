@@ -120,6 +120,10 @@ def ease_seconds(
     return min(seconds, EASE_MAX_SECONDS)
 
 
+# Time constant of the resting-pitch ease: 95% of the way in about 2 s.
+_PITCH_EASE_TAU = 0.7
+
+
 class BreathingMove(Move):  # type: ignore
     """Breathing move with interpolation to neutral and then continuous breathing patterns."""
 
@@ -165,6 +169,19 @@ class BreathingMove(Move):  # type: ignore
         self.antenna_sway_amplitude = np.deg2rad(_idle_setting("REACHY_BREATHING_ANTENNA_DEG", 5.0))
         self.antenna_frequency = _idle_setting("REACHY_BREATHING_ANTENNA_HZ", 0.25)
         self.breathing_frequency = 0.1  # Hz (6 breaths per minute)
+
+        # The companion's mood (task 8.2): read each cycle, set from other threads
+        # (plain float stores). Defaults give the unscaled motion. Rate and depth
+        # scale the breath; the pitch offset (radians, positive downward) shifts the
+        # resting head pitch, eased in over about 2 s.
+        self.rate_scale = 1.0
+        self.depth_scale = 1.0
+        self.pitch_offset = 0.0
+        # Integrated phases (cycles), so a rate change never jumps the pose.
+        self._last_breath_t: float | None = None
+        self._breath_phase = 0.0
+        self._antenna_phase = 0.0
+        self._pitch_now = 0.0
 
         # The companion (decision 026): breathing holds the body where it was
         # when breathing began, instead of returning body yaw 0 -- that was a
@@ -218,15 +235,30 @@ class BreathingMove(Move):  # type: ignore
         else:
             # Phase 2: breathing patterns from the neutral base, facing the body's way.
             breathing_time = t - self.interpolation_duration
+            rate = float(self.rate_scale)
+            depth = float(self.depth_scale)
+            if self._last_breath_t is None or t < self._last_breath_t:
+                # First sample (or time ran backwards): start the phases from time.
+                self._breath_phase = self.breathing_frequency * breathing_time
+                self._antenna_phase = self.antenna_frequency * breathing_time
+                if self._last_breath_t is None:
+                    self._pitch_now = 0.0
+            else:
+                dt = t - self._last_breath_t
+                self._breath_phase += self.breathing_frequency * rate * dt
+                self._antenna_phase += self.antenna_frequency * rate * dt
+                self._pitch_now += (float(self.pitch_offset) - self._pitch_now) * (1.0 - np.exp(-dt / _PITCH_EASE_TAU))
+            self._last_breath_t = t
 
             # Gentle z-axis breathing
-            z_offset = self.breathing_z_amplitude * np.sin(2 * np.pi * self.breathing_frequency * breathing_time)
+            z_offset = self.breathing_z_amplitude * depth * np.sin(2 * np.pi * self._breath_phase)
             head_pose = _turned(
-                create_head_pose(x=0, y=0, z=z_offset, roll=0, pitch=0, yaw=0, degrees=True, mm=False), yaw
+                create_head_pose(x=0, y=0, z=z_offset, roll=0, pitch=self._pitch_now, yaw=0, degrees=False, mm=False),
+                yaw,
             )
 
             # Antenna sway (opposite directions)
-            antenna_sway = self.antenna_sway_amplitude * np.sin(2 * np.pi * self.antenna_frequency * breathing_time)
+            antenna_sway = self.antenna_sway_amplitude * np.sin(2 * np.pi * self._antenna_phase)
             antennas = np.array([antenna_sway, -antenna_sway], dtype=np.float64)
 
         # Return in official Move interface format: (head_pose, antennas_array, body_yaw)
@@ -452,6 +484,9 @@ class MovementManager:
         # The companion (decision 026): a turn asked for while no breathing is
         # current, as (yaw, duration); applied when breathing next becomes current.
         self._pending_turn: Tuple[float, float] | None = None
+        # The mood's breathing feel (rate, depth, pitch offset): current for a
+        # BreathingMove now, and for the next one.
+        self.breathing_feel: Tuple[float, float, float] = (1.0, 1.0, 0.0)
         self._listening_debounce_s = 0.15
         self._last_listening_toggle_time = self._now()
         # A listening change inside the debounce, applied once it has passed (the companion,
@@ -517,6 +552,17 @@ class MovementManager:
         or to the next breathing if none is current. Thread-safe.
         """
         self._command_queue.put(("turn_idle_body", (yaw, duration)))
+
+    def set_breathing(self, rate_scale: float, depth_scale: float, pitch_offset: float) -> None:
+        """Set the breathing rate and depth scales and resting pitch offset (radians). Thread-safe.
+
+        Applied to the current breathing at once, and kept for every later breathing.
+        """
+        self._command_queue.put(("set_breathing", (rate_scale, depth_scale, pitch_offset)))
+
+    def apply_breathing_feel(self, move: "BreathingMove") -> None:
+        """Give `move` the stored breathing feel."""
+        move.rate_scale, move.depth_scale, move.pitch_offset = self.breathing_feel
 
     def release_hold(self) -> None:
         """Release a held pose, if any, and let normal idle behaviour resume.
@@ -620,7 +666,11 @@ class MovementManager:
         """Handle a single cross-thread command."""
         if command == "play_sequence":
             head, antennas, body_yaw = self._last_commanded_pose
-            start = (np.asarray(head, dtype=np.float64).copy(), (float(antennas[0]), float(antennas[1])), float(body_yaw))
+            start = (
+                np.asarray(head, dtype=np.float64).copy(),
+                (float(antennas[0]), float(antennas[1])),
+                float(body_yaw),
+            )
             # A frame without a body yaw keeps the yaw the sequence starts from.
             frames = [(h, a, start[2] if y is None else y, m, p) for h, a, y, m, p in payload]
             move = PoseSequenceMove(frames, start)
@@ -714,6 +764,15 @@ class MovementManager:
                 # the turn starts with the next breathing.
                 self._pending_turn = (yaw, duration)
             logger.info("Turning the idle body to %.2f rad over %.1fs", yaw, duration)
+        elif command == "set_breathing":
+            try:
+                rate, depth, pitch = (float(v) for v in payload)
+            except (TypeError, ValueError):
+                logger.warning("Ignored set_breathing command with invalid payload: %s", payload)
+                return
+            self.breathing_feel = (rate, depth, pitch)
+            if isinstance(self.state.current_move, BreathingMove):
+                self.apply_breathing_feel(self.state.current_move)
         elif command == "set_moving_state":
             try:
                 duration = float(payload)
@@ -875,6 +934,7 @@ class MovementManager:
                         interpolation_start_antennas=current_antennas,
                         body_yaw=float(head_joints[0]),  # joint 0 is the body yaw
                     )
+                    self.apply_breathing_feel(breathing_move)
                     self.move_queue.append(breathing_move)
                     logger.debug("Started breathing after %.1fs of inactivity", idle_for)
                 except Exception as e:

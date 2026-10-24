@@ -800,7 +800,6 @@ def test_a_recorded_move_turns_with_the_body_it_starts_on() -> None:
     assert yaw == pytest.approx(0.7, abs=1e-6)  # the head turns with the body
 
 
-
 # --- the companion's micro-moves as one queued move (2026-10-10) ------------------------
 
 
@@ -894,9 +893,7 @@ def test_a_later_change_replaces_a_deferred_one() -> None:
 def test_breathing_resumes_once_a_deferred_stop_applies() -> None:
     manager = MovementManager(MagicMock())
     manager.current_robot.get_current_joint_positions.return_value = ([0.0] * 7, (0.0, 0.0))
-    manager.current_robot.get_current_head_pose.return_value = create_head_pose(
-        0, 0, 0, 0, 0, 0, degrees=True
-    )
+    manager.current_robot.get_current_head_pose.return_value = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
     now = manager._now()
     manager._last_listening_toggle_time = now - 1.0
     manager._handle_command("set_listening", True, now)
@@ -929,3 +926,101 @@ def test_the_last_listening_request_wins_through_the_public_api(sequence) -> Non
     manager._last_listening_toggle_time = manager._now() - manager._listening_debounce_s
     manager._poll_signals(manager._now())
     assert manager._is_listening is sequence[-1] and manager._pending_listening is None
+
+
+def _breather() -> BreathingMove:
+    return BreathingMove(
+        interpolation_start_pose=create_head_pose(0, 0, 0, 0, 0, 0, degrees=True),
+        interpolation_start_antennas=(0.0, 0.0),
+        interpolation_duration=1.0,
+    )
+
+
+def _z_and_pitch(move: BreathingMove, t: float) -> tuple[float, float]:
+    head, _, _ = move.evaluate(t)
+    return float(head[2, 3]), float(-math.asin(head[2, 0]))  # z, pitch (positive downward)
+
+
+def test_breathing_defaults_reproduce_the_unscaled_motion() -> None:
+    """Rate 1, depth 1, pitch 0 give exactly sin-of-time breathing, sampled at any times."""
+    move = _breather()
+    assert (move.rate_scale, move.depth_scale, move.pitch_offset) == (1.0, 1.0, 0.0)
+    for t in (1.0, 3.7, 12.5, 12.6, 40.0, 91.3):
+        head, antennas, _ = move.evaluate(t)
+        bt = t - 1.0
+        assert head[2, 3] == pytest.approx(0.003 * math.sin(2 * math.pi * 0.1 * bt), abs=1e-9)
+        sway = move.antenna_sway_amplitude * math.sin(2 * math.pi * move.antenna_frequency * bt)
+        np.testing.assert_allclose(antennas, [sway, -sway], atol=1e-9)
+        assert _z_and_pitch(_breather(), t)[1] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_breathing_depth_and_rate_scale_the_motion() -> None:
+    """Depth 1.3 scales the z swing; rate 1.3 speeds the sine up by the same factor."""
+    deep = _breather()
+    deep.depth_scale = 1.3
+    z, _ = _z_and_pitch(deep, 1.0 + 2.5)  # the peak at the default rate: sin(pi/2)
+    assert z == pytest.approx(0.003 * 1.3, rel=1e-6)
+
+    fast = _breather()
+    fast.rate_scale = 1.3
+    for step in range(1, 101):  # 2.0 s in 0.02 s steps, as the motor loop does
+        z, _ = _z_and_pitch(fast, 1.0 + step * 0.02)
+    assert z == pytest.approx(0.003 * math.sin(2 * math.pi * 0.1 * 1.3 * 2.0), abs=1e-5)
+
+
+def _trace(move: BreathingMove, t0: float, t1: float, dt: float = 0.02) -> list[float]:
+    out = []
+    t = t0
+    while t <= t1 + 1e-9:
+        out.append(_z_and_pitch(move, t)[0])
+        t += dt
+    return out
+
+
+def test_breathing_phase_is_continuous_when_the_rate_changes_mid_cycle() -> None:
+    """A rate change moves no sample further than the default motion's own largest step."""
+    default = _trace(_breather(), 1.0, 61.0)
+    default_max = max(abs(b - a) for a, b in zip(default, default[1:]))
+
+    for new_rate, allowed in ((0.7, default_max), (1.3, default_max * 1.3)):
+        move = _breather()
+        first = _trace(move, 1.0, 30.3)
+        move.rate_scale = new_rate
+        second = _trace(move, 30.32, 61.0)
+        series = first + second
+        worst = max(abs(b - a) for a, b in zip(series, series[1:]))
+        assert worst <= allowed * 1.01, (new_rate, worst, allowed)
+
+
+def test_breathing_pitch_offset_eases_in_over_about_two_seconds() -> None:
+    """The resting pitch moves toward the offset smoothly: not at once, nearly there in 2 s."""
+    pitches = []
+    fresh = _breather()
+    fresh.pitch_offset = 0.04
+    t = 1.0
+    while t <= 8.0:
+        pitches.append(_z_and_pitch(fresh, t)[1])
+        t += 0.02
+    assert pitches[0] < 0.004  # not a jump
+    assert max(abs(b - a) for a, b in zip(pitches, pitches[1:])) < 0.002
+    assert 0.8 * 0.04 < pitches[int(2.0 / 0.02)] < 0.99 * 0.04
+    assert pitches[-1] == pytest.approx(0.04, abs=1e-3)
+
+
+def test_manager_hands_the_breathing_feel_to_the_current_and_to_a_new_breathing_move() -> None:
+    """set_breathing reaches a current BreathingMove and survives into the next one."""
+    manager = MovementManager(MagicMock())
+    manager.set_breathing(0.8, 1.2, -0.03)
+    manager._poll_signals(manager._now())  # no breathing current: stored for the next
+    assert manager.breathing_feel == (0.8, 1.2, -0.03)
+
+    current = _breather()
+    manager.state.current_move = current
+    manager.state.move_start_time = manager._now()
+    manager.set_breathing(1.1, 0.9, 0.02)
+    manager._poll_signals(manager._now())
+    assert (current.rate_scale, current.depth_scale, current.pitch_offset) == (1.1, 0.9, 0.02)
+
+    fresh = _breather()
+    manager.apply_breathing_feel(fresh)
+    assert (fresh.rate_scale, fresh.depth_scale, fresh.pitch_offset) == (1.1, 0.9, 0.02)

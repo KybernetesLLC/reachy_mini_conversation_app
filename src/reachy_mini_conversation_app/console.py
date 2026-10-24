@@ -102,6 +102,10 @@ def _finite_float(value: object, message: str) -> float:
     return parsed
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
 # reachy_mini 1.10.0: yaw_body is capped at 160 degrees (URDF, max_body_yaw).
 _BODY_YAW_LIMIT = math.radians(160.0)
 
@@ -1177,6 +1181,18 @@ class LocalStream:
             await self._on_handler_loop(self.handler.say(text))
             return {"ok": True}
 
+        @rpc.method("conversation.breathing")  # type: ignore[untyped-decorator]
+        def _rpc_breathing(params: dict[str, object]) -> dict[str, object]:
+            # The companion's mood (task 8.2): breathing rate, depth and resting pitch.
+            manager = self._movement_manager()
+            if manager is None:
+                raise JsonRpcError("movement manager unavailable", reason="not_running")
+            rate = _clamp(_finite_float(params.get("rate_scale", 1.0), "rate_scale must be numeric"), 0.7, 1.3)
+            depth = _clamp(_finite_float(params.get("depth_scale", 1.0), "depth_scale must be numeric"), 0.7, 1.3)
+            pitch = _clamp(_finite_float(params.get("pitch_offset", 0.0), "pitch_offset must be numeric"), -0.05, 0.05)
+            manager.set_breathing(rate, depth, pitch)
+            return {"rate_scale": rate, "depth_scale": depth, "pitch_offset": pitch}
+
         @rpc.method("conversation.type")  # type: ignore[untyped-decorator]
         async def _rpc_type(params: dict[str, object]) -> dict[str, object]:
             # Type to Reachy (the companion, 2026-10-08): text as if spoken.
@@ -1407,7 +1423,9 @@ class LocalStream:
                     raise JsonRpcError("micro frames must be objects", reason="invalid_params", code=-32602)
                 antennas_raw = item.get("antennas")
                 if not isinstance(antennas_raw, (list, tuple)) or len(antennas_raw) != 2:
-                    raise JsonRpcError("micro frames need 'antennas' as [right, left]", reason="invalid_params", code=-32602)
+                    raise JsonRpcError(
+                        "micro frames need 'antennas' as [right, left]", reason="invalid_params", code=-32602
+                    )
                 head = item.get("head_pose") or {}
                 if not isinstance(head, dict):
                     raise JsonRpcError("micro head_pose must be an object", reason="invalid_params", code=-32602)
@@ -1415,7 +1433,9 @@ class LocalStream:
                 move = _finite_float(item.get("move", 0.0), error)
                 pause = _finite_float(item.get("pause", 0.0), error)
                 if move <= 0 or pause < 0:
-                    raise JsonRpcError("micro frames need move > 0 and pause >= 0", reason="invalid_params", code=-32602)
+                    raise JsonRpcError(
+                        "micro frames need move > 0 and pause >= 0", reason="invalid_params", code=-32602
+                    )
                 pose = create_head_pose(
                     *(_finite_float(head.get(k, 0.0), error) for k in ("x", "y", "z", "roll", "pitch", "yaw")),
                     degrees=False,

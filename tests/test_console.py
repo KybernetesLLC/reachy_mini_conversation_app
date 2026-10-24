@@ -3259,7 +3259,6 @@ def test_a_barge_in_drops_the_reply_already_past_the_sdk_mixer() -> None:
         threading.Thread(target=audio._pipeline.set_state, args=(Gst.State.NULL,), daemon=True).start()
 
 
-
 def test_a_micro_move_over_rpc_queues_one_sequence() -> None:
     """The companion's idle micro-move in one request, not one hold per frame."""
     _stream, manager, app = _pose_stream()
@@ -3577,7 +3576,9 @@ async def test_the_playback_guard_rebuilds_off_the_event_loop_after_unheard_repl
     monkeypatch.setattr(playback_health.GOVERNOR, "rebuild", rebuild)
     await asyncio.wait_for(stream.playback_guard_loop(interval_s=0.01), timeout=2.0)
     await asyncio.gather(*stream._background)
-    assert rebuilt == [(robot.media.audio, "unheard replies", "3 replies in a row pushed but not heard within 5 s", False)]
+    assert rebuilt == [
+        (robot.media.audio, "unheard replies", "3 replies in a row pushed but not heard within 5 s", False)
+    ]
 
 
 @pytest.mark.asyncio
@@ -3670,7 +3671,7 @@ def test_a_drop_probe_that_removed_itself_is_not_removed_again(monkeypatch: pyte
     Gst.init(None)
     pad = _ProbePad()
     _drop_until(pad, 10)
-    (probe_id, callback), = pad.active.items()
+    ((probe_id, callback),) = pad.active.items()
     later = Gst.Buffer.new_allocate(None, 4, None)
     later.pts = 20
     info = SimpleNamespace(get_buffer=lambda: later)
@@ -3791,3 +3792,41 @@ async def test_an_open_on_an_open_session_does_not_refresh(monkeypatch: pytest.M
     monkeypatch.setattr(playback_health, "refresh_after_idle", lambda audio, cause: refreshed.append(cause))
     await stream.open_session()
     assert refreshed == []
+
+
+def test_breathing_rpc_clamps_and_returns_the_applied_values() -> None:
+    """Out-of-range values are clamped to 0.7-1.3, 0.7-1.3 and +-0.05 rad, and echoed back."""
+    _stream, manager, app = _pose_stream()
+
+    resp = _rpc_call(app, "conversation.breathing", {"rate_scale": 5.0, "depth_scale": 0.1, "pitch_offset": -1.0})
+
+    assert resp["result"] == {"rate_scale": 1.3, "depth_scale": 0.7, "pitch_offset": -0.05}
+    _drive_manager(manager)
+    assert manager.breathing_feel == (1.3, 0.7, -0.05)
+
+
+def test_breathing_rpc_works_when_the_current_move_is_not_breathing() -> None:
+    """A hold is current: the values wait for the next BreathingMove, and a new one takes them."""
+    _stream, manager, app = _pose_stream()
+    _rpc_call(app, "conversation.pose", {"antennas": [0.1, -0.1], "duration": 0.5})
+    _drive_manager(manager)
+    assert isinstance(manager.state.current_move, HoldPoseMove)
+
+    resp = _rpc_call(app, "conversation.breathing", {"rate_scale": 0.9, "depth_scale": 1.1, "pitch_offset": 0.02})
+    _drive_manager(manager)
+
+    assert "error" not in resp
+    assert resp["result"] == {"rate_scale": 0.9, "depth_scale": 1.1, "pitch_offset": 0.02}
+    later = BreathingMove(
+        interpolation_start_pose=create_head_pose(0, 0, 0, 0, 0, 0, degrees=True),
+        interpolation_start_antennas=(0.0, 0.0),
+    )
+    manager.apply_breathing_feel(later)
+    assert (later.rate_scale, later.depth_scale, later.pitch_offset) == (0.9, 1.1, 0.02)
+
+
+def test_breathing_rpc_rejects_non_numeric_values() -> None:
+    """A non-number is an invalid-params error, not a crash."""
+    _stream, _manager, app = _pose_stream()
+    resp = _rpc_call(app, "conversation.breathing", {"rate_scale": "fast"})
+    assert resp["error"]["code"] == -32602
