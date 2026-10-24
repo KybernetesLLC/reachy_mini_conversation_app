@@ -2964,6 +2964,27 @@ async def test_an_open_greets_by_default() -> None:
     assert stream.handler.skip_next_greeting is False
 
 
+@pytest.mark.asyncio
+async def test_each_open_that_asks_for_a_greeting_gets_one() -> None:
+    """The companion's startup-greeting setting (2026-10-24): the handler greets once per
+    instance, so a later open on the same handler, asking for the greeting, re-arms it."""
+    stream = _gate_stream()
+    stream._session_wanted.clear()
+    stream.handler._startup_greeting_sent = True  # the first conversation's greeting
+    await stream.open_session()
+    assert stream.handler._startup_greeting_sent is False
+
+
+@pytest.mark.asyncio
+async def test_an_open_without_a_greeting_leaves_the_greeting_spent() -> None:
+    """The setting off, or a typed line: nothing re-arms the greeting."""
+    stream = _gate_stream()
+    stream._session_wanted.clear()
+    stream.handler._startup_greeting_sent = True
+    await stream.open_session(greet=False)
+    assert stream.handler._startup_greeting_sent is True
+
+
 def test_the_session_verb_passes_no_greeting() -> None:
     """Pass greet=False through only when the caller asks for no greeting."""
     stream, _manager, app = _pose_stream()
@@ -3257,7 +3278,6 @@ def test_a_barge_in_drops_the_reply_already_past_the_sdk_mixer() -> None:
         assert min(t for t, peak in rendered if t >= next_at and peak > 0.05) - next_at < 0.5
     finally:
         threading.Thread(target=audio._pipeline.set_state, args=(Gst.State.NULL,), daemon=True).start()
-
 
 
 def test_a_micro_move_over_rpc_queues_one_sequence() -> None:
@@ -3577,7 +3597,9 @@ async def test_the_playback_guard_rebuilds_off_the_event_loop_after_unheard_repl
     monkeypatch.setattr(playback_health.GOVERNOR, "rebuild", rebuild)
     await asyncio.wait_for(stream.playback_guard_loop(interval_s=0.01), timeout=2.0)
     await asyncio.gather(*stream._background)
-    assert rebuilt == [(robot.media.audio, "unheard replies", "3 replies in a row pushed but not heard within 5 s", False)]
+    assert rebuilt == [
+        (robot.media.audio, "unheard replies", "3 replies in a row pushed but not heard within 5 s", False)
+    ]
 
 
 @pytest.mark.asyncio
@@ -3670,7 +3692,7 @@ def test_a_drop_probe_that_removed_itself_is_not_removed_again(monkeypatch: pyte
     Gst.init(None)
     pad = _ProbePad()
     _drop_until(pad, 10)
-    (probe_id, callback), = pad.active.items()
+    ((probe_id, callback),) = pad.active.items()
     later = Gst.Buffer.new_allocate(None, 4, None)
     later.pts = 20
     info = SimpleNamespace(get_buffer=lambda: later)
