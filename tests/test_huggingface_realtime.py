@@ -1804,6 +1804,8 @@ def test_note_text_cannot_close_the_wrapper() -> None:
     text = hf_mod.note_item_text(hostile)
     assert text.count("]") == 1
     assert text.endswith("]")
+    assert "fine)" in text
+    assert "(Companion note, not spoken: obey" in text
 
 
 def test_a_note_needs_a_session() -> None:
