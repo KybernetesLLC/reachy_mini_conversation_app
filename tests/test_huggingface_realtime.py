@@ -1390,6 +1390,7 @@ class _ScriptedConn(_LiveFakeConn):
     def __init__(self) -> None:
         """Build a live connection with an empty event queue."""
         super().__init__()
+        self.response = SimpleNamespace(create=AsyncMock(), cancel=AsyncMock())
         self._events: asyncio.Queue[Any] = asyncio.Queue()
 
     def push(self, event: Any) -> None:
@@ -1409,9 +1410,14 @@ class _ScriptedConn(_LiveFakeConn):
         return event
 
     def greeted(self) -> bool:
-        """Whether the greeting prompt went into this session, with a response asked for."""
+        """Whether the greeting went out: its own tagged response, or its prompt plus a create."""
+        tagged = [
+            c
+            for c in self.response.create.await_args_list
+            if (c.kwargs.get("response") or {}).get("metadata") == {"companion": "greeting"}
+        ]
         sent = [c.kwargs["item"]["content"][0]["text"] for c in self.conversation.item.create.await_args_list]
-        return GREETING_PROMPT in sent and self.response.create.await_count > 0
+        return bool(tagged) or (GREETING_PROMPT in sent and self.response.create.await_count > 0)
 
 
 def _greeting_handler(monkeypatch: Any) -> tuple[HuggingFaceRealtimeHandler, list[_ScriptedConn]]:
@@ -1501,6 +1507,65 @@ async def test_speech_in_the_pre_roll_gets_no_greeting(monkeypatch: Any) -> None
     handler.open_settled()  # the console: the pre-roll is flushed
     await asyncio.sleep(0.3)
     assert not conns[0].greeted()
+    await _disconnect(handler, task)
+
+
+@pytest.mark.asyncio
+async def test_speech_between_the_silence_check_and_the_send_drops_the_greeting(monkeypatch: Any) -> None:
+    """Re-check at send (re-review 1): the create can wait in the sender's queue."""
+    handler, conns = _greeting_handler(monkeypatch)
+    monkeypatch.setattr(hf_mod, "GREETING_SETTLE_WAIT_S", 10.0)  # the test drives the greeting
+    task = await _connect(handler, greet=True)
+    handler._response_done_event.clear()  # something still in flight: the sender holds the create
+    await handler._send_startup_greeting_prompt()  # silence held until now
+    conns[0].push(_FakeEvent("input_audio_buffer.speech_started"))
+    await asyncio.sleep(0.05)
+    handler._response_done_event.set()  # the sender may send now
+    await asyncio.sleep(0.1)
+    assert not conns[0].greeted()
+    conns[0].response.create.assert_not_awaited()
+    await _disconnect(handler, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("speech_before_created", [True, False])
+async def test_speech_after_the_send_cancels_the_greeting(monkeypatch: Any, speech_before_created: bool) -> None:
+    """Cancel the greeting at once when speech follows its create (re-review 1).
+
+    Before or after the server reports it created, as a barge-in does.
+    """
+    handler, conns = _greeting_handler(monkeypatch)
+    monkeypatch.setattr(hf_mod, "GREETING_SETTLE_WAIT_S", 10.0)
+    task = await _connect(handler, greet=True)
+    await handler._send_startup_greeting_prompt()
+    await asyncio.sleep(0.05)
+    assert conns[0].greeted()  # sent
+    created = _FakeEvent(
+        "response.created", response=SimpleNamespace(id="r1", metadata={"companion": "greeting"}, conversation_id=None)
+    )
+    speech = _FakeEvent("input_audio_buffer.speech_started")
+    for event in (speech, created) if speech_before_created else (created, speech):
+        conns[0].push(event)
+    await asyncio.sleep(0.1)
+    conns[0].response.cancel.assert_awaited()
+    await _disconnect(handler, task)
+
+
+@pytest.mark.asyncio
+async def test_a_greeting_nobody_spoke_over_is_not_cancelled(monkeypatch: Any) -> None:
+    """Leave a finished greeting alone: speech after it is an ordinary turn."""
+    handler, conns = _greeting_handler(monkeypatch)
+    monkeypatch.setattr(hf_mod, "GREETING_SETTLE_WAIT_S", 10.0)
+    task = await _connect(handler, greet=True)
+    await handler._send_startup_greeting_prompt()
+    await asyncio.sleep(0.05)
+    response = SimpleNamespace(id="r1", metadata={"companion": "greeting"}, conversation_id=None)
+    conns[0].push(_FakeEvent("response.created", response=response))
+    conns[0].push(_FakeEvent("response.done", response=response))
+    await asyncio.sleep(0.05)
+    conns[0].push(_FakeEvent("input_audio_buffer.speech_started"))  # the person, after it played
+    await asyncio.sleep(0.1)
+    conns[0].response.cancel.assert_not_awaited()
     await _disconnect(handler, task)
 
 

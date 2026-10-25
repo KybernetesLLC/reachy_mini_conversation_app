@@ -205,6 +205,9 @@ NOTE_TEXT = "[Companion note, not spoken: {text}]"
 # GREETING_SETTLE_WAIT_S, then GREETING_HOLD_S more; speech or a reply by then skips it.
 GREETING_HOLD_S = 0.8
 GREETING_SETTLE_WAIT_S = 2.0
+# The greeting is its own out-of-band response, tagged, so nothing of it stays in the
+# conversation to be answered late. Re-checked at send; cancelled if the person starts.
+GREETING_TAG = {"companion": "greeting"}
 
 
 def _out_of_band_request(
@@ -377,6 +380,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # when the greeting is sent or skipped, so a reconnect within it stays quiet.
         self.greet_at_open = False
         self._spoke_since_open = False
+        self._greeting_live = False  # its create is sent and its response not yet done
         self._open_settled: asyncio.Event = asyncio.Event()
         self._in_flight_tool_calls: set[str] = set()
         # Function calls whose function_call_output is not yet sent. The server rejects an
@@ -1291,24 +1295,29 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if not greeting_prompt:
             return
 
-        try:
-            await self.connection.conversation.item.create(
-                item={
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": greeting_prompt,
-                        },
-                    ],
-                },
+        self._mark_activity("startup_greeting_prompt")
+        await self._safe_response_create(
+            response=_out_of_band_request(
+                GREETING_TAG, ["audio"], greeting_prompt, [{"type": "input_text", "text": "(Say the line now.)"}]
             )
-            self._mark_activity("startup_greeting_prompt")
-            await self._safe_response_create()
-            logger.info("Queued startup greeting prompt")
-        except Exception as e:
-            logger.warning("Failed to queue startup greeting prompt: %s", e)
+        )
+        logger.info("Queued startup greeting prompt")
+
+    async def _cancel_greeting(self) -> None:
+        """Stop the greeting's response at once: the person has started speaking.
+
+        As a barge-in does: drop its held and queued audio, and cancel it on the server.
+        """
+        self._greeting_live = False
+        logger.info("Startup greeting cancelled: the person started speaking")
+        self._gate_drop_held()
+        if self._clear_queue:
+            self._clear_queue()
+        if self.connection:
+            try:
+                await self.connection.response.cancel()
+            except Exception as e:
+                logger.debug("could not cancel the greeting's response (%s)", e)
 
     async def _response_sender_loop(self) -> None:
         """Dedicated worker that sends ``response.create()`` calls serially.
@@ -1374,6 +1383,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         break
                     announcement_added = True
 
+                greeting = (kwargs.get("response") or {}).get("metadata") == GREETING_TAG
+                if greeting:
+                    if self._spoke_since_open:
+                        logger.info("Startup greeting dropped at send: the person has started speaking")
+                        break
+                    self._greeting_live = True
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
                 try:
@@ -1422,6 +1437,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     break
 
                 sent = True
+            if (kwargs.get("response") or {}).get("metadata") == GREETING_TAG:
+                self._greeting_live = False  # done, cancelled, rejected or never sent
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
@@ -1627,7 +1644,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             # Manage events received from the realtime server. The greeting's hold is
             # this open's: reset before the console can see the connection.
-            self._spoke_since_open = False
+            self._spoke_since_open = self._greeting_live = False
             self._open_settled.clear()
             self.connection = conn
             self._reset_owed_outputs()
@@ -1678,6 +1695,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._gate_drop_held()
                         if self._clear_queue:
                             self._clear_queue()
+                        if self._greeting_live:
+                            await self._cancel_greeting()
                         self.deps.movement_manager.set_listening(True)
                         logger.debug("User speech started")
 
@@ -1706,6 +1725,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._followup_pending, self._followup_live = False, True
                         self._response_started()
                         self._gate_start()
+                        if _companion_tag(event) == GREETING_TAG["companion"] and self._spoke_since_open:
+                            await self._cancel_greeting()  # speech came between its create and now
                         self._mark_activity("response_created")
                         self.deps.movement_manager.set_speaking(True)
                         if self._turn_user_done_at is not None and self._turn_response_created_at is None:
@@ -1724,6 +1745,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._response_started_or_rejected_event.set()
                         if _companion_tag(event) is None:
                             self._followup_live = False
+                        elif _companion_tag(event) == GREETING_TAG["companion"]:
+                            self._greeting_live = False
                         # Checked against the function call's response_id on the robot (2026-10-23).
                         logger.debug("Response done: id=%s", getattr(getattr(event, "response", None), "id", None))
                         self._log_usage(getattr(getattr(event, "response", None), "usage", None))
