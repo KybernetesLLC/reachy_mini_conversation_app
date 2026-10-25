@@ -200,6 +200,13 @@ _NOTE_POLL_SECONDS = 0.25
 COMPANION_NOTE_WAIT_S = 30.0
 
 NOTE_TEXT = "[Companion note, not spoken: {text}]"
+
+
+def note_item_text(text: str) -> str:
+    """Return the note as sent, with brackets in the text turned to parentheses so it cannot close the wrapper."""
+    return NOTE_TEXT.format(text=text.replace("[", "(").replace("]", ")"))
+
+
 # The startup greeting (the companion, 2026-10-24): only when an open asks for it, and only
 # into silence. It waits for the console to finish the open (the pre-roll flush), at most
 # GREETING_SETTLE_WAIT_S, then GREETING_HOLD_S more; speech or a reply by then skips it.
@@ -1260,7 +1267,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 item={
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": NOTE_TEXT.format(text=text)}],
+                    "content": [{"type": "input_text", "text": note_item_text(text)}],
                 },
             )
         except Exception as exc:
