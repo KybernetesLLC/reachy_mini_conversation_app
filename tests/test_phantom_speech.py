@@ -478,3 +478,49 @@ def test_an_episode_ended_before_its_listing_ran_still_lists_the_sink_inputs(
     assert len(warnings) == 1
     assert "node 108 serial 1347 16000 Hz pid 1330 (this app)" in warnings[0]
     assert fakes.snapshots == 1
+
+
+class _Playbin:
+    """The SDK's play_sound playbin, as the app tools' music and express sounds leave it."""
+
+    def __init__(self, position_s: float, duration_s: float) -> None:
+        self.position_s, self.duration_s = position_s, duration_s
+
+    def get_name(self) -> str:
+        return "player"
+
+    def get_state(self, timeout: int) -> Any:
+        Gst = _gst()
+        return (Gst.StateChangeReturn.SUCCESS, Gst.State.PLAYING, Gst.State.VOID_PENDING)
+
+    def query_position(self, fmt: Any) -> tuple[bool, int]:
+        return True, int(self.position_s * _gst().SECOND)
+
+    def query_duration(self, fmt: Any) -> tuple[bool, int]:
+        return True, int(self.duration_s * _gst().SECOND)
+
+
+@pytest.mark.parametrize(
+    ("position_s", "level", "words"),
+    [
+        (12.0, logging.INFO, "the SDK's sound player was playing"),  # music from an app tool
+        (47.5, logging.WARNING, "Phantom speech"),  # a playbin left at its end is no excuse
+    ],
+)
+def test_sound_from_the_sdks_own_player_is_an_info_line_not_a_phantom(
+    caplog: pytest.LogCaptureFixture, position_s: float, level: int, words: str
+) -> None:
+    """The app tools' music and express sounds play through play_sound, not watch_motif."""
+    fakes = _Fakes()
+    watch = ph.PhantomWatch(motif=lambda: (False, None), list_inputs=fakes.list_inputs)
+    audio = SimpleNamespace(_playbin=_Playbin(position_s, 47.5))
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        _monitor(watch.detector, 100.0, 101.0, loud=True)
+        for event in watch.take():
+            watch.act(event, audio)
+        _monitor(watch.detector, 101.0, 104.0, loud=False)
+        for event in watch.take():
+            watch.act(event, audio)
+    lines = [(r.levelno, r.getMessage()) for r in caplog.records if r.name == ph.logger.name]
+    assert len(lines) == 1
+    assert lines[0][0] == level and words in lines[0][1]

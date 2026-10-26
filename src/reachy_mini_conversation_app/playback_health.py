@@ -879,7 +879,9 @@ def stop_motif(audio: Any) -> bool:
 # inside the app's speech pipeline, so the sound most likely never passed through it.
 # This detector logs any such episode: the speaker's monitor loud for PHANTOM_LOUD_S while
 # the app pushed nothing (and its queued audio has played out) for PHANTOM_QUIET_S and no
-# motif played. One WARNING per episode, at most one every PHANTOM_REPORT_EVERY_S, names
+# motif played. Sound while the SDK's play_sound playbin is mid-sound (the app tools'
+# music and express sounds bypass watch_motif) is one INFO line, not phantom speech.
+# One WARNING per episode, at most one every PHANTOM_REPORT_EVERY_S, names
 # every sink input (pw-dump, or pactl), whether the app's speech sink carried sound in
 # the episode (a pad probe on it: RMS of each buffer), and whether the head wobbler fired.
 # Nothing is kept but RMS numbers and times. Nothing here runs on the event loop or blocks
@@ -906,6 +908,8 @@ class PhantomEpisode:
     end: float | None = None
     end_cause: str = ""
     inputs: SinkInputs | None = None
+    sdk_sound: str | None = None  # the SDK's sound player was playing: not a phantom
+    sdk_checked: bool = False
 
 
 class PhantomEvent(NamedTuple):
@@ -1261,6 +1265,29 @@ def _wall(t: float) -> str:
     return when.strftime("%H:%M:%S")
 
 
+def _sdk_sound(audio: Any) -> str | None:
+    """Describe the SDK's play_sound playbin if it is playing a sound now, else None. Never raises.
+
+    The app tools' music and express sounds use play_sound directly, not watch_motif. A
+    playbin left at its end (the SDK never tears it down) is not playing.
+    """
+    playbin = getattr(audio, "_playbin", None)
+    if playbin is None:
+        return None
+    try:
+        from gi.repository import Gst
+
+        if playbin.get_state(0)[1] != Gst.State.PLAYING:
+            return None
+        ok_pos, pos = playbin.query_position(Gst.Format.TIME)
+        ok_dur, dur = playbin.query_duration(Gst.Format.TIME)
+        if not (ok_pos and ok_dur) or pos >= dur - Gst.SECOND // 10:
+            return None
+        return f"{playbin.get_name()} at {pos / Gst.SECOND:.1f} of {dur / Gst.SECOND:.1f} s"
+    except Exception:
+        return None
+
+
 def _describe_playbin(audio: Any) -> str:
     """Describe the SDK's motif playbin: none, or its state and position. Never raises."""
     playbin = getattr(audio, "_playbin", None)
@@ -1351,8 +1378,20 @@ class PhantomWatch:
 
     def _act(self, event: PhantomEvent, episode: PhantomEpisode, audio: Any) -> None:
         """Carry out one event. Holds the act lock."""
-        if event.kind == "started" and episode.report:
+        if not episode.sdk_checked:  # at the start, or at the end if the start has not run
+            episode.sdk_checked = True
+            episode.sdk_sound = _sdk_sound(audio)
+        if event.kind == "started" and episode.report and episode.sdk_sound is None:
             self._list(episode)
+        elif event.kind == "ended" and episode.sdk_sound is not None:
+            logger.info(
+                "Speaker sound with no push from the app while the SDK's sound player was playing "
+                "(%s): %.1f s loud, %s to %s; not phantom speech",
+                episode.sdk_sound,
+                episode.loud_s,
+                _wall(episode.start),
+                _wall(episode.end if episode.end is not None else episode.last_loud),
+            )
         elif event.kind == "ended" and episode.report:
             self._list(episode)  # its start's listing may not have run yet
             logger.warning("%s", self.report(episode, audio))
