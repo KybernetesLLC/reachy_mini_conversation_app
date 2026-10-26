@@ -40,6 +40,8 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     # tool call, pushed to console.py's /rpc dispatch. Returns whether a peer
     # could receive it, so the handler's capped queue knows what to retry.
     _tool_call_observer: Callable[[dict[str, Any]], bool] | None = None
+    # Each new realtime session (the restarts included), for the companion's turn pairing.
+    _session_observer: Callable[[str], None] | None = None
 
     def __init__(self) -> None:
         """Initialize the stream handler and shared idle/activity tracking."""
@@ -47,35 +49,59 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         self.last_activity_time = time.monotonic()
         self.last_idle_behavior_time = self.last_activity_time
 
-    def set_activity_observer(self, observer: Callable[[str], None] | None) -> None:
-        """Attach or detach an activity observer. Pass None to clear."""
+    def set_activity_observer(self, observer: Callable[..., None] | None) -> None:
+        """Attach or detach an activity observer, called (reason) or, for a user turn's realtime
+        item, (reason, item_id=...). Pass None to clear."""
         self._activity_observer = observer
 
-    def set_transcript_observer(self, observer: Callable[[str, str, bool, str | None], None] | None) -> None:
+    def set_session_observer(self, observer: Callable[[str], None] | None) -> None:
+        """Attach/detach the observer told "started" at each new realtime session."""
+        self._session_observer = observer
+
+    def _notify_session(self, state: str) -> None:
+        """Tell the session observer, if attached. Not activity: it holds off nothing."""
+        observer = self._session_observer
+        if observer is not None:
+            try:
+                observer(state)
+            except Exception:
+                logger.debug("session observer raised (ignored)", exc_info=True)
+
+    def set_transcript_observer(self, observer: Callable[..., None] | None) -> None:
         """Attach/detach a transcript observer, called (role, text, final, artifact): artifact
-        is the output gate's cut kind for a reply that was not spoken, else None."""
+        is the output gate's cut kind for a reply that was not spoken, else None. A user
+        transcript with a realtime item also passes item_id=..."""
         self._transcript_observer = observer
 
     def set_tool_call_observer(self, observer: Callable[[dict[str, Any]], bool] | None) -> None:
         """Attach/detach the tool-call-report observer. Pass None to clear."""
         self._tool_call_observer = observer
 
-    def _emit_transcript(self, role: str, text: str, final: bool = True, artifact: str | None = None) -> None:
+    def _emit_transcript(
+        self, role: str, text: str, final: bool = True, artifact: str | None = None, item_id: str | None = None
+    ) -> None:
         """Forward one transcript chunk to the observer, if attached."""
         observer = self._transcript_observer
         if observer is not None and text:
             try:
-                observer(role, text, final, artifact)
+                if item_id is None:
+                    observer(role, text, final, artifact)
+                else:
+                    observer(role, text, final, artifact, item_id=item_id)
             except Exception:
                 logger.debug("transcript observer raised (ignored)", exc_info=True)
 
-    def _mark_activity(self, reason: str) -> None:
-        """Record non-idle conversation activity for the idle timer."""
+    def _mark_activity(self, reason: str, item_id: str | None = None) -> None:
+        """Record non-idle conversation activity for the idle timer. `item_id` is the realtime
+        item of a user turn's speech or transcription, for the companion's turn pairing."""
         self.last_activity_time = time.monotonic()
         logger.debug("last activity time updated to %s (%s)", self.last_activity_time, reason)
         if self._activity_observer is not None:
             try:
-                self._activity_observer(reason)
+                if item_id is None:
+                    self._activity_observer(reason)
+                else:
+                    self._activity_observer(reason, item_id=item_id)
             except Exception:
                 logger.debug("activity observer raised (ignored)", exc_info=True)
 

@@ -628,13 +628,49 @@ async def test_a_failed_transcription_is_reported_as_activity(monkeypatch: Any) 
         monkeypatch,
         (_FakeEvent("conversation.item.input_audio_transcription.failed", item_id="item_1"),),
     )
-    seen: list[str] = []
-    handler.set_activity_observer(seen.append)
+    seen: list[tuple[str, Any]] = []
+    handler.set_activity_observer(lambda reason, item_id=None: seen.append((reason, item_id)))
 
     await handler._run_realtime_session()
 
-    assert "user_transcription_failed" in seen
+    assert ("user_transcription_failed", "item_1") in seen
     assert [msg for msg in _messages(_drain(handler)) if msg.get("role") == "user"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_user_turns_item_id_travels_with_its_speech_and_transcript(monkeypatch: Any) -> None:
+    """Who-is-speaking joins a turn's speech window to its transcript by the realtime item_id."""
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("input_audio_buffer.speech_started", item_id="item_2"),
+            _FakeEvent("input_audio_buffer.speech_stopped", item_id="item_2"),
+            _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item_2", transcript="Hi"),
+        ),
+    )
+    seen: list[tuple[str, Any]] = []
+    said: list[tuple[str, str, Any]] = []
+    handler.set_activity_observer(lambda reason, item_id=None: seen.append((reason, item_id)))
+    handler.set_transcript_observer(
+        lambda role, text, final, artifact=None, item_id=None: said.append((role, text, item_id))
+    )
+    sessions: list[str] = []
+    handler.set_session_observer(sessions.append)
+
+    await handler._run_realtime_session()
+
+    for reason in ("user_speech_started", "user_speech_stopped", "user_transcription_completed"):
+        assert (reason, "item_2") in seen
+    assert ("user", "Hi", "item_2") in said
+    assert sessions == ["started"]  # each realtime session, the restarts included
+
+
+def test_an_activity_with_no_item_id_keeps_the_one_argument_call() -> None:
+    handler = _plain_handler()
+    seen: list[str] = []
+    handler.set_activity_observer(seen.append)
+    handler._mark_activity("say")
+    assert seen == ["say"]
 
 
 @pytest.mark.asyncio

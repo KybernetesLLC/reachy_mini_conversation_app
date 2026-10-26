@@ -397,6 +397,9 @@ class LocalStream:
         setter = getattr(self.handler, "set_activity_observer", None)
         if callable(setter):
             setter(self._dispatch_activity)
+        session_setter = getattr(self.handler, "set_session_observer", None)
+        if callable(session_setter):
+            session_setter(self._dispatch_session)
         transcript_setter = getattr(self.handler, "set_transcript_observer", None)
         if callable(transcript_setter):
             transcript_setter(self._dispatch_transcript)
@@ -406,13 +409,18 @@ class LocalStream:
         if hasattr(self.handler, "on_sight"):
             self.handler.on_sight = self._dispatch_sight
 
-    def _dispatch_transcript(self, role: str, text: str, final: bool, artifact: str | None = None) -> None:
+    def _dispatch_transcript(
+        self, role: str, text: str, final: bool, artifact: str | None = None, item_id: str | None = None
+    ) -> None:
         """Push a conversation.transcript notification to JSON-RPC clients. A reply the
-        output gate cut carries its kind as "artifact": the supervisor never keeps it."""
+        output gate cut carries its kind as "artifact": the supervisor never keeps it. A user
+        transcript carries its realtime "item_id" when it has one."""
         if self._rpc is not None:
             params: dict[str, Any] = {"role": role, "text": text, "final": final}
             if artifact:
                 params["artifact"] = artifact
+            if item_id:
+                params["item_id"] = item_id
             self._rpc.broadcast_threadsafe("conversation.transcript", params)
 
     def _dispatch_sight(self, b64_jpeg: str, source: str) -> None:
@@ -481,11 +489,19 @@ class LocalStream:
         "assistant_transcript_done": "ready",
     }
 
-    def _dispatch_activity(self, reason: str) -> None:
-        """Fan one activity reason out to JSON-RPC clients."""
+    def _dispatch_session(self, state: str) -> None:
+        """Push a conversation.realtime notification: a new realtime session ("started")."""
+        if self._rpc is not None:
+            self._rpc.broadcast_threadsafe("conversation.realtime", {"state": state})
+
+    def _dispatch_activity(self, reason: str, item_id: str | None = None) -> None:
+        """Fan one activity reason out to JSON-RPC clients, with its realtime item_id if any."""
         if self._rpc is not None:
             # Raw reason (the browser orb maps it exactly like the old SSE feed)...
-            self._rpc.broadcast_threadsafe("conversation.activity", {"reason": reason})
+            params: dict[str, Any] = {"reason": reason}
+            if item_id:
+                params["item_id"] = item_id
+            self._rpc.broadcast_threadsafe("conversation.activity", params)
             # ...plus a semantic turn state for clients without that mapping (mobile).
             state = self._REASON_TO_TURN.get(reason)
             if state and state != self._last_turn_state:
@@ -1532,7 +1548,9 @@ class LocalStream:
                 move = _finite_float(item.get("move", 0.0), error)
                 pause = _finite_float(item.get("pause", 0.0), error)
                 if move <= 0 or pause < 0:
-                    raise JsonRpcError("micro frames need move > 0 and pause >= 0", reason="invalid_params", code=-32602)
+                    raise JsonRpcError(
+                        "micro frames need move > 0 and pause >= 0", reason="invalid_params", code=-32602
+                    )
                 pose = create_head_pose(
                     *(_finite_float(head.get(k, 0.0), error) for k in ("x", "y", "z", "roll", "pitch", "yaw")),
                     degrees=False,

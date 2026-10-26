@@ -4240,3 +4240,25 @@ async def test_the_idle_rebuild_checks_its_holds_again_when_it_runs(
     assert rebuilt == []
     lines = [r.getMessage() for r in caplog.records if "rebuild skipped" in r.getMessage()]
     assert len(lines) == 1 and "trigger: idle rebuild" in lines[0], lines
+
+
+def test_the_companions_item_ids_and_session_starts_are_broadcast() -> None:
+    """Who-is-speaking pairs a user turn's speech with its transcript by the realtime item_id;
+    a new realtime session is its own notification, not activity (activity holds off idle)."""
+    sent: list[tuple[str, dict]] = []
+    rpc = SimpleNamespace(_clients=set(), broadcast_threadsafe=lambda m, p: sent.append((m, p)))
+    stream = LocalStream(_FakeSessionHandler(), SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))
+    stream._rpc = rpc
+    stream._dispatch_activity("user_speech_stopped", item_id="item_7")
+    stream._dispatch_activity("say")
+    stream._dispatch_transcript("user", "hello", True, item_id="item_7")
+    stream._dispatch_transcript("assistant", "hi", True)
+    stream._dispatch_session("started")
+    assert ("conversation.activity", {"reason": "user_speech_stopped", "item_id": "item_7"}) in sent
+    assert ("conversation.activity", {"reason": "say"}) in sent
+    assert (
+        "conversation.transcript",
+        {"role": "user", "text": "hello", "final": True, "item_id": "item_7"},
+    ) in sent
+    assert ("conversation.transcript", {"role": "assistant", "text": "hi", "final": True}) in sent
+    assert ("conversation.realtime", {"state": "started"}) in sent

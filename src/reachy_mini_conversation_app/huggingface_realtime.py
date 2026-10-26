@@ -1703,6 +1703,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._connected_event.set()
             except Exception:
                 pass
+            self._notify_session("started")  # the companion's turn pairing starts again
 
             response_sender_task: asyncio.Task[None] | None = None
             greeting_task: asyncio.Task[None] | None = None
@@ -1724,7 +1725,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._new_user_turn()
                         self._user_speaking = True
                         self._last_speech_at = time.monotonic()
-                        self._mark_activity("user_speech_started")
+                        self._mark_activity("user_speech_started", getattr(event, "item_id", None))
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
@@ -1739,7 +1740,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "input_audio_buffer.speech_stopped":
                         self._user_speaking = False
                         self._last_speech_at = time.monotonic()
-                        self._mark_activity("user_speech_stopped")
+                        self._mark_activity("user_speech_stopped", getattr(event, "item_id", None))
                         self.deps.movement_manager.set_listening(False)
                         logger.debug("User speech stopped - server will auto-commit with VAD")
 
@@ -1827,12 +1828,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     # A failed transcription has no completion. The companion pairs each user
                     # speech window with its item's completion, so it hears of this one too.
                     if event.type == "conversation.item.input_audio_transcription.failed":
-                        self._mark_activity("user_transcription_failed")
+                        self._mark_activity("user_transcription_failed", getattr(event, "item_id", None))
                         logger.warning("User transcription failed for item %s", getattr(event, "item_id", None))
 
                     # Handle completed transcription (user finished speaking)
                     if event.type == "conversation.item.input_audio_transcription.completed":
-                        self._mark_activity("user_transcription_completed")
+                        self._mark_activity("user_transcription_completed", getattr(event, "item_id", None))
                         raw_transcript = event.transcript or ""
                         transcript = raw_transcript.strip()
                         logger.debug("User transcript: %s", raw_transcript)
@@ -1853,7 +1854,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._start_user_turn()
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
-                        self._emit_transcript("user", transcript, True)
+                        self._emit_transcript("user", transcript, True, item_id=getattr(event, "item_id", None))
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.delta":
