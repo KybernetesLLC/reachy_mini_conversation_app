@@ -525,6 +525,7 @@ class ReplyTracker:
         self._lags: list[float] = []  # measured, not yet reported by tick
         self._last_lag: tuple[float, float] | None = None  # (lag, measured at)
         self._heard_until: float | None = None  # when the last heard reply has played out
+        self._heard_at: float | None = None  # when the last heard reply was first heard
         self.unheard_in_a_row = 0
         self.armed = False
         self.last_pushed_at: float | None = None
@@ -548,6 +549,9 @@ class ReplyTracker:
             current["last"] = now
             current["seconds"] += seconds
             current["speech"] += speech_s
+            if current["lag"] == "measured":  # heard while still pushed: it plays this much longer
+                ends = current["heard_at"] + current["seconds"]
+                self._heard_until = max(self._heard_until or ends, ends)
 
     def flushed(self, now: float) -> None:
         """Note a barge-in: the reply being pushed is dropped audio, never unheard; earlier ones are judged."""
@@ -558,6 +562,8 @@ class ReplyTracker:
                 if reply["lag"] == "pending":
                     reply["lag"] = "none"
             self._before = None
+            if self._heard_until is not None:  # the heard reply's queued rest was dropped too
+                self._heard_until = min(self._heard_until, now)
 
     def monitored(self, now: float, seconds: float, speech_s: float) -> None:
         """Note a buffer from the speaker's monitor, arriving at ``now``."""
@@ -574,6 +580,10 @@ class ReplyTracker:
         rebuilt = self._rebuilt_at()
         if rebuilt is not None and self._before is not None and self._before["heard_at"] < rebuilt:
             self._before = None  # the rebuild dropped whatever of it was still queued
+        heard_at, until = self._heard_at, self._heard_until
+        if rebuilt is not None and heard_at is not None and until is not None:
+            if heard_at < rebuilt < until:
+                self._heard_until = rebuilt  # the rebuild dropped the heard reply's rest too
         for reply in self._replies:
             if reply["lag"] != "pending":
                 continue
@@ -607,6 +617,7 @@ class ReplyTracker:
             return  # sound that started before the push
         reply["lag"] = "measured"
         reply["heard_at"] = now
+        self._heard_at = now
         self._heard_until = max(self._heard_until or now, now + reply["seconds"])
         self._before = reply
         lag = max(0.0, now - expected)
@@ -621,9 +632,9 @@ class ReplyTracker:
         app's own sound: a late reply is never a phantom, its start or its tail.
         """
         with self._lock:
+            self._expire(now)  # first, so a rebuild has cut the heard reply short
             if self._heard_until is not None and now < self._heard_until + REPLY_TAIL_S:
                 return True
-            self._expire(now)
             for reply in self._replies:
                 if reply["lag"] == "pending" and not reply["flushed"]:
                     if reply["speech"] >= MIN_SPEECH_S:

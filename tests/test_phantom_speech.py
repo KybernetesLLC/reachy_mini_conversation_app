@@ -1003,6 +1003,69 @@ def test_a_late_reply_opens_no_episode_while_it_plays() -> None:
     assert det.take() == []
 
 
+def _console_rig(rebuilt_at: Any = None) -> tuple[ph.ReplyTracker, ps.PhantomDetector]:
+    """Build the real tracker and detector, wired as the console wires them."""
+    tracker = ph.ReplyTracker(rebuilt_at=rebuilt_at or (lambda: None))
+    det = ps.PhantomDetector(motif=lambda: (False, None), pending=tracker.pending)
+    return tracker, det
+
+
+@pytest.mark.parametrize("rate", [1.0, 1.5])
+def test_a_late_reply_heard_while_still_pushed_opens_no_episode(rate: float) -> None:
+    """A 15 s reply pushed from 10 s at ``rate`` times real time, heard 5 s late (15 to 30 s)."""
+    tracker, det = _console_rig()
+    pushed = 0.0
+    for step in range(1, 261):  # 10.1 s to 36.0 s, in 0.1 s steps, in console order
+        t = round(10.0 + 0.1 * step, 6)
+        if pushed < 15.0 - 1e-9:
+            chunk = min(0.1 * rate, 15.0 - pushed)
+            tracker.pushed(t, chunk, chunk)
+            det.pushed(t, chunk)
+            pushed += chunk
+        speech = 0.1 if 15.0 < t <= 30.0 + 1e-9 else 0.0
+        tracker.monitored(t, 0.1, speech)
+        det.monitored(t, 0.1, speech)
+        if step % 5 == 0:
+            tracker.tick(t)
+    assert det.take() == []
+
+
+def _late_reply_then_sound(tracker: ph.ReplyTracker, det: ps.PhantomDetector, cut: Any) -> None:
+    """Push a 30 s reply at 10 s, heard from 15 s; ``cut(t)`` at 22 s; sound 24 to 30 s."""
+    for i in range(300):
+        tracker.pushed(10.0 + 0.001 * i, 0.1, 0.1)
+        det.pushed(10.0 + 0.001 * i, 0.1)
+    for step in range(1, 251):  # 10.1 s to 35.0 s
+        t = round(10.0 + 0.1 * step, 6)
+        if abs(t - 22.0) < 1e-9:
+            cut(t)
+        speech = 0.1 if 15.0 < t <= 22.0 + 1e-9 or 24.0 < t <= 30.0 + 1e-9 else 0.0
+        tracker.monitored(t, 0.1, speech)
+        det.monitored(t, 0.1, speech)
+
+
+def test_sound_after_a_barge_in_on_a_late_reply_opens_an_episode() -> None:
+    """A barge-in cuts the heard reply short, as it cuts the detector's queued audio."""
+    tracker, det = _console_rig()
+
+    def barge_in(t: float) -> None:
+        tracker.flushed(t)  # console order: the tracker, then the detector
+        det.flushed(t)
+
+    _late_reply_then_sound(tracker, det, barge_in)
+    started = [e.episode.start for e in det.take() if e.kind == "started"]
+    assert len(started) == 1 and 24.0 <= started[0] < 30.0
+
+
+def test_a_rebuild_cuts_a_heard_reply_short() -> None:
+    """A speaker rebuild drops what was queued, so the heard reply stops counting then."""
+    rebuilt: list[float] = []
+    tracker, det = _console_rig(rebuilt_at=lambda: rebuilt[-1] if rebuilt else None)
+    _late_reply_then_sound(tracker, det, rebuilt.append)
+    assert tracker.pending(24.9)  # the tail after the rebuild
+    assert not tracker.pending(25.1)
+
+
 def test_the_probe_follows_a_new_speaker_sink_at_the_next_tick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
