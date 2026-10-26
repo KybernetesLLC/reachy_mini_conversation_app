@@ -879,8 +879,9 @@ STOP_WAIT_S = 5.0  # a stop waits this long for the sound's playbin to reach NUL
 # A caller may wait on it: every caller runs off the asyncio loop. conversation.sound uses
 # asyncio.to_thread, the app tools use asyncio.to_thread (companion_express and
 # companion_music), and the SDK's play_move runs its own loop in its caller's thread; the
-# app does not call play_move. Closing never takes this lock: the reaper sets each
-# sound's own playbin to NULL.
+# app does not call play_move. The SDK's goto_sleep plays a sound from the go_to_sleep
+# tool's asyncio.to_thread, and its wake_up from main's startup, before the wrap. Closing
+# never takes this lock: the reaper sets each sound's own playbin to NULL.
 PLAY_SOUND_LOCK = threading.Lock()
 
 
