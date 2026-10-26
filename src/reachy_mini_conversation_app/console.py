@@ -1099,7 +1099,9 @@ class LocalStream:
             return
         try:
             kept = playback_health.keep_monitor(self._speaker_monitor, audio, now, found=found)
-            if kept in ("stopped", "unavailable"):
+            # Only "stopped" means the monitor went away; "unavailable" can be a rebuild in
+            # progress (the sink has no device while it is NULL), which must not close an episode.
+            if kept == "stopped":
                 self._phantom.monitor_stopped(now)
         except Exception:
             logger.warning("Speaker monitor check failed", exc_info=True)

@@ -3705,6 +3705,31 @@ def test_one_speaker_sink_lookup_serves_the_monitor_and_the_phantom_watch(
     assert seen == [("monitor", found), ("phantom", found)]
 
 
+def test_the_phantom_watch_reads_the_reply_trackers_pending_replies() -> None:
+    """A reply pushed and not yet heard keeps the app from counting as quiet."""
+    stream = LocalStream(MagicMock(), _audio_robot())
+    stream._replies.pushed(10.0, 2.0, 2.0)
+    assert not stream._phantom.detector.app_quiet(50.0)
+
+
+@pytest.mark.parametrize(("kept", "closed"), [("stopped", True), ("unavailable", False)])
+def test_only_a_stopped_monitor_closes_an_open_phantom_episode(
+    monkeypatch: pytest.MonkeyPatch, kept: str, closed: bool
+) -> None:
+    """"unavailable" can be a rebuild in progress; only "stopped" means the monitor went away."""
+    from reachy_mini_conversation_app import playback_health
+
+    stream = LocalStream(MagicMock(), _audio_robot())
+    monkeypatch.setattr(playback_health, "current_speaker_sink", lambda a, c=None: (True, None))
+    monkeypatch.setattr(playback_health, "keep_monitor", lambda m, a, n, found=None: kept)
+    calls: list[float] = []
+    stream._phantom = SimpleNamespace(
+        monitor_stopped=calls.append, keep=lambda audio, now, found=None: None
+    )
+    stream._keep_speaker_watches("audio", 5.0)
+    assert calls == ([5.0] if closed else [])
+
+
 def test_a_monitor_buffer_reaches_the_reply_tracker_and_the_phantom_watch() -> None:
     """Each monitor buffer feeds the reply tracker and the phantom watch."""
     robot = _audio_robot()
