@@ -3384,11 +3384,15 @@ def test_a_sound_over_rpc_plays_through_the_apps_own_player(tmp_path) -> None:
     media.play_sound.assert_called_once_with(str(wav))
 
 
-def test_a_sound_stop_ends_the_sound_and_leaves_speech_alone() -> None:
+def test_a_sound_stop_ends_the_sound_and_leaves_speech_alone(monkeypatch: Any) -> None:
     """Stop the played sound without touching the speech pipeline."""
+    from reachy_mini_conversation_app import playback_health
+
+    monkeypatch.setattr(playback_health, "SOUNDS", playback_health.SoundActivity())
     _stream, media, app = _sound_stream()
     playbin = MagicMock()
     media.audio._playbin = playbin
+    playback_health.open_sound(playbin, "ring.wav")
     resp = _rpc_call(app, "conversation.sound", {"stop": True})
     assert resp["result"] == {"playing": False}
     assert media.audio._playbin is playbin  # the SDK's handle, left to the SDK
@@ -3491,25 +3495,34 @@ def test_a_sound_over_rpc_is_watched_once_through_the_play_sound_wrap(
     assert watched == [(playbin, str(wav))]
 
 
+def _on_an_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
 def test_a_sound_stop_goes_through_the_sound_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
     """The stop is logged as the sound stream's close."""
     from reachy_mini_conversation_app import playback_health
 
     _stream, media, app = _sound_stream()
-    stopped: list[Any] = []
-
-    def stop(audio: Any) -> bool:
-        try:
-            asyncio.get_running_loop()
-            on_loop = True
-        except RuntimeError:
-            on_loop = False
-        stopped.append((audio, on_loop))
-        return True
-
-    monkeypatch.setattr(playback_health, "stop_sound", stop)
+    stopped: list[bool] = []
+    monkeypatch.setattr(playback_health, "stop_sound", lambda: stopped.append(_on_an_event_loop()))
     assert _rpc_call(app, "conversation.sound", {"stop": True})["result"] == {"playing": False}
-    assert stopped == [(media.audio, False)]  # set_state(NULL) runs off the event loop
+    assert stopped == [False]  # set_state(NULL) runs off the event loop
+
+
+def test_a_sound_over_rpc_plays_off_the_event_loop(tmp_path: Path) -> None:
+    """play_sound's wrap takes a lock: conversation.sound calls it off the event loop."""
+    _stream, media, app = _sound_stream()
+    played: list[bool] = []
+    media.play_sound = lambda path: played.append(_on_an_event_loop())
+    wav = tmp_path / "ring.wav"
+    wav.write_bytes(b"RIFF")
+    assert _rpc_call(app, "conversation.sound", {"file": str(wav)})["result"] == {"playing": True}
+    assert played == [False]
 
 
 def test_capture_off_and_on_hold_the_media_lock_against_a_rebuild() -> None:
@@ -4198,12 +4211,32 @@ def test_the_idle_rebuild_threshold_is_read_from_the_environment(
     assert _gate_stream()._tick_policy.idle_s == 10800.0
 
 
-def test_one_fresh_at_serves_both_idle_callers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The last push, the last rebuild and the stream's start, read in one place."""
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opens", ["session", "connected", "sound", "reply", "nothing"])
+async def test_the_idle_rebuild_checks_its_holds_again_when_it_runs(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, opens: str
+) -> None:
+    """A hold that comes on between the tick's decision and the worker skips the rebuild."""
     from reachy_mini_conversation_app import playback_health
 
-    stream = _gate_stream()
-    stream._speaker_started_at = 5.0
-    stream._replies.pushed(7.0, 1.0, 1.0)
-    monkeypatch.setattr(playback_health.GOVERNOR, "last_rebuild_at", 6.0)
-    assert stream._speaker_fresh_at() == (7.0, 6.0, 5.0)
+    stream, rebuilt = _idle_watchdog_stream(monkeypatch, now=12000.0)
+    held: list[Any] = []
+    monkeypatch.setattr(stream, "_run_off_loop", lambda func, *args: held.append((func, args)))
+    stream._tick_speaker_rebuild(stream._robot.media.audio)
+    ((func, args),) = held  # decided: due, and queued for a worker
+    if opens == "session":
+        stream._session_wanted.set()
+    elif opens == "connected":
+        stream.handler.connection = object()
+    elif opens == "sound":
+        monkeypatch.setattr(playback_health.SOUNDS, "state", lambda: (True, None))
+    elif opens == "reply":
+        monkeypatch.setattr(stream._replies, "pending", lambda now: True)
+    with caplog.at_level(logging.INFO):
+        await asyncio.to_thread(func, *args)
+    if opens == "nothing":
+        assert len(rebuilt) == 1
+        return
+    assert rebuilt == []
+    lines = [r.getMessage() for r in caplog.records if "rebuild skipped" in r.getMessage()]
+    assert len(lines) == 1 and "trigger: idle rebuild" in lines[0], lines
