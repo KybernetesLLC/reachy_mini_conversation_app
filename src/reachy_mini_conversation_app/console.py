@@ -341,12 +341,11 @@ class LocalStream:
         self._phantom = phantom_speech.PhantomWatch(pending=lambda now: self._replies.pending(now))
         self._speaker_sink_cache: dict[str, Any] = {}
         # Every play_sound caller is seen from the start (the app tools use it directly),
-        # and each sound's playbin is torn down at its end: the SDK leaves its stream open.
-        self._phantom.sounds.listeners.append(playback_health.watch_sound)
+        # and each sound's playbin is closed at its end: the SDK leaves its stream open.
         try:
             sdk_audio = getattr(getattr(robot, "media", None), "audio", None)
             if sdk_audio is not None:
-                self._phantom.sounds.install(sdk_audio)
+                playback_health.install_sound_wrap(sdk_audio)
         except Exception:
             logger.warning("Could not wrap the SDK's play_sound", exc_info=True)
         self._speaker_monitor = playback_health.SpeakerMonitor(self._on_monitor_buffer)
@@ -1121,8 +1120,13 @@ class LocalStream:
     def _keep_speaker_watches(self, audio: Any, now: float) -> None:
         """Keep the speaker monitor and the phantom watch's probes on, in one worker hop.
 
-        The speaker sink is looked up once (one MEDIA_LOCK) and handed to both.
+        The speaker sink is looked up once (one MEDIA_LOCK) and handed to both. play_sound
+        is wrapped again if the SDK made its audio object anew.
         """
+        try:
+            playback_health.install_sound_wrap(audio)
+        except Exception:
+            logger.warning("Could not wrap the SDK's play_sound", exc_info=True)
         try:
             found = playback_health.current_speaker_sink(audio, self._speaker_sink_cache)
         except Exception:
@@ -1470,14 +1474,14 @@ class LocalStream:
             media = self._robot.media
             audio = getattr(media, "audio", None)
             if params.get("stop"):
-                if audio is not None:  # SOUND_LOCK may wait on a sound starting: off the loop
+                if audio is not None:  # set_state(NULL) waits on the playbin's threads
                     await asyncio.to_thread(playback_health.stop_sound, audio)
                 return {"playing": False}
             path = params.get("file")
             if not isinstance(path, str) or not os.path.isfile(path):
                 raise JsonRpcError("sound requires 'file', an existing path", reason="invalid_params", code=-32602)
             # The SDK's playbin is a second speaker stream it never tears down (2026-10-15):
-            # the play_sound wrap hands it to watch_sound, as for every other caller.
+            # the play_sound wrap closes it at its end, as for every other caller.
             await asyncio.to_thread(media.play_sound, path)
             return {"playing": True}
 

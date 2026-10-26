@@ -287,6 +287,12 @@ class Rig:
         threading.Thread(target=self.pipeline.set_state, args=(Gst.State.NULL,), daemon=True).start()
 
 
+@pytest.fixture(autouse=True)
+def fresh_sounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start each test with no sound open: SOUNDS is process-wide, and other files open some."""
+    monkeypatch.setattr(ph, "SOUNDS", ph.SoundActivity())
+
+
 @pytest.fixture
 def rig() -> Any:
     """Yield a Rig and close it."""
@@ -381,68 +387,65 @@ def test_the_watchdog_logs_one_info_line_and_does_nothing_when_healthy(
 # --- a play_sound playbin, the second stream -------------------------------------------------
 
 
-def test_a_sound_stream_is_logged_and_torn_down_when_the_sound_ends(
-    rig: Rig, caplog: pytest.LogCaptureFixture, tmp_path: Any
-) -> None:
-    """A play_sound playbin is a second speaker stream: opened, then closed at its end."""
+def _wav(path: Any, seconds: float) -> str:
+    """Write a 22,050 Hz mono tone of ``seconds`` to ``path``; return it."""
     import wave
 
-    Gst = rig.Gst
-    rig.start()
-    path = tmp_path / "motif.wav"
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(22050)
-        w.writeframes((np.ones(5512) * 1000).astype(np.int16).tobytes())  # 0.25 s
+        w.writeframes((np.ones(int(22050 * seconds)) * 1000).astype(np.int16).tobytes())
+    return str(path)
 
+
+def test_a_sound_stream_is_closed_at_its_end_on_the_sdks_own_loop(
+    rig: Rig, glib_loop: Any, caplog: pytest.LogCaptureFixture, tmp_path: Any
+) -> None:
+    """The SDK's audio and a GLib loop (the test rig skips the SDK's own): EOS closes the sound."""
+    Gst = rig.Gst
+    rig.start()
+    path = _wav(tmp_path / "ring.wav", 0.25)
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
-        rig.audio.play_sound(str(path))
+        assert ph.install_sound_wrap(rig.audio)
+        rig.audio.play_sound(path)
         playbin = rig.audio._playbin
-        watcher = ph.watch_sound(rig.audio, playbin, str(path))
-        watcher.join(timeout=5.0)
-
+        deadline = time.monotonic() + 5.0
+        while ph.SOUNDS.state()[0] and time.monotonic() < deadline:
+            time.sleep(0.02)
     messages = [r.getMessage() for r in caplog.records if r.name == ph.logger.name]
-    assert any("Sound stream opened" in m and "motif.wav" in m for m in messages), messages
-    assert any("Sound stream closed" in m and "ended" in m for m in messages), messages
-    assert rig.audio._playbin is None
+    assert f"Sound stream opened: {path} (a second speaker stream)" in messages, messages
+    assert f"Sound stream closed (the sound ended): {path}" in messages, messages
     assert playbin.get_state(0)[1] == Gst.State.NULL
     # Speech is untouched by the second stream's end.
     lat = rig.reply_latency(0.6)
     assert lat is not None and lat < 1.0
 
 
-def test_a_replaced_sound_is_not_torn_down_twice(
-    rig: Rig,
-    caplog: pytest.LogCaptureFixture,
-    tmp_path: Any,
+def test_a_replaced_sound_is_closed_once_and_a_stop_ends_the_next(
+    rig: Rig, glib_loop: Any, caplog: pytest.LogCaptureFixture, tmp_path: Any
 ) -> None:
-    """A newer sound owns audio._playbin; the old watcher only logs the replacement."""
-    import wave
-
+    """The real SDK audio: a newer sound closes the old one; a stop closes the newer one."""
+    Gst = rig.Gst
     rig.start()
-    path = tmp_path / "long.wav"
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(22050)
-        w.writeframes((np.ones(22050 * 3) * 1000).astype(np.int16).tobytes())  # 3 s
-
+    path = _wav(tmp_path / "long.wav", 3.0)
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
-        rig.audio.play_sound(str(path))
+        ph.install_sound_wrap(rig.audio)
+        rig.audio.play_sound(path)
         first = rig.audio._playbin
-        old = ph.watch_sound(rig.audio, first, str(path))
         time.sleep(0.3)
-        rig.audio.play_sound(str(path))  # the SDK sets the first to NULL and replaces it
+        rig.audio.play_sound(path)  # the SDK sets the first to NULL and replaces it
         second = rig.audio._playbin
-        old.join(timeout=3.0)
-        assert not old.is_alive()
-        assert rig.audio._playbin is second  # the newer sound is left alone
+        time.sleep(0.3)
+        assert second.get_state(0)[1] == Gst.State.PLAYING  # the newer sound plays on
         assert ph.stop_sound(rig.audio)
-
-    messages = [r.getMessage() for r in caplog.records if r.name == ph.logger.name]
-    assert any("Sound stream closed" in m and "replaced" in m for m in messages), messages
-    assert rig.audio._playbin is None  # stopped; only a watched sound logs its close
+    closes = [r.getMessage() for r in caplog.records if "Sound stream closed" in r.getMessage()]
+    assert closes == [
+        f"Sound stream closed (replaced by a newer sound): {path}",
+        f"Sound stream closed (stopped): {path}",
+    ]
+    assert first.get_state(0)[1] == second.get_state(0)[1] == Gst.State.NULL
+    assert ph.SOUNDS.state()[0] is False
 
 
 # --- one cooldown for every rebuild trigger -----------------------------------------------
@@ -944,7 +947,7 @@ def test_a_flushed_reply_never_heard_records_no_lag() -> None:
     tracker = ph.ReplyTracker(rebuilt_at=lambda: None)
     _push(tracker, 10.0, 1.0)
     tracker.flushed(10.2)
-    _hear(tracker, 9.0, 14.0, [(12.0, 13.0)])  # a motif, say
+    _hear(tracker, 9.0, 14.0, [(12.0, 13.0)])  # a sound, say
     assert _lags(tracker.tick(14.0)) == []
     assert tracker.last_lag() is None
 
@@ -959,7 +962,7 @@ def test_a_reply_heard_then_flushed_keeps_its_lag() -> None:
 
 
 def test_sound_already_playing_at_the_push_is_not_the_reply() -> None:
-    """A motif loud from before the push to past the window: no sound starts after the push, no lag."""
+    """A sound loud from before the push to past the window: none starts after the push, no lag."""
     tracker = ph.ReplyTracker(rebuilt_at=lambda: None)
     _hear(tracker, 8.0, 10.0, [(9.0, 200.0)])
     _push(tracker, 10.0, 1.0)
@@ -968,7 +971,7 @@ def test_sound_already_playing_at_the_push_is_not_the_reply() -> None:
 
 
 def test_a_sound_before_the_push_is_not_the_reply() -> None:
-    """A motif that started and ended before the push is ignored; the reply's own sound is its lag."""
+    """A sound started and ended before the push is ignored; the reply's own sound is its lag."""
     tracker = ph.ReplyTracker(rebuilt_at=lambda: None)
     _hear(tracker, 8.0, 10.0, [(8.5, 9.5)])
     _push(tracker, 10.0, 1.0)
@@ -1368,77 +1371,6 @@ def test_the_triggers_recover_the_behind_case(rig: Rig, caplog: pytest.LogCaptur
     assert len(after) >= 3 and all(lat is not None and lat < 1.0 for lat in after[-3:]), latencies
 
 
-# --- a play_sound playbin's teardown race -------------------------------------------------
-
-
-def test_a_sound_started_during_a_teardown_is_not_orphaned(monkeypatch: pytest.MonkeyPatch) -> None:
-    """watch_sound's check-and-clear and any caller's play_sound are one under SOUND_LOCK.
-
-    The review (2026-10-15): between the watcher's identity check and its
-    ``_playbin = None``, a new sound could take ``_playbin``; the watcher then dropped
-    the new playbin's handle, and nothing could stop or tear it down. A direct caller
-    (the app tools) takes no lock of its own: the play_sound wrap takes it for them.
-    """
-    from reachy_mini_conversation_app import phantom_speech as ps
-
-    Gst = _gst()
-    ended = Gst.Message.new_eos(None)
-    bus = SimpleNamespace(timed_pop_filtered=lambda timeout, types: ended)
-
-    class Playbin:
-        def __init__(self, name: str) -> None:
-            self.name = name
-            self.states: list[Any] = []
-
-        def get_bus(self) -> Any:
-            return bus
-
-        def query_duration(self, fmt: Any) -> tuple[bool, int]:
-            return False, -1
-
-        def set_state(self, state: Any) -> None:
-            self.states.append(state)
-
-    old, new = Playbin("old"), Playbin("new")
-    started = threading.Event()
-
-    class Audio:
-        reads = 0
-
-        def __init__(self) -> None:
-            self.value: Any = old
-
-        @property
-        def _playbin(self) -> Any:
-            Audio.reads += 1
-            value = self.value
-            if Audio.reads == 2:  # the watcher's identity check at the end: a new sound starts right after it
-                threading.Thread(target=self.play_sound, args=("new.wav",), daemon=True).start()
-                started.wait(0.2)  # without the lock, play_sound runs to the end here
-                time.sleep(0.1)
-            return value
-
-        @_playbin.setter
-        def _playbin(self, value: Any) -> None:
-            self.value = value
-
-    audio = Audio()
-
-    def play_sound(path: str) -> None:
-        started.set()
-        audio.value = new
-
-    audio.play_sound = play_sound  # the SDK's method on the instance, wrapped as the app wraps it
-    assert ps.SoundStarts().install(audio)
-    Audio.reads = 0  # count the watcher's reads only
-    ph.watch_sound(audio, old, "old.wav").join(timeout=3.0)
-    deadline = time.monotonic() + 2.0
-    while audio.value is not new and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert audio.value is new  # the new sound kept its handle
-    assert old.states == [Gst.State.NULL] and new.states == []
-
-
 def test_the_reply_tracker_keeps_the_last_push_time() -> None:
     """The open reads when a reply was last pushed."""
     tracker = ph.ReplyTracker(rebuilt_at=lambda: None)
@@ -1615,49 +1547,256 @@ def test_the_two_policies_come_from_the_environment() -> None:
     )
 
 
-# --- review round (2026-10-26) ----------------------------------------------------------
+# --- play_sound playbins closed at their end, from the SDK's GLib loop (/simplify) ---------
+#
+# Each sound's EOS or error reaches a bus watch on the SDK's own running GLib main loop;
+# a replacement is closed by the play_sound wrap, a stop by stop_sound, a sound with no end
+# by a timer. No thread per sound, and nothing touches audio._playbin but the SDK.
 
 
-def test_a_sound_ending_as_the_next_starts_leaves_the_newer_sound_alone(
+@pytest.fixture
+def glib_loop() -> Any:
+    """Run a GLib main loop on the default context, as the SDK's GStreamerAudio does."""
+    _gst()
+    from gi.repository import GLib
+
+    loop = GLib.MainLoop()
+    thread = threading.Thread(target=loop.run, daemon=True)
+    thread.start()
+    yield loop
+    loop.quit()
+    thread.join(timeout=2.0)
+
+
+class _SoundPlaybin:
+    """A play_sound playbin with a real bus; it records its states."""
+
+    def __init__(self, name: str, duration_s: float | None = 0.3) -> None:
+        Gst = _gst()
+        self.name, self.duration_s = name, duration_s
+        self.bus = Gst.Bus.new()
+        self.state = Gst.State.PLAYING
+        self.states: list[Any] = []
+
+    def get_bus(self) -> Any:
+        return self.bus
+
+    def get_state(self, timeout: int) -> Any:
+        Gst = _gst()
+        return (Gst.StateChangeReturn.SUCCESS, self.state, Gst.State.VOID_PENDING)
+
+    def set_state(self, state: Any) -> None:
+        self.state = state
+        self.states.append(state)
+
+    def query_duration(self, fmt: Any) -> tuple[bool, int]:
+        if self.duration_s is None:
+            return False, -1
+        return True, int(self.duration_s * _gst().SECOND)
+
+    def post(self, kind: str) -> None:
+        """Post EOS, an error, or ASYNC_DONE (prerolled: the duration is known) on its bus."""
+        Gst = _gst()
+        from gi.repository import GLib
+
+        if kind == "eos":
+            self.bus.post(Gst.Message.new_eos(None))
+        elif kind == "error":
+            failed = Gst.ResourceError.FAILED
+            error = GLib.Error.new_literal(Gst.ResourceError.quark(), "boom", failed)
+            self.bus.post(Gst.Message.new_error(None, error, "debug"))
+        else:
+            self.bus.post(Gst.Message.new_async_done(None, Gst.CLOCK_TIME_NONE))
+
+
+class _SdkAudio:
+    """The SDK's play_sound as it treats _playbin: the old one to NULL, a new one each call."""
+
+    def __init__(self, duration_s: float | None = 0.3) -> None:
+        self._playbin: Any = None
+        self.made: list[_SoundPlaybin] = []
+        self.duration_s = duration_s
+
+    def play_sound(self, sound_file: str) -> None:
+        if self._playbin is not None:
+            self._playbin.set_state(_gst().State.NULL)
+        self.made.append(_SoundPlaybin(sound_file, self.duration_s))
+        self._playbin = self.made[-1]
+
+
+def _until(check: Any, timeout_s: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while not check() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return bool(check())
+
+
+def _closes(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str]]:
+    closes = [r for r in caplog.records if "Sound stream closed" in r.getMessage()]
+    return [(r.levelno, r.getMessage()) for r in closes]
+
+
+@pytest.mark.parametrize(("kind", "cause"), [("eos", "the sound ended"), ("error", "error: boom")])
+def test_a_sound_is_closed_by_its_end_or_its_error(
+    glib_loop: Any, caplog: pytest.LogCaptureFixture, kind: str, cause: str
+) -> None:
+    """The bus watch on the GLib loop sets the playbin to NULL and closes it in SOUNDS, once."""
+    Gst = _gst()
+    audio = _SdkAudio()
+    assert ph.install_sound_wrap(audio)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        audio.play_sound("ring.wav")
+        playbin = audio.made[0]
+        assert ph.SOUNDS.state()[0] is True
+        playbin.post(kind)
+        assert _until(lambda: ph.SOUNDS.state()[0] is False)
+        time.sleep(0.2)
+    assert playbin.states == [Gst.State.NULL]
+    assert audio._playbin is playbin  # the SDK's handle, left alone
+    assert _closes(caplog) == [(logging.INFO, f"Sound stream closed ({cause}): ring.wav")]
+
+
+def test_a_replaced_sound_is_closed_once_by_the_wrap(
+    glib_loop: Any,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The teardown's identity check: the EOS came, then a newer sound took _playbin first.
-
-    The watcher has seen its sound end and waits for SOUND_LOCK; a new play_sound holds
-    it and replaces _playbin. The watcher must then leave the newer sound alone.
-    """
+    """The SDK sets the old playbin to NULL; the wrap closes it; its late EOS does nothing."""
     Gst = _gst()
-    popped = threading.Event()
-
-    class Playbin:
-        def __init__(self) -> None:
-            self.states: list[Any] = []
-
-        def get_bus(self) -> Any:
-            return self
-
-        def timed_pop_filtered(self, timeout: Any, types: Any) -> Any:
-            popped.set()
-            return Gst.Message.new_eos(None)
-
-        def query_duration(self, fmt: Any) -> tuple[bool, int]:
-            return False, -1
-
-        def set_state(self, state: Any) -> None:
-            self.states.append(state)
-
-    old, new = Playbin(), Playbin()
-    audio = SimpleNamespace(_playbin=old)
+    audio = _SdkAudio()
+    ph.install_sound_wrap(audio)
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
-        with ph.SOUND_LOCK:  # a new play_sound is under way
-            watcher = ph.watch_sound(audio, old, "old.wav")
-            assert popped.wait(2.0)
-            time.sleep(0.2)  # the watcher now waits for the lock to tear its sound down
-            audio._playbin = new  # the SDK replaced it (and set the old one to NULL itself)
-        watcher.join(timeout=3.0)
-    assert not watcher.is_alive()
+        audio.play_sound("song.wav")
+        audio.play_sound("ring.wav")
+        old, new = audio.made
+        old.post("eos")  # queued before the NULL: arrives after the close
+        time.sleep(0.3)
+        assert ph.SOUNDS.state()[0] is True  # the newer sound is still open
+        new.post("eos")
+        assert _until(lambda: ph.SOUNDS.state()[0] is False)
+    assert old.states == [Gst.State.NULL]  # by the SDK, once
+    assert new.states == [Gst.State.NULL]
+    assert _closes(caplog) == [
+        (logging.INFO, "Sound stream closed (replaced by a newer sound): song.wav"),
+        (logging.INFO, "Sound stream closed (the sound ended): ring.wav"),
+    ]
+
+
+def test_an_older_sound_ending_leaves_the_newer_one_alone(glib_loop: Any) -> None:
+    """The identity rule: a sound's end touches its own playbin only, never audio._playbin."""
+    audio = _SdkAudio()
+    ph.install_sound_wrap(audio)
+    audio.play_sound("old.wav")
+    old = audio.made[0]
+    new = _SoundPlaybin("new.wav")
+    audio._playbin = new  # a newer sound took the handle (the SDK's own replacement)
+    old.post("eos")
+    assert _until(lambda: old.states != [])
+    time.sleep(0.2)
     assert audio._playbin is new and new.states == []
-    assert old.states == []  # the SDK's to set to NULL, not the watcher's
-    closes = [r.getMessage() for r in caplog.records if "Sound stream closed" in r.getMessage()]
-    left = "the sound ended, then replaced or stopped, left to the SDK"
-    assert closes == [f"Sound stream closed ({left}): old.wav"]
+
+
+def test_a_stop_closes_the_sound_once_at_once(
+    glib_loop: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """stop_sound sets the current sound to NULL and closes it; nothing else follows."""
+    Gst = _gst()
+    audio = _SdkAudio()
+    ph.install_sound_wrap(audio)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        audio.play_sound("ring.wav")
+        assert ph.stop_sound(audio) is True
+        assert ph.SOUNDS.state()[0] is False  # at once
+        audio.made[0].post("eos")
+        time.sleep(0.3)
+    assert audio.made[0].states == [Gst.State.NULL]
+    assert _closes(caplog) == [(logging.INFO, "Sound stream closed (stopped): ring.wav")]
+    assert ph.stop_sound(SimpleNamespace(_playbin=None)) is False
+
+
+@pytest.mark.parametrize("duration_s", [0.1, None])
+def test_a_sound_with_no_end_is_closed_overdue_with_a_warning(
+    glib_loop: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    duration_s: Any,
+) -> None:
+    """No EOS by its duration and SOUND_SLACK_S, or SOUND_MAX_S unknown: a timer closes it."""
+    Gst = _gst()
+    monkeypatch.setattr(ph, "SOUND_SLACK_S", 0.2)
+    monkeypatch.setattr(ph, "SOUND_MAX_S", 0.5)
+    audio = _SdkAudio(duration_s=duration_s)
+    ph.install_sound_wrap(audio)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        audio.play_sound("stuck.wav")
+        audio.made[0].post("async-done")  # prerolled: the duration is read once, if known
+        assert _until(lambda: ph.SOUNDS.state()[0] is False, timeout_s=2.0)
+    assert audio.made[0].states == [Gst.State.NULL]
+    ((level, line),) = _closes(caplog)
+    assert level == logging.WARNING and line.startswith("Sound stream closed (no end ")
+
+
+def test_no_thread_is_made_per_sound(glib_loop: Any) -> None:
+    """Five sounds open at once run on the GLib loop, not on threads of their own."""
+    audio = _SdkAudio()
+    ph.install_sound_wrap(audio)
+    before = threading.active_count()
+    for n in range(5):
+        audio.play_sound(f"{n}.wav")
+    assert threading.active_count() == before
+    audio.made[-1].post("eos")
+    assert _until(lambda: ph.SOUNDS.state()[0] is False)
+
+
+@pytest.mark.parametrize("caller", ["conversation.sound", "app tools", "play_move"])
+def test_every_play_sound_caller_is_closed_at_its_end(glib_loop: Any, caller: str) -> None:
+    """The route and play_move through the real MediaManager.play_sound, and a direct call."""
+    from reachy_mini.media.media_manager import MediaManager
+
+    Gst = _gst()
+    audio = _SdkAudio()
+    ph.install_sound_wrap(audio)
+    if caller == "app tools":
+        audio.play_sound("express.wav")
+    else:  # conversation.sound's media.play_sound and ReachyMini.play_move both reach this
+        media = SimpleNamespace(audio=audio, logger=ph.logger)  # MediaManager.play_sound's self
+        MediaManager.play_sound(media, "ring.wav")  # type: ignore[arg-type]
+    audio.made[0].post("eos")
+    assert _until(lambda: audio.made[0].states == [Gst.State.NULL])
+    assert ph.SOUNDS.state()[0] is False
+
+
+def test_the_wrap_calls_the_original_once_and_says_when_it_wrapped() -> None:
+    """The wrapper calls the SDK's original method once, never itself; one wrap per method."""
+    calls: list[str] = []
+    audio = SimpleNamespace(_playbin=None, play_sound=calls.append)
+    assert ph.install_sound_wrap(audio) is True
+    assert ph.install_sound_wrap(audio) is False  # already wrapped
+    audio.play_sound("x.wav")
+    assert calls == ["x.wav"]
+    audio.play_sound = calls.append  # the SDK put a fresh method on the same object
+    assert ph.install_sound_wrap(audio) is True
+    assert ph.install_sound_wrap(SimpleNamespace()) is False  # no play_sound to wrap
+
+
+def test_a_sound_playing_before_the_wrap_is_watched_from_then(
+    glib_loop: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The SDK's wake-up sound can play before the wrap: opened then. A stopped one is not."""
+    Gst = _gst()
+    started = _SoundPlaybin("wake_up")
+    audio = SimpleNamespace(_playbin=started, play_sound=lambda path: None)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        assert ph.install_sound_wrap(audio)
+        assert ph.SOUNDS.state()[0] is True
+        audio.play_sound = lambda path: None
+        assert ph.install_sound_wrap(audio)  # a fresh method: already open, not opened twice
+        started.post("eos")
+        assert _until(lambda: ph.SOUNDS.state()[0] is False)
+    opened = [r.getMessage() for r in caplog.records if "Sound stream opened" in r.getMessage()]
+    before = "(a sound started before the wrap)"
+    assert opened == [f"Sound stream opened: {before} (a second speaker stream)"]
+    ended = SimpleNamespace(_playbin=_SoundPlaybin("old"), play_sound=lambda path: None)
+    ended._playbin.state = Gst.State.NULL  # a sound already torn down
+    assert ph.install_sound_wrap(ended)
+    assert ph.SOUNDS.state()[0] is False

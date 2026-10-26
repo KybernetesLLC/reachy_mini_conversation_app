@@ -6,7 +6,7 @@ inside the app's speech pipeline, so the sound most likely never passed through 
 This detector logs any such episode: the speaker's monitor loud for PHANTOM_LOUD_S while
 the app pushed nothing (and its queued audio has played out) for PHANTOM_QUIET_S and no
 sound of its own was open in that time. Every play_sound playbin is the app's: each is
-marked open when it starts and closed when watch_sound tears it down at its end, so
+marked open when it starts and closed when playback_health closes it at its end, so
 "a sound is open" is a flag, whoever called play_sound. A reply pushed but not yet
 heard (ReplyTracker's pending state: it may play up to 65 s late) is the app's own
 sound too.
@@ -37,7 +37,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from reachy_mini_conversation_app import playback_health
-from reachy_mini_conversation_app.playback_health import SOUNDS, LOUD_RMS, SOUND_LOCK, rms
+from reachy_mini_conversation_app.playback_health import SOUNDS, LOUD_RMS, rms
 
 
 logger = logging.getLogger(__name__)
@@ -511,78 +511,6 @@ def _caps_format(caps: Any) -> str:
     return str(caps.get_structure(0).get_value("format"))
 
 
-def wrap_once(obj: Any, name: str, tag: Any, make_wrapper: Callable[[Any], Any]) -> bool:
-    """Replace ``obj.name`` with ``make_wrapper(original)``, once per ``tag``.
-
-    The wrapper is built around the original, captured here before wrapping, so it never
-    calls itself. Returns whether ``obj.name`` is wrapped.
-    """
-    original = getattr(obj, name, None)
-    if original is None:
-        return False
-    if getattr(original, "_wrapped_by", None) is tag:
-        return True
-    wrapper = make_wrapper(original)
-    wrapper._wrapped_by = tag
-    setattr(obj, name, wrapper)
-    return True
-
-
-class SoundStarts:
-    """Wrap the SDK audio's play_sound once, to hand each new sound's playbin to listeners.
-
-    Every caller goes through it: MediaManager.play_sound calls audio.play_sound (the
-    SDK's play_move does), and so do conversation.sound and the app tools' music and
-    express sounds. The wrapper holds SOUND_LOCK while the original replaces
-    audio._playbin, so a teardown never clears a newer sound's handle; it calls the
-    original method, captured before wrapping, never itself. ``listeners`` are called
-    under that lock, after the original, with (audio, playbin, path), for a playbin the
-    call made; they must not take SOUND_LOCK.
-    """
-
-    def __init__(self) -> None:
-        """Start with no listener."""
-        self.listeners: list[Callable[[Any, Any, Any], object]] = []
-
-    def install(self, audio: Any) -> bool:
-        """Wrap ``audio.play_sound``, once. Returns whether it is wrapped.
-
-        AGENTS.md: build on the SDK's public API, never monkey-patch its internals. This
-        wraps a public method on the instance, the only way to see the app tools' direct
-        play_sound calls without editing them (app_tools/companion_express.py is not ours
-        to touch); an SDK bump that keeps play_sound keeps it working.
-        """
-
-        def make(original: Callable[..., Any]) -> Callable[..., Any]:
-            def play_sound(sound_file: Any, *args: Any, **kwargs: Any) -> Any:
-                with SOUND_LOCK:
-                    before = getattr(audio, "_playbin", None)
-                    result = original(sound_file, *args, **kwargs)
-                    playbin = getattr(audio, "_playbin", None)
-                    if playbin is not None and playbin is not before:  # else none was made
-                        self._tell(audio, playbin, sound_file)
-                return result
-
-            return play_sound
-
-        fresh = getattr(getattr(audio, "play_sound", None), "_wrapped_by", None) is not self
-        wrapped = wrap_once(audio, "play_sound", self, make)
-        if wrapped and fresh:  # a sound may have started before the wrap: the SDK's wake-up
-            with SOUND_LOCK:
-                playbin = getattr(audio, "_playbin", None)
-                if playbin is not None and not SOUNDS.is_open(playbin):
-                    self._tell(audio, playbin, "(a sound started before the wrap)")
-        return wrapped
-
-    def _tell(self, audio: Any, playbin: Any, path: Any) -> None:
-        """Hand a new playbin to every listener. Holds SOUND_LOCK."""
-        for listener in list(self.listeners):
-            try:
-                listener(audio, playbin, path)
-            except Exception:
-                logger.warning("A play_sound listener failed", exc_info=True)
-
-
 def _wall(t: float) -> str:
     """Return a monotonic time as the wall-clock time it was."""
     when = datetime.datetime.now() - datetime.timedelta(seconds=time.monotonic() - t)
@@ -629,7 +557,7 @@ def _describe_playbin(audio: Any) -> str:
 
 
 class PhantomWatch:
-    """The detector, the speech-sink probe, the play_sound wrap and the report, for the console.
+    """The detector, the speech-sink probe and the report, for the console.
 
     monitored() runs on the speaker monitor's streaming thread; pushed(), flushed() and
     take() on the event loop; keep() and act() in a worker thread.
@@ -643,14 +571,13 @@ class PhantomWatch:
         clock: Callable[[], float] = time.monotonic,
         pending: Callable[[float], bool] | None = None,
     ) -> None:
-        """Build with the module's sound state, its own play_sound wrapper and pw-dump.
+        """Build with the module's sound state and pw-dump.
 
         ``pending(now)``: whether a pushed reply is still unheard (ReplyTracker.pending).
         """
         self.detector = PhantomDetector(sound=sound, pending=pending)
         self.monitored = self.detector.monitored  # the monitor's streaming thread; never raises
         self.pad = pad or PadLevel()
-        self.sounds = SoundStarts()
         self._clock = clock
         self._list_inputs = list_inputs or (lambda: list_sink_inputs(os.getpid()))
         # Each event runs in its own worker: one episode's start and end are not interleaved.
@@ -682,7 +609,7 @@ class PhantomWatch:
         self.detector.monitor_stopped(now)
 
     def keep(self, audio: Any, now: float | None = None, found: Found | None = None) -> None:
-        """Keep the probe on the speaker sink during a suspected episode, and play_sound wrapped.
+        """Keep the probe on the speaker sink during a suspected episode.
 
         Runs in a worker thread. ``found`` is current_speaker_sink's answer when the caller
         already looked it up. The probe goes on when the monitor turns loud while the app is
@@ -706,7 +633,6 @@ class PhantomWatch:
                     self._probe_for, self._probe_since = onset, now
         elif now - self._probe_since >= PROBE_MAX_S:
             self.pad.detach()  # and stays off for the rest of this suspicion
-        self.sounds.install(audio)
         self._log_errors(now)
 
     def _log_errors(self, now: float) -> None:

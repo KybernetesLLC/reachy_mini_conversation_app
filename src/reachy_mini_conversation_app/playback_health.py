@@ -19,19 +19,21 @@ sound of it on the speaker's monitor (ReplyTracker). pa_stream_get_latency, read
 through pulsesink's ring buffer, is no measure: it read 0 on the robot while speech
 played (2026-10-15) and in every trixie-container reading. A reply heard more than
 LATENCY_LIMIT_S late is logged as a WARNING and nothing else: the measure can be
-fooled (a pause in a backlog, or a motif, reads as a reply's onset), so it may not
+fooled (a pause in a backlog, or a sound, reads as a reply's onset), so it may not
 rebuild the speaker and cut a reply off (owner, 2026-10-16: log only). Once a minute
 the watchdog logs the last measured lag and its age.
 """
 
 from __future__ import annotations
 import os
+import enum
 import math
 import time
 import logging
 import functools
 import threading
 from typing import Any, TypeVar, Callable, Sequence, NamedTuple
+from dataclasses import dataclass
 
 
 logger = logging.getLogger(__name__)
@@ -466,7 +468,7 @@ MIN_SPEECH_S = 0.3  # less speech than this is not judged
 # sound of it on the monitor. Replies play in the order pushed, so sounds are matched
 # to replies first in, first out: the oldest reply not yet heard claims the next sound
 # that starts (a loud monitor buffer after a quiet one) after its push. Sound already
-# playing at the push (a motif) has no start, so it is never a reply's. A reply pushed
+# playing at the push (a sound) has no start, so it is never a reply's. A reply pushed
 # while the one before it still plays is queued, not lagged: its lag counts from when
 # the one before ends (heard at + seconds pushed), and the first loud buffer from then
 # is its sound, start or not. LAG_WINDOW_S is longer than the robot's 65 s lag, so
@@ -863,17 +865,39 @@ def keep_monitor(
 # down: its stream stays open after the sound, and pipewire-pulse replays the last
 # 4 MiB of a stream left open with nothing written (every 6.8 h at 22,050 Hz). Every
 # play_sound caller (conversation.sound, the app tools, the SDK's play_move) passes
-# through the instance wrap in phantom_speech.SoundStarts, which holds SOUND_LOCK while
-# the SDK replaces audio._playbin and then hands the new playbin to watch_sound.
+# through install_sound_wrap's instance wrap, which opens each new sound. Its end or
+# error closes it from a bus watch on the SDK's own GLib main loop (GStreamerAudio runs
+# one on the default context for its pipeline's bus), so there is no thread per sound.
+# A replacement is closed by the wrap, a stop by stop_sound, a sound with no end by a
+# timer. Closing sets that sound's own playbin to NULL; audio._playbin is the SDK's.
 
-
-SOUND_LOCK = threading.Lock()
-SOUND_SLACK_S = 5.0  # a sound with no end this long past its duration is torn down
+SOUND_SLACK_S = 5.0  # a sound with no end this long past its duration is closed
 SOUND_MAX_S = 1800.0  # the same bound for a sound whose duration is not known
 
 
+class SoundEnd(enum.Enum):
+    """Why a sound was closed."""
+
+    ENDED = "the sound ended"
+    ERROR = "error"
+    OVERDUE = "no end by its bound"
+    REPLACED = "replaced by a newer sound"
+    STOPPED = "stopped"
+
+
+@dataclass(eq=False)
+class _Sound:
+    """One open sound: its playbin, its path, and its overdue timer."""
+
+    playbin: Any
+    path: Any
+    timer: int = 0
+    bound_s: float = SOUND_MAX_S  # until preroll gives the duration
+    timed: bool = False  # the duration was read, once, at preroll
+
+
 class SoundActivity:
-    """Which play_sound playbins are open, and when the last one closed.
+    """Which play_sound sounds are open, and when the last one closed.
 
     The phantom-speech detector and the idle rebuild read it: a sound is the app's own.
     """
@@ -882,24 +906,21 @@ class SoundActivity:
         """Start with no sound open."""
         self._clock = clock
         self._lock = threading.Lock()
-        self._open: set[int] = set()
+        self._open: dict[int, _Sound] = {}
         self._closed_at: float | None = None
 
-    def opened(self, playbin: Any) -> None:
-        """Note a sound's playbin as playing."""
+    def opened(self, sound: _Sound) -> bool:
+        """Note a sound as playing; returns False if its playbin is open already."""
         with self._lock:
-            self._open.add(id(playbin))
+            return self._open.setdefault(id(sound.playbin), sound) is sound
 
-    def closed(self, playbin: Any) -> None:
-        """Note a sound's playbin as ended or torn down; closing one twice is harmless."""
+    def take(self, playbin: Any) -> _Sound | None:
+        """Close ``playbin``'s sound and return it; None if it was not open. Atomic."""
         with self._lock:
-            self._open.discard(id(playbin))
-            self._closed_at = self._clock()
-
-    def is_open(self, playbin: Any) -> bool:
-        """Return whether ``playbin`` is open (watched and not yet closed)."""
-        with self._lock:
-            return id(playbin) in self._open
+            sound = self._open.pop(id(playbin), None)
+            if sound is not None:
+                self._closed_at = self._clock()
+            return sound
 
     def state(self) -> tuple[bool, float | None]:
         """Return (a sound is open, when the last one closed)."""
@@ -910,77 +931,121 @@ class SoundActivity:
 SOUNDS = SoundActivity()
 
 
-def watch_sound(audio: Any, playbin: Any, path: Any) -> threading.Thread:
-    """Mark a play_sound playbin open, and tear it down from its own thread when the sound ends.
+def open_sound(playbin: Any, path: Any) -> None:
+    """Mark a sound open and watch its bus and its bound on the GLib main loop."""
+    from gi.repository import GLib
 
-    The play_sound wrap calls this holding SOUND_LOCK, so it must not take the lock
-    itself before it returns. The thread waits on the playbin's bus for the end or an
-    error, gives up on a sound with no end SOUND_SLACK_S past its duration, and sets it
-    to NULL if it is still the current sound. A newer sound has replaced it already
-    (the SDK's play_sound set it to NULL), and so has capture off (stop_playing).
+    sound = _Sound(playbin, path, bound_s=SOUND_MAX_S)
+    if not SOUNDS.opened(sound):
+        return
+    logger.info("Sound stream opened: %s (a second speaker stream)", path)
+    playbin.get_bus().add_watch(GLib.PRIORITY_DEFAULT, _on_sound_message, sound)
+    sound.timer = GLib.timeout_add(int(sound.bound_s * 1000), _on_sound_overdue, sound)
+
+
+def _on_sound_message(_bus: Any, msg: Any, sound: _Sound) -> bool:
+    """Close the sound at its end or error; read its duration once, at preroll."""
+    from gi.repository import Gst, GLib
+
+    if msg.type == Gst.MessageType.EOS:
+        close_sound(sound.playbin, SoundEnd.ENDED)
+        return False
+    if msg.type == Gst.MessageType.ERROR:
+        close_sound(sound.playbin, SoundEnd.ERROR, msg.parse_error()[0].message)
+        return False
+    if msg.type == Gst.MessageType.ASYNC_DONE and not sound.timed:
+        sound.timed = True
+        known, duration = sound.playbin.query_duration(Gst.Format.TIME)
+        if known and duration >= 0:
+            GLib.source_remove(sound.timer)
+            sound.bound_s = duration / Gst.SECOND + SOUND_SLACK_S
+            sound.timer = GLib.timeout_add(int(sound.bound_s * 1000), _on_sound_overdue, sound)
+    return True
+
+
+def _on_sound_overdue(sound: _Sound) -> bool:
+    """Close a sound that had no end by its bound."""
+    close_sound(sound.playbin, SoundEnd.OVERDUE)
+    return False
+
+
+def close_sound(playbin: Any, end: SoundEnd, detail: str = "") -> bool:
+    """Close a sound, the one path for every end: its playbin to NULL, its watch and timer gone.
+
+    Returns whether it was open; a second close, from any thread, does nothing.
+    """
+    from gi.repository import Gst, GLib
+
+    if end is not SoundEnd.REPLACED:  # the SDK set a replaced playbin to NULL itself
+        playbin.set_state(Gst.State.NULL)
+    sound = SOUNDS.take(playbin)
+    if sound is None:
+        return False
+    if end not in (SoundEnd.ENDED, SoundEnd.ERROR):  # the watch removes itself on those
+        playbin.get_bus().remove_watch()
+    if end is not SoundEnd.OVERDUE:  # the timer removes itself when it fires
+        GLib.source_remove(sound.timer)
+    if end is SoundEnd.OVERDUE:
+        cause = f"no end {sound.bound_s:.1f} s after it started"
+    else:
+        cause = f"{end.value}: {detail}" if detail else end.value
+    log = logger.warning if end is SoundEnd.OVERDUE else logger.info
+    log("Sound stream closed (%s): %s", cause, sound.path)
+    return True
+
+
+def wrap_once(obj: Any, name: str, tag: Any, make_wrapper: Callable[[Any], Any]) -> bool:
+    """Replace ``obj.name`` with ``make_wrapper(original)``; returns whether this call wrapped it.
+
+    The wrapper is built around the original, captured here before wrapping, so it never
+    calls itself. A method already wrapped with ``tag`` is left alone.
+    """
+    original = getattr(obj, name, None)
+    if original is None or getattr(original, "_wrapped_by", None) is tag:
+        return False
+    wrapper = make_wrapper(original)
+    wrapper._wrapped_by = tag
+    setattr(obj, name, wrapper)
+    return True
+
+
+def install_sound_wrap(audio: Any) -> bool:
+    """Wrap ``audio.play_sound`` once, to open each new sound; returns whether this call wrapped.
+
+    AGENTS.md: build on the SDK's public API, never monkey-patch its internals. This wraps a
+    public method on the instance, the only way to see the app tools' direct play_sound calls
+    without editing them (app_tools/companion_express.py is not ours to touch); an SDK bump
+    that keeps play_sound keeps it working. A sound already playing when it wraps (the SDK's
+    wake-up, before the app starts) is opened then.
     """
     from gi.repository import Gst
 
-    logger.info("Sound stream opened: %s (a second speaker stream beside speech)", path)
-    SOUNDS.opened(playbin)
-    started = time.monotonic()
+    def make(original: Callable[..., Any]) -> Callable[..., Any]:
+        def play_sound(sound_file: Any, *args: Any, **kwargs: Any) -> Any:
+            before = getattr(audio, "_playbin", None)
+            result = original(sound_file, *args, **kwargs)
+            playbin = getattr(audio, "_playbin", None)
+            if playbin is not before:  # else the SDK made no playbin
+                if before is not None:
+                    close_sound(before, SoundEnd.REPLACED)
+                if playbin is not None:
+                    open_sound(playbin, sound_file)
+            return result
 
-    def watch() -> tuple[str, bool]:
-        """Wait for the sound's end; returns (the cause, whether it ran past its bound)."""
-        bus, duration_of = playbin.get_bus(), playbin.query_duration
-        bound = SOUND_MAX_S
-        ends = Gst.MessageType.EOS | Gst.MessageType.ERROR
-        while True:
-            current = getattr(audio, "_playbin", None)
-            if current is None:
-                return "stopped", False
-            if current is not playbin:
-                return "replaced by a newer sound", False
-            msg = bus.timed_pop_filtered(200 * Gst.MSECOND, ends)
-            if msg is not None and msg.type == Gst.MessageType.ERROR:
-                err, _debug = msg.parse_error()
-                return f"error: {err.message}", False
-            if msg is not None:
-                return "the sound ended", False
-            known, duration = duration_of(Gst.Format.TIME)
-            if known and duration >= 0:
-                bound = duration / Gst.SECOND + SOUND_SLACK_S
-            if time.monotonic() - started > bound:
-                return f"no end {bound:.0f} s after it started", True
+        return play_sound
 
-    def wait() -> None:
-        try:
-            cause, overdue = watch()
-            if not cause.startswith(("the sound ended", "error", "no end")):
-                logger.info("Sound stream closed (%s): %s", cause, path)  # NULL already
-                return
-            with SOUND_LOCK:  # a new sound cannot take _playbin between the check and the clear
-                current = getattr(audio, "_playbin", None)
-                ours = current is not None and current is playbin
-                if ours:
-                    audio._playbin = None
-                    playbin.set_state(Gst.State.NULL)
-            how = "torn down" if ours else "then replaced or stopped, left to the SDK"
-            log = logger.warning if overdue else logger.info
-            log("Sound stream closed (%s, %s): %s", cause, how, path)
-        finally:
-            SOUNDS.closed(playbin)
-
-    thread = threading.Thread(target=wait, name="sound-watch", daemon=True)
-    thread.start()
-    return thread
+    if not wrap_once(audio, "play_sound", install_sound_wrap, make):
+        return False
+    playbin = getattr(audio, "_playbin", None)
+    if playbin is not None and playbin.get_state(0)[1] != Gst.State.NULL:
+        open_sound(playbin, "(a sound started before the wrap)")
+    return True
 
 
 def stop_sound(audio: Any) -> bool:
-    """conversation.sound's stop: the current sound's stream alone, never speech."""
-    from gi.repository import Gst
-
-    with SOUND_LOCK:
-        playbin = getattr(audio, "_playbin", None)
-        if playbin is None:
-            return False
-        audio._playbin = None
-        playbin.set_state(Gst.State.NULL)
-    SOUNDS.closed(playbin)  # its watcher logs the close
-    logger.debug("Sound stream stop requested")
+    """Stop the current sound, never speech (conversation.sound); returns whether there was one."""
+    playbin = getattr(audio, "_playbin", None)
+    if playbin is None:
+        return False
+    close_sound(playbin, SoundEnd.STOPPED)
     return True

@@ -3391,7 +3391,7 @@ def test_a_sound_stop_ends_the_sound_and_leaves_speech_alone() -> None:
     media.audio._playbin = playbin
     resp = _rpc_call(app, "conversation.sound", {"stop": True})
     assert resp["result"] == {"playing": False}
-    assert media.audio._playbin is None
+    assert media.audio._playbin is playbin  # the SDK's handle, left to the SDK
     playbin.set_state.assert_called_once()
     media.audio.clear_player.assert_not_called()
 
@@ -3471,18 +3471,12 @@ async def test_the_playback_watchdog_survives_a_failed_check(monkeypatch: pytest
 def test_a_sound_over_rpc_is_watched_once_through_the_play_sound_wrap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """conversation.sound's playbin reaches watch_sound once, through the wrap every caller shares.
-
-    The route used to watch the playbin itself as well; with the wrap's listener that
-    would be two watchers on one bus, so the route only plays the sound now.
-    """
+    """conversation.sound's playbin is opened once, through the wrap every caller shares."""
     from reachy_mini.media.media_manager import MediaManager
     from reachy_mini_conversation_app import playback_health
 
     watched: list[Any] = []
-    monkeypatch.setattr(
-        playback_health, "watch_sound", lambda audio, pb, path: watched.append((audio, pb, path))
-    )
+    monkeypatch.setattr(playback_health, "open_sound", lambda pb, path: watched.append((pb, path)))
     app = FastAPI()
     playbin = object()
     audio = SimpleNamespace(_playbin=None)
@@ -3494,7 +3488,7 @@ def test_a_sound_over_rpc_is_watched_once_through_the_play_sound_wrap(
     wav = tmp_path / "ring.wav"
     wav.write_bytes(b"RIFF")
     assert _rpc_call(app, "conversation.sound", {"file": str(wav)})["result"] == {"playing": True}
-    assert watched == [(audio, playbin, str(wav))]
+    assert watched == [(playbin, str(wav))]
 
 
 def test_a_sound_stop_goes_through_the_sound_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3515,7 +3509,7 @@ def test_a_sound_stop_goes_through_the_sound_teardown(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(playback_health, "stop_sound", stop)
     assert _rpc_call(app, "conversation.sound", {"stop": True})["result"] == {"playing": False}
-    assert stopped == [(media.audio, False)]  # SOUND_LOCK is taken off the event loop
+    assert stopped == [(media.audio, False)]  # set_state(NULL) runs off the event loop
 
 
 def test_capture_off_and_on_hold_the_media_lock_against_a_rebuild() -> None:
@@ -3685,17 +3679,31 @@ async def test_the_phantom_watch_hears_of_a_push_before_the_audio_is_pushed() ->
 
 
 def test_the_sound_wrapper_is_installed_at_startup() -> None:
-    """Every play_sound caller is seen from the start, and each sound handed to watch_sound."""
-    from reachy_mini_conversation_app import phantom_speech, playback_health
+    """Every play_sound caller is seen from the start: the SDK audio's method is wrapped."""
+    from reachy_mini_conversation_app import playback_health
 
     played: list[str] = []
     robot = _audio_robot()
     robot.media.audio = SimpleNamespace(_playbin=None, play_sound=played.append)
-    stream = LocalStream(MagicMock(), robot)
+    LocalStream(MagicMock(), robot)
     robot.media.audio.play_sound("a.wav")
     assert played == ["a.wav"]
-    assert isinstance(stream._phantom.sounds, phantom_speech.SoundStarts)
-    assert stream._phantom.sounds.listeners == [playback_health.watch_sound]
+    assert playback_health.install_sound_wrap(robot.media.audio) is False  # wrapped already
+
+
+def test_each_tick_wraps_play_sound_on_the_current_sdk_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK can make its media objects anew: the speaker-watch hop wraps what it finds."""
+    from reachy_mini_conversation_app import playback_health
+
+    stream = LocalStream(MagicMock(), _audio_robot())
+    monkeypatch.setattr(playback_health, "current_speaker_sink", lambda *a, **k: (False, None))
+    monkeypatch.setattr(playback_health, "keep_monitor", lambda *a, **k: "unavailable")
+    played: list[str] = []
+    fresh = SimpleNamespace(_playbin=None, _pipeline=None, play_sound=played.append)
+    stream._keep_speaker_watches(fresh, 5.0)
+    assert playback_health.install_sound_wrap(fresh) is False  # the hop wrapped it
 
 
 def test_one_speaker_sink_lookup_serves_the_monitor_and_the_phantom_watch(
