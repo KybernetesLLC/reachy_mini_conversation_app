@@ -3653,7 +3653,7 @@ async def test_the_phantom_watch_hears_of_a_push_before_the_audio_is_pushed() ->
 
 def test_the_sound_wrapper_is_installed_at_startup() -> None:
     """Every play_sound caller is seen from the start, through the SDK audio's own method."""
-    from reachy_mini_conversation_app import playback_health
+    from reachy_mini_conversation_app import phantom_speech
 
     played: list[str] = []
     robot = _audio_robot()
@@ -3661,7 +3661,7 @@ def test_the_sound_wrapper_is_installed_at_startup() -> None:
     stream = LocalStream(MagicMock(), robot)
     robot.media.audio.play_sound("a.wav")
     assert played == ["a.wav"]
-    assert isinstance(stream._phantom.sounds, playback_health.SoundStarts)
+    assert isinstance(stream._phantom.sounds, phantom_speech.SoundStarts)
     assert stream._phantom.sounds.starts()
 
 

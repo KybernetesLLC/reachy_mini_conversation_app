@@ -25,7 +25,7 @@ from reachy_mini.utils import create_head_pose
 from reachy_mini.io.jsonrpc import JsonRpcError
 from reachy_mini.apps.jsonrpc_server import JsonRpcServer
 from reachy_mini.media.media_manager import MediaBackend
-from reachy_mini_conversation_app import startup, playback_health
+from reachy_mini_conversation_app import startup, phantom_speech, playback_health
 from reachy_mini_conversation_app.config import (
     HF_BACKEND,
     LOCKED_PROFILE,
@@ -337,7 +337,7 @@ class LocalStream:
         # The unheard-reply trigger: replies pushed, judged against the speaker's monitor.
         self._replies = playback_health.ReplyTracker()
         # The phantom-speech detector (2026-10-26): speaker sound the app did not push.
-        self._phantom = playback_health.PhantomWatch()
+        self._phantom = phantom_speech.PhantomWatch()
         # Every play_sound caller is seen from the start (the app tools use it directly).
         try:
             sdk_audio = getattr(getattr(robot, "media", None), "audio", None)
@@ -1080,17 +1080,21 @@ class LocalStream:
             audio = getattr(getattr(self._robot, "media", None), "audio", None)
             tick += 1
             if tick % 2 == 0 and audio is not None:
-                try:
-                    await asyncio.to_thread(playback_health.keep_monitor, self._speaker_monitor, audio, self._now())
-                except Exception:
-                    logger.warning("Speaker monitor check failed", exc_info=True)
-                try:
-                    await asyncio.to_thread(self._phantom.keep, audio, self._now())
-                except Exception:
-                    logger.warning("Phantom speech probe check failed", exc_info=True)
+                await asyncio.to_thread(self._keep_speaker_watches, audio, self._now())
             self._judge_replies(audio)
             for event in self._phantom.take():
                 self._run_off_loop(self._phantom.act, event, audio)
+
+    def _keep_speaker_watches(self, audio: Any, now: float) -> None:
+        """Keep the speaker monitor and the phantom watch's probes on, in one worker hop."""
+        try:
+            playback_health.keep_monitor(self._speaker_monitor, audio, now)
+        except Exception:
+            logger.warning("Speaker monitor check failed", exc_info=True)
+        try:
+            self._phantom.keep(audio, now)
+        except Exception:
+            logger.warning("Phantom speech probe check failed", exc_info=True)
 
     def _on_monitor_buffer(self, now: float, seconds: float, speech_s: float) -> None:
         """Pass a speaker-monitor buffer to the reply tracker and the phantom watch."""
@@ -2117,9 +2121,10 @@ class LocalStream:
 
                 seconds, speech = playback_health.loud_seconds(audio_frame, int(handler_output[0] or 0))
                 # First: the speech-sink probe comes off before the reply can reach the sink.
-                self._phantom.pushed(self._now(), seconds)
+                now = self._now()
+                self._phantom.pushed(now, seconds)
                 self._robot.media.push_audio_sample(audio_frame)
-                self._replies.pushed(self._now(), seconds, speech)
+                self._replies.pushed(now, seconds, speech)
                 self._emit_level("assistant", audio_frame)
 
             else:
