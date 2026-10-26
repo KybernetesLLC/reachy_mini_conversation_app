@@ -3468,28 +3468,42 @@ async def test_the_playback_watchdog_survives_a_failed_check(monkeypatch: pytest
     assert len(calls) == 2
 
 
-def test_a_sound_over_rpc_is_watched_as_a_second_stream(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """conversation.sound's playbin is logged, and torn down at its end by the watcher."""
+def test_a_sound_over_rpc_is_watched_once_through_the_play_sound_wrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """conversation.sound's playbin reaches watch_sound once, through the wrap every caller shares.
+
+    The route used to watch the playbin itself as well; with the wrap's listener that
+    would be two watchers on one bus, so the route only plays the sound now.
+    """
+    from reachy_mini.media.media_manager import MediaManager
     from reachy_mini_conversation_app import playback_health
 
-    _stream, media, app = _sound_stream()
-    playbin = MagicMock()
-    media.play_sound.side_effect = lambda path: setattr(media.audio, "_playbin", playbin)
     watched: list[Any] = []
-    monkeypatch.setattr(playback_health, "watch_motif", lambda audio, pb, path: watched.append((audio, pb, path)))
+    monkeypatch.setattr(
+        playback_health, "watch_sound", lambda audio, pb, path: watched.append((audio, pb, path))
+    )
+    app = FastAPI()
+    playbin = object()
+    audio = SimpleNamespace(_playbin=None)
+    audio.play_sound = lambda path: setattr(audio, "_playbin", playbin)
+    media = SimpleNamespace(audio=audio, backend=None, logger=logging.getLogger("sdk"))
+    media.play_sound = lambda path: MediaManager.play_sound(media, path)  # type: ignore[arg-type]
+    stream = LocalStream(MagicMock(), SimpleNamespace(media=media), settings_app=app)
+    stream._init_settings_ui_if_needed()
     wav = tmp_path / "ring.wav"
     wav.write_bytes(b"RIFF")
     assert _rpc_call(app, "conversation.sound", {"file": str(wav)})["result"] == {"playing": True}
-    assert watched == [(media.audio, playbin, str(wav))]
+    assert watched == [(audio, playbin, str(wav))]
 
 
-def test_a_sound_stop_goes_through_the_motif_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The stop is logged as the motif stream's close."""
+def test_a_sound_stop_goes_through_the_sound_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stop is logged as the sound stream's close."""
     from reachy_mini_conversation_app import playback_health
 
     _stream, media, app = _sound_stream()
     stopped: list[Any] = []
-    monkeypatch.setattr(playback_health, "stop_motif", lambda audio: stopped.append(audio) or True)
+    monkeypatch.setattr(playback_health, "stop_sound", lambda audio: stopped.append(audio) or True)
     assert _rpc_call(app, "conversation.sound", {"stop": True})["result"] == {"playing": False}
     assert stopped == [media.audio]
 
@@ -3661,8 +3675,8 @@ async def test_the_phantom_watch_hears_of_a_push_before_the_audio_is_pushed() ->
 
 
 def test_the_sound_wrapper_is_installed_at_startup() -> None:
-    """Every play_sound caller is seen from the start, through the SDK audio's own method."""
-    from reachy_mini_conversation_app import phantom_speech
+    """Every play_sound caller is seen from the start, and each sound handed to watch_sound."""
+    from reachy_mini_conversation_app import phantom_speech, playback_health
 
     played: list[str] = []
     robot = _audio_robot()
@@ -3671,7 +3685,7 @@ def test_the_sound_wrapper_is_installed_at_startup() -> None:
     robot.media.audio.play_sound("a.wav")
     assert played == ["a.wav"]
     assert isinstance(stream._phantom.sounds, phantom_speech.SoundStarts)
-    assert stream._phantom.sounds.starts()
+    assert stream._phantom.sounds.listeners == [playback_health.watch_sound]
 
 
 def test_one_speaker_sink_lookup_serves_the_monitor_and_the_phantom_watch(
@@ -4065,3 +4079,90 @@ def test_breathing_rpc_keeps_the_fields_a_partial_call_does_not_name() -> None:
     resp = _rpc_call(app, "conversation.breathing", {"rate_scale": 0.9})
 
     assert resp["result"] == {"rate_scale": 0.9, "depth_scale": 0.8, "pitch_offset": 0.03}
+
+
+# The periodic idle rebuild (2026-10-26): the watchdog's tick rebuilds a speech stream
+# with no write for hours, so pipewire-pulse's index never runs far enough to wrap.
+
+
+def _idle_watchdog_stream(
+    monkeypatch: pytest.MonkeyPatch, now: float
+) -> tuple[LocalStream, list[Any]]:
+    """Return a parked, capture-on stream, speaker started at 0, read at ``now``; one tick."""
+    from reachy_mini_conversation_app import playback_health
+
+    stream = _gate_stream()
+    stream._session_wanted.clear()
+    stream._capture_on = True
+    stream._robot.media.audio = SimpleNamespace(_pipeline="pipeline")
+    stream._now = lambda: now
+    stream._speaker_started_at = 0.0
+    stream._idle_rebuild_s = 10800.0
+    monkeypatch.setattr(playback_health.GOVERNOR, "last_rebuild_at", None)
+    monkeypatch.setattr(playback_health.SOUNDS, "state", lambda: (False, None))
+    rebuilt: list[Any] = []
+
+    def refresh(audio: Any, cause: str) -> None:
+        rebuilt.append((audio, cause, threading.current_thread() is threading.main_thread()))
+
+    monkeypatch.setattr(playback_health, "refresh_after_idle", refresh)
+
+    def check(pipeline: Any, replies: Any = None) -> Any:
+        stream._stop_event.set()
+        return playback_health.Verdict("ok", "test")
+
+    monkeypatch.setattr(playback_health, "check_playback", check)
+    return stream, rebuilt
+
+
+@pytest.mark.asyncio
+async def test_the_watchdog_rebuilds_a_speech_stream_idle_for_hours_off_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """3 h 20 min with no write: one rebuild through the idle refresh, in a worker."""
+    from reachy_mini_conversation_app import playback_health
+
+    stream, rebuilt = _idle_watchdog_stream(monkeypatch, now=12000.0)
+    await asyncio.wait_for(stream.playback_watchdog_loop(interval_s=0.01), timeout=2.0)
+    await asyncio.gather(*stream._background)
+    cause = "200 min idle with no write to the speech stream (periodic rebuild)"
+    assert rebuilt == [(stream._robot.media.audio, cause, False)]
+    assert playback_health.IDLE_REBUILD_ENV == "REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "busy", ["session", "sound", "reply", "capture off", "recent push", "recent rebuild"]
+)
+async def test_pair_idle_rebuild_never_runs_while_the_app_is_busy_or_fresh(
+    monkeypatch: pytest.MonkeyPatch, busy: str
+) -> None:
+    """Rebuild x a session, a sound, a reply, capture off, and the open-time refresh's rebuild."""
+    from reachy_mini_conversation_app import playback_health
+
+    stream, rebuilt = _idle_watchdog_stream(monkeypatch, now=12000.0)
+    if busy == "session":
+        stream._session_wanted.set()
+    elif busy == "sound":
+        monkeypatch.setattr(playback_health.SOUNDS, "state", lambda: (True, None))
+    elif busy == "reply":
+        monkeypatch.setattr(stream._replies, "pending", lambda now: True)
+    elif busy == "capture off":
+        stream._capture_on = False
+    elif busy == "recent push":
+        stream._replies.pushed(5000.0, 1.0, 1.0)
+    else:
+        monkeypatch.setattr(playback_health.GOVERNOR, "last_rebuild_at", 2000.0)
+    await asyncio.wait_for(stream.playback_watchdog_loop(interval_s=0.01), timeout=2.0)
+    await asyncio.gather(*stream._background)
+    assert rebuilt == []
+
+
+def test_the_idle_rebuild_threshold_is_read_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S, read the way the idle refresh's is."""
+    monkeypatch.setenv("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", "7200")
+    assert _gate_stream()._idle_rebuild_s == 7200.0
+    monkeypatch.setenv("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", "soon")
+    assert _gate_stream()._idle_rebuild_s == 10800.0

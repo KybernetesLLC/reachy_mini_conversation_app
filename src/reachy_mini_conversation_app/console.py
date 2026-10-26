@@ -340,7 +340,9 @@ class LocalStream:
         # A reply pushed but not yet heard may still play late: the app's own sound.
         self._phantom = phantom_speech.PhantomWatch(pending=lambda now: self._replies.pending(now))
         self._speaker_sink_cache: dict[str, Any] = {}
-        # Every play_sound caller is seen from the start (the app tools use it directly).
+        # Every play_sound caller is seen from the start (the app tools use it directly),
+        # and each sound's playbin is torn down at its end: the SDK leaves its stream open.
+        self._phantom.sounds.listeners.append(playback_health.watch_sound)
         try:
             sdk_audio = getattr(getattr(robot, "media", None), "audio", None)
             if sdk_audio is not None:
@@ -350,7 +352,12 @@ class LocalStream:
         self._speaker_monitor = playback_health.SpeakerMonitor(self._on_monitor_buffer)
         # The idle refresh: when the speaker stream last started (here, or capture on).
         self._speaker_started_at: float | None = self._now()
-        self._refresh_idle_s = playback_health.refresh_idle_s_from_env()
+        self._refresh_idle_s = playback_health.seconds_from_env(
+            playback_health.REFRESH_IDLE_ENV, playback_health.REFRESH_IDLE_S
+        )
+        self._idle_rebuild_s = playback_health.seconds_from_env(
+            playback_health.IDLE_REBUILD_ENV, playback_health.IDLE_REBUILD_S
+        )
         self._preroll_clock = preroll_clock
         # Where the pre-roll counts back from, on _preroll_clock: the wake word's
         # peak when the opener said when it was, else None (the connect).
@@ -696,6 +703,27 @@ class LocalStream:
         if audio is None:
             return
         self._run_off_loop(playback_health.refresh_after_idle, audio, verdict.cause)
+
+    def _rebuild_speaker_if_idle(self, audio: Any) -> None:
+        """Run the periodic idle rebuild from the watchdog's tick, off the event loop.
+
+        Through GOVERNOR, and only with capture on: with it off the pipeline is NULL and
+        its stream closed.
+        """
+        if not self._capture_on:
+            return
+        now = self._now()
+        rebuilt_at = playback_health.GOVERNOR.last_rebuild_at
+        verdict = playback_health.idle_rebuild_decision(
+            now,
+            (self._replies.last_pushed_at, rebuilt_at, self._speaker_started_at),
+            self._idle_rebuild_s,
+            reply=self._replies.pending(now),
+            session=self._session_wanted.is_set() or self._backend_connected(),
+            sound=playback_health.SOUNDS.state()[0],
+        )
+        if verdict.action == "rebuild":
+            self._run_off_loop(playback_health.refresh_after_idle, audio, verdict.cause)
 
     async def _on_handler_loop(self, coro: Any) -> Any:
         """Run `coro` on the handler's own loop, from any loop.
@@ -1050,7 +1078,8 @@ class LocalStream:
     async def playback_watchdog_loop(self, interval_s: float = playback_health.CHECK_INTERVAL_S) -> None:
         """Log the last measured reply lag once per interval (playback_health.check_playback).
 
-        Off the event loop. A lag over the bound is the playback guard's WARNING.
+        Off the event loop. A lag over the bound is the playback guard's WARNING. Each
+        tick also runs the periodic idle rebuild.
         """
         while not self._stop_event.is_set():
             try:
@@ -1062,6 +1091,10 @@ class LocalStream:
             pipeline = getattr(audio, "_pipeline", None)
             if pipeline is None:
                 continue
+            try:
+                self._rebuild_speaker_if_idle(audio)
+            except Exception:
+                logger.warning("Idle speaker rebuild check failed", exc_info=True)
             try:
                 await asyncio.to_thread(playback_health.check_playback, pipeline, replies=self._replies)
             except Exception:
@@ -1440,15 +1473,14 @@ class LocalStream:
             audio = getattr(media, "audio", None)
             if params.get("stop"):
                 if audio is not None:
-                    playback_health.stop_motif(audio)
+                    playback_health.stop_sound(audio)
                 return {"playing": False}
             path = params.get("file")
             if not isinstance(path, str) or not os.path.isfile(path):
                 raise JsonRpcError("sound requires 'file', an existing path", reason="invalid_params", code=-32602)
-            # The SDK's playbin is a second speaker stream it never tears down (2026-10-15).
-            playbin = await asyncio.to_thread(playback_health.play_motif, media, audio, path)
-            if playbin is not None:
-                playback_health.watch_motif(audio, playbin, path)
+            # The SDK's playbin is a second speaker stream it never tears down (2026-10-15):
+            # the play_sound wrap hands it to watch_sound, as for every other caller.
+            await asyncio.to_thread(media.play_sound, path)
             return {"playing": True}
 
         @rpc.method("conversation.micro")  # type: ignore[untyped-decorator]
