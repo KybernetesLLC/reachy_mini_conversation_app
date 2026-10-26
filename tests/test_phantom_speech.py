@@ -459,3 +459,22 @@ def test_the_monitor_callback_never_raises_into_gstreamer() -> None:
     """The monitor's callback swallows a failure."""
     watch = ph.PhantomWatch(motif=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
     watch.monitored(1.0, 0.1, 0.1)  # no exception
+
+
+def test_an_episode_ended_before_its_listing_ran_still_lists_the_sink_inputs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Each event runs in its own worker: an end handled first lists the sink inputs itself."""
+    fakes = _Fakes()
+    watch = ph.PhantomWatch(motif=lambda: (False, None), list_inputs=fakes.list_inputs)
+    _monitor(watch.detector, 100.0, 101.0, loud=True)
+    watch.pushed(101.0, 1.0)  # ends the episode: started and ended come out together
+    started, ended = watch.take()
+    audio = SimpleNamespace(_playbin=None)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        watch.act(ended, audio)
+        watch.act(started, audio)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "node 108 serial 1347 16000 Hz pid 1330 (this app)" in warnings[0]
+    assert fakes.snapshots == 1

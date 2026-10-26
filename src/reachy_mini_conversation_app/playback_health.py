@@ -1297,6 +1297,8 @@ class PhantomWatch:
         self.pad = pad or PadLevel()
         self.wobbler = wobbler or WobblerWatch()
         self._list_inputs = list_inputs or (lambda: list_sink_inputs(os.getpid()))
+        # Each event runs in its own worker: one episode's start and end are not interleaved.
+        self._act_lock = threading.Lock()
 
     def monitored(self, now: float, seconds: float, speech_s: float) -> None:
         """Note a speaker-monitor buffer, from GStreamer's thread. Never raises."""
@@ -1333,23 +1335,35 @@ class PhantomWatch:
         """List the sink inputs when a reported episode starts; log it at its end. Never raises."""
         episode = event.episode
         try:
-            if event.kind == "started" and episode.report:
-                try:
-                    episode.inputs = self._list_inputs()
-                except Exception as exc:
-                    episode.inputs = ([], f"unavailable ({type(exc).__name__}: {exc})")
-            elif event.kind == "ended" and episode.report:
-                logger.warning("%s", self.report(episode, audio))
-            elif event.kind == "ended":
-                logger.info(
-                    "Phantom speech again within %.0f s of the last report: %.1f s loud, %s to %s",
-                    PHANTOM_REPORT_EVERY_S,
-                    episode.loud_s,
-                    _wall(episode.start),
-                    _wall(episode.end if episode.end is not None else episode.last_loud),
-                )
+            with self._act_lock:
+                self._act(event, episode, audio)
         except Exception:
             logger.warning("Phantom speech report failed", exc_info=True)
+
+    def _list(self, episode: PhantomEpisode) -> None:
+        """List the sink inputs onto ``episode``, once."""
+        if episode.inputs is not None:
+            return
+        try:
+            episode.inputs = self._list_inputs()
+        except Exception as exc:
+            episode.inputs = ([], f"unavailable ({type(exc).__name__}: {exc})")
+
+    def _act(self, event: PhantomEvent, episode: PhantomEpisode, audio: Any) -> None:
+        """Carry out one event. Holds the act lock."""
+        if event.kind == "started" and episode.report:
+            self._list(episode)
+        elif event.kind == "ended" and episode.report:
+            self._list(episode)  # its start's listing may not have run yet
+            logger.warning("%s", self.report(episode, audio))
+        elif event.kind == "ended":
+            logger.info(
+                "Phantom speech again within %.0f s of the last report: %.1f s loud, %s to %s",
+                PHANTOM_REPORT_EVERY_S,
+                episode.loud_s,
+                _wall(episode.start),
+                _wall(episode.end if episode.end is not None else episode.last_loud),
+            )
 
     def report(self, episode: PhantomEpisode, audio: Any) -> str:
         """Return the episode's WARNING line."""
