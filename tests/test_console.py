@@ -3503,9 +3503,19 @@ def test_a_sound_stop_goes_through_the_sound_teardown(monkeypatch: pytest.Monkey
 
     _stream, media, app = _sound_stream()
     stopped: list[Any] = []
-    monkeypatch.setattr(playback_health, "stop_sound", lambda audio: stopped.append(audio) or True)
+
+    def stop(audio: Any) -> bool:
+        try:
+            asyncio.get_running_loop()
+            on_loop = True
+        except RuntimeError:
+            on_loop = False
+        stopped.append((audio, on_loop))
+        return True
+
+    monkeypatch.setattr(playback_health, "stop_sound", stop)
     assert _rpc_call(app, "conversation.sound", {"stop": True})["result"] == {"playing": False}
-    assert stopped == [media.audio]
+    assert stopped == [(media.audio, False)]  # SOUND_LOCK is taken off the event loop
 
 
 def test_capture_off_and_on_hold_the_media_lock_against_a_rebuild() -> None:
@@ -4102,8 +4112,9 @@ def _idle_watchdog_stream(
     monkeypatch.setattr(playback_health.SOUNDS, "state", lambda: (False, None))
     rebuilt: list[Any] = []
 
-    def refresh(audio: Any, cause: str) -> None:
-        rebuilt.append((audio, cause, threading.current_thread() is threading.main_thread()))
+    def refresh(audio: Any, cause: str, governor: Any = None, level: int = logging.WARNING) -> None:
+        on_loop = threading.current_thread() is threading.main_thread()
+        rebuilt.append((audio, cause, on_loop, logging.getLevelName(level)))
 
     monkeypatch.setattr(playback_health, "refresh_after_idle", refresh)
 
@@ -4126,13 +4137,14 @@ async def test_the_watchdog_rebuilds_a_speech_stream_idle_for_hours_off_the_loop
     await asyncio.wait_for(stream.playback_watchdog_loop(interval_s=0.01), timeout=2.0)
     await asyncio.gather(*stream._background)
     cause = "200 min idle with no write to the speech stream (periodic rebuild)"
-    assert rebuilt == [(stream._robot.media.audio, cause, False)]
+    assert rebuilt == [(stream._robot.media.audio, cause, False, "INFO")]
     assert playback_health.IDLE_REBUILD_ENV == "REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "busy", ["session", "sound", "reply", "capture off", "recent push", "recent rebuild"]
+    "busy",
+    ["session", "connected", "sound", "reply", "capture off", "recent push", "recent rebuild"],
 )
 async def test_pair_idle_rebuild_never_runs_while_the_app_is_busy_or_fresh(
     monkeypatch: pytest.MonkeyPatch, busy: str
@@ -4143,6 +4155,8 @@ async def test_pair_idle_rebuild_never_runs_while_the_app_is_busy_or_fresh(
     stream, rebuilt = _idle_watchdog_stream(monkeypatch, now=12000.0)
     if busy == "session":
         stream._session_wanted.set()
+    elif busy == "connected":  # the gate clear, but a session still connected
+        stream.handler.connection = object()
     elif busy == "sound":
         monkeypatch.setattr(playback_health.SOUNDS, "state", lambda: (True, None))
     elif busy == "reply":

@@ -212,19 +212,27 @@ class RebuildGovernor:
         """Start with no rebuild history; ``clock`` is injectable for tests."""
         self._clock = clock
         self._history: list[float] = []
+        self._skipped: str | None = None  # the last skip's line, logged once until it changes
         self.last_rebuild_at: float | None = None
 
-    def rebuild(self, audio: Any, trigger: str, cause: str) -> bool:
+    def _skip(self, trigger: str, why: str) -> bool:
+        """Log a skipped rebuild at INFO once per cause, then at DEBUG. Holds MEDIA_LOCK."""
+        line = f"Speaker stream rebuild skipped (trigger: {trigger}): {why}"
+        logger.log(logging.DEBUG if line == self._skipped else logging.INFO, "%s", line)
+        self._skipped = line
+        return False
+
+    def rebuild(self, audio: Any, trigger: str, cause: str, level: int = logging.WARNING) -> bool:
         """Rebuild the speaker stream for ``trigger`` unless the cooldown holds it back.
 
         Returns whether a rebuild ran and the sink came back. A pipeline that is not
-        PLAYING (capture off) is left alone and uses no cooldown.
+        PLAYING (capture off) is left alone and uses no cooldown. ``level`` is the
+        "Rebuilding" line's: a fault's rebuild is a WARNING, a routine one need not be.
         """
         with MEDIA_LOCK:
             pipeline = getattr(audio, "_pipeline", None)
             if not _playing(pipeline):
-                logger.info("Speaker stream rebuild skipped (trigger: %s): the pipeline is not playing", trigger)
-                return False
+                return self._skip(trigger, "the pipeline is not playing")
             now = self._clock()
             verdict = rebuild_decision(now, self._history)
             if verdict.action != "rebuild":
@@ -234,11 +242,12 @@ class RebuildGovernor:
                 return False
             sink = speaker_sink(pipeline)
             if sink is None:
-                logger.info("Speaker stream rebuild skipped (trigger: %s): no speaker sink", trigger)
-                return False
+                return self._skip(trigger, "no speaker sink")
+            self._skipped = None
             self._history = [t for t in self._history if now - t < REBUILD_WINDOW_S] + [now]
             self.last_rebuild_at = now
-            logger.warning(
+            logger.log(
+                level,
                 "Rebuilding the speaker stream (trigger: %s, cause: %s; rebuild %d in the last %.0f s)",
                 trigger,
                 cause,
@@ -297,9 +306,11 @@ def refresh_decision(now: float, fresh_at: Sequence[float | None], idle_s: float
     return Verdict("ok", f"{idle:.0f} s idle, under {idle_s:.0f} s")
 
 
-def refresh_after_idle(audio: Any, cause: str, governor: RebuildGovernor | None = None) -> bool:
+def refresh_after_idle(
+    audio: Any, cause: str, governor: RebuildGovernor | None = None, level: int = logging.WARNING
+) -> bool:
     """Rebuild the speaker stream for the idle refresh, and log whether it was refreshed."""
-    ok = (governor or GOVERNOR).rebuild(audio, "idle refresh", cause)
+    ok = (governor or GOVERNOR).rebuild(audio, "idle refresh", cause, level)
     if ok:
         logger.info("Speaker stream refreshed after %s", cause)
     return ok
@@ -954,6 +965,11 @@ class SoundActivity:
             self._open.discard(id(playbin))
             self._closed_at = self._clock()
 
+    def is_open(self, playbin: Any) -> bool:
+        """Return whether ``playbin`` is open (watched and not yet closed)."""
+        with self._lock:
+            return id(playbin) in self._open
+
     def state(self) -> tuple[bool, float | None]:
         """Return (a sound is open, when the last one closed)."""
         with self._lock:
@@ -984,8 +1000,11 @@ def watch_sound(audio: Any, playbin: Any, path: Any) -> threading.Thread:
         bound = SOUND_MAX_S
         ends = Gst.MessageType.EOS | Gst.MessageType.ERROR
         while True:
-            if getattr(audio, "_playbin", None) is not playbin:
-                return "replaced by a newer sound or stopped", False
+            current = getattr(audio, "_playbin", None)
+            if current is None:
+                return "stopped", False
+            if current is not playbin:
+                return "replaced by a newer sound", False
             msg = bus.timed_pop_filtered(200 * Gst.MSECOND, ends)
             if msg is not None and msg.type == Gst.MessageType.ERROR:
                 err, _debug = msg.parse_error()
@@ -1001,16 +1020,18 @@ def watch_sound(audio: Any, playbin: Any, path: Any) -> threading.Thread:
     def wait() -> None:
         try:
             cause, overdue = watch()
-            if "replaced" in cause:
-                logger.info("Sound stream closed (%s): %s", cause, path)
+            if not cause.startswith(("the sound ended", "error", "no end")):
+                logger.info("Sound stream closed (%s): %s", cause, path)  # NULL already
                 return
             with SOUND_LOCK:  # a new sound cannot take _playbin between the check and the clear
                 current = getattr(audio, "_playbin", None)
-                if current is not None and current is playbin:
+                ours = current is not None and current is playbin
+                if ours:
                     audio._playbin = None
-                    current.set_state(Gst.State.NULL)
+                    playbin.set_state(Gst.State.NULL)
+            how = "torn down" if ours else "then replaced or stopped, left to the SDK"
             log = logger.warning if overdue else logger.info
-            log("Sound stream closed (%s, torn down): %s", cause, path)
+            log("Sound stream closed (%s, %s): %s", cause, how, path)
         finally:
             SOUNDS.closed(playbin)
 
@@ -1029,6 +1050,6 @@ def stop_sound(audio: Any) -> bool:
             return False
         audio._playbin = None
         playbin.set_state(Gst.State.NULL)
-    SOUNDS.closed(playbin)
-    logger.info("Sound stream closed (stop requested, torn down)")
+    SOUNDS.closed(playbin)  # its watcher logs the close
+    logger.debug("Sound stream stop requested")
     return True

@@ -378,7 +378,7 @@ def test_an_episode_is_reported_once_with_the_sink_inputs_and_the_pad(
     assert "node 108 serial 1347 16000 Hz pid 1330 (this app)" in line
     assert "speech sink pad, probed from " in line and ": 20 buffers, 0 loud" in line
     assert "wobbler" not in line
-    assert "no motif playbin" in line
+    assert "and no sound;" in line and "no sound playbin" in line and "motif" not in line
     assert fakes.snapshots == 1
 
 
@@ -575,7 +575,10 @@ class _SoundPlaybin:
 
     def timed_pop_filtered(self, timeout: Any, types: Any) -> Any:
         self.pops -= 1
-        return _gst().Message.new_eos(None) if self.pops <= 0 else None
+        if self.pops <= 0:
+            return _gst().Message.new_eos(None)
+        time.sleep(0.01)  # a real bus waits out its timeout; never a busy loop
+        return None
 
     def query_duration(self, fmt: Any) -> tuple[bool, int]:
         return True, int(self.duration_s * _gst().SECOND)
@@ -619,7 +622,9 @@ def test_every_play_sound_caller_is_closed_once_at_its_end(caller: str) -> None:
     assert made[0].states == [Gst.State.NULL]  # torn down once
 
 
-def test_a_sound_replaced_mid_play_is_torn_down_by_the_sdk_not_twice() -> None:
+def test_a_sound_replaced_mid_play_is_torn_down_by_the_sdk_not_twice(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A newer sound's play_sound sets the old playbin to NULL; its watcher leaves it."""
     Gst = _gst()
     made: list[_SoundPlaybin] = []
@@ -632,13 +637,20 @@ def test_a_sound_replaced_mid_play_is_torn_down_by_the_sdk_not_twice() -> None:
     sounds = ps.SoundStarts()
     sounds.listeners.append(ph.watch_sound)
     sounds.install(audio)
-    audio.play_sound("song.wav")
-    time.sleep(0.3)
-    audio.play_sound("ring.wav")
-    assert _wait_until(lambda: made[1].states == [Gst.State.NULL])
-    assert _wait_until(lambda: ph.SOUNDS.state()[0] is False)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        audio.play_sound("song.wav")
+        time.sleep(0.3)
+        audio.play_sound("ring.wav")
+        assert _wait_until(lambda: made[1].states == [Gst.State.NULL])
+        assert _wait_until(lambda: ph.SOUNDS.state()[0] is False)
+        time.sleep(0.3)
     assert made[0].states == [Gst.State.NULL]  # by the SDK, once
     assert audio._playbin is None
+    closes = [r.getMessage() for r in caplog.records if "Sound stream closed" in r.getMessage()]
+    assert closes == [
+        "Sound stream closed (replaced by a newer sound): song.wav",
+        "Sound stream closed (the sound ended, torn down): ring.wav",
+    ]
 
 
 def test_the_wrapper_calls_the_original_once_holding_the_sound_lock() -> None:
@@ -674,6 +686,7 @@ def test_the_sound_wrapper_tells_its_listeners_of_a_new_playbin_only() -> None:
     sounds.install(audio)
     audio.play_sound("x.wav")
     audio.play_sound = lambda path: None  # the SDK failing to make a playbin
+    audio._playbin = None  # the first sound was torn down at its end
     sounds.install(audio)
     audio.play_sound("y.wav")
     assert heard == [("x.wav", "playbin for x.wav")]
@@ -688,7 +701,9 @@ def test_a_sound_with_no_end_is_torn_down_past_its_duration(
     playbin = _SoundPlaybin("stuck.wav", pops=10**9, duration_s=0.1)
     audio = SimpleNamespace(_playbin=playbin)
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
-        ph.watch_sound(audio, playbin, "stuck.wav").join(timeout=3.0)
+        watcher = ph.watch_sound(audio, playbin, "stuck.wav")
+        watcher.join(timeout=3.0)
+    assert not watcher.is_alive()
     assert playbin.states == [Gst.State.NULL] and audio._playbin is None
     assert ph.SOUNDS.state()[0] is False
     late = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
@@ -1195,3 +1210,47 @@ def test_keep_monitor_uses_the_sink_it_is_given(monkeypatch: pytest.MonkeyPatch)
     sink = SimpleNamespace(get_factory=lambda: factory, get_property=lambda name: "dev")
     monitor = SimpleNamespace(source="dev.monitor", last_buffer_at=9.0)
     assert ph.keep_monitor(monitor, None, 10.0, found=(True, sink)) == "running"
+
+
+# --- review round (2026-10-26) ----------------------------------------------------------
+
+
+def test_a_stop_closes_the_sound_at_once_and_logs_one_close_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """conversation.sound's stop: closed in SOUNDS before the watcher wakes, one close line."""
+    Gst = _gst()
+    playbin = _SoundPlaybin("ring.wav", pops=10**9)
+    audio = SimpleNamespace(_playbin=playbin)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        watcher = ph.watch_sound(audio, playbin, "ring.wav")
+        assert ph.SOUNDS.state()[0] is True
+        assert ph.stop_sound(audio) is True
+        assert ph.SOUNDS.state()[0] is False  # at once, not when the watcher next looks
+        watcher.join(timeout=3.0)
+    assert not watcher.is_alive()
+    assert playbin.states == [Gst.State.NULL] and audio._playbin is None
+    closes = [r.getMessage() for r in caplog.records if "Sound stream closed" in r.getMessage()]
+    assert closes == ["Sound stream closed (stopped): ring.wav"]
+
+
+def test_a_sound_playing_before_the_wrap_is_handed_to_the_listeners_once() -> None:
+    """The SDK's wake-up sound can play before the wrap is installed: it is watched from then."""
+    started = SimpleNamespace(name="wake_up")
+    audio = SimpleNamespace(_playbin=started, play_sound=lambda path: None)
+    sounds = ps.SoundStarts()
+    heard: list[tuple[Any, Any]] = []
+
+    def listen(a: Any, playbin: Any, path: Any) -> None:
+        heard.append((playbin, path))
+        ph.SOUNDS.opened(playbin)
+
+    sounds.listeners.append(listen)
+    try:
+        assert sounds.install(audio)
+        assert sounds.install(audio)  # already wrapped: not handed over again
+        audio.play_sound = lambda path: None  # a fresh method: wrapped again, but already watched
+        assert sounds.install(audio)
+        assert heard == [(started, "(a sound started before the wrap)")]
+    finally:
+        ph.SOUNDS.closed(started)

@@ -438,12 +438,11 @@ def test_a_replaced_sound_is_not_torn_down_twice(
         old.join(timeout=3.0)
         assert not old.is_alive()
         assert rig.audio._playbin is second  # the newer sound is left alone
-        ph.stop_sound(rig.audio)
+        assert ph.stop_sound(rig.audio)
 
     messages = [r.getMessage() for r in caplog.records if r.name == ph.logger.name]
     assert any("Sound stream closed" in m and "replaced" in m for m in messages), messages
-    assert any("Sound stream closed" in m and "stop" in m for m in messages), messages
-    assert rig.audio._playbin is None
+    assert rig.audio._playbin is None  # stopped; only a watched sound logs its close
 
 
 # --- one cooldown for every rebuild trigger -----------------------------------------------
@@ -1431,6 +1430,7 @@ def test_a_sound_started_during_a_teardown_is_not_orphaned(monkeypatch: pytest.M
 
     audio.play_sound = play_sound  # the SDK's method on the instance, wrapped as the app wraps it
     assert ps.SoundStarts().install(audio)
+    Audio.reads = 0  # count the watcher's reads only
     ph.watch_sound(audio, old, "old.wav").join(timeout=3.0)
     deadline = time.monotonic() + 2.0
     while audio.value is not new and time.monotonic() < deadline:
@@ -1656,3 +1656,125 @@ def test_the_replay_check_reads_the_classic_journal_format() -> None:
     ]
     (stretch,) = ph.idle_stretches(lines, 3600.0)
     assert stretch.ongoing and round(stretch.seconds) == 33566
+
+
+# --- review round (2026-10-26) ----------------------------------------------------------
+
+
+def test_a_sound_ending_as_the_next_starts_leaves_the_newer_sound_alone(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The teardown's identity check: the EOS came, then a newer sound took _playbin first.
+
+    The watcher has seen its sound end and waits for SOUND_LOCK; a new play_sound holds
+    it and replaces _playbin. The watcher must then leave the newer sound alone.
+    """
+    Gst = _gst()
+    popped = threading.Event()
+
+    class Playbin:
+        def __init__(self) -> None:
+            self.states: list[Any] = []
+
+        def get_bus(self) -> Any:
+            return self
+
+        def timed_pop_filtered(self, timeout: Any, types: Any) -> Any:
+            popped.set()
+            return Gst.Message.new_eos(None)
+
+        def query_duration(self, fmt: Any) -> tuple[bool, int]:
+            return False, -1
+
+        def set_state(self, state: Any) -> None:
+            self.states.append(state)
+
+    old, new = Playbin(), Playbin()
+    audio = SimpleNamespace(_playbin=old)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        with ph.SOUND_LOCK:  # a new play_sound is under way
+            watcher = ph.watch_sound(audio, old, "old.wav")
+            assert popped.wait(2.0)
+            time.sleep(0.2)  # the watcher now waits for the lock to tear its sound down
+            audio._playbin = new  # the SDK replaced it (and set the old one to NULL itself)
+        watcher.join(timeout=3.0)
+    assert not watcher.is_alive()
+    assert audio._playbin is new and new.states == []
+    assert old.states == []  # the SDK's to set to NULL, not the watcher's
+    closes = [r.getMessage() for r in caplog.records if "Sound stream closed" in r.getMessage()]
+    left = "the sound ended, then replaced or stopped, left to the SDK"
+    assert closes == [f"Sound stream closed ({left}): old.wav"]
+
+
+def test_the_periodic_rebuild_is_an_info_line_and_other_triggers_stay_warnings(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An expected rebuild every 3 h does not crowd the journal's warnings."""
+    audio = SimpleNamespace(_pipeline=_Pipeline())
+    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: True)
+    now = [100.0]
+    governor = ph.RebuildGovernor(clock=lambda: now[0])
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        periodic = "200 min idle (periodic rebuild)"
+        assert ph.refresh_after_idle(audio, periodic, governor, logging.INFO)
+        now[0] = 1000.0
+        assert ph.refresh_after_idle(audio, "75 min idle", governor)
+    rebuilding = [r for r in caplog.records if r.getMessage().startswith("Rebuilding the speaker")]
+    assert [r.levelno for r in rebuilding] == [logging.INFO, logging.WARNING]
+    assert "(periodic rebuild)" in rebuilding[0].getMessage()
+
+
+def test_a_skipped_rebuild_is_logged_once_per_cause(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No speaker sink, tick after tick: one INFO line until the cause changes or a rebuild runs."""
+    pipeline = _Pipeline()
+    audio = SimpleNamespace(_pipeline=pipeline)
+    sinks: list[Any] = [None]
+    monkeypatch.setattr(ph, "speaker_sink", lambda p: sinks[0])
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: True)
+    now = [100.0]
+    governor = ph.RebuildGovernor(clock=lambda: now[0])
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        for _ in range(3):
+            assert governor.rebuild(audio, "idle refresh", "x") is False
+        pipeline.playing = False
+        assert governor.rebuild(audio, "idle refresh", "x") is False  # a new cause
+        pipeline.playing, sinks[0] = True, "sink"
+        assert governor.rebuild(audio, "idle refresh", "x") is True
+        sinks[0] = None
+        now[0] = 2000.0
+        assert governor.rebuild(audio, "idle refresh", "x") is False  # after a rebuild: again
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    skips = [m for m in infos if "skipped" in m]
+    assert skips == [
+        "Speaker stream rebuild skipped (trigger: idle refresh): no speaker sink",
+        "Speaker stream rebuild skipped (trigger: idle refresh): the pipeline is not playing",
+        "Speaker stream rebuild skipped (trigger: idle refresh): no speaker sink",
+    ]
+
+
+def test_the_replay_check_counts_a_capture_start_and_the_first_line_as_writes() -> None:
+    """The stream is new at capture on, and nothing before the excerpt is known."""
+    import datetime
+
+    at = datetime.datetime.fromisoformat
+    lag = "Playback latency: none"
+    first = [
+        _journal("2026-10-26 01:00:00", "playback_health:325", lag),
+        _journal("2026-10-26 05:00:00", "playback_health:325", lag),
+    ]
+    assert ph.idle_stretches(first, 3 * 3600.0) == [
+        ph.IdleStretch(at("2026-10-26 01:00:00"), at("2026-10-26 05:00:00"), ongoing=True)
+    ]
+    capture = [
+        _journal("2026-10-26 01:00:00", "console:1093", "Reply heard after 0.2 s"),
+        _journal("2026-10-26 01:30:00", "console:1360", "Audio capture stopped via /rpc"),
+        _journal("2026-10-26 03:00:00", "console:1360", "Audio capture started via /rpc"),
+        _journal("2026-10-26 05:00:00", "playback_health:325", lag),
+    ]
+    assert ph.idle_stretches(capture, 3 * 3600.0) == []  # 2 h since capture on
+    assert ph.idle_stretches(capture, 1.5 * 3600.0) == [
+        ph.IdleStretch(at("2026-10-26 03:00:00"), at("2026-10-26 05:00:00"), ongoing=True)
+    ]

@@ -559,18 +559,28 @@ class SoundStarts:
                     before = getattr(audio, "_playbin", None)
                     result = original(sound_file, *args, **kwargs)
                     playbin = getattr(audio, "_playbin", None)
-                    if playbin is None or playbin is before:
-                        return result  # no new playbin: the SDK could not make one
-                    for listener in list(self.listeners):
-                        try:
-                            listener(audio, playbin, sound_file)
-                        except Exception:
-                            logger.warning("A play_sound listener failed", exc_info=True)
+                    if playbin is not None and playbin is not before:  # else none was made
+                        self._tell(audio, playbin, sound_file)
                 return result
 
             return play_sound
 
-        return wrap_once(audio, "play_sound", self, make)
+        fresh = getattr(getattr(audio, "play_sound", None), "_wrapped_by", None) is not self
+        wrapped = wrap_once(audio, "play_sound", self, make)
+        if wrapped and fresh:  # a sound may have started before the wrap: the SDK's wake-up
+            with SOUND_LOCK:
+                playbin = getattr(audio, "_playbin", None)
+                if playbin is not None and not SOUNDS.is_open(playbin):
+                    self._tell(audio, playbin, "(a sound started before the wrap)")
+        return wrapped
+
+    def _tell(self, audio: Any, playbin: Any, path: Any) -> None:
+        """Hand a new playbin to every listener. Holds SOUND_LOCK."""
+        for listener in list(self.listeners):
+            try:
+                listener(audio, playbin, path)
+            except Exception:
+                logger.warning("A play_sound listener failed", exc_info=True)
 
 
 def _wall(t: float) -> str:
@@ -606,16 +616,16 @@ def _playbin_status(audio: Any) -> PlaybinStatus | None:
 
 
 def _describe_playbin(audio: Any) -> str:
-    """Describe the SDK's motif playbin: none, or its state and position. Never raises."""
+    """Describe the SDK's play_sound playbin: none, or its state and position. Never raises."""
     try:
         status = _playbin_status(audio)
         if status is None:
-            return "no motif playbin"
+            return "no sound playbin"
         pos, dur = status.position_s, status.duration_s
         at = f", at {pos:.1f} of {dur:.1f} s" if pos is not None and dur is not None else ""
-        return f"motif playbin {status.name} {status.state.value_nick}{at}"
+        return f"sound playbin {status.name} {status.state.value_nick}{at}"
     except Exception as exc:
-        return f"motif playbin present (unreadable: {exc})"
+        return f"sound playbin present (unreadable: {exc})"
 
 
 class PhantomWatch:
@@ -780,5 +790,5 @@ class PhantomWatch:
         return (
             f"Phantom speech: the speaker played {episode.loud_s:.1f} s loud "
             f"from {_wall(episode.start)} to {_wall(end)} ({cause}) with no push from the app "
-            f"({push}) and no motif; {pad}; {_describe_playbin(audio)}; {listed}"
+            f"({push}) and no sound; {pad}; {_describe_playbin(audio)}; {listed}"
         )

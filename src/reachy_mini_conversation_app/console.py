@@ -708,7 +708,8 @@ class LocalStream:
         """Run the periodic idle rebuild from the watchdog's tick, off the event loop.
 
         Through GOVERNOR, and only with capture on: with it off the pipeline is NULL and
-        its stream closed.
+        its stream closed. Logged at INFO: it is routine. Upstream's mode keeps a session
+        wanted all the time, so it never runs there; the companion parks the app (R-36).
         """
         if not self._capture_on:
             return
@@ -723,7 +724,8 @@ class LocalStream:
             sound=playback_health.SOUNDS.state()[0],
         )
         if verdict.action == "rebuild":
-            self._run_off_loop(playback_health.refresh_after_idle, audio, verdict.cause)
+            refresh = playback_health.refresh_after_idle
+            self._run_off_loop(refresh, audio, verdict.cause, None, logging.INFO)  # routine: INFO
 
     async def _on_handler_loop(self, coro: Any) -> Any:
         """Run `coro` on the handler's own loop, from any loop.
@@ -1472,8 +1474,8 @@ class LocalStream:
             media = self._robot.media
             audio = getattr(media, "audio", None)
             if params.get("stop"):
-                if audio is not None:
-                    playback_health.stop_sound(audio)
+                if audio is not None:  # SOUND_LOCK may wait on a sound starting: off the loop
+                    await asyncio.to_thread(playback_health.stop_sound, audio)
                 return {"playing": False}
             path = params.get("file")
             if not isinstance(path, str) or not os.path.isfile(path):
