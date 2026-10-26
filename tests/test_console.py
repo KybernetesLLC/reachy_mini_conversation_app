@@ -2925,6 +2925,26 @@ def test_a_note_over_the_rpc_runs_on_the_handlers_loop() -> None:
     assert seen == [("Alli (she/her) has joined.", loop)]
 
 
+def test_a_note_over_the_rpc_passes_now_only_when_asked() -> None:
+    """now=True reaches add_note; without it add_note is called as before."""
+    stream, _manager, app = _pose_stream()
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def add_note(text: str, **kwargs: object) -> None:
+        calls.append((text, kwargs))
+
+    stream.handler.add_note = add_note
+    stream.handler._is_connected.return_value = True
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    try:
+        _rpc_call(app, "conversation.note", {"text": "a"})
+        _rpc_call(app, "conversation.note", {"text": "b", "now": True})
+    finally:
+        _stop_loop(loop, thread)
+    assert calls == [("a", {}), ("b", {"now": True})]
+
+
 def test_a_note_needs_text() -> None:
     """Empty text is refused as a result, not an error -- the brief's own contract."""
     _stream, _manager, app = _pose_stream()

@@ -1249,8 +1249,14 @@ class LocalStream:
             if not self.handler._is_connected():
                 return {"queued": False, "reason": "no session"}
 
+            # now=True sends while the person is speaking (the mid-speech note test).
+            now = bool(params.get("now", False))
+
             async def _add_note() -> None:
-                self.handler.add_note(text)
+                if now:
+                    self.handler.add_note(text, now=True)
+                else:
+                    self.handler.add_note(text)
 
             # On the handler's own loop: add_note's asyncio.create_task must bind to
             # the loop that owns the websocket, not the RPC server's, or the eventual
