@@ -1824,6 +1824,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._emit_debounced_partial(current_partial, item_id, sequence_counter)
                         )
 
+                    # A failed transcription has no completion. The companion pairs each user
+                    # speech window with its item's completion, so it hears of this one too.
+                    if event.type == "conversation.item.input_audio_transcription.failed":
+                        self._mark_activity("user_transcription_failed")
+                        logger.warning("User transcription failed for item %s", getattr(event, "item_id", None))
+
                     # Handle completed transcription (user finished speaking)
                     if event.type == "conversation.item.input_audio_transcription.completed":
                         self._mark_activity("user_transcription_completed")

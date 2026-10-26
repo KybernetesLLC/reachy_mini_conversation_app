@@ -621,6 +621,23 @@ async def test_run_session_skips_empty_completed_transcript(monkeypatch: Any) ->
 
 
 @pytest.mark.asyncio
+async def test_a_failed_transcription_is_reported_as_activity(monkeypatch: Any) -> None:
+    """The companion pairs each user speech window with its item's completion; an item whose
+    transcription failed has no completion, so it is reported as its own activity."""
+    handler = _session_handler(
+        monkeypatch,
+        (_FakeEvent("conversation.item.input_audio_transcription.failed", item_id="item_1"),),
+    )
+    seen: list[str] = []
+    handler.set_activity_observer(seen.append)
+
+    await handler._run_realtime_session()
+
+    assert "user_transcription_failed" in seen
+    assert [msg for msg in _messages(_drain(handler)) if msg.get("role") == "user"] == []
+
+
+@pytest.mark.asyncio
 async def test_run_session_generic_error_is_surfaced(monkeypatch: Any) -> None:
     """A generic realtime error is forwarded to the UI as an assistant message."""
     handler = _session_handler(
