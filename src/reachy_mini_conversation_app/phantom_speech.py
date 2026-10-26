@@ -424,6 +424,10 @@ class PadLevel:
         """Whether a sink is being measured."""
         return self._sink is not None
 
+    def measures(self, sink: Any) -> bool:
+        """Whether the probe is on ``sink``."""
+        return sink is not None and sink is self._sink
+
     def probed_from(self, start: float, end: float) -> float | None:
         """Return when the probe went on, if it was on at any time from ``start`` to ``end``."""
         with self._probe_lock:
@@ -725,6 +729,9 @@ class PhantomWatch:
         if found is None:
             found = playback_health.current_speaker_sink(audio, self._sink_cache)
         sink = found[1]
+        if self.pad.attached and not self.pad.measures(sink):
+            self.pad.detach()  # a new pipeline: the next branch puts the probe on its sink
+            self._probe_for = None
         onset = self.detector.suspected(now)
         if sink is None or onset is None:
             self.pad.detach()

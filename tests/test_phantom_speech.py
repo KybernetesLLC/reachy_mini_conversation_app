@@ -974,3 +974,78 @@ def test_monitor_errors_are_counted_not_raised(caplog: pytest.LogCaptureFixture)
     with caplog.at_level(logging.INFO, logger=ps.logger.name):
         watch.keep(SimpleNamespace(_pipeline=None), 100.0)
     assert any("monitor" in w and "RuntimeError" in w for w in _warnings(caplog))
+
+
+# --- re-review of the /code-review fixes ------------------------------------------------------
+
+
+def test_a_late_reply_opens_no_episode_while_it_plays() -> None:
+    """In console order: each monitor buffer goes to the real tracker, then the detector."""
+    tracker = ph.ReplyTracker(rebuilt_at=lambda: None)
+    det = ps.PhantomDetector(motif=lambda: (False, None), pending=tracker.pending)
+    for i in range(20):  # 2 s of reply pushed at 10 s, in 0.1 s chunks
+        tracker.pushed(10.0 + 0.01 * i, 0.1, 0.1)
+        det.pushed(10.0 + 0.01 * i, 0.1)
+
+    def feed(start: float, end: float, loud: bool) -> None:
+        t = start
+        while t < end - 1e-9:
+            t = round(t + 0.1, 6)
+            speech = 0.1 if loud else 0.0
+            tracker.monitored(t, 0.1, speech)
+            det.monitored(t, 0.1, speech)
+            if round(t * 10) % 5 == 0:
+                tracker.tick(t)
+
+    feed(10.2, 59.9, loud=False)
+    feed(59.9, 61.9, loud=True)  # the reply, heard 50 s late, plays to its end
+    feed(61.9, 66.0, loud=False)
+    assert det.take() == []
+
+
+def test_the_probe_follows_a_new_speaker_sink_at_the_next_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pipeline restart mid-suspicion: the probe moves to the new sink."""
+    _gst()
+    old_pad, new_pad = _FakePad(), _FakePad()
+    old = SimpleNamespace(get_static_pad=lambda name: old_pad)
+    new = SimpleNamespace(get_static_pad=lambda name: new_pad)
+    watch = ps.PhantomWatch(motif=lambda: (False, None))
+    _suspect(watch, 99.7, 100.0)
+    watch.keep(SimpleNamespace(), 100.0, found=(True, old))
+    assert len(old_pad.probes) == 1
+    watch.keep(SimpleNamespace(), 101.0, found=(True, new))
+    assert old_pad.probes == {} and len(new_pad.probes) == 1
+
+
+def test_errors_are_logged_at_most_once_a_minute(caplog: pytest.LogCaptureFixture) -> None:
+    """Errors between logs are held and logged together a minute after the last."""
+    Gst = _gst()
+    watch = ps.PhantomWatch(motif=lambda: (False, None))
+    bad = SimpleNamespace(type=Gst.PadProbeType.BUFFER, get_buffer=lambda: None)
+    audio = SimpleNamespace(_pipeline=None)
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
+        for now in (100.0, 130.0, 161.0):
+            watch.pad._on_probe(None, bad)
+            watch.keep(audio, now)
+    warnings = _warnings(caplog)
+    assert len(warnings) == 2
+    assert "probe 1 " in warnings[0] and "probe 2 " in warnings[1]
+
+
+def test_keep_monitor_uses_the_sink_it_is_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No second lookup (and no second MEDIA_LOCK) when the caller found the sink."""
+
+    def lookup(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("looked the sink up again")
+
+    monkeypatch.setattr(ph, "current_speaker_sink", lookup)
+    stopped: list[bool] = []
+    monitor = SimpleNamespace(source="dev.monitor", stop=lambda: stopped.append(True))
+    assert ph.keep_monitor(monitor, None, 10.0, found=(False, None)) == "stopped"
+    assert stopped == [True]
+    factory = SimpleNamespace(get_name=lambda: "pulsesink")
+    sink = SimpleNamespace(get_factory=lambda: factory, get_property=lambda name: "dev")
+    monitor = SimpleNamespace(source="dev.monitor", last_buffer_at=9.0)
+    assert ph.keep_monitor(monitor, None, 10.0, found=(True, sink)) == "running"

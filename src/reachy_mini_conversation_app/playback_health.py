@@ -443,6 +443,7 @@ MIN_SPEECH_S = 0.3  # less speech than this is not judged
 # heard late (a WARNING, never a rebuild).
 LAG_WINDOW_S = 90.0
 QUEUE_SLACK_S = 0.3  # a queued reply's sound may arrive this much before the estimate
+REPLY_TAIL_S = 3.0  # a heard reply is the app's own sound until it has played, and this long
 
 
 def rms(samples: Any) -> float | None:
@@ -523,6 +524,7 @@ class ReplyTracker:
         self._before: dict[str, Any] | None = None  # the last reply heard, which a queued reply waits for
         self._lags: list[float] = []  # measured, not yet reported by tick
         self._last_lag: tuple[float, float] | None = None  # (lag, measured at)
+        self._heard_until: float | None = None  # when the last heard reply has played out
         self.unheard_in_a_row = 0
         self.armed = False
         self.last_pushed_at: float | None = None
@@ -605,18 +607,22 @@ class ReplyTracker:
             return  # sound that started before the push
         reply["lag"] = "measured"
         reply["heard_at"] = now
+        self._heard_until = max(self._heard_until or now, now + reply["seconds"])
         self._before = reply
         lag = max(0.0, now - expected)
         self._lags.append(lag)
         self._last_lag = (lag, now)
 
     def pending(self, now: float) -> bool:
-        """Return whether a reply with speech was pushed and none of its sound heard yet.
+        """Return whether a pushed reply may still be playing: unheard yet, or heard and not over.
 
-        Such a reply may still play, up to LAG_WINDOW_S late (the robot's 65 s lag), so the
-        phantom-speech detector counts it as the app's own sound.
+        A reply may play up to LAG_WINDOW_S late (the robot's 65 s lag), and once heard it
+        plays for as long as was pushed. The phantom-speech detector counts both as the
+        app's own sound: a late reply is never a phantom, its start or its tail.
         """
         with self._lock:
+            if self._heard_until is not None and now < self._heard_until + REPLY_TAIL_S:
+                return True
             self._expire(now)
             for reply in self._replies:
                 if reply["lag"] == "pending" and not reply["flushed"]:
