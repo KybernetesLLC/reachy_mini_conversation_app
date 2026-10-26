@@ -8,6 +8,7 @@ and whether the head wobbler fired. RMS numbers only; no audio is kept.
 """
 
 from __future__ import annotations
+import re
 import json
 import time
 import logging
@@ -18,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from reachy_mini_conversation_app import phantom_speech as ps
 from reachy_mini_conversation_app import playback_health as ph
 
 
@@ -30,7 +32,7 @@ def _gst() -> Any:
     return Gst
 
 
-def _monitor(det: ph.PhantomDetector, start: float, end: float, loud: bool) -> None:
+def _monitor(det: ps.PhantomDetector, start: float, end: float, loud: bool) -> None:
     """Feed the detector 0.1 s monitor buffers from ``start`` to ``end``."""
     step = 0.1
     t = start
@@ -39,7 +41,7 @@ def _monitor(det: ph.PhantomDetector, start: float, end: float, loud: bool) -> N
         det.monitored(t, step, step if loud else 0.0)
 
 
-def _kinds(det: ph.PhantomDetector) -> list[str]:
+def _kinds(det: ps.PhantomDetector) -> list[str]:
     return [e.kind for e in det.take()]
 
 
@@ -48,7 +50,7 @@ def _kinds(det: ph.PhantomDetector) -> list[str]:
 
 def test_a_loud_monitor_with_nothing_pushed_is_one_episode_with_its_start_and_end() -> None:
     """Half a second of sound with nothing pushed opens an episode; two quiet seconds close it."""
-    det = ph.PhantomDetector(motif=lambda: (False, None))
+    det = ps.PhantomDetector(motif=lambda: (False, None))
     _monitor(det, 100.0, 100.4, loud=True)
     assert det.take() == []  # 0.4 s loud: not yet
     _monitor(det, 100.4, 103.0, loud=True)
@@ -66,7 +68,7 @@ def test_a_loud_monitor_with_nothing_pushed_is_one_episode_with_its_start_and_en
 
 def test_a_blip_under_half_a_second_is_not_an_episode() -> None:
     """Short sounds far apart never add up to an episode."""
-    det = ph.PhantomDetector(motif=lambda: (False, None))
+    det = ps.PhantomDetector(motif=lambda: (False, None))
     _monitor(det, 10.0, 10.3, loud=True)
     _monitor(det, 10.3, 14.0, loud=False)
     _monitor(det, 14.0, 14.3, loud=True)
@@ -76,7 +78,7 @@ def test_a_blip_under_half_a_second_is_not_an_episode() -> None:
 
 def test_the_apps_own_reply_is_never_an_episode() -> None:
     """Sound while the app's reply plays is the reply."""
-    det = ph.PhantomDetector(motif=lambda: (False, None))
+    det = ps.PhantomDetector(motif=lambda: (False, None))
     det.pushed(10.0, 2.0)
     _monitor(det, 10.0, 12.2, loud=True)
     _monitor(det, 12.2, 20.0, loud=False)
@@ -85,7 +87,7 @@ def test_the_apps_own_reply_is_never_an_episode() -> None:
 
 def test_audio_queued_faster_than_real_time_is_still_the_apps_while_it_plays() -> None:
     """Six seconds pushed in half a second plays until 16 s: the push 5 s ago is no phantom."""
-    det = ph.PhantomDetector(motif=lambda: (False, None))
+    det = ps.PhantomDetector(motif=lambda: (False, None))
     for i in range(6):
         det.pushed(10.0 + 0.1 * i, 1.0)
     _monitor(det, 10.2, 16.2, loud=True)
@@ -95,7 +97,7 @@ def test_audio_queued_faster_than_real_time_is_still_the_apps_while_it_plays() -
 
 def test_a_barge_in_drops_the_queued_estimate() -> None:
     """After a barge-in the dropped audio no longer counts as playing."""
-    det = ph.PhantomDetector(motif=lambda: (False, None))
+    det = ps.PhantomDetector(motif=lambda: (False, None))
     det.pushed(10.0, 6.0)
     det.flushed(11.0)
     _monitor(det, 11.0, 14.5, loud=False)
@@ -106,7 +108,7 @@ def test_a_barge_in_drops_the_queued_estimate() -> None:
 def test_a_motif_playing_or_just_ended_is_not_an_episode() -> None:
     """A motif, and its tail for PHANTOM_QUIET_S, is the app's own sound."""
     state = {"motif": (True, None)}
-    det = ph.PhantomDetector(motif=lambda: state["motif"])
+    det = ps.PhantomDetector(motif=lambda: state["motif"])
     _monitor(det, 20.0, 21.0, loud=True)
     state["motif"] = (False, 21.0)
     _monitor(det, 21.0, 22.0, loud=True)  # the motif's tail
@@ -118,7 +120,7 @@ def test_a_motif_playing_or_just_ended_is_not_an_episode() -> None:
 
 def test_the_app_pushing_ends_an_episode() -> None:
     """A push during an episode ends it there."""
-    det = ph.PhantomDetector(motif=lambda: (False, None))
+    det = ps.PhantomDetector(motif=lambda: (False, None))
     _monitor(det, 100.0, 101.0, loud=True)
     det.pushed(101.0, 1.0)
     _monitor(det, 101.0, 101.5, loud=True)
@@ -130,7 +132,7 @@ def test_the_app_pushing_ends_an_episode() -> None:
 
 def test_the_last_push_age_is_kept_on_the_episode() -> None:
     """The episode says how long before it the app last pushed."""
-    det = ph.PhantomDetector(motif=lambda: (False, None))
+    det = ps.PhantomDetector(motif=lambda: (False, None))
     det.pushed(50.0, 1.0)
     _monitor(det, 100.0, 101.0, loud=True)
     (event,) = det.take()
@@ -175,7 +177,7 @@ ROBOT_DUMP = [
 
 def test_the_sink_inputs_are_the_output_streams_with_the_apps_marked() -> None:
     """Playback streams only, each with its node, serial, rate and client, the app's marked."""
-    inputs = ph.sink_inputs_from_pw_dump(ROBOT_DUMP, own_pid=1330)
+    inputs = ps.sink_inputs_from_pw_dump(ROBOT_DUMP, own_pid=1330)
     assert [(i["node"], i["serial"], i["rate"], i["pid"], i["ours"]) for i in inputs] == [
         (108, 1347, 16000, 1330, True),
         (128, 1830, 22050, 1330, True),
@@ -186,7 +188,7 @@ def test_the_sink_inputs_are_the_output_streams_with_the_apps_marked() -> None:
 
 def test_the_sink_inputs_line_names_each_node() -> None:
     """The WARNING's listing names every node, the app's marked."""
-    line = ph.describe_sink_inputs(ph.sink_inputs_from_pw_dump(ROBOT_DUMP, own_pid=1330))
+    line = ps.describe_sink_inputs(ps.sink_inputs_from_pw_dump(ROBOT_DUMP, own_pid=1330))
     assert "node 108 serial 1347 16000 Hz pid 1330 (this app)" in line
     assert "node 140 serial 1900 48000 Hz pid 1173" in line
     assert "maxlength 4194304" in line
@@ -209,7 +211,7 @@ PACTL_JSON = [
 
 def test_pactl_sink_inputs_are_read_the_same_way() -> None:
     """Where pactl is installed, its JSON gives the same fields."""
-    (entry,) = ph.sink_inputs_from_pactl(PACTL_JSON, own_pid=1330)
+    (entry,) = ps.sink_inputs_from_pactl(PACTL_JSON, own_pid=1330)
     assert (entry["node"], entry["serial"], entry["rate"], entry["pid"], entry["ours"]) == (
         108,
         1347,
@@ -232,8 +234,8 @@ def test_listing_the_sink_inputs_uses_pw_dump_then_pactl_and_never_raises(
             raise FileNotFoundError("pw-dump")
         return SimpleNamespace(returncode=0, stdout=json.dumps(PACTL_JSON))
 
-    monkeypatch.setattr(ph.subprocess, "run", run)
-    inputs, source = ph.list_sink_inputs(own_pid=1330)
+    monkeypatch.setattr(ps.subprocess, "run", run)
+    inputs, source = ps.list_sink_inputs(own_pid=1330)
     assert source == "pactl" and inputs[0]["node"] == 108
     assert [c[0] for c in calls] == ["pw-dump", "pactl"]
 
@@ -242,8 +244,8 @@ def test_listing_the_sink_inputs_uses_pw_dump_then_pactl_and_never_raises(
             raise subprocess.TimeoutExpired(cmd, 5)
         return SimpleNamespace(returncode=0, stdout="not json")
 
-    monkeypatch.setattr(ph.subprocess, "run", broken)
-    inputs, source = ph.list_sink_inputs(own_pid=1330)
+    monkeypatch.setattr(ps.subprocess, "run", broken)
+    inputs, source = ps.list_sink_inputs(own_pid=1330)
     assert inputs == [] and "unavailable" in source
 
 
@@ -265,21 +267,18 @@ def test_buffer_rms_reads_the_pad_format(fmt: str, samples: list[float], rms: fl
 
     dtype = {"F32LE": "<f4", "S16LE": "<i2", "U8": "u1"}[fmt]
     data = np.asarray(samples, dtype=dtype).tobytes()
-    got = ph.buffer_rms(data, fmt)
+    got = ps.buffer_rms(data, fmt)
     assert got == (None if rms is None else pytest.approx(rms, rel=1e-3))
 
 
 def test_the_pad_level_summarises_a_window() -> None:
     """Buffers in the window, those above LOUD_RMS, the peak and the format."""
-    level = ph.PadLevel()
+    level = ps.PadLevel()
     for i in range(10):
-        level.record(100.0 + 0.1 * i, 0.2 if i < 5 else 0.0, "F32LE")
-    level.record(200.0, 0.9, "F32LE")
-    summary = level.summary(100.0, 101.0)
-    assert (summary.buffers, summary.loud) == (10, 5)
-    assert summary.max_rms == pytest.approx(0.2)
-    assert summary.fmt == "F32LE"
-    assert level.summary(300.0, 301.0).buffers == 0
+        level._record(100.0 + 0.1 * i, 0.2 if i < 5 else 0.0, "F32LE")
+    level._record(200.0, 0.9, "F32LE")
+    assert level.summary(100.0, 101.0) == "10 buffers, 5 loud, max RMS 0.2000 (F32LE)"
+    assert level.summary(300.0, 301.0) == "no buffers"
 
 
 def test_a_pad_probe_measures_buffers_reaching_a_real_sink() -> None:
@@ -289,7 +288,7 @@ def test_a_pad_probe_measures_buffers_reaching_a_real_sink() -> None:
         "audiotestsrc num-buffers=20 wave=sine volume=0.5 ! "
         "audio/x-raw,format=F32LE,rate=16000,channels=1 ! fakesink name=sink sync=false"
     )
-    level = ph.PadLevel()
+    level = ps.PadLevel()
     sink = pipeline.get_by_name("sink")
     assert level.attach(sink)
     assert level.attach(sink)  # the same sink again: one probe, not two
@@ -298,13 +297,13 @@ def test_a_pad_probe_measures_buffers_reaching_a_real_sink() -> None:
     pipeline.get_bus().timed_pop_filtered(5 * Gst.SECOND, done)
     pipeline.set_state(Gst.State.NULL)
     summary = level.summary(0.0, time.monotonic() + 1.0)
-    assert summary.buffers == 20 and summary.loud == 20
-    assert summary.max_rms == pytest.approx(0.5 / 2**0.5, rel=0.05)
+    found = re.fullmatch(r"20 buffers, 20 loud, max RMS ([\d.]+) \(F32LE\)", summary)
+    assert found and float(found.group(1)) == pytest.approx(0.5 / 2**0.5, rel=0.05)
 
 
 def test_a_failing_measurement_never_reaches_the_streaming_thread() -> None:
     """The probe returns OK whatever goes wrong inside it."""
-    level = ph.PadLevel()
+    level = ps.PadLevel()
     info = SimpleNamespace(get_buffer=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
     pad = SimpleNamespace(get_current_caps=lambda: None)
     Gst = _gst()
@@ -319,7 +318,7 @@ def test_the_wobbler_watch_counts_nonzero_offsets_and_passes_them_on() -> None:
     applied: list[tuple[float, ...]] = []
     wobbler = SimpleNamespace(_apply_offsets=applied.append)
     audio = SimpleNamespace(_head_wobbler=wobbler)
-    watch = ph.WobblerWatch(clock=lambda: 50.0)
+    watch = ps.WobblerWatch(clock=lambda: 50.0)
     assert watch.keep(audio) is True
     assert watch.keep(audio) is True  # wrapped once, not twice
     wobbler._apply_offsets((0.0,) * 6)
@@ -332,7 +331,7 @@ def test_the_wobbler_watch_counts_nonzero_offsets_and_passes_them_on() -> None:
     watch.keep(audio)
     newer._apply_offsets((0.0, 0.002, 0.0, 0.0, 0.0, 0.0))
     assert watch.fired(49.0, 51.0) == 2
-    assert ph.WobblerWatch().keep(SimpleNamespace(_head_wobbler=None)) is False
+    assert ps.WobblerWatch().keep(SimpleNamespace(_head_wobbler=None)) is False
 
 
 # --- motifs: open and closed, from the fork's own watcher --------------------------------
@@ -362,13 +361,13 @@ def test_watch_motif_marks_the_motif_active_until_it_ends() -> None:
 
 class _Fakes:
     def __init__(self) -> None:
-        self.pad = ph.PadLevel()
-        self.wobbler = ph.WobblerWatch()
+        self.pad = ps.PadLevel()
+        self.wobbler = ps.WobblerWatch()
         self.snapshots = 0
 
     def list_inputs(self) -> tuple[list[dict[str, Any]], str]:
         self.snapshots += 1
-        return ph.sink_inputs_from_pw_dump(ROBOT_DUMP, own_pid=1330), "pw-dump"
+        return ps.sink_inputs_from_pw_dump(ROBOT_DUMP, own_pid=1330), "pw-dump"
 
 
 def test_an_episode_is_reported_once_with_the_sink_inputs_the_pad_and_the_wobbler(
@@ -376,7 +375,7 @@ def test_an_episode_is_reported_once_with_the_sink_inputs_the_pad_and_the_wobble
 ) -> None:
     """One WARNING at the episode's end, with what was listed at its start."""
     fakes = _Fakes()
-    watch = ph.PhantomWatch(
+    watch = ps.PhantomWatch(
         motif=lambda: (False, None),
         list_inputs=fakes.list_inputs,
         pad=fakes.pad,
@@ -384,10 +383,10 @@ def test_an_episode_is_reported_once_with_the_sink_inputs_the_pad_and_the_wobble
     )
     watch.pushed(10.0, 1.0)
     for i in range(20):
-        fakes.pad.record(100.0 + 0.1 * i, 0.0, "F32LE")  # the app's sink: silence only
+        fakes.pad._record(100.0 + 0.1 * i, 0.0, "F32LE")  # the app's sink: silence only
     _monitor(watch.detector, 100.0, 102.0, loud=True)
     audio = SimpleNamespace(_playbin=None)
-    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
         for event in watch.take():
             watch.act(event, audio)
         _monitor(watch.detector, 102.0, 105.0, loud=False)
@@ -411,14 +410,14 @@ def test_a_second_episode_within_the_minute_is_one_info_line(
 ) -> None:
     """A second episode in the minute is one INFO line, with no listing."""
     fakes = _Fakes()
-    watch = ph.PhantomWatch(
+    watch = ps.PhantomWatch(
         motif=lambda: (False, None),
         list_inputs=fakes.list_inputs,
         pad=fakes.pad,
         wobbler=fakes.wobbler,
     )
     audio = SimpleNamespace(_playbin=None)
-    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
         for start in (100.0, 120.0):
             _monitor(watch.detector, start, start + 1.0, loud=True)
             _monitor(watch.detector, start + 1.0, start + 4.0, loud=False)
@@ -435,10 +434,10 @@ def test_a_report_that_fails_is_logged_and_never_raises(caplog: pytest.LogCaptur
     def broken() -> Any:
         raise RuntimeError("no pw-dump today")
 
-    watch = ph.PhantomWatch(motif=lambda: (False, None), list_inputs=broken)
+    watch = ps.PhantomWatch(motif=lambda: (False, None), list_inputs=broken)
     _monitor(watch.detector, 100.0, 101.0, loud=True)
     _monitor(watch.detector, 101.0, 104.0, loud=False)
-    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
         for event in watch.take():
             watch.act(event, SimpleNamespace(_playbin=None))
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
@@ -447,7 +446,7 @@ def test_a_report_that_fails_is_logged_and_never_raises(caplog: pytest.LogCaptur
 
 def test_the_monitor_callback_never_raises_into_gstreamer() -> None:
     """The monitor's callback swallows a failure."""
-    watch = ph.PhantomWatch(motif=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    watch = ps.PhantomWatch(motif=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
     watch.monitored(1.0, 0.1, 0.1)  # no exception
 
 
@@ -456,12 +455,12 @@ def test_an_episode_ended_before_its_listing_ran_still_lists_the_sink_inputs(
 ) -> None:
     """Each event runs in its own worker: an end handled first lists the sink inputs itself."""
     fakes = _Fakes()
-    watch = ph.PhantomWatch(motif=lambda: (False, None), list_inputs=fakes.list_inputs)
+    watch = ps.PhantomWatch(motif=lambda: (False, None), list_inputs=fakes.list_inputs)
     _monitor(watch.detector, 100.0, 101.0, loud=True)
     watch.pushed(101.0, 1.0)  # ends the episode: started and ended come out together
     started, ended = watch.take()
     audio = SimpleNamespace(_playbin=None)
-    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
         watch.act(ended, audio)
         watch.act(started, audio)
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
@@ -502,16 +501,16 @@ def test_sound_from_the_sdks_own_player_is_an_info_line_not_a_phantom(
 ) -> None:
     """The app tools' music and express sounds play through play_sound, not watch_motif."""
     fakes = _Fakes()
-    watch = ph.PhantomWatch(motif=lambda: (False, None), list_inputs=fakes.list_inputs)
+    watch = ps.PhantomWatch(motif=lambda: (False, None), list_inputs=fakes.list_inputs)
     audio = SimpleNamespace(_playbin=_Playbin(position_s, 47.5))
-    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
         _monitor(watch.detector, 100.0, 101.0, loud=True)
         for event in watch.take():
             watch.act(event, audio)
         _monitor(watch.detector, 101.0, 104.0, loud=False)
         for event in watch.take():
             watch.act(event, audio)
-    lines = [(r.levelno, r.getMessage()) for r in caplog.records if r.name == ph.logger.name]
+    lines = [(r.levelno, r.getMessage()) for r in caplog.records if r.name == ps.logger.name]
     assert len(lines) == 1
     assert lines[0][0] == level and words in lines[0][1]
 
@@ -519,12 +518,12 @@ def test_sound_from_the_sdks_own_player_is_an_info_line_not_a_phantom(
 # --- fix round 1 (the review, 2026-10-26) --------------------------------------------------
 
 
-def _run(watch: ph.PhantomWatch, audio: Any) -> None:
+def _run(watch: ps.PhantomWatch, audio: Any) -> None:
     for event in watch.take():
         watch.act(event, audio)
 
 
-def _episode(watch: ph.PhantomWatch, start: float, audio: Any) -> None:
+def _episode(watch: ps.PhantomWatch, start: float, audio: Any) -> None:
     """One second of sound from ``start`` and three of quiet, acted on as the console does."""
     _monitor(watch.detector, start, start + 1.0, loud=True)
     _run(watch, audio)
@@ -539,9 +538,9 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
 def test_at_most_one_phantom_warning_a_minute(caplog: pytest.LogCaptureFixture) -> None:
     """Episodes within PHANTOM_REPORT_EVERY_S of a WARNING are INFO lines."""
     fakes = _Fakes()
-    watch = ph.PhantomWatch(motif=lambda: (False, None), list_inputs=fakes.list_inputs)
+    watch = ps.PhantomWatch(motif=lambda: (False, None), list_inputs=fakes.list_inputs)
     audio = SimpleNamespace(_playbin=None)
-    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
         for start in (100.0, 130.0, 165.0):
             _episode(watch, start, audio)
     assert len(_warnings(caplog)) == 2
@@ -553,13 +552,13 @@ def test_an_sdk_sound_does_not_use_up_the_minutes_warning(
 ) -> None:
     """Only a WARNING actually logged starts the minute; an app sound is an INFO line."""
     clock = [99.0]
-    sounds = ph.SoundStarts(clock=lambda: clock[0])
+    sounds = ps.SoundStarts(clock=lambda: clock[0])
     audio = SimpleNamespace(_playbin=None, play_sound=lambda path: None)
     sounds.install(audio)
     audio.play_sound("express.wav")  # at 99.0, a second before the sound is heard
-    watch = ph.PhantomWatch(motif=lambda: (False, None), list_inputs=_Fakes().list_inputs)
+    watch = ps.PhantomWatch(motif=lambda: (False, None), list_inputs=_Fakes().list_inputs)
     watch.sounds = sounds
-    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
         _episode(watch, 100.0, audio)
         _episode(watch, 120.0, audio)
     assert len(_warnings(caplog)) == 1
@@ -570,14 +569,14 @@ def test_a_short_sdk_sound_ended_before_the_report_runs_is_no_warning(
 ) -> None:
     """A 1.2 s express motif: its playbin is at its end when act runs, but its start was seen."""
     clock = [100.0]
-    sounds = ph.SoundStarts(clock=lambda: clock[0])
+    sounds = ps.SoundStarts(clock=lambda: clock[0])
     audio = SimpleNamespace(_playbin=None, play_sound=lambda path: None)
     sounds.install(audio)
     audio.play_sound("motif.wav")
     audio._playbin = _Playbin(1.2, 1.2)  # at its end, never torn down
-    watch = ph.PhantomWatch(motif=lambda: (False, None), list_inputs=_Fakes().list_inputs)
+    watch = ps.PhantomWatch(motif=lambda: (False, None), list_inputs=_Fakes().list_inputs)
     watch.sounds = sounds
-    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
         _monitor(watch.detector, 100.1, 101.3, loud=True)
         _monitor(watch.detector, 101.3, 104.0, loud=False)
         _run(watch, audio)  # start and end acted on together, after the sound ended
@@ -591,7 +590,7 @@ def test_a_motif_and_a_direct_caller_each_go_through_the_wrapper_once() -> None:
     played: list[str] = []
     audio = SimpleNamespace(_playbin=None)
     audio.play_sound = lambda path: played.append(path)
-    sounds = ph.SoundStarts(clock=lambda: 5.0)
+    sounds = ps.SoundStarts(clock=lambda: 5.0)
     assert sounds.install(audio) is True
     assert sounds.install(audio) is True  # wrapped once, not twice
     media = SimpleNamespace(play_sound=lambda path: audio.play_sound(path))  # as MediaManager
@@ -599,14 +598,14 @@ def test_a_motif_and_a_direct_caller_each_go_through_the_wrapper_once() -> None:
     media.play_sound("song.wav")
     assert played == ["ring.wav", "song.wav"]
     assert sounds.starts() == [5.0, 5.0]
-    assert ph.SoundStarts().install(SimpleNamespace()) is False
+    assert ps.SoundStarts().install(SimpleNamespace()) is False
 
 
 def test_the_sound_wrapper_tells_its_listeners_after_the_original_ran() -> None:
     """The hook a later unit uses to tear each playbin down at its end."""
     audio = SimpleNamespace(_playbin=None)
     audio.play_sound = lambda path: setattr(audio, "_playbin", f"playbin for {path}")
-    sounds = ph.SoundStarts(clock=lambda: 1.0)
+    sounds = ps.SoundStarts(clock=lambda: 1.0)
     heard: list[tuple[str, Any]] = []
     sounds.listeners.append(lambda a, path, playbin: heard.append((path, playbin)))
     sounds.install(audio)
@@ -645,7 +644,7 @@ def test_the_probe_is_on_only_while_the_app_is_quiet(monkeypatch: pytest.MonkeyP
     """A push removes it before the reply's buffers flow; quiet puts it back."""
     _gst()
     audio, pad = _probe_rig(monkeypatch, [True])
-    watch = ph.PhantomWatch(motif=lambda: (False, None))
+    watch = ps.PhantomWatch(motif=lambda: (False, None))
     watch.keep(audio, 100.0)
     assert len(pad.probes) == 1  # nothing ever pushed: quiet
     watch.pushed(101.0, 2.0)
@@ -661,7 +660,7 @@ def test_the_probe_comes_off_when_the_pipeline_stops(monkeypatch: pytest.MonkeyP
     _gst()
     playing = [True]
     audio, pad = _probe_rig(monkeypatch, playing)
-    watch = ph.PhantomWatch(motif=lambda: (False, None))
+    watch = ps.PhantomWatch(motif=lambda: (False, None))
     watch.keep(audio, 100.0)
     playing[0] = False
     watch.keep(audio, 101.0)
@@ -675,20 +674,20 @@ def test_a_detached_probe_sees_none_of_a_real_reply() -> None:
         "audiotestsrc num-buffers=20 wave=sine volume=0.5 ! "
         "audio/x-raw,format=F32LE,rate=16000,channels=1 ! fakesink name=sink sync=false"
     )
-    watch = ph.PhantomWatch(motif=lambda: (False, None))
+    watch = ps.PhantomWatch(motif=lambda: (False, None))
     assert watch.pad.attach(pipeline.get_by_name("sink"))
     watch.pushed(time.monotonic(), 1.0)
     pipeline.set_state(Gst.State.PLAYING)
     done = Gst.MessageType.EOS | Gst.MessageType.ERROR
     pipeline.get_bus().timed_pop_filtered(5 * Gst.SECOND, done)
     pipeline.set_state(Gst.State.NULL)
-    assert watch.pad.summary(0.0, time.monotonic() + 1.0).buffers == 0
+    assert watch.pad.summary(0.0, time.monotonic() + 1.0) == "no buffers"
 
 
 def test_the_pad_format_is_read_from_caps_events_not_per_buffer() -> None:
     """Each buffer uses the format of the last CAPS event; the pad's caps are not queried."""
     Gst = _gst()
-    level = ph.PadLevel()
+    level = ps.PadLevel()
     caps = Gst.Caps.from_string("audio/x-raw,format=S16LE,rate=16000,channels=1")
     event = Gst.Event.new_caps(caps)
     event_info = SimpleNamespace(type=Gst.PadProbeType.EVENT_DOWNSTREAM, get_event=lambda: event)
@@ -698,8 +697,7 @@ def test_the_pad_format_is_read_from_caps_events_not_per_buffer() -> None:
     info = SimpleNamespace(type=Gst.PadProbeType.BUFFER, get_buffer=lambda: buf)
     assert level._on_probe(pad, info) == Gst.PadProbeReturn.OK
     summary = level.summary(0.0, time.monotonic() + 1.0)
-    assert (summary.buffers, summary.fmt) == (1, "S16LE")
-    assert summary.max_rms == pytest.approx(0.5)
+    assert summary == "1 buffers, 1 loud, max RMS 0.5000 (S16LE)"
 
 
 def test_a_huge_or_undecodable_listing_is_a_reason_not_an_exception(
@@ -711,11 +709,11 @@ def test_a_huge_or_undecodable_listing_is_a_reason_not_an_exception(
     def run(cmd: list[str], **kwargs: Any) -> Any:
         seen.update(kwargs)
         if cmd[0] == "pw-dump":
-            return SimpleNamespace(returncode=0, stdout="x" * (ph.SINK_INPUTS_MAX_BYTES + 1))
+            return SimpleNamespace(returncode=0, stdout="x" * (ps.SINK_INPUTS_MAX_BYTES + 1))
         raise FileNotFoundError("pactl")
 
-    monkeypatch.setattr(ph.subprocess, "run", run)
-    inputs, source = ph.list_sink_inputs(own_pid=1)
+    monkeypatch.setattr(ps.subprocess, "run", run)
+    inputs, source = ps.list_sink_inputs(own_pid=1)
     assert inputs == [] and "bytes" in source
     assert seen.get("errors") == "replace"
 
@@ -724,9 +722,9 @@ def test_a_listing_that_hangs_is_killed_at_its_timeout(monkeypatch: pytest.Monke
     """A real child: back within the timeout, reason given, no child left behind."""
     import os
 
-    monkeypatch.setattr(ph, "SINK_INPUT_COMMANDS", [["sleep", "10"]])
+    monkeypatch.setattr(ps, "SINK_INPUT_COMMANDS", [["sleep", "10"]])
     began = time.monotonic()
-    inputs, source = ph.list_sink_inputs(own_pid=1, timeout_s=0.2)
+    inputs, source = ps.list_sink_inputs(own_pid=1, timeout_s=0.2)
     assert time.monotonic() - began < 3.0
     assert inputs == [] and "TimeoutExpired" in source
     pgrep = ["pgrep", "-P", str(os.getpid()), "sleep"]
@@ -742,14 +740,14 @@ def test_a_phantom_soon_after_a_short_sdk_sound_is_still_a_warning(
 ) -> None:
     """The reviewer's case: play_sound, 1 s of sound, 1.8 s quiet, then 57 s of sound."""
     clock = [99.0]
-    sounds = ph.SoundStarts(clock=lambda: clock[0])
+    sounds = ps.SoundStarts(clock=lambda: clock[0])
     audio = SimpleNamespace(_playbin=None, play_sound=lambda path: None)
     sounds.install(audio)
     audio.play_sound("express.wav")
     audio._playbin = _Playbin(1.0, 1.0)  # the express sound, at its end
-    watch = ph.PhantomWatch(motif=lambda: (False, None), list_inputs=_Fakes().list_inputs)
+    watch = ps.PhantomWatch(motif=lambda: (False, None), list_inputs=_Fakes().list_inputs)
     watch.sounds = sounds
-    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
         _monitor(watch.detector, 99.0, 100.0, loud=True)
         _run(watch, audio)
         _monitor(watch.detector, 100.0, 101.8, loud=False)
@@ -763,14 +761,14 @@ def test_a_phantom_soon_after_a_short_sdk_sound_is_still_a_warning(
 def test_a_long_song_mid_sound_stays_an_info_line(caplog: pytest.LogCaptureFixture) -> None:
     """The playbin still mid-sound covers a long sound, whatever the start-time match says."""
     clock = [99.0]
-    sounds = ph.SoundStarts(clock=lambda: clock[0])
+    sounds = ps.SoundStarts(clock=lambda: clock[0])
     audio = SimpleNamespace(_playbin=None, play_sound=lambda path: None)
     sounds.install(audio)
     audio.play_sound("song.wav")
     audio._playbin = _Playbin(1.0, 180.0)
-    watch = ph.PhantomWatch(motif=lambda: (False, None), list_inputs=_Fakes().list_inputs)
+    watch = ps.PhantomWatch(motif=lambda: (False, None), list_inputs=_Fakes().list_inputs)
     watch.sounds = sounds
-    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
         _monitor(watch.detector, 99.0, 139.0, loud=True)
         _run(watch, audio)
         _monitor(watch.detector, 139.0, 142.0, loud=False)
@@ -784,7 +782,7 @@ def test_a_keep_that_checked_quiet_before_a_push_cannot_attach_after_it(
     """The gate: keep's quiet check and attach are one step, so a push's detach comes after."""
     _gst()
     audio, pad = _probe_rig(monkeypatch, [True])
-    watch = ph.PhantomWatch(motif=lambda: (False, None))
+    watch = ps.PhantomWatch(motif=lambda: (False, None))
     inside, go = threading.Event(), threading.Event()
     quiet = watch.detector.app_quiet
 
