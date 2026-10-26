@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import time
 import logging
+import threading
 import subprocess
 from types import SimpleNamespace
 from typing import Any
@@ -731,3 +732,76 @@ def test_a_listing_that_hangs_is_killed_at_its_timeout(monkeypatch: pytest.Monke
     pgrep = ["pgrep", "-P", str(os.getpid()), "sleep"]
     left = subprocess.run(pgrep, capture_output=True, text=True)
     assert left.stdout.strip() == ""
+
+
+# --- re-review (fix round 1) -----------------------------------------------------------------
+
+
+def test_a_phantom_soon_after_a_short_sdk_sound_is_still_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The reviewer's case: play_sound, 1 s of sound, 1.8 s quiet, then 57 s of sound."""
+    clock = [99.0]
+    sounds = ph.SoundStarts(clock=lambda: clock[0])
+    audio = SimpleNamespace(_playbin=None, play_sound=lambda path: None)
+    sounds.install(audio)
+    audio.play_sound("express.wav")
+    audio._playbin = _Playbin(1.0, 1.0)  # the express sound, at its end
+    watch = ph.PhantomWatch(motif=lambda: (False, None), list_inputs=_Fakes().list_inputs)
+    watch.sounds = sounds
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        _monitor(watch.detector, 99.0, 100.0, loud=True)
+        _run(watch, audio)
+        _monitor(watch.detector, 100.0, 101.8, loud=False)
+        _monitor(watch.detector, 101.8, 158.8, loud=True)
+        _run(watch, audio)
+        _monitor(watch.detector, 158.8, 162.0, loud=False)
+        _run(watch, audio)
+    assert len(_warnings(caplog)) == 1
+
+
+def test_a_long_song_mid_sound_stays_an_info_line(caplog: pytest.LogCaptureFixture) -> None:
+    """The playbin still mid-sound covers a long sound, whatever the start-time match says."""
+    clock = [99.0]
+    sounds = ph.SoundStarts(clock=lambda: clock[0])
+    audio = SimpleNamespace(_playbin=None, play_sound=lambda path: None)
+    sounds.install(audio)
+    audio.play_sound("song.wav")
+    audio._playbin = _Playbin(1.0, 180.0)
+    watch = ph.PhantomWatch(motif=lambda: (False, None), list_inputs=_Fakes().list_inputs)
+    watch.sounds = sounds
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        _monitor(watch.detector, 99.0, 139.0, loud=True)
+        _run(watch, audio)
+        _monitor(watch.detector, 139.0, 142.0, loud=False)
+        _run(watch, audio)
+    assert _warnings(caplog) == []
+
+
+def test_a_keep_that_checked_quiet_before_a_push_cannot_attach_after_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate: keep's quiet check and attach are one step, so a push's detach comes after."""
+    _gst()
+    audio, pad = _probe_rig(monkeypatch, [True])
+    watch = ph.PhantomWatch(motif=lambda: (False, None))
+    inside, go = threading.Event(), threading.Event()
+    quiet = watch.detector.app_quiet
+
+    def slow_quiet(now: float) -> bool:
+        result = quiet(now)
+        inside.set()
+        go.wait(2.0)  # the push arrives between the check and the attach
+        return result
+
+    monkeypatch.setattr(watch.detector, "app_quiet", slow_quiet)
+    keeper = threading.Thread(target=watch.keep, args=(audio, 100.0))
+    keeper.start()
+    assert inside.wait(2.0)
+    pusher = threading.Thread(target=watch.pushed, args=(100.1, 2.0))
+    pusher.start()
+    pusher.join(0.2)
+    go.set()
+    keeper.join(2.0)
+    pusher.join(2.0)
+    assert pad.probes == {}  # the push's detach came after the attach

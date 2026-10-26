@@ -881,7 +881,7 @@ def stop_motif(audio: Any) -> bool:
 # the app pushed nothing (and its queued audio has played out) for PHANTOM_QUIET_S and no
 # motif played. Sound from the SDK's play_sound (the app tools' music and express sounds
 # bypass watch_motif) is one INFO line, not phantom speech: a sound started within
-# SDK_SOUND_S before the episode, or a playbin still mid-sound when it is reported.
+# SDK_SOUND_S before an episode no longer than that, or a playbin still mid-sound.
 # One WARNING per episode, at most one every PHANTOM_REPORT_EVERY_S, names
 # every sink input (pw-dump, or pactl), whether the app's speech sink carried sound in
 # the episode (a pad probe on it: RMS of each buffer), and whether the head wobbler fired.
@@ -914,8 +914,22 @@ class PhantomEpisode:
     end: float | None = None
     end_cause: str = ""
     inputs: SinkInputs | None = None
-    sdk_sound: str | None = None  # the SDK's sound player was playing: not a phantom
+    sound_started: str | None = None  # a play_sound call just before the episode
+    sound_playing: str | None = None  # the SDK's playbin mid-sound when it was checked
     sdk_checked: bool = False
+
+    def sdk_sound(self) -> str | None:
+        """Name the SDK sound that accounts for the episode, or None.
+
+        A start time just before only accounts for a short episode: a phantom beginning
+        within PHANTOM_END_S of a short sound's end is folded into its episode, and must
+        still be warned of. A playbin still mid-sound accounts for a long song.
+        """
+        if self.sound_playing is not None:
+            return self.sound_playing
+        if self.sound_started is not None and self.loud_s <= SDK_SOUND_S:
+            return self.sound_started
+        return None
 
 
 class PhantomEvent(NamedTuple):
@@ -1491,16 +1505,18 @@ class PhantomWatch:
         """Carry out one event. Holds the act lock."""
         if not episode.sdk_checked:  # at the start, or at the end if the start has not run
             episode.sdk_checked = True
-            episode.sdk_sound = self._sound_before(episode) or _sdk_sound(audio)
+            episode.sound_started = self._sound_before(episode)
+            episode.sound_playing = _sdk_sound(audio)
+        sdk_sound = episode.sdk_sound()
         last = self._last_warning
         may_warn = last is None or episode.start - last >= PHANTOM_REPORT_EVERY_S
-        if event.kind == "started" and may_warn and episode.sdk_sound is None:
+        if event.kind == "started" and may_warn and sdk_sound is None:
             self._list(episode)
-        elif event.kind == "ended" and episode.sdk_sound is not None:
+        elif event.kind == "ended" and sdk_sound is not None:
             logger.info(
                 "Speaker sound with no push from the app while the SDK's sound player was playing "
                 "(%s): %.1f s loud, %s to %s; not phantom speech",
-                episode.sdk_sound,
+                sdk_sound,
                 episode.loud_s,
                 _wall(episode.start),
                 _wall(episode.end if episode.end is not None else episode.last_loud),
