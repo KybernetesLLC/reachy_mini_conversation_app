@@ -5,11 +5,11 @@ before. The app logged no push and the head did not move; the wobbler is fed fro
 inside the app's speech pipeline, so the sound most likely never passed through it.
 This detector logs any such episode: the speaker's monitor loud for PHANTOM_LOUD_S while
 the app pushed nothing (and its queued audio has played out) for PHANTOM_QUIET_S and no
-motif played. Sound from the SDK's play_sound (the app tools' music and express sounds
-bypass watch_motif) is one INFO line, not phantom speech: a sound started within
-SDK_SOUND_S before an episode no longer than that, or a playbin still mid-sound.
-A reply pushed but not yet heard (ReplyTracker's pending state: it may play up to 65 s
-late) is the app's own sound too.
+sound of its own was open in that time. Every play_sound playbin is the app's: each is
+marked open when it starts and closed when watch_sound tears it down at its end, so
+"a sound is open" is a flag, whoever called play_sound. A reply pushed but not yet
+heard (ReplyTracker's pending state: it may play up to 65 s late) is the app's own
+sound too.
 One WARNING per episode, at most one every PHANTOM_REPORT_EVERY_S, names every sink input
 (pw-dump, or pactl) and whether the app's speech sink carried sound in the episode (a pad
 probe on it: RMS of each buffer). Nothing is kept but RMS numbers and times. Nothing runs
@@ -37,19 +37,18 @@ from dataclasses import dataclass
 import numpy as np
 
 from reachy_mini_conversation_app import playback_health
-from reachy_mini_conversation_app.playback_health import MOTIFS, LOUD_RMS, rms
+from reachy_mini_conversation_app.playback_health import SOUNDS, LOUD_RMS, SOUND_LOCK, rms
 
 
 logger = logging.getLogger(__name__)
 
 PHANTOM_LOUD_S = 0.5  # monitor speech, within one candidate, that opens an episode
-PHANTOM_QUIET_S = 3.0  # the app pushed nothing, its queued audio and any motif ended, this long ago
+PHANTOM_QUIET_S = 3.0  # the app pushed nothing, its queued audio and any sound ended, this long ago
 PHANTOM_END_S = 2.0  # a quiet monitor for this long closes an episode
 PHANTOM_REPORT_EVERY_S = 60.0  # at most one WARNING in this long
 PROBE_MAX_S = 30.0  # the speech-sink probe stays on at most this long for one suspicion
 MONITOR_GONE_S = 120.0  # an open episode with no monitor buffers for this long is closed
 ERRORS_EVERY_S = 60.0  # caught errors are logged at most this often
-SDK_SOUND_S = 3.0  # sound this soon after a play_sound call is that sound (motifs run 0.4-1.9 s)
 SINK_INPUTS_TIMEOUT_S = 5.0
 SINK_INPUTS_MAX_BYTES = 8 * 1024 * 1024  # pw-dump printed 342 KB on the robot (2026-10-26)
 SINK_INPUT_COMMANDS = [["pw-dump"], ["pactl", "-f", "json", "list", "sink-inputs"]]
@@ -69,22 +68,6 @@ class PhantomEpisode:
     end: float | None = None
     end_cause: str = ""
     inputs: SinkInputs | None = None
-    sound_started: str | None = None  # a play_sound call just before the episode
-    sound_playing: str | None = None  # the SDK's playbin mid-sound when it was checked
-    sdk_checked: bool = False
-
-    def sdk_sound(self) -> str | None:
-        """Name the SDK sound that accounts for the episode, or None.
-
-        A start time just before only accounts for a short episode: a phantom beginning
-        within PHANTOM_END_S of a short sound's end is folded into its episode, and must
-        still be warned of. A playbin still mid-sound accounts for a long song.
-        """
-        if self.sound_playing is not None:
-            return self.sound_playing
-        if self.sound_started is not None and self.loud_s <= SDK_SOUND_S:
-            return self.sound_started
-        return None
 
     @property
     def end_or_last(self) -> float:
@@ -131,14 +114,14 @@ class PhantomDetector:
 
     def __init__(
         self,
-        motif: Callable[[], tuple[bool, float | None]] | None = None,
+        sound: Callable[[], tuple[bool, float | None]] | None = None,
         pending: Callable[[float], bool] | None = None,
     ) -> None:
-        """``motif`` returns (a motif is playing, when the last one closed); MOTIFS by default.
+        """``sound`` returns (a sound is open, when the last one closed); SOUNDS by default.
 
         ``pending(now)`` says whether a pushed reply has not been heard yet (ReplyTracker).
         """
-        self._motif = motif or MOTIFS.state
+        self._sound = sound or SOUNDS.state
         self._pending = pending or (lambda now: False)
         self.errors = ErrorCount()
         self._lock = threading.Lock()
@@ -177,7 +160,7 @@ class PhantomDetector:
                 return False
         if self._pending(now):
             return False
-        playing, closed_at = self._motif()
+        playing, closed_at = self._sound()
         if playing:
             return False
         return closed_at is None or now - closed_at >= PHANTOM_QUIET_S
@@ -228,7 +211,7 @@ class PhantomDetector:
             with self._lock:
                 self._monitored(now, seconds, speech_s)
         except Exception as exc:
-            # The motif and pending callables belong to other modules, so no narrower class
+            # The sound and pending callables belong to other modules, so no narrower class
             # covers them; an exception out of here would reach the monitor's appsink callback.
             self.errors.note(exc)
 
@@ -546,21 +529,20 @@ def wrap_once(obj: Any, name: str, tag: Any, make_wrapper: Callable[[Any], Any])
 
 
 class SoundStarts:
-    """Wrap the SDK audio's play_sound once, to note when each sound starts.
+    """Wrap the SDK audio's play_sound once, to hand each new sound's playbin to listeners.
 
-    Every caller goes through it: MediaManager.play_sound calls audio.play_sound, and so
-    do play_motif and the app tools' music and express sounds. The wrapper calls the
-    original method, captured before wrapping, never itself: play_motif calls it under
-    MOTIF_LOCK. ``listeners`` are called after the original, with (audio, path, playbin),
-    for anything that has to follow each sound's playbin.
+    Every caller goes through it: MediaManager.play_sound calls audio.play_sound (the
+    SDK's play_move does), and so do conversation.sound and the app tools' music and
+    express sounds. The wrapper holds SOUND_LOCK while the original replaces
+    audio._playbin, so a teardown never clears a newer sound's handle; it calls the
+    original method, captured before wrapping, never itself. ``listeners`` are called
+    under that lock, after the original, with (audio, playbin, path), for a playbin the
+    call made; they must not take SOUND_LOCK.
     """
 
-    def __init__(self, clock: Callable[[], float] = time.monotonic, keep: int = 1000) -> None:
-        """Start with no sound seen."""
-        self._clock = clock
-        self._lock = threading.Lock()
-        self._starts: deque[float] = deque(maxlen=keep)
-        self.listeners: list[Callable[[Any, Any, Any], None]] = []
+    def __init__(self) -> None:
+        """Start with no listener."""
+        self.listeners: list[Callable[[Any, Any, Any], object]] = []
 
     def install(self, audio: Any) -> bool:
         """Wrap ``audio.play_sound``, once. Returns whether it is wrapped.
@@ -573,30 +555,22 @@ class SoundStarts:
 
         def make(original: Callable[..., Any]) -> Callable[..., Any]:
             def play_sound(sound_file: Any, *args: Any, **kwargs: Any) -> Any:
-                with self._lock:
-                    self._starts.append(self._clock())
-                result = original(sound_file, *args, **kwargs)
-                for listener in list(self.listeners):
-                    try:
-                        listener(audio, sound_file, getattr(audio, "_playbin", None))
-                    except Exception:
-                        logger.warning("A play_sound listener failed", exc_info=True)
+                with SOUND_LOCK:
+                    before = getattr(audio, "_playbin", None)
+                    result = original(sound_file, *args, **kwargs)
+                    playbin = getattr(audio, "_playbin", None)
+                    if playbin is None or playbin is before:
+                        return result  # no new playbin: the SDK could not make one
+                    for listener in list(self.listeners):
+                        try:
+                            listener(audio, playbin, sound_file)
+                        except Exception:
+                            logger.warning("A play_sound listener failed", exc_info=True)
                 return result
 
             return play_sound
 
         return wrap_once(audio, "play_sound", self, make)
-
-    def starts(self) -> list[float]:
-        """Return the times of the sounds started, oldest first."""
-        with self._lock:
-            return list(self._starts)
-
-    def last_before(self, t: float) -> float | None:
-        """Return the time of the last sound started at or before ``t``, or None."""
-        with self._lock:
-            before = [s for s in self._starts if s <= t]
-        return before[-1] if before else None
 
 
 def _wall(t: float) -> str:
@@ -631,26 +605,6 @@ def _playbin_status(audio: Any) -> PlaybinStatus | None:
     )
 
 
-def _sdk_sound(audio: Any) -> str | None:
-    """Describe the SDK's play_sound playbin if it is playing a sound now, else None. Never raises.
-
-    The app tools' music and express sounds use play_sound directly, not watch_motif. A
-    playbin left at its end (the SDK never tears it down) is not playing.
-    """
-    try:
-        from gi.repository import Gst
-
-        status = _playbin_status(audio)
-        if status is None or status.state != Gst.State.PLAYING:
-            return None
-        pos, dur = status.position_s, status.duration_s
-        if pos is None or dur is None or pos >= dur - 0.1:
-            return None
-        return f"{status.name} at {pos:.1f} of {dur:.1f} s"
-    except Exception:
-        return None
-
-
 def _describe_playbin(audio: Any) -> str:
     """Describe the SDK's motif playbin: none, or its state and position. Never raises."""
     try:
@@ -665,7 +619,7 @@ def _describe_playbin(audio: Any) -> str:
 
 
 class PhantomWatch:
-    """The detector, the speech-sink probe, the play_sound starts and the report, for the console.
+    """The detector, the speech-sink probe, the play_sound wrap and the report, for the console.
 
     monitored() runs on the speaker monitor's streaming thread; pushed(), flushed() and
     take() on the event loop; keep() and act() in a worker thread.
@@ -673,17 +627,17 @@ class PhantomWatch:
 
     def __init__(
         self,
-        motif: Callable[[], tuple[bool, float | None]] | None = None,
+        sound: Callable[[], tuple[bool, float | None]] | None = None,
         list_inputs: Callable[[], SinkInputs] | None = None,
         pad: PadLevel | None = None,
         clock: Callable[[], float] = time.monotonic,
         pending: Callable[[float], bool] | None = None,
     ) -> None:
-        """Build with the module's motif state, its own play_sound wrapper and pw-dump.
+        """Build with the module's sound state, its own play_sound wrapper and pw-dump.
 
         ``pending(now)``: whether a pushed reply is still unheard (ReplyTracker.pending).
         """
-        self.detector = PhantomDetector(motif=motif, pending=pending)
+        self.detector = PhantomDetector(sound=sound, pending=pending)
         self.monitored = self.detector.monitored  # the monitor's streaming thread; never raises
         self.pad = pad or PadLevel()
         self.sounds = SoundStarts()
@@ -774,13 +728,6 @@ class PhantomWatch:
         except Exception:
             logger.warning("Phantom speech report failed", exc_info=True)
 
-    def _sound_before(self, episode: PhantomEpisode) -> str | None:
-        """Name a play_sound call made within SDK_SOUND_S before the episode, or None."""
-        at = self.sounds.last_before(episode.start + 0.5)
-        if at is None or episode.start - at > SDK_SOUND_S:
-            return None
-        return f"a play_sound call {max(0.0, episode.start - at):.1f} s before"
-
     def _list(self, episode: PhantomEpisode) -> None:
         """List the sink inputs onto ``episode``, once."""
         if episode.inputs is not None:
@@ -793,26 +740,14 @@ class PhantomWatch:
     def _act(self, event: PhantomEvent, audio: Any) -> None:
         """Carry out one event. Holds the act lock."""
         episode = event.episode
-        if not episode.sdk_checked:  # at the start, or at the end if the start has not run
-            episode.sdk_checked = True
-            episode.sound_started = self._sound_before(episode)
-            episode.sound_playing = _sdk_sound(audio)
-        sdk_sound = episode.sdk_sound()
         last = self._last_warning
         may_warn = last is None or episode.start - last >= PHANTOM_REPORT_EVERY_S
         if event.kind == "started":
-            if may_warn:  # even when a play_sound start may explain it: it may run long
+            if may_warn:
                 self._list(episode)
             return
         span = (episode.loud_s, _wall(episode.start), _wall(episode.end_or_last))
-        if sdk_sound is not None:
-            logger.info(
-                "Speaker sound with no push from the app while the SDK's sound player was playing "
-                "(%s): %.1f s loud, %s to %s; not phantom speech",
-                sdk_sound,
-                *span,
-            )
-        elif may_warn:
+        if may_warn:
             self._list(episode)  # its start's listing may not have run yet
             self._last_warning = episode.start
             logger.warning("%s", self.report(episode, audio))

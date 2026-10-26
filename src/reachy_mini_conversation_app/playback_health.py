@@ -26,12 +26,14 @@ the watchdog logs the last measured lag and its age.
 
 from __future__ import annotations
 import os
+import re
 import math
 import time
 import logging
+import datetime
 import functools
 import threading
-from typing import Any, TypeVar, Callable, Sequence, NamedTuple
+from typing import Any, TypeVar, Callable, Iterable, Sequence, NamedTuple
 
 
 logger = logging.getLogger(__name__)
@@ -265,18 +267,18 @@ REFRESH_IDLE_ENV = "REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S"
 REFRESH_IDLE_S = 600.0
 
 
-def refresh_idle_s_from_env(environ: Any = os.environ) -> float:
-    """Return the idle refresh threshold in seconds from the environment; 0 means off."""
-    raw = str(environ.get(REFRESH_IDLE_ENV, "")).strip()
+def seconds_from_env(name: str, default: float, environ: Any = os.environ) -> float:
+    """Return a threshold in seconds from the environment variable ``name``; 0 means off."""
+    raw = str(environ.get(name, "")).strip()
     if not raw:
-        return REFRESH_IDLE_S
+        return default
     try:
         value = float(raw)
     except ValueError:
         value = -1.0
     if not math.isfinite(value) or value < 0:
-        logger.warning("%s=%r is not a number of seconds >= 0; using %.0f", REFRESH_IDLE_ENV, raw, REFRESH_IDLE_S)
-        return REFRESH_IDLE_S
+        logger.warning("%s=%r is not a number of seconds >= 0; using %.0f", name, raw, default)
+        return default
     return value
 
 
@@ -301,6 +303,98 @@ def refresh_after_idle(audio: Any, cause: str, governor: RebuildGovernor | None 
     if ok:
         logger.info("Speaker stream refreshed after %s", cause)
     return ok
+
+
+# The periodic idle rebuild (2026-10-26, 05:22): a speech stream with no write for hours
+# replayed the last 65 s it carried. With prebuf 0, pipewire-pulse advances the stream's
+# read index through an underrun; 2^31 bytes on (9 h 19 m at 64,000 B/s) the 32-bit
+# difference to the write index wraps, and the server plays the last 4 MiB written. So
+# the watchdog rebuilds the stream after this long with no write, through GOVERNOR, when
+# no reply, session or sound is playing. 0 turns it off.
+IDLE_REBUILD_ENV = "REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S"
+IDLE_REBUILD_S = 3 * 3600.0
+
+
+def idle_rebuild_decision(
+    now: float,
+    fresh_at: Sequence[float | None],
+    idle_s: float = IDLE_REBUILD_S,
+    *,
+    reply: bool = False,
+    session: bool = False,
+    sound: bool = False,
+) -> Verdict:
+    """Decide whether the watchdog rebuilds a speech stream left idle. Pure.
+
+    ``fresh_at`` as for refresh_decision; ``reply``, ``session`` and ``sound`` say what
+    of the app's is playing or open, and any of them holds the rebuild back.
+    """
+    busy = (
+        (reply, "a reply is playing"),
+        (session, "a session is open"),
+        (sound, "a sound is playing"),
+    )
+    held = [why for on, why in busy if on]
+    if held:
+        return Verdict("ok", "held: " + ", ".join(held))
+    verdict = refresh_decision(now, fresh_at, idle_s)
+    if verdict.action != "refresh":
+        return verdict
+    cause = f"{verdict.cause} with no write to the speech stream (periodic rebuild)"
+    return Verdict("rebuild", cause)
+
+
+# The replay check: journal lines that mean the speech stream was written to or made new,
+# and the line that closes it (capture off sets the pipeline to NULL).
+STREAM_WRITE_LINES = (
+    "Reply heard after",
+    "Reply not heard",
+    "Speaker stream rebuilt",
+    "Audio capture started",
+)
+STREAM_CLOSE_LINES = ("Audio capture stopped",)
+_STAMP = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
+
+
+class IdleStretch(NamedTuple):
+    """A stretch with the speech stream open and nothing written to it."""
+
+    start: datetime.datetime
+    end: datetime.datetime
+    ongoing: bool  # still idle at the excerpt's last line
+
+    @property
+    def seconds(self) -> float:
+        """The stretch's length."""
+        return (self.end - self.start).total_seconds()
+
+
+def idle_stretches(lines: Iterable[str], idle_s: float) -> list[IdleStretch]:
+    """Return every stretch of a journal excerpt with the speech stream idle over ``idle_s``. Pure.
+
+    The excerpt's first timed line counts as a write: what came before it is not known.
+    Reads ``journalctl -o short-iso`` or the classic format, by the app's own timestamp.
+    """
+    found: list[IdleStretch] = []
+    last_write: datetime.datetime | None = None
+    seen = False
+    at: datetime.datetime | None = None
+    for line in lines:
+        stamp = _STAMP.search(line)
+        if stamp is None:
+            continue
+        at = datetime.datetime.fromisoformat(f"{stamp[1]} {stamp[2]}")
+        writes = any(key in line for key in STREAM_WRITE_LINES)
+        closes = any(key in line for key in STREAM_CLOSE_LINES)
+        if not seen:
+            seen, last_write = True, at
+        if writes or closes:
+            if last_write is not None and (at - last_write).total_seconds() > idle_s:
+                found.append(IdleStretch(last_write, at, ongoing=False))
+            last_write = at if writes else None
+    if at is not None and last_write is not None and (at - last_write).total_seconds() > idle_s:
+        found.append(IdleStretch(last_write, at, ongoing=True))
+    return found
 
 
 def lag_report(last: tuple[float, float] | None, now: float) -> str:
@@ -821,112 +915,120 @@ def keep_monitor(
     return "started" if monitor.start(source) else "unavailable"
 
 
-# --- the motif playbin: conversation.sound's second speaker stream ------------------------
+# --- play_sound playbins: a second speaker stream per sound -------------------------------
+#
+# The SDK's play_sound builds a playbin with its own speaker sink and never tears it
+# down: its stream stays open after the sound, and pipewire-pulse replays the last
+# 4 MiB of a stream left open with nothing written (every 6.8 h at 22,050 Hz). Every
+# play_sound caller (conversation.sound, the app tools, the SDK's play_move) passes
+# through the instance wrap in phantom_speech.SoundStarts, which holds SOUND_LOCK while
+# the SDK replaces audio._playbin and then hands the new playbin to watch_sound.
 
 
-MOTIF_LOCK = threading.Lock()
+SOUND_LOCK = threading.Lock()
+SOUND_SLACK_S = 5.0  # a sound with no end this long past its duration is torn down
+SOUND_MAX_S = 1800.0  # the same bound for a sound whose duration is not known
 
 
-class MotifActivity:
-    """Which motif playbins the fork's watcher holds open, and when the last one closed.
+class SoundActivity:
+    """Which play_sound playbins are open, and when the last one closed.
 
-    The phantom-speech detector reads it: a motif is sound the app made without a push.
-    Only motifs started through watch_motif are known; the SDK's play_move sounds are not.
+    The phantom-speech detector and the idle rebuild read it: a sound is the app's own.
     """
 
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
-        """Start with no motif open."""
+        """Start with no sound open."""
         self._clock = clock
         self._lock = threading.Lock()
         self._open: set[int] = set()
         self._closed_at: float | None = None
 
     def opened(self, playbin: Any) -> None:
-        """Note a motif's playbin as playing."""
+        """Note a sound's playbin as playing."""
         with self._lock:
             self._open.add(id(playbin))
 
     def closed(self, playbin: Any) -> None:
-        """Note a motif's playbin as ended or torn down; closing one twice is harmless."""
+        """Note a sound's playbin as ended or torn down; closing one twice is harmless."""
         with self._lock:
             self._open.discard(id(playbin))
             self._closed_at = self._clock()
 
     def state(self) -> tuple[bool, float | None]:
-        """Return (a motif is open, when the last one closed)."""
+        """Return (a sound is open, when the last one closed)."""
         with self._lock:
             return bool(self._open), self._closed_at
 
 
-MOTIFS = MotifActivity()
+SOUNDS = SoundActivity()
 
 
-def play_motif(media: Any, audio: Any, path: str) -> Any:
-    """Start a sound with the SDK's play_sound under MOTIF_LOCK; return its playbin, to watch."""
-    with MOTIF_LOCK:
-        media.play_sound(path)
-        return getattr(audio, "_playbin", None)
+def watch_sound(audio: Any, playbin: Any, path: Any) -> threading.Thread:
+    """Mark a play_sound playbin open, and tear it down from its own thread when the sound ends.
 
-
-def watch_motif(audio: Any, playbin: Any, path: str) -> threading.Thread:
-    """Log a motif's playbin as a second stream, and tear it down when the sound ends.
-
-    The SDK's play_sound builds a playbin with its own speaker sink and never tears it
-    down: its stream stays open after the sound. This waits for its end (or error) on
-    the playbin's bus, from its own thread, and sets it to NULL if it is still the
-    current sound. A newer sound has replaced it already (the SDK set it to NULL).
+    The play_sound wrap calls this holding SOUND_LOCK, so it must not take the lock
+    itself before it returns. The thread waits on the playbin's bus for the end or an
+    error, gives up on a sound with no end SOUND_SLACK_S past its duration, and sets it
+    to NULL if it is still the current sound. A newer sound has replaced it already
+    (the SDK's play_sound set it to NULL), and so has capture off (stop_playing).
     """
     from gi.repository import Gst
 
-    logger.info("Motif stream opened: %s (a second speaker stream beside speech)", path)
-    MOTIFS.opened(playbin)
+    logger.info("Sound stream opened: %s (a second speaker stream beside speech)", path)
+    SOUNDS.opened(playbin)
+    started = time.monotonic()
+
+    def watch() -> tuple[str, bool]:
+        """Wait for the sound's end; returns (the cause, whether it ran past its bound)."""
+        bus, duration_of = playbin.get_bus(), playbin.query_duration
+        bound = SOUND_MAX_S
+        ends = Gst.MessageType.EOS | Gst.MessageType.ERROR
+        while True:
+            if getattr(audio, "_playbin", None) is not playbin:
+                return "replaced by a newer sound or stopped", False
+            msg = bus.timed_pop_filtered(200 * Gst.MSECOND, ends)
+            if msg is not None and msg.type == Gst.MessageType.ERROR:
+                err, _debug = msg.parse_error()
+                return f"error: {err.message}", False
+            if msg is not None:
+                return "the sound ended", False
+            known, duration = duration_of(Gst.Format.TIME)
+            if known and duration >= 0:
+                bound = duration / Gst.SECOND + SOUND_SLACK_S
+            if time.monotonic() - started > bound:
+                return f"no end {bound:.0f} s after it started", True
 
     def wait() -> None:
         try:
-            watch()
+            cause, overdue = watch()
+            if "replaced" in cause:
+                logger.info("Sound stream closed (%s): %s", cause, path)
+                return
+            with SOUND_LOCK:  # a new sound cannot take _playbin between the check and the clear
+                current = getattr(audio, "_playbin", None)
+                if current is not None and current is playbin:
+                    audio._playbin = None
+                    current.set_state(Gst.State.NULL)
+            log = logger.warning if overdue else logger.info
+            log("Sound stream closed (%s, torn down): %s", cause, path)
         finally:
-            MOTIFS.closed(playbin)
+            SOUNDS.closed(playbin)
 
-    def watch() -> None:
-        bus = playbin.get_bus()
-        cause = None
-        while cause is None:
-            if getattr(audio, "_playbin", None) is not playbin:
-                cause = "replaced by a newer sound or stopped"
-                break
-            msg = bus.timed_pop_filtered(200 * Gst.MSECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
-            if msg is None:
-                continue
-            if msg.type == Gst.MessageType.ERROR:
-                err, _debug = msg.parse_error()
-                cause = f"error: {err.message}"
-            else:
-                cause = "the sound ended"
-        if "replaced" in cause:
-            logger.info("Motif stream closed (%s): %s", cause, path)
-            return
-        with MOTIF_LOCK:  # a new sound cannot take _playbin between the check and the clear
-            current = getattr(audio, "_playbin", None)
-            if current is not None and current is playbin:
-                audio._playbin = None
-                current.set_state(Gst.State.NULL)
-        logger.info("Motif stream closed (%s, torn down): %s", cause, path)
-
-    thread = threading.Thread(target=wait, name="motif-watch", daemon=True)
+    thread = threading.Thread(target=wait, name="sound-watch", daemon=True)
     thread.start()
     return thread
 
 
-def stop_motif(audio: Any) -> bool:
-    """conversation.sound's stop: the motif's stream alone, never speech."""
+def stop_sound(audio: Any) -> bool:
+    """conversation.sound's stop: the current sound's stream alone, never speech."""
     from gi.repository import Gst
 
-    with MOTIF_LOCK:
+    with SOUND_LOCK:
         playbin = getattr(audio, "_playbin", None)
         if playbin is None:
             return False
         audio._playbin = None
         playbin.set_state(Gst.State.NULL)
-    MOTIFS.closed(playbin)
-    logger.info("Motif stream closed (stop requested, torn down)")
+    SOUNDS.closed(playbin)
+    logger.info("Sound stream closed (stop requested, torn down)")
     return True

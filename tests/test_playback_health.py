@@ -378,13 +378,13 @@ def test_the_watchdog_logs_one_info_line_and_does_nothing_when_healthy(
     assert "Playback latency" in lines[0].getMessage()
 
 
-# --- the motif playbin, the second stream -------------------------------------------------
+# --- a play_sound playbin, the second stream -------------------------------------------------
 
 
-def test_a_motif_stream_is_logged_and_torn_down_when_the_sound_ends(
+def test_a_sound_stream_is_logged_and_torn_down_when_the_sound_ends(
     rig: Rig, caplog: pytest.LogCaptureFixture, tmp_path: Any
 ) -> None:
-    """conversation.sound's playbin is a second speaker stream: opened, then closed at its end."""
+    """A play_sound playbin is a second speaker stream: opened, then closed at its end."""
     import wave
 
     Gst = rig.Gst
@@ -399,12 +399,12 @@ def test_a_motif_stream_is_logged_and_torn_down_when_the_sound_ends(
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
         rig.audio.play_sound(str(path))
         playbin = rig.audio._playbin
-        watcher = ph.watch_motif(rig.audio, playbin, str(path))
+        watcher = ph.watch_sound(rig.audio, playbin, str(path))
         watcher.join(timeout=5.0)
 
     messages = [r.getMessage() for r in caplog.records if r.name == ph.logger.name]
-    assert any("Motif stream opened" in m and "motif.wav" in m for m in messages), messages
-    assert any("Motif stream closed" in m and "ended" in m for m in messages), messages
+    assert any("Sound stream opened" in m and "motif.wav" in m for m in messages), messages
+    assert any("Sound stream closed" in m and "ended" in m for m in messages), messages
     assert rig.audio._playbin is None
     assert playbin.get_state(0)[1] == Gst.State.NULL
     # Speech is untouched by the second stream's end.
@@ -412,7 +412,11 @@ def test_a_motif_stream_is_logged_and_torn_down_when_the_sound_ends(
     assert lat is not None and lat < 1.0
 
 
-def test_a_replaced_motif_is_not_torn_down_twice(rig: Rig, caplog: pytest.LogCaptureFixture, tmp_path: Any) -> None:
+def test_a_replaced_sound_is_not_torn_down_twice(
+    rig: Rig,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Any,
+) -> None:
     """A newer sound owns audio._playbin; the old watcher only logs the replacement."""
     import wave
 
@@ -427,18 +431,18 @@ def test_a_replaced_motif_is_not_torn_down_twice(rig: Rig, caplog: pytest.LogCap
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
         rig.audio.play_sound(str(path))
         first = rig.audio._playbin
-        old = ph.watch_motif(rig.audio, first, str(path))
+        old = ph.watch_sound(rig.audio, first, str(path))
         time.sleep(0.3)
         rig.audio.play_sound(str(path))  # the SDK sets the first to NULL and replaces it
         second = rig.audio._playbin
         old.join(timeout=3.0)
         assert not old.is_alive()
         assert rig.audio._playbin is second  # the newer sound is left alone
-        ph.stop_motif(rig.audio)
+        ph.stop_sound(rig.audio)
 
     messages = [r.getMessage() for r in caplog.records if r.name == ph.logger.name]
-    assert any("Motif stream closed" in m and "replaced" in m for m in messages), messages
-    assert any("Motif stream closed" in m and "stop" in m for m in messages), messages
+    assert any("Sound stream closed" in m and "replaced" in m for m in messages), messages
+    assert any("Sound stream closed" in m and "stop" in m for m in messages), messages
     assert rig.audio._playbin is None
 
 
@@ -1365,16 +1369,19 @@ def test_the_triggers_recover_the_behind_case(rig: Rig, caplog: pytest.LogCaptur
     assert len(after) >= 3 and all(lat is not None and lat < 1.0 for lat in after[-3:]), latencies
 
 
-# --- the motif playbin's teardown race ---------------------------------------------------
+# --- a play_sound playbin's teardown race -------------------------------------------------
 
 
-def test_a_sound_started_during_a_motif_teardown_is_not_orphaned(monkeypatch: pytest.MonkeyPatch) -> None:
-    """watch_motif's check-and-clear and play_motif's start are one under MOTIF_LOCK.
+def test_a_sound_started_during_a_teardown_is_not_orphaned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """watch_sound's check-and-clear and any caller's play_sound are one under SOUND_LOCK.
 
     The review (2026-10-15): between the watcher's identity check and its
     ``_playbin = None``, a new sound could take ``_playbin``; the watcher then dropped
-    the new playbin's handle, and nothing could stop or tear it down.
+    the new playbin's handle, and nothing could stop or tear it down. A direct caller
+    (the app tools) takes no lock of its own: the play_sound wrap takes it for them.
     """
+    from reachy_mini_conversation_app import phantom_speech as ps
+
     Gst = _gst()
     ended = Gst.Message.new_eos(None)
     bus = SimpleNamespace(timed_pop_filtered=lambda timeout, types: ended)
@@ -1386,6 +1393,9 @@ def test_a_sound_started_during_a_motif_teardown_is_not_orphaned(monkeypatch: py
 
         def get_bus(self) -> Any:
             return bus
+
+        def query_duration(self, fmt: Any) -> tuple[bool, int]:
+            return False, -1
 
         def set_state(self, state: Any) -> None:
             self.states.append(state)
@@ -1404,8 +1414,8 @@ def test_a_sound_started_during_a_motif_teardown_is_not_orphaned(monkeypatch: py
             Audio.reads += 1
             value = self.value
             if Audio.reads == 2:  # the watcher's identity check at the end: a new sound starts right after it
-                threading.Thread(target=ph.play_motif, args=(media, self, "new.wav"), daemon=True).start()
-                started.wait(0.2)  # without the lock, play_motif runs to the end here
+                threading.Thread(target=self.play_sound, args=("new.wav",), daemon=True).start()
+                started.wait(0.2)  # without the lock, play_sound runs to the end here
                 time.sleep(0.1)
             return value
 
@@ -1419,20 +1429,14 @@ def test_a_sound_started_during_a_motif_teardown_is_not_orphaned(monkeypatch: py
         started.set()
         audio.value = new
 
-    media = SimpleNamespace(play_sound=play_sound)
-    ph.watch_motif(audio, old, "old.wav").join(timeout=3.0)
+    audio.play_sound = play_sound  # the SDK's method on the instance, wrapped as the app wraps it
+    assert ps.SoundStarts().install(audio)
+    ph.watch_sound(audio, old, "old.wav").join(timeout=3.0)
     deadline = time.monotonic() + 2.0
     while audio.value is not new and time.monotonic() < deadline:
         time.sleep(0.01)
     assert audio.value is new  # the new sound kept its handle
     assert old.states == [Gst.State.NULL] and new.states == []
-
-
-def test_play_motif_returns_the_new_playbin() -> None:
-    """The sound route starts the SDK's player under MOTIF_LOCK and watches what it made."""
-    audio = SimpleNamespace(_playbin=None)
-    media = SimpleNamespace(play_sound=lambda path: setattr(audio, "_playbin", f"playbin for {path}"))
-    assert ph.play_motif(media, audio, "ring.wav") == "playbin for ring.wav"
 
 
 # The idle refresh (2026-10-18): a session opening after REFRESH_IDLE_S with nothing
@@ -1460,16 +1464,6 @@ def test_the_idle_refresh_counts_from_the_latest_of_push_rebuild_and_start(
 def test_the_idle_refresh_cause_is_in_minutes() -> None:
     """The cause reads as the log line's "N min idle"."""
     assert ph.refresh_decision(4500.0, (0.0,), 600.0).cause == "75 min idle"
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [(None, 600.0), ("", 600.0), ("900", 900.0), ("0", 0.0), ("-5", 600.0), ("soon", 600.0), ("nan", 600.0)],
-)
-def test_the_idle_refresh_threshold_comes_from_the_environment(raw: str | None, expected: float) -> None:
-    """REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S, 0 for off; anything invalid keeps the default."""
-    environ = {} if raw is None else {ph.REFRESH_IDLE_ENV: raw}
-    assert ph.refresh_idle_s_from_env(environ) == expected
 
 
 def test_the_reply_tracker_keeps_the_last_push_time() -> None:
@@ -1527,3 +1521,138 @@ def test_pair_idle_refresh_and_the_unheard_trigger_share_one_cooldown(monkeypatc
     assert rebuilt == ["sink", "sink"]
     # The next open, 5 minutes on with nothing pushed: the watchdog's rebuild counts as fresh.
     assert ph.refresh_decision(431.0, (None, governor.last_rebuild_at, 0.0)).action == "ok"
+
+
+# The periodic idle rebuild (2026-10-26): a speech stream with no write for hours lets
+# pipewire-pulse's read index run 2^31 bytes ahead of its write index (9 h 19 m at
+# 64,000 B/s), and the server replays the last 4 MiB written. The watchdog rebuilds the
+# stream after IDLE_REBUILD_S with no write, when nothing of the app's is playing.
+
+
+@pytest.mark.parametrize(
+    ("fresh_at", "busy", "action"),
+    [
+        ((None, None, 0.0), {}, "rebuild"),  # 3 h 20 min since the stream started
+        ((1000.0, None, 0.0), {}, "rebuild"),  # 3 h 3 min since the last push
+        ((2000.0, None, 0.0), {}, "ok"),  # 2 h 47 min: not yet
+        ((None, 1500.0, 0.0), {}, "ok"),  # a rebuild 2 h 55 min ago, this one or another
+        ((None, None, 0.0), {"reply": True}, "ok"),
+        ((None, None, 0.0), {"session": True}, "ok"),
+        ((None, None, 0.0), {"sound": True}, "ok"),
+    ],
+)
+def test_the_idle_rebuild_is_due_after_hours_with_no_write_and_nothing_playing(
+    fresh_at: tuple[float | None, ...], busy: dict[str, bool], action: str
+) -> None:
+    """Due IDLE_REBUILD_S after the last write; never mid reply, session or sound."""
+    assert ph.idle_rebuild_decision(12000.0, fresh_at, ph.IDLE_REBUILD_S, **busy).action == action
+
+
+def test_the_idle_rebuild_says_why_it_ran_and_why_it_waited() -> None:
+    """The cause tells the periodic rebuild from the open-time refresh in the journal."""
+    due = ph.idle_rebuild_decision(12000.0, (0.0,), 10800.0)
+    assert due.cause == "200 min idle with no write to the speech stream (periodic rebuild)"
+    held = ph.idle_rebuild_decision(12000.0, (0.0,), 10800.0, session=True, sound=True)
+    assert held.cause == "held: a session is open, a sound is playing"
+    assert ph.idle_rebuild_decision(12000.0, (0.0,), 0.0).action == "ok"  # 0 turns it off
+
+
+@pytest.mark.parametrize(
+    ("env", "default"),
+    [
+        ("REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S", 600.0),
+        ("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", 10800.0),
+    ],
+)
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("900", 900.0),
+        ("0", 0.0),
+        ("-5", None),
+        ("soon", None),
+        ("nan", None),
+    ],
+)
+def test_the_idle_thresholds_come_from_the_environment(
+    env: str, default: float, raw: str | None, expected: float | None
+) -> None:
+    """Seconds, 0 for off; anything missing or invalid keeps the default."""
+    assert ph.REFRESH_IDLE_ENV == "REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S"
+    assert ph.IDLE_REBUILD_ENV == "REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S"
+    assert (ph.REFRESH_IDLE_S, ph.IDLE_REBUILD_S) == (600.0, 10800.0)
+    environ = {} if raw is None else {env: raw}
+    assert ph.seconds_from_env(env, default, environ) == (default if expected is None else expected)
+
+
+def test_the_idle_rebuild_runs_through_the_governor_and_its_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rebuild x the other triggers: one governor, one cooldown; the rebuild freshens the stream."""
+    now = [20000.0]
+    rebuilt: list[str] = []
+    audio = SimpleNamespace(_pipeline=_Pipeline())
+    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
+    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: rebuilt.append(sink) or True)
+    governor = ph.RebuildGovernor(clock=lambda: now[0])
+    due = ph.idle_rebuild_decision(now[0], (None, None, 0.0))
+    assert ph.refresh_after_idle(audio, due.cause, governor)
+    now[0] = 20010.0  # the unheard trigger 10 s on is held back by the shared cooldown
+    assert governor.rebuild(audio, "unheard replies", "3 in a row") is False
+    assert rebuilt == ["sink"]
+    # The next check, an hour on: fresh from the rebuild, so not due again for 3 h.
+    fresh = (None, governor.last_rebuild_at, 0.0)
+    assert ph.idle_rebuild_decision(23600.0, fresh).action == "ok"
+    assert ph.idle_rebuild_decision(30801.0, fresh).action == "rebuild"
+
+
+# The replay check: a journal excerpt in, every speech stream idle past the threshold out.
+
+
+def _journal(stamp: str, source: str, message: str) -> str:
+    """One journal line as the robot writes it (journalctl -o short-iso)."""
+    day, clock = stamp.split()
+    return (
+        f"{day}T{clock}-04:00 brain python[1173]: runner - WARNING - {stamp},000 INFO "
+        f"reachy_mini_conversation_app.{source} | {message}"
+    )
+
+
+_LAG = "Playback latency: last reply heard after 0.21 s"
+_JOURNAL = [
+    _journal("2026-10-25 19:44:45", "playback_health:252", "Speaker stream rebuilt (trigger: x)"),
+    _journal("2026-10-25 20:03:14", "console:1093", "Reply heard after 0.21 s (first push to ...)"),
+    _journal("2026-10-25 21:00:00", "playback_health:325", f"{_LAG}, 3406 s ago"),
+    _journal("2026-10-26 05:22:40", "playback_health:325", f"{_LAG}, 33566 s ago"),
+    _journal("2026-10-26 06:38:29", "playback_health:252", "Speaker stream rebuilt (trigger: x)"),
+    _journal("2026-10-26 06:40:00", "console:1360", "Audio capture stopped via /rpc"),
+    _journal("2026-10-26 12:40:00", "console:1360", "Audio capture started via /rpc"),
+    _journal("2026-10-26 13:00:00", "console:1093", "Reply not heard (1 in a row): 0.00 s heard"),
+    _journal("2026-10-26 17:00:00", "playback_health:325", f"{_LAG}, 14400 s ago"),
+]
+
+
+def test_the_replay_check_finds_every_speech_stream_idle_past_the_threshold() -> None:
+    """10-25: 10 h 35 min from the last reply to the next rebuild; capture off is no idle."""
+    import datetime
+
+    found = ph.idle_stretches(_JOURNAL, 3 * 3600.0)
+    at = datetime.datetime.fromisoformat
+    assert found == [
+        ph.IdleStretch(at("2026-10-25 20:03:14"), at("2026-10-26 06:38:29"), ongoing=False),
+        ph.IdleStretch(at("2026-10-26 13:00:00"), at("2026-10-26 17:00:00"), ongoing=True),
+    ]
+    assert [round(s.seconds) for s in found] == [38115, 14400]
+    assert ph.idle_stretches(_JOURNAL, 12 * 3600.0) == []
+
+
+def test_the_replay_check_reads_the_classic_journal_format() -> None:
+    """Without -o short-iso, the app's own timestamp inside the line is used."""
+    lines = [
+        "Oct 25 20:03:14 brain python[1]: 2026-10-25 20:03:14,483 INFO x | Reply heard after 0.2 s",
+        "Oct 26 05:22:40 brain python[1]: 2026-10-26 05:22:40,001 INFO x | Playback latency",
+    ]
+    (stretch,) = ph.idle_stretches(lines, 3600.0)
+    assert stretch.ongoing and round(stretch.seconds) == 33566
