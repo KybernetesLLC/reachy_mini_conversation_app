@@ -883,8 +883,11 @@ SOUND_END_SLACK_S = 0.25
 # asyncio.to_thread, the app tools use asyncio.to_thread (companion_express and
 # companion_music), and the SDK's play_move runs its own loop in its caller's thread; the
 # app does not call play_move. The SDK's goto_sleep plays a sound from the go_to_sleep
-# tool's asyncio.to_thread, and its wake_up from main's startup, before the wrap. Closing
-# never takes this lock: the reaper sets each sound's own playbin to NULL.
+# tool's asyncio.to_thread and from main's inactivity-timeout thread, and its wake_up
+# from main's startup, before the wrap. Closing never waits for this lock: the reaper
+# sets each sound's own playbin to NULL, and the sweep only tries the lock, skipping a
+# round while a play_sound holds it, so the SDK's NULL of a replaced sound is never taken
+# for a close outside the wrap.
 PLAY_SOUND_LOCK = threading.Lock()
 
 
@@ -968,42 +971,53 @@ class SoundActivity:
         stopped at its end. A sound past its bound whose position still moves plays on,
         logged once, up to SOUND_MAX_S.
         """
-        now = self.clock()
-        for sound in self.open_sounds():
-            try:
-                _, current, pending = sound.playbin.get_state(0)
-                if pending == Gst.State.VOID_PENDING:  # not on its way up
-                    if current == Gst.State.NULL:
-                        close_sound(sound.playbin, SoundEnd.OUTSIDE)
+        if not PLAY_SOUND_LOCK.acquire(blocking=False):
+            return True  # a play_sound is replacing a sound: look again at the next round
+        try:
+            now = self.clock()
+            for sound in self.open_sounds():
+                try:
+                    _, current, pending = sound.playbin.get_state(0)
+                    if pending == Gst.State.VOID_PENDING:  # not on its way up
+                        if current == Gst.State.NULL:
+                            close_sound(sound.playbin, SoundEnd.OUTSIDE)
+                            continue
+                        if current == Gst.State.READY:
+                            close_sound(sound.playbin, SoundEnd.FAILED_START)
+                            continue
+                    if not sound.watched:  # no EOS reaches it: its end is a position stopped there
+                        timed, duration = sound.playbin.query_duration(Gst.Format.TIME)
+                        found, position = sound.playbin.query_position(Gst.Format.TIME)
+                        last, sound.position = sound.position, (position if found else None)
+                        end = duration - SOUND_END_SLACK_S * Gst.SECOND
+                        if timed and found and position >= end and position == last:
+                            close_sound(sound.playbin, SoundEnd.ENDED, "seen by the sweep")
+                            continue
+                    age = now - sound.opened_at
+                    if age <= sound.bound_s:
                         continue
-                    if current == Gst.State.READY:
-                        close_sound(sound.playbin, SoundEnd.FAILED_START)
+                    known, position = sound.playbin.query_position(Gst.Format.TIME)
+                    if age > SOUND_MAX_S:
+                        why = f"over the {SOUND_MAX_S:.0f} s cap"
+                    elif known and sound.position is None:  # unread at preroll: compare from now
+                        sound.position = position
                         continue
-                if not sound.watched:  # no EOS reaches it: an end is a position stopped at the end
-                    timed, duration = sound.playbin.query_duration(Gst.Format.TIME)
-                    found, position = sound.playbin.query_position(Gst.Format.TIME)
-                    last, sound.position = sound.position, (position if found else None)
-                    end = duration - SOUND_END_SLACK_S * Gst.SECOND
-                    if timed and found and position >= end and position == last:
-                        close_sound(sound.playbin, SoundEnd.ENDED, "seen by the sweep")
+                    elif known and sound.position is not None and position > sound.position:
+                        sound.position = position
+                        if not sound.late:
+                            sound.late = True
+                            logger.info("Sound stream still playing past its bound: %s", sound.path)
                         continue
-                age = now - sound.opened_at
-                if age <= sound.bound_s:
-                    continue
-                known, position = sound.playbin.query_position(Gst.Format.TIME)
-                if age > SOUND_MAX_S:
-                    why = f"over the {SOUND_MAX_S:.0f} s cap"
-                elif known and sound.position is not None and position > sound.position:
-                    sound.position = position
-                    if not sound.late:
-                        sound.late = True
-                        logger.info("Sound stream still playing past its bound: %s", sound.path)
-                    continue
-                else:
-                    why = "its position stalled" if known else "its position unknown"
-                close_sound(sound.playbin, SoundEnd.OVERDUE, f"{age:.1f} s after it started, {why}")
-            except Exception:
-                logger.warning("Sound sweep failed for %s", sound.path, exc_info=True)
+                    else:
+                        why = "its position stalled" if known else "its position unknown"
+                    detail = f"{age:.1f} s after it started, {why}"
+                    close_sound(sound.playbin, SoundEnd.OVERDUE, detail)
+                except Exception:  # one sound's failure never stops the others, or the sweep
+                    logger.warning("Sound sweep failed for %s", sound.path, exc_info=True)
+        except Exception:  # an exception out of a GLib callback would end the sweep for good
+            logger.warning("Sound sweep failed", exc_info=True)
+        finally:
+            PLAY_SOUND_LOCK.release()
         with self._lock:
             self._sweeping = bool(self._open)
             return self._sweeping

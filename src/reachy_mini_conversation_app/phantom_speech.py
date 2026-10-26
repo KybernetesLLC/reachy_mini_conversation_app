@@ -34,10 +34,15 @@ from typing import Any, Callable, Sequence, NamedTuple
 from collections import deque
 from dataclasses import dataclass
 
+import gi
 import numpy as np
 
 from reachy_mini_conversation_app import playback_health
 from reachy_mini_conversation_app.playback_health import SOUNDS, LOUD_RMS, rms
+
+
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst  # noqa: E402
 
 
 logger = logging.getLogger(__name__)
@@ -400,7 +405,6 @@ class PadLevel:
         self._pad: Any = None
         self._probe: Any = None
         self._fmt = "unknown"  # from the pad's caps when attached, then each CAPS event
-        self._gst: Any = None  # gi.repository.Gst, bound when attached
 
     @property
     def attached(self) -> bool:
@@ -449,8 +453,6 @@ class PadLevel:
 
         Runs in a worker; detach() may run on the event loop at the same time.
         """
-        from gi.repository import Gst
-
         with self._probe_lock:
             if sink is not None and sink is self._sink:
                 return True
@@ -460,7 +462,6 @@ class PadLevel:
                 return False
             caps = pad.get_current_caps()
             self._fmt = _caps_format(caps) if caps is not None else "unknown"
-            self._gst = Gst
             mask = Gst.PadProbeType.BUFFER | Gst.PadProbeType.EVENT_DOWNSTREAM
             self._probe = pad.add_probe(mask, self._on_probe)
             self._sink, self._pad = sink, pad
@@ -485,9 +486,6 @@ class PadLevel:
 
     def _on_probe(self, pad: Any, info: Any) -> Any:
         """Record a buffer's RMS, or a new format, on the streaming thread: never raises or logs."""
-        Gst = self._gst
-        if Gst is None:
-            from gi.repository import Gst
         try:
             if info.type & Gst.PadProbeType.BUFFER:
                 buf = info.get_buffer()
@@ -531,8 +529,6 @@ def _playbin_status(audio: Any) -> PlaybinStatus | None:
     playbin = getattr(audio, "_playbin", None)
     if playbin is None:
         return None
-    from gi.repository import Gst
-
     ok_pos, pos = playbin.query_position(Gst.Format.TIME)
     ok_dur, dur = playbin.query_duration(Gst.Format.TIME)
     return PlaybinStatus(

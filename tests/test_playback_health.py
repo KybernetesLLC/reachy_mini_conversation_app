@@ -1741,16 +1741,21 @@ def test_a_stop_closes_the_sound_once_at_once(
 
 
 @pytest.mark.parametrize(
-    ("duration_s", "moving", "closed_at"),
-    [(1.0, False, 7.0), (None, False, 31.0), (1.0, True, 31.0)],
-    ids=["stalled past its duration", "no duration known", "moving past the hard cap"],
+    ("duration_s", "moving_until", "closed_at"),
+    [(1.0, 0.0, 7.0), (None, 0.0, 31.0), (1.0, 99.0, 31.0), (1.0, 10.0, 11.0)],
+    ids=[
+        "stalled past its duration",
+        "no duration known",
+        "moving past the hard cap",
+        "moved past its bound, then stalled",
+    ],
 )
 def test_a_sound_with_no_end_is_closed_overdue_with_a_warning(
     glib_loop: Any,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     duration_s: Any,
-    moving: bool,
+    moving_until: float,
     closed_at: float,
 ) -> None:
     """Stalled past its duration and SOUND_SLACK_S, or past SOUND_MAX_S whatever its position."""
@@ -1768,8 +1773,7 @@ def test_a_sound_with_no_end_is_closed_overdue_with_a_warning(
         time.sleep(0.2)
         while ph.SOUNDS.state()[0] and now[0] < 40.0:
             now[0] += 1.0
-            if moving:
-                playbin.position_s = now[0]
+            playbin.position_s = min(now[0], moving_until)
             ph.SOUNDS.sweep()
     assert now[0] == closed_at
     assert _until(lambda: playbin.states == [Gst.State.NULL])
@@ -1893,33 +1897,62 @@ def test_a_bookkeeping_failure_never_breaks_play_sound(
     assert len(warnings) == 1 and "ring.wav" in warnings[0].getMessage()
 
 
+@pytest.mark.parametrize(
+    ("duration_s", "positions", "ends"),
+    [
+        (2.0, (1.0, 2.0, 2.0), True),
+        (2.0, (1.0, 1.9, 1.9), True),
+        (2.0, (1.0, 1.0, 1.0), False),
+        (None, (1.0, 2.0, 2.0), False),
+    ],
+    ids=["stopped at its end", "stopped just short", "stalled mid-sound", "no duration known"],
+)
 def test_a_sound_with_no_watch_is_closed_by_the_sweep_at_its_end(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    duration_s: Any,
+    positions: tuple[float, ...],
+    ends: bool,
 ) -> None:
-    """The watch failed: the sweep sees the position stop at the duration, and closes it."""
+    """The watch failed: the sweep closes it when its position stops at its duration.
+
+    Within SOUND_END_SLACK_S of the end counts; a stall mid-sound, or with no known
+    duration, does not.
+    """
     Gst = _gst()
     now = [0.0]
     monkeypatch.setattr(ph, "SOUNDS", ph.SoundActivity(clock=lambda: now[0]))
     monkeypatch.setattr(ph, "SOUND_SWEEP_S", 3600.0)  # the test sweeps by hand
-    audio = _SdkAudio(duration_s=2.0)
+    audio = _SdkAudio(duration_s=duration_s)
     audio.bus = _RecordingBus(fail=True)
     ph.install_sound_wrap(audio)
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
         audio.play_sound("ring.wav")
         playbin = audio.made[0]
-        for second, position in enumerate((1.0, 2.0, 2.0), start=1):
+        for second, position in enumerate(positions, start=1):
             now[0], playbin.position_s = float(second), position
             ph.SOUNDS.sweep()
-            assert ph.SOUNDS.state()[0] is (second < 3)  # open until the position stops at the end
+            assert ph.SOUNDS.state()[0] is (second < 3 or not ends)
+    if not ends:
+        time.sleep(0.1)
+        assert playbin.states == [] and _closes(caplog) == []
+        return
     assert _until(lambda: playbin.states == [Gst.State.NULL])  # queued through the reaper
     ((level, line),) = _closes(caplog)
     assert level == logging.INFO and line.startswith("Sound stream closed (the sound ended")
 
 
+@pytest.mark.parametrize("preroll_position", [0.0, None], ids=["read at preroll", "unread"])
 def test_a_sound_still_playing_past_its_bound_is_never_cut_off(
-    glib_loop: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    glib_loop: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    preroll_position: Any,
 ) -> None:
-    """Its EOS comes 20 s late, its position moving all along: one INFO line, never set to NULL."""
+    """Its EOS comes 20 s late, its position moving all along: one INFO line, never set to NULL.
+
+    A position the preroll could not read is read at the first overdue sweep, not taken as stalled.
+    """
     Gst = _gst()
     now = [0.0]
     monkeypatch.setattr(ph, "SOUNDS", ph.SoundActivity(clock=lambda: now[0]))
@@ -1929,6 +1962,7 @@ def test_a_sound_still_playing_past_its_bound_is_never_cut_off(
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
         audio.play_sound("song.wav")
         playbin = audio.made[0]
+        playbin.position_s = preroll_position
         playbin.post("async-done")
         time.sleep(0.2)
         for second in range(1, 27):
@@ -2101,3 +2135,75 @@ def test_a_sound_before_the_wrap_that_cannot_be_tracked_says_so(
         "play_sound is wrapped, but the sound playing before the wrap could not be tracked:"
         " it is not closed at its end"
     ]
+
+
+def test_one_sweep_runs_while_sounds_are_open_and_stops_when_none_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two sounds share one GLib timeout; empty, the sweep ends; the next open starts one."""
+    _gst()
+    from gi.repository import GLib
+
+    armed: list[int] = []
+    timers = SimpleNamespace(
+        PRIORITY_DEFAULT=GLib.PRIORITY_DEFAULT,
+        timeout_add=lambda ms, func: armed.append(ms) or 0,
+    )
+    monkeypatch.setattr(ph, "GLib", timers)
+    audio = _SdkAudio()
+    ph.install_sound_wrap(audio)
+    first = _SoundPlaybin("a.wav")
+    ph.open_sound(first, "a.wav")
+    audio.play_sound("b.wav")
+    assert len(armed) == 1
+    assert ph.SOUNDS.sweep() is True  # sounds open: it runs on
+    ph.stop_sound()
+    assert ph.SOUNDS.state()[0] is False
+    assert ph.SOUNDS.sweep() is False  # nothing open: the timeout ends
+    audio.play_sound("c.wav")
+    assert len(armed) == 2
+
+
+def test_a_sound_the_sweep_cannot_read_never_stops_the_sweep(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One sound's check raises: the next sound is still closed, and the sweep runs on."""
+    _gst()
+    monkeypatch.setattr(ph, "SOUND_SWEEP_S", 3600.0)  # the test sweeps by hand
+    audio = _SdkAudio()
+    ph.install_sound_wrap(audio)
+    broken = _SoundPlaybin("broken.wav")
+
+    def unreadable(timeout: int) -> Any:
+        raise RuntimeError("no state")
+
+    broken.get_state = unreadable
+    ph.open_sound(broken, "broken.wav")
+    audio.play_sound("ring.wav")
+    audio.stop_playing()  # the SDK sets ring.wav to NULL outside the wrap
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        assert ph.SOUNDS.sweep() is True
+    assert _closes(caplog) == [(logging.INFO, "Sound stream closed (closed outside): ring.wav")]
+    failed = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert failed == ["Sound sweep failed for broken.wav"]
+    assert ph.SOUNDS.state()[0] is True  # broken.wav, still open for the next sweep
+
+
+def test_a_sound_being_replaced_is_left_to_the_wrap(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """While a play_sound holds its lock, the SDK's NULL is a replacement, not "closed outside"."""
+    Gst = _gst()
+    monkeypatch.setattr(ph, "SOUND_SWEEP_S", 3600.0)  # the test sweeps by hand
+    audio = _SdkAudio()
+    ph.install_sound_wrap(audio)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        audio.play_sound("song.wav")
+        old = audio.made[0]
+        with ph.PLAY_SOUND_LOCK:  # a play_sound under way: the SDK has just set it to NULL
+            old.set_state(Gst.State.NULL)
+            assert ph.SOUNDS.sweep() is True
+            assert ph.SOUNDS.state()[0] is True
+            ph.close_sound(old, ph.SoundEnd.REPLACED)
+    replaced = "Sound stream closed (replaced by a newer sound): song.wav"
+    assert _closes(caplog) == [(logging.INFO, replaced)]
