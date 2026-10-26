@@ -3636,6 +3636,35 @@ async def test_pushes_and_barge_ins_reach_the_phantom_watch() -> None:
     assert seen == [("pushed", 42.0, pytest.approx(0.1)), ("flushed", 42.0, None)]
 
 
+@pytest.mark.asyncio
+async def test_the_phantom_watch_hears_of_a_push_before_the_audio_is_pushed() -> None:
+    """The speech-sink probe comes off before the reply's buffers can reach the sink."""
+    order: list[str] = []
+    push = MagicMock(side_effect=lambda frame: order.append("push"))
+    robot = _audio_robot(push_audio_sample=push)
+    handler = MagicMock()
+    stream = LocalStream(handler, robot)
+    stream._phantom = SimpleNamespace(pushed=lambda now, seconds: order.append("phantom"))
+    frame = np.full(2400, 9830, dtype=np.int16)
+    handler.emit = AsyncMock(side_effect=_stop_after(stream, (24000, frame)))
+    await stream.play_loop()
+    assert order == ["phantom", "push"]
+
+
+def test_the_sound_wrapper_is_installed_at_startup() -> None:
+    """Every play_sound caller is seen from the start, through the SDK audio's own method."""
+    from reachy_mini_conversation_app import playback_health
+
+    played: list[str] = []
+    robot = _audio_robot()
+    robot.media.audio = SimpleNamespace(_playbin=None, play_sound=played.append)
+    stream = LocalStream(MagicMock(), robot)
+    robot.media.audio.play_sound("a.wav")
+    assert played == ["a.wav"]
+    assert isinstance(stream._phantom.sounds, playback_health.SoundStarts)
+    assert stream._phantom.sounds.starts()
+
+
 def test_a_monitor_buffer_reaches_the_reply_tracker_and_the_phantom_watch() -> None:
     """Each monitor buffer feeds the reply tracker and the phantom watch."""
     robot = _audio_robot()
@@ -3671,7 +3700,7 @@ async def test_the_playback_guard_keeps_the_phantom_probes_and_reports_off_the_e
     stream._phantom = SimpleNamespace(
         take=lambda: events.pop() if events else [],
         act=act,
-        keep=lambda audio: kept.append(threading.current_thread() is threading.main_thread()),
+        keep=lambda audio, now: kept.append(threading.current_thread() is threading.main_thread()),
     )
     await asyncio.wait_for(stream.playback_guard_loop(interval_s=0.01), timeout=2.0)
     await asyncio.gather(*stream._background)

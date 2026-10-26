@@ -338,6 +338,13 @@ class LocalStream:
         self._replies = playback_health.ReplyTracker()
         # The phantom-speech detector (2026-10-26): speaker sound the app did not push.
         self._phantom = playback_health.PhantomWatch()
+        # Every play_sound caller is seen from the start (the app tools use it directly).
+        try:
+            sdk_audio = getattr(getattr(robot, "media", None), "audio", None)
+            if sdk_audio is not None:
+                self._phantom.sounds.install(sdk_audio)
+        except Exception:
+            logger.warning("Could not wrap the SDK's play_sound", exc_info=True)
         self._speaker_monitor = playback_health.SpeakerMonitor(self._on_monitor_buffer)
         # The idle refresh: when the speaker stream last started (here, or capture on).
         self._speaker_started_at: float | None = self._now()
@@ -1078,7 +1085,7 @@ class LocalStream:
                 except Exception:
                     logger.warning("Speaker monitor check failed", exc_info=True)
                 try:
-                    await asyncio.to_thread(self._phantom.keep, audio)
+                    await asyncio.to_thread(self._phantom.keep, audio, self._now())
                 except Exception:
                     logger.warning("Phantom speech probe check failed", exc_info=True)
             self._judge_replies(audio)
@@ -2108,10 +2115,11 @@ class LocalStream:
                 # Cast if needed
                 audio_frame = audio_to_float32(audio_data)
 
-                self._robot.media.push_audio_sample(audio_frame)
                 seconds, speech = playback_health.loud_seconds(audio_frame, int(handler_output[0] or 0))
-                self._replies.pushed(self._now(), seconds, speech)
+                # First: the speech-sink probe comes off before the reply can reach the sink.
                 self._phantom.pushed(self._now(), seconds)
+                self._robot.media.push_audio_sample(audio_frame)
+                self._replies.pushed(self._now(), seconds, speech)
                 self._emit_level("assistant", audio_frame)
 
             else:
