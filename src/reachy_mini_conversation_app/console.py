@@ -336,7 +336,9 @@ class LocalStream:
         self._background: set[asyncio.Future[Any]] = set()
         # The unheard-reply trigger: replies pushed, judged against the speaker's monitor.
         self._replies = playback_health.ReplyTracker()
-        self._speaker_monitor = playback_health.SpeakerMonitor(self._replies.monitored)
+        # The phantom-speech detector (2026-10-26): speaker sound the app did not push.
+        self._phantom = playback_health.PhantomWatch()
+        self._speaker_monitor = playback_health.SpeakerMonitor(self._on_monitor_buffer)
         # The idle refresh: when the speaker stream last started (here, or capture on).
         self._speaker_started_at: float | None = self._now()
         self._refresh_idle_s = playback_health.refresh_idle_s_from_env()
@@ -1075,7 +1077,18 @@ class LocalStream:
                     await asyncio.to_thread(playback_health.keep_monitor, self._speaker_monitor, audio, self._now())
                 except Exception:
                     logger.warning("Speaker monitor check failed", exc_info=True)
+                try:
+                    await asyncio.to_thread(self._phantom.keep, audio)
+                except Exception:
+                    logger.warning("Phantom speech probe check failed", exc_info=True)
             self._judge_replies(audio)
+            for event in self._phantom.take():
+                self._run_off_loop(self._phantom.act, event, audio)
+
+    def _on_monitor_buffer(self, now: float, seconds: float, speech_s: float) -> None:
+        """Pass a speaker-monitor buffer to the reply tracker and the phantom watch."""
+        self._replies.monitored(now, seconds, speech_s)
+        self._phantom.monitored(now, seconds, speech_s)
 
     def _judge_replies(self, audio: Any) -> None:
         """Log the replies judged since the last tick; a rebuild verdict is carried out off the event loop."""
@@ -1914,6 +1927,7 @@ class LocalStream:
         """
         logger.info("User intervention: flushing player queue")
         self._replies.flushed(self._now())  # dropped audio is not unheard
+        self._phantom.flushed(self._now())
         audio = getattr(self._robot.media, "audio", None)
         if audio is not None:
             appsrc = getattr(audio, "_appsrc", None)
@@ -2097,6 +2111,7 @@ class LocalStream:
                 self._robot.media.push_audio_sample(audio_frame)
                 seconds, speech = playback_health.loud_seconds(audio_frame, int(handler_output[0] or 0))
                 self._replies.pushed(self._now(), seconds, speech)
+                self._phantom.pushed(self._now(), seconds)
                 self._emit_level("assistant", audio_frame)
 
             else:

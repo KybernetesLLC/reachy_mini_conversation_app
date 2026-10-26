@@ -3618,6 +3618,68 @@ def test_a_barge_in_marks_the_reply_flushed_never_unheard() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pushes_and_barge_ins_reach_the_phantom_watch() -> None:
+    """The phantom-speech detector knows what the app pushed and what a barge-in dropped."""
+    robot = _audio_robot(push_audio_sample=MagicMock())
+    handler = MagicMock()
+    stream = LocalStream(handler, robot)
+    stream._now = lambda: 42.0
+    seen: list[tuple[str, float, float | None]] = []
+    stream._phantom = SimpleNamespace(
+        pushed=lambda now, seconds: seen.append(("pushed", now, seconds)),
+        flushed=lambda now: seen.append(("flushed", now, None)),
+    )
+    frame = np.full(2400, 9830, dtype=np.int16)  # 0.1 s at 24 kHz
+    handler.emit = AsyncMock(side_effect=_stop_after(stream, (24000, frame)))
+    await stream.play_loop()
+    stream.clear_audio_queue()
+    assert seen == [("pushed", 42.0, pytest.approx(0.1)), ("flushed", 42.0, None)]
+
+
+def test_a_monitor_buffer_reaches_the_reply_tracker_and_the_phantom_watch() -> None:
+    """Each monitor buffer feeds the reply tracker and the phantom watch."""
+    robot = _audio_robot()
+    stream = LocalStream(MagicMock(), robot)
+    seen: list[tuple[str, float, float, float]] = []
+    stream._replies = SimpleNamespace(monitored=lambda *a: seen.append(("replies", *a)))
+    stream._phantom = SimpleNamespace(monitored=lambda *a: seen.append(("phantom", *a)))
+    stream._speaker_monitor._on_buffer(5.0, 0.05, 0.05)
+    assert seen == [("replies", 5.0, 0.05, 0.05), ("phantom", 5.0, 0.05, 0.05)]
+
+
+@pytest.mark.asyncio
+async def test_the_playback_guard_keeps_the_phantom_probes_and_reports_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phantom events are acted on in a worker thread, never on the event loop."""
+    from reachy_mini_conversation_app import playback_health
+
+    robot = _audio_robot()
+    robot.media.audio = SimpleNamespace(_pipeline=None)
+    stream = LocalStream(MagicMock(), robot)
+    stream._replies = SimpleNamespace(tick=lambda now: [], unheard_in_a_row=0, armed=True)
+    monkeypatch.setattr(playback_health, "keep_monitor", lambda monitor, audio, now: "unavailable")
+    events = [["an event"]]
+    acted: list[tuple[Any, Any, bool]] = []
+    kept: list[bool] = []
+    loop = asyncio.get_running_loop()
+
+    def act(event: Any, audio: Any) -> None:
+        acted.append((event, audio, threading.current_thread() is threading.main_thread()))
+        loop.call_soon_threadsafe(stream._stop_event.set)
+
+    stream._phantom = SimpleNamespace(
+        take=lambda: events.pop() if events else [],
+        act=act,
+        keep=lambda audio: kept.append(threading.current_thread() is threading.main_thread()),
+    )
+    await asyncio.wait_for(stream.playback_guard_loop(interval_s=0.01), timeout=2.0)
+    await asyncio.gather(*stream._background)
+    assert acted == [("an event", robot.media.audio, False)]
+    assert all(not on_main for on_main in kept)
+
+
+@pytest.mark.asyncio
 async def test_the_playback_guard_rebuilds_off_the_event_loop_after_unheard_replies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
