@@ -879,20 +879,27 @@ def stop_motif(audio: Any) -> bool:
 # inside the app's speech pipeline, so the sound most likely never passed through it.
 # This detector logs any such episode: the speaker's monitor loud for PHANTOM_LOUD_S while
 # the app pushed nothing (and its queued audio has played out) for PHANTOM_QUIET_S and no
-# motif played. Sound while the SDK's play_sound playbin is mid-sound (the app tools'
-# music and express sounds bypass watch_motif) is one INFO line, not phantom speech.
+# motif played. Sound from the SDK's play_sound (the app tools' music and express sounds
+# bypass watch_motif) is one INFO line, not phantom speech: a sound started within
+# SDK_SOUND_S before the episode, or a playbin still mid-sound when it is reported.
 # One WARNING per episode, at most one every PHANTOM_REPORT_EVERY_S, names
 # every sink input (pw-dump, or pactl), whether the app's speech sink carried sound in
 # the episode (a pad probe on it: RMS of each buffer), and whether the head wobbler fired.
-# Nothing is kept but RMS numbers and times. Nothing here runs on the event loop or blocks
-# a streaming thread: the monitor and the pad probe only record, under a short lock; the
-# listing and the report run in a worker thread.
+# Nothing is kept but RMS numbers and times. Nothing runs on the event loop. The pad probe
+# runs Python on the speaker's streaming thread, which must wait for the GIL, so it is on
+# only while the app is quiet: put on by keep() once nothing of the app's has played for
+# PHANTOM_QUIET_S, taken off by pushed() before a reply's audio is pushed. Any wait then
+# falls on silence or on the phantom itself, never on a reply. The listing and the report
+# run in a worker thread.
 
 PHANTOM_LOUD_S = 0.5  # monitor speech, within one candidate, that opens an episode
 PHANTOM_QUIET_S = 3.0  # the app pushed nothing, its queued audio and any motif ended, this long ago
 PHANTOM_END_S = 2.0  # a quiet monitor for this long closes an episode
 PHANTOM_REPORT_EVERY_S = 60.0  # at most one WARNING in this long
+SDK_SOUND_S = 3.0  # sound this soon after a play_sound call is that sound (motifs run 0.4-1.9 s)
 SINK_INPUTS_TIMEOUT_S = 5.0
+SINK_INPUTS_MAX_BYTES = 8 * 1024 * 1024  # pw-dump printed 342 KB on the robot (2026-10-26)
+SINK_INPUT_COMMANDS = [["pw-dump"], ["pactl", "-f", "json", "list", "sink-inputs"]]
 SinkInputs = tuple[list[dict[str, Any]], str]  # (the sink inputs, where they were read from)
 
 
@@ -904,7 +911,6 @@ class PhantomEpisode:
     last_loud: float
     loud_s: float
     last_push_age_s: float | None
-    report: bool
     end: float | None = None
     end_cause: str = ""
     inputs: SinkInputs | None = None
@@ -935,7 +941,6 @@ class PhantomDetector:
         # (start, loud seconds, last loud) of sound that may open an episode
         self._candidate: tuple[float, float, float] | None = None
         self._episode: PhantomEpisode | None = None
-        self._last_report: float | None = None
         self._events: list[PhantomEvent] = []
 
     def pushed(self, now: float, seconds: float) -> None:
@@ -952,6 +957,11 @@ class PhantomDetector:
         with self._lock:
             if self._play_end is not None:
                 self._play_end = min(self._play_end, now)
+
+    def app_quiet(self, now: float) -> bool:
+        """Return whether no sound of the app's own played for PHANTOM_QUIET_S."""
+        with self._lock:
+            return self._app_quiet(now)
 
     def _app_quiet(self, now: float) -> bool:
         """Whether no sound of the app's own played for PHANTOM_QUIET_S. Holds the lock."""
@@ -999,11 +1009,8 @@ class PhantomDetector:
             if loud_s < PHANTOM_LOUD_S - 1e-9:
                 return
             self._candidate = None
-            report = self._last_report is None or now - self._last_report >= PHANTOM_REPORT_EVERY_S
-            if report:
-                self._last_report = now
             age = None if self._last_push is None else start - self._last_push
-            self._episode = PhantomEpisode(start, now, loud_s, age, report)
+            self._episode = PhantomEpisode(start, now, loud_s, age)
             self._events.append(PhantomEvent("started", self._episode))
 
     def take(self) -> list[PhantomEvent]:
@@ -1086,16 +1093,17 @@ def list_sink_inputs(own_pid: int, timeout_s: float = SINK_INPUTS_TIMEOUT_S) -> 
 
     Runs subprocesses: call it from a worker thread, never the event loop.
     """
-    tries: list[tuple[list[str], Callable[[Any, int], list[dict[str, Any]]]]] = [
-        (["pw-dump"], sink_inputs_from_pw_dump),
-        (["pactl", "-f", "json", "list", "sink-inputs"], sink_inputs_from_pactl),
-    ]
     errors = []
-    for cmd, parse in tries:
+    for cmd in SINK_INPUT_COMMANDS:
+        parse = sink_inputs_from_pactl if cmd[0] == "pactl" else sink_inputs_from_pw_dump
         try:
-            done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+            run = {"capture_output": True, "text": True, "errors": "replace"}
+            done = subprocess.run(cmd, timeout=timeout_s, **run)
             if done.returncode != 0:
                 errors.append(f"{cmd[0]} exited {done.returncode}")
+                continue
+            if len(done.stdout) > SINK_INPUTS_MAX_BYTES:
+                errors.append(f"{cmd[0]} printed {len(done.stdout)} bytes, over the cap")
                 continue
             return parse(json.loads(done.stdout), own_pid), cmd[0]
         except Exception as exc:
@@ -1158,9 +1166,11 @@ class PadLevel:
         """Keep the last ``keep`` buffers: a minute or more at pulsesink's buffer sizes."""
         self._lock = threading.Lock()
         self._buffers: deque[tuple[float, float | None, str]] = deque(maxlen=keep)
+        self._probe_lock = threading.Lock()  # the sink, pad and probe below
         self._sink: Any = None
         self._pad: Any = None
         self._probe: Any = None
+        self._fmt = "unknown"  # from the pad's caps when attached, then each CAPS event
 
     @property
     def attached(self) -> bool:
@@ -1185,21 +1195,33 @@ class PadLevel:
         )
 
     def attach(self, sink: Any) -> bool:
-        """Measure ``sink``'s input pad; a different sink moves the probe. Returns success."""
+        """Measure ``sink``'s input pad; a different sink moves the probe. Returns success.
+
+        Runs in a worker; detach() may run on the event loop at the same time.
+        """
         from gi.repository import Gst
 
-        if sink is self._sink:
+        with self._probe_lock:
+            if sink is not None and sink is self._sink:
+                return True
+            self._detach()
+            pad = sink.get_static_pad("sink") if sink is not None else None
+            if pad is None:
+                return False
+            caps = pad.get_current_caps()
+            self._fmt = _caps_format(caps) if caps is not None else "unknown"
+            mask = Gst.PadProbeType.BUFFER | Gst.PadProbeType.EVENT_DOWNSTREAM
+            self._probe = pad.add_probe(mask, self._on_probe)
+            self._sink, self._pad = sink, pad
             return True
-        self.detach()
-        pad = sink.get_static_pad("sink") if sink is not None else None
-        if pad is None:
-            return False
-        self._probe = pad.add_probe(Gst.PadProbeType.BUFFER, self._on_buffer)
-        self._sink, self._pad = sink, pad
-        return True
 
     def detach(self) -> None:
-        """Remove the probe, if any."""
+        """Remove the probe, if any. Never blocks on the streaming thread."""
+        with self._probe_lock:
+            self._detach()
+
+    def _detach(self) -> None:
+        """Remove the probe. Holds the probe lock."""
         if self._pad is not None and self._probe is not None:
             try:
                 self._pad.remove_probe(self._probe)
@@ -1207,18 +1229,27 @@ class PadLevel:
                 logger.debug("Could not remove the speech sink's pad probe", exc_info=True)
         self._sink = self._pad = self._probe = None
 
-    def _on_buffer(self, pad: Any, info: Any) -> Any:
-        """Record one buffer's RMS on the streaming thread: never raises, blocks or logs."""
+    def _on_probe(self, pad: Any, info: Any) -> Any:
+        """Record a buffer's RMS, or a new format, on the streaming thread: never raises or logs."""
         from gi.repository import Gst
 
         try:
-            buf = info.get_buffer()
-            caps = pad.get_current_caps()
-            fmt = str(caps.get_structure(0).get_value("format")) if caps is not None else "unknown"
-            self.record(time.monotonic(), buffer_rms(buf.extract_dup(0, buf.get_size()), fmt), fmt)
+            if info.type & Gst.PadProbeType.BUFFER:
+                buf = info.get_buffer()
+                rms = buffer_rms(buf.extract_dup(0, buf.get_size()), self._fmt)
+                self.record(time.monotonic(), rms, self._fmt)
+            else:
+                event = info.get_event()
+                if event.type == Gst.EventType.CAPS:
+                    self._fmt = _caps_format(event.parse_caps())
         except Exception:
             pass
         return Gst.PadProbeReturn.OK
+
+
+def _caps_format(caps: Any) -> str:
+    """Return the sample format named in audio caps."""
+    return str(caps.get_structure(0).get_value("format"))
 
 
 class WobblerWatch:
@@ -1305,6 +1336,62 @@ def _describe_playbin(audio: Any) -> str:
         return f"motif playbin present (unreadable: {exc})"
 
 
+class SoundStarts:
+    """Wrap the SDK audio's play_sound once, to note when each sound starts.
+
+    Every caller goes through it: MediaManager.play_sound calls audio.play_sound, and so
+    do play_motif and the app tools' music and express sounds. The wrapper calls the
+    original method, captured before wrapping, never itself: play_motif calls it under
+    MOTIF_LOCK. ``listeners`` are called after the original, with (audio, path, playbin),
+    for anything that has to follow each sound's playbin.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic, keep: int = 1000) -> None:
+        """Start with no sound seen."""
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._starts: deque[float] = deque(maxlen=keep)
+        self.listeners: list[Callable[[Any, Any, Any], None]] = []
+
+    def install(self, audio: Any) -> bool:
+        """Wrap ``audio.play_sound``, once. Returns whether it is wrapped."""
+        original = getattr(audio, "play_sound", None)
+        if original is None:
+            return False
+        if getattr(original, "_sound_starts", None) is self:
+            return True
+        starts = self
+
+        def play_sound(sound_file: Any, *args: Any, **kwargs: Any) -> Any:
+            with starts._lock:
+                starts._starts.append(starts._clock())
+            result = original(sound_file, *args, **kwargs)
+            for listener in list(starts.listeners):
+                try:
+                    listener(audio, sound_file, getattr(audio, "_playbin", None))
+                except Exception:
+                    logger.warning("A play_sound listener failed", exc_info=True)
+            return result
+
+        play_sound._sound_starts = self  # type: ignore[attr-defined]
+        audio.play_sound = play_sound
+        return True
+
+    def starts(self) -> list[float]:
+        """Return the times of the sounds started, oldest first."""
+        with self._lock:
+            return list(self._starts)
+
+    def last_before(self, t: float) -> float | None:
+        """Return the time of the last sound started at or before ``t``, or None."""
+        with self._lock:
+            before = [s for s in self._starts if s <= t]
+        return before[-1] if before else None
+
+
+SOUNDS = SoundStarts()
+
+
 class PhantomWatch:
     """The detector, the speech-sink probe and the wobbler count, and the report, for the console.
 
@@ -1318,14 +1405,20 @@ class PhantomWatch:
         list_inputs: Callable[[], SinkInputs] | None = None,
         pad: PadLevel | None = None,
         wobbler: WobblerWatch | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        """Build with the module's motif state and pw-dump by default."""
+        """Build with the module's motif state, play_sound wrapper and pw-dump by default."""
         self.detector = PhantomDetector(motif=motif)
         self.pad = pad or PadLevel()
         self.wobbler = wobbler or WobblerWatch()
+        self.sounds = SOUNDS
+        self._clock = clock
         self._list_inputs = list_inputs or (lambda: list_sink_inputs(os.getpid()))
         # Each event runs in its own worker: one episode's start and end are not interleaved.
         self._act_lock = threading.Lock()
+        # keep()'s quiet check and attach, and pushed()'s detach, happen in one order.
+        self._probe_gate = threading.Lock()
+        self._last_warning: float | None = None  # the start of the last episode WARNED about
 
     def monitored(self, now: float, seconds: float, speech_s: float) -> None:
         """Note a speaker-monitor buffer, from GStreamer's thread. Never raises."""
@@ -1335,8 +1428,10 @@ class PhantomWatch:
             pass
 
     def pushed(self, now: float, seconds: float) -> None:
-        """Note audio the app pushed."""
-        self.detector.pushed(now, seconds)
+        """Note audio the app is pushing, before it is pushed: the speech-sink probe comes off."""
+        with self._probe_gate:
+            self.detector.pushed(now, seconds)
+            self.pad.detach()
 
     def flushed(self, now: float) -> None:
         """Note a barge-in: the queued audio was dropped."""
@@ -1346,26 +1441,42 @@ class PhantomWatch:
         """Return the events to act on, off the event loop."""
         return self.detector.take()
 
-    def keep(self, audio: Any) -> None:
-        """Keep the probe on the current speaker sink and the count on the current wobbler.
+    def keep(self, audio: Any, now: float | None = None) -> None:
+        """Keep the probe on the current speaker sink while the app is quiet, and the counts on.
 
-        Runs in a worker thread.
+        Runs in a worker thread. A pipeline that is not playing takes the probe off.
         """
+        now = self._clock() if now is None else now
         with MEDIA_LOCK:
             pipeline = getattr(audio, "_pipeline", None)
             sink = speaker_sink(pipeline) if _playing(pipeline) else None
-        if sink is not None:
-            self.pad.attach(sink)
+        if sink is None:
+            self.pad.detach()
+        else:
+            with self._probe_gate:
+                if self.detector.app_quiet(now):
+                    self.pad.attach(sink)
         self.wobbler.keep(audio)
+        self.sounds.install(audio)
 
     def act(self, event: PhantomEvent, audio: Any) -> None:
-        """List the sink inputs when a reported episode starts; log it at its end. Never raises."""
+        """List the sink inputs when an episode may be warned of; log it at its end.
+
+        Never raises.
+        """
         episode = event.episode
         try:
             with self._act_lock:
                 self._act(event, episode, audio)
         except Exception:
             logger.warning("Phantom speech report failed", exc_info=True)
+
+    def _sound_before(self, episode: PhantomEpisode) -> str | None:
+        """Name a play_sound call made within SDK_SOUND_S before the episode, or None."""
+        at = self.sounds.last_before(episode.start + 0.5)
+        if at is None or episode.start - at > SDK_SOUND_S:
+            return None
+        return f"a play_sound call {max(0.0, episode.start - at):.1f} s before"
 
     def _list(self, episode: PhantomEpisode) -> None:
         """List the sink inputs onto ``episode``, once."""
@@ -1380,8 +1491,10 @@ class PhantomWatch:
         """Carry out one event. Holds the act lock."""
         if not episode.sdk_checked:  # at the start, or at the end if the start has not run
             episode.sdk_checked = True
-            episode.sdk_sound = _sdk_sound(audio)
-        if event.kind == "started" and episode.report and episode.sdk_sound is None:
+            episode.sdk_sound = self._sound_before(episode) or _sdk_sound(audio)
+        last = self._last_warning
+        may_warn = last is None or episode.start - last >= PHANTOM_REPORT_EVERY_S
+        if event.kind == "started" and may_warn and episode.sdk_sound is None:
             self._list(episode)
         elif event.kind == "ended" and episode.sdk_sound is not None:
             logger.info(
@@ -1392,8 +1505,9 @@ class PhantomWatch:
                 _wall(episode.start),
                 _wall(episode.end if episode.end is not None else episode.last_loud),
             )
-        elif event.kind == "ended" and episode.report:
+        elif event.kind == "ended" and may_warn:
             self._list(episode)  # its start's listing may not have run yet
+            self._last_warning = episode.start
             logger.warning("%s", self.report(episode, audio))
         elif event.kind == "ended":
             logger.info(
