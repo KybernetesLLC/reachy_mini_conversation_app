@@ -610,6 +610,20 @@ class ReplyTracker:
         self._lags.append(lag)
         self._last_lag = (lag, now)
 
+    def pending(self, now: float) -> bool:
+        """Return whether a reply with speech was pushed and none of its sound heard yet.
+
+        Such a reply may still play, up to LAG_WINDOW_S late (the robot's 65 s lag), so the
+        phantom-speech detector counts it as the app's own sound.
+        """
+        with self._lock:
+            self._expire(now)
+            for reply in self._replies:
+                if reply["lag"] == "pending" and not reply["flushed"]:
+                    if reply["speech"] >= MIN_SPEECH_S:
+                        return True
+            return False
+
     def last_lag(self) -> tuple[float, float] | None:
         """Return (seconds, measured at) of the last measured reply lag, or None."""
         with self._lock:
@@ -756,24 +770,30 @@ def current_speaker_sink(audio: Any, cache: dict[str, Any] | None = None) -> tup
         if cache is not None and cache.get("pipeline") is pipeline:
             return True, cache["sink"]
         sink = speaker_sink(pipeline)
-        if cache is not None:
+        if cache is not None and sink is not None:  # a sink not found yet is looked up again
             cache.update(pipeline=pipeline, sink=sink)
         return True, sink
 
 
-def keep_monitor(monitor: SpeakerMonitor, audio: Any, now: float, stale_s: float = 5.0) -> str:
+def keep_monitor(
+    monitor: SpeakerMonitor,
+    audio: Any,
+    now: float,
+    stale_s: float = 5.0,
+    found: tuple[bool, Any] | None = None,
+) -> str:
     """Keep the speaker monitor on the device the speaker plays to; restart it if it went quiet.
 
+    ``found`` is current_speaker_sink's answer when the caller already looked it up.
     Returns what it did: "running", "started", "stopped" or "unavailable".
     """
-    with MEDIA_LOCK:
-        playing, sink = current_speaker_sink(audio)
-        if not playing:
-            if monitor.source is not None:
-                monitor.stop()
-                return "stopped"
-            return "unavailable"
-        source = SpeakerMonitor.monitor_source(sink)
+    playing, sink = found if found is not None else current_speaker_sink(audio)
+    if not playing:
+        if monitor.source is not None:
+            monitor.stop()
+            return "stopped"
+        return "unavailable"
+    source = SpeakerMonitor.monitor_source(sink)
     if source is None:
         return "unavailable"
     stale = monitor.last_buffer_at is None or now - monitor.last_buffer_at > stale_s

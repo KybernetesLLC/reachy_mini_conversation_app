@@ -8,15 +8,17 @@ the app pushed nothing (and its queued audio has played out) for PHANTOM_QUIET_S
 motif played. Sound from the SDK's play_sound (the app tools' music and express sounds
 bypass watch_motif) is one INFO line, not phantom speech: a sound started within
 SDK_SOUND_S before an episode no longer than that, or a playbin still mid-sound.
-One WARNING per episode, at most one every PHANTOM_REPORT_EVERY_S, names
-every sink input (pw-dump, or pactl), whether the app's speech sink carried sound in
-the episode (a pad probe on it: RMS of each buffer), and whether the head wobbler fired.
-Nothing is kept but RMS numbers and times. Nothing runs on the event loop. The pad probe
-runs Python on the speaker's streaming thread, which must wait for the GIL, so it is on
-only while the app is quiet: put on by keep() once nothing of the app's has played for
-PHANTOM_QUIET_S, taken off by pushed() before a reply's audio is pushed. Any wait then
-falls on silence or on the phantom itself, never on a reply. The listing and the report
-run in a worker thread.
+A reply pushed but not yet heard (ReplyTracker's pending state: it may play up to 65 s
+late) is the app's own sound too.
+One WARNING per episode, at most one every PHANTOM_REPORT_EVERY_S, names every sink input
+(pw-dump, or pactl) and whether the app's speech sink carried sound in the episode (a pad
+probe on it: RMS of each buffer). Nothing is kept but RMS numbers and times. Nothing runs
+on the event loop. The pad probe runs Python on the speaker's streaming thread, which must
+wait for the GIL, so it is on only during a suspected episode: keep() puts it on once the
+monitor turns loud while the app is quiet, and takes it off when that ends or after
+PROBE_MAX_S; pushed() takes it off before a reply's audio is pushed. Any wait then falls
+on silence or on the phantom itself, never on a reply, and never on a long idle stretch.
+The listing and the report run in a worker thread.
 """
 
 from __future__ import annotations
@@ -44,11 +46,15 @@ PHANTOM_LOUD_S = 0.5  # monitor speech, within one candidate, that opens an epis
 PHANTOM_QUIET_S = 3.0  # the app pushed nothing, its queued audio and any motif ended, this long ago
 PHANTOM_END_S = 2.0  # a quiet monitor for this long closes an episode
 PHANTOM_REPORT_EVERY_S = 60.0  # at most one WARNING in this long
+PROBE_MAX_S = 30.0  # the speech-sink probe stays on at most this long for one suspicion
+MONITOR_GONE_S = 120.0  # an open episode with no monitor buffers for this long is closed
+ERRORS_EVERY_S = 60.0  # caught errors are logged at most this often
 SDK_SOUND_S = 3.0  # sound this soon after a play_sound call is that sound (motifs run 0.4-1.9 s)
 SINK_INPUTS_TIMEOUT_S = 5.0
 SINK_INPUTS_MAX_BYTES = 8 * 1024 * 1024  # pw-dump printed 342 KB on the robot (2026-10-26)
 SINK_INPUT_COMMANDS = [["pw-dump"], ["pactl", "-f", "json", "list", "sink-inputs"]]
 Row = dict[str, Any]  # one sink input
+Found = tuple[bool, Any]  # current_speaker_sink's (the pipeline is playing, its speaker sink)
 SinkInputs = tuple[list[Row], str]  # (the sink inputs, where they were read from)
 
 
@@ -93,6 +99,29 @@ class PhantomEvent(NamedTuple):
     episode: PhantomEpisode
 
 
+class ErrorCount:
+    """Errors a callback on a streaming thread caught: counted there, logged from a worker."""
+
+    def __init__(self) -> None:
+        """Start with none."""
+        self._lock = threading.Lock()
+        self._count = 0
+        self._last = ""
+
+    def note(self, exc: BaseException) -> None:
+        """Count one error."""
+        with self._lock:
+            self._count += 1
+            self._last = f"{type(exc).__name__}: {exc}"
+
+    def take(self) -> tuple[int, str]:
+        """Return (errors since the last take, the last one) and start again."""
+        with self._lock:
+            taken = (self._count, self._last)
+            self._count, self._last = 0, ""
+        return taken
+
+
 class PhantomDetector:
     """Find speaker sound the app did not push. Times are passed in; thread-safe.
 
@@ -100,10 +129,20 @@ class PhantomDetector:
     loop. Events are queued for take(), so nothing is done on the caller's thread.
     """
 
-    def __init__(self, motif: Callable[[], tuple[bool, float | None]] | None = None) -> None:
-        """``motif`` returns (a motif is playing, when the last one closed); MOTIFS by default."""
+    def __init__(
+        self,
+        motif: Callable[[], tuple[bool, float | None]] | None = None,
+        pending: Callable[[float], bool] | None = None,
+    ) -> None:
+        """``motif`` returns (a motif is playing, when the last one closed); MOTIFS by default.
+
+        ``pending(now)`` says whether a pushed reply has not been heard yet (ReplyTracker).
+        """
         self._motif = motif or MOTIFS.state
+        self._pending = pending or (lambda now: False)
+        self.errors = ErrorCount()
         self._lock = threading.Lock()
+        self._last_buffer: float | None = None  # the last monitor buffer while an episode is open
         self._last_push: float | None = None
         self._play_end: float | None = None  # when the audio pushed so far has played out
         # (start, loud seconds, last loud) of sound that may open an episode
@@ -118,7 +157,7 @@ class PhantomDetector:
             self._play_end = max(self._play_end or now, now) + seconds
             self._candidate = None
             if self._episode is not None:
-                self._end(now, "the app pushed audio")
+                self._end(self._episode.last_loud, "the app pushed audio")
 
     def flushed(self, now: float) -> None:
         """Note a barge-in: the queued audio was dropped."""
@@ -136,10 +175,37 @@ class PhantomDetector:
         for t in (self._last_push, self._play_end):
             if t is not None and now - t < PHANTOM_QUIET_S:
                 return False
+        if self._pending(now):
+            return False
         playing, closed_at = self._motif()
         if playing:
             return False
         return closed_at is None or now - closed_at >= PHANTOM_QUIET_S
+
+    def suspected(self, now: float) -> float | None:
+        """Return the onset of the sound now suspected (a candidate or an open episode), or None."""
+        with self._lock:
+            if self._episode is not None:
+                return self._episode.start
+            candidate = self._candidate
+            if candidate is not None and now - candidate[2] <= PHANTOM_END_S:
+                return candidate[0]
+            return None
+
+    def monitor_stopped(self, now: float) -> None:
+        """Note that the speaker monitor stopped (capture off, sleep): an open episode ends."""
+        with self._lock:
+            self._candidate = None
+            if self._episode is not None:
+                self._end(self._episode.last_loud, "the speaker monitor stopped")
+
+    def expire(self, now: float) -> None:
+        """Close an open episode that has had no monitor buffer for MONITOR_GONE_S."""
+        with self._lock:
+            last = self._last_buffer
+            if self._episode is not None and last is not None and now - last >= MONITOR_GONE_S:
+                cause = f"no speaker-monitor buffers for {MONITOR_GONE_S:.0f} s"
+                self._end(self._episode.last_loud, cause)
 
     def _end(self, end: float, cause: str) -> None:
         """Close the open episode. Holds the lock."""
@@ -161,11 +227,14 @@ class PhantomDetector:
         try:
             with self._lock:
                 self._monitored(now, seconds, speech_s)
-        except Exception:
-            pass
+        except Exception as exc:
+            # The motif and pending callables belong to other modules, so no narrower class
+            # covers them; an exception out of here would reach the monitor's appsink callback.
+            self.errors.note(exc)
 
     def _monitored(self, now: float, seconds: float, speech_s: float) -> None:
         """Note a monitor buffer. Holds the lock."""
+        self._last_buffer = now
         loud = speech_s > 0.0
         episode = self._episode
         if episode is not None:
@@ -336,8 +405,11 @@ def buffer_rms(data: bytes, fmt: str) -> float | None:
 class PadLevel:
     """A pad probe on the speaker sink's input, keeping (time, RMS, format) of recent buffers."""
 
-    def __init__(self, keep: int = 12000) -> None:
+    def __init__(self, keep: int = 12000, clock: Callable[[], float] = time.monotonic) -> None:
         """Keep the last ``keep`` buffers: a minute or more at pulsesink's buffer sizes."""
+        self._clock = clock
+        self.errors = ErrorCount()
+        self._spans: deque[list[float | None]] = deque(maxlen=100)  # [on, off] of the probe
         self._lock = threading.Lock()
         self._buffers: deque[tuple[float, float | None, str]] = deque(maxlen=keep)
         self._probe_lock = threading.Lock()  # the sink, pad and probe below
@@ -352,9 +424,11 @@ class PadLevel:
         """Whether a sink is being measured."""
         return self._sink is not None
 
-    def measures(self, sink: Any) -> bool:
-        """Whether the probe is on ``sink``."""
-        return sink is not None and sink is self._sink
+    def probed_from(self, start: float, end: float) -> float | None:
+        """Return when the probe went on, if it was on at any time from ``start`` to ``end``."""
+        with self._probe_lock:
+            spans = [on for on, off in self._spans if on <= end and (off is None or off >= start)]
+        return min(spans) if spans else None
 
     def _record(self, now: float, rms_: float | None, fmt: str) -> None:
         """Note one buffer."""
@@ -403,6 +477,7 @@ class PadLevel:
             mask = Gst.PadProbeType.BUFFER | Gst.PadProbeType.EVENT_DOWNSTREAM
             self._probe = pad.add_probe(mask, self._on_probe)
             self._sink, self._pad = sink, pad
+            self._spans.append([self._clock(), None])
             return True
 
     def detach(self) -> None:
@@ -417,6 +492,8 @@ class PadLevel:
                 self._pad.remove_probe(self._probe)
             except Exception:
                 logger.debug("Could not remove the speech sink's pad probe", exc_info=True)
+        if self._sink is not None and self._spans and self._spans[-1][1] is None:
+            self._spans[-1][1] = self._clock()
         self._sink = self._pad = self._probe = None
 
     def _on_probe(self, pad: Any, info: Any) -> Any:
@@ -428,13 +505,17 @@ class PadLevel:
             if info.type & Gst.PadProbeType.BUFFER:
                 buf = info.get_buffer()
                 level = buffer_rms(buf.extract_dup(0, buf.get_size()), self._fmt)
-                self._record(time.monotonic(), level, self._fmt)
+                self._record(self._clock(), level, self._fmt)
             else:
                 event = info.get_event()
                 if event.type == Gst.EventType.CAPS:
                     self._fmt = _caps_format(event.parse_caps())
-        except Exception:
-            pass
+        except (AttributeError, TypeError, ValueError) as exc:  # a buffer or caps not as expected
+            self.errors.note(exc)
+        except Exception as exc:
+            # Anything else is counted too: an exception out of a probe callback would leave
+            # its return value to PyGObject, and this probe must always return OK.
+            self.errors.note(exc)
         return Gst.PadProbeReturn.OK
 
 
@@ -460,53 +541,6 @@ def wrap_once(obj: Any, name: str, tag: Any, make_wrapper: Callable[[Any], Any])
     return True
 
 
-class WobblerWatch:
-    """Count the head wobbler's moves: nonzero offsets it applies, counted per second."""
-
-    def __init__(self, clock: Callable[[], float] = time.monotonic, keep: int = 3600) -> None:
-        """Start with no wobbler watched; ``keep`` seconds of counts are kept."""
-        self._clock = clock
-        self._seconds: deque[list[int]] = deque(maxlen=keep)  # [second, nonzero offsets]
-
-    def keep(self, audio: Any) -> bool:
-        """Watch the SDK's current wobbler, once; a new one is watched too. Returns success."""
-        wobbler = getattr(audio, "_head_wobbler", None)
-        if wobbler is None:
-            return False
-
-        def make(apply: Callable[[Any], Any]) -> Callable[[Any], Any]:
-            def counted(offsets: Any) -> Any:
-                try:
-                    if any(abs(float(v)) > 0.0 for v in offsets):
-                        self._count(int(self._clock()))
-                except Exception:
-                    pass
-                return apply(offsets)
-
-            return counted
-
-        return wrap_once(wobbler, "_apply_offsets", self, make)
-
-    def _count(self, second: int) -> None:
-        """Add one move at ``second``. Only GLib's main loop calls this, so there is one writer."""
-        seconds = self._seconds
-        if seconds and seconds[-1][0] == second:
-            seconds[-1][1] += 1
-        else:
-            seconds.append([second, 1])
-
-    def fired(self, start: float, end: float) -> int:
-        """Return how many nonzero offsets the wobbler applied from ``start`` to ``end``."""
-        total = 0
-        for second, count in reversed(list(self._seconds)):
-            if second > end:
-                continue
-            if second < int(start):
-                break
-            total += count
-        return total
-
-
 class SoundStarts:
     """Wrap the SDK audio's play_sound once, to note when each sound starts.
 
@@ -525,7 +559,13 @@ class SoundStarts:
         self.listeners: list[Callable[[Any, Any, Any], None]] = []
 
     def install(self, audio: Any) -> bool:
-        """Wrap ``audio.play_sound``, once. Returns whether it is wrapped."""
+        """Wrap ``audio.play_sound``, once. Returns whether it is wrapped.
+
+        AGENTS.md: build on the SDK's public API, never monkey-patch its internals. This
+        wraps a public method on the instance, the only way to see the app tools' direct
+        play_sound calls without editing them (app_tools/companion_express.py is not ours
+        to touch); an SDK bump that keeps play_sound keeps it working.
+        """
 
         def make(original: Callable[..., Any]) -> Callable[..., Any]:
             def play_sound(sound_file: Any, *args: Any, **kwargs: Any) -> Any:
@@ -621,7 +661,7 @@ def _describe_playbin(audio: Any) -> str:
 
 
 class PhantomWatch:
-    """The detector, the speech-sink probe and the wobbler count, and the report, for the console.
+    """The detector, the speech-sink probe, the play_sound starts and the report, for the console.
 
     monitored() runs on the speaker monitor's streaming thread; pushed(), flushed() and
     take() on the event loop; keep() and act() in a worker thread.
@@ -632,14 +672,16 @@ class PhantomWatch:
         motif: Callable[[], tuple[bool, float | None]] | None = None,
         list_inputs: Callable[[], SinkInputs] | None = None,
         pad: PadLevel | None = None,
-        wobbler: WobblerWatch | None = None,
         clock: Callable[[], float] = time.monotonic,
+        pending: Callable[[float], bool] | None = None,
     ) -> None:
-        """Build with the module's motif state, its own play_sound wrapper and pw-dump."""
-        self.detector = PhantomDetector(motif=motif)
+        """Build with the module's motif state, its own play_sound wrapper and pw-dump.
+
+        ``pending(now)``: whether a pushed reply is still unheard (ReplyTracker.pending).
+        """
+        self.detector = PhantomDetector(motif=motif, pending=pending)
         self.monitored = self.detector.monitored  # the monitor's streaming thread; never raises
         self.pad = pad or PadLevel()
-        self.wobbler = wobbler or WobblerWatch()
         self.sounds = SoundStarts()
         self._clock = clock
         self._list_inputs = list_inputs or (lambda: list_sink_inputs(os.getpid()))
@@ -649,7 +691,9 @@ class PhantomWatch:
         self._probe_gate = threading.Lock()
         self._last_warning: float | None = None  # the start of the last episode WARNED about
         self._sink_cache: dict[str, Any] = {}  # the speaker sink, by pipeline
-        self._wrapped_for: tuple[int, int] | None = None  # (audio, wobbler) last wrapped
+        self._probe_for: float | None = None  # the onset of the suspicion the probe is on for
+        self._probe_since = 0.0
+        self._errors_logged_at: float | None = None
 
     def pushed(self, now: float, seconds: float) -> None:
         """Note audio the app is pushing, before it is pushed: the speech-sink probe comes off."""
@@ -665,24 +709,52 @@ class PhantomWatch:
         """Return the events to act on, off the event loop."""
         return self.detector.take()
 
-    def keep(self, audio: Any, now: float | None = None) -> None:
-        """Keep the probe on the current speaker sink while the app is quiet, and the counts on.
+    def monitor_stopped(self, now: float) -> None:
+        """Note that the speaker monitor stopped: an open episode ends at its last loud buffer."""
+        self.detector.monitor_stopped(now)
 
-        Runs in a worker thread. A pipeline that is not playing takes the probe off.
+    def keep(self, audio: Any, now: float | None = None, found: Found | None = None) -> None:
+        """Keep the probe on the speaker sink during a suspected episode, and play_sound wrapped.
+
+        Runs in a worker thread. ``found`` is current_speaker_sink's answer when the caller
+        already looked it up. The probe goes on when the monitor turns loud while the app is
+        quiet, and comes off when that ends, after PROBE_MAX_S, or when the pipeline stops.
         """
         now = self._clock() if now is None else now
-        _, sink = playback_health.current_speaker_sink(audio, self._sink_cache)
-        if sink is None:
+        self.detector.expire(now)
+        if found is None:
+            found = playback_health.current_speaker_sink(audio, self._sink_cache)
+        sink = found[1]
+        onset = self.detector.suspected(now)
+        if sink is None or onset is None:
             self.pad.detach()
-        elif not self.pad.measures(sink):
+            self._probe_for = None
+        elif onset != self._probe_for:
             with self._probe_gate:
-                if self.detector.app_quiet(now):
-                    self.pad.attach(sink)
-        wrapped_for = (id(audio), id(getattr(audio, "_head_wobbler", None)))
-        if wrapped_for != self._wrapped_for:
-            self.wobbler.keep(audio)
-            self.sounds.install(audio)
-            self._wrapped_for = wrapped_for
+                if self.detector.app_quiet(now) and self.pad.attach(sink):
+                    self._probe_for, self._probe_since = onset, now
+        elif now - self._probe_since >= PROBE_MAX_S:
+            self.pad.detach()  # and stays off for the rest of this suspicion
+        self.sounds.install(audio)
+        self._log_errors(now)
+
+    def _log_errors(self, now: float) -> None:
+        """Log the errors the streaming-thread callbacks caught, at most once a minute."""
+        logged = self._errors_logged_at
+        if logged is not None and now - logged < ERRORS_EVERY_S:
+            return
+        probe, probe_last = self.pad.errors.take()
+        monitor, monitor_last = self.detector.errors.take()
+        if not probe and not monitor:
+            return
+        self._errors_logged_at = now
+        logger.warning(
+            "Phantom detector errors caught: probe %d (last: %s), monitor %d (last: %s)",
+            probe,
+            probe_last or "none",
+            monitor,
+            monitor_last or "none",
+        )
 
     def act(self, event: PhantomEvent, audio: Any) -> None:
         """List the sink inputs when an episode may be warned of; log it at its end.
@@ -722,7 +794,7 @@ class PhantomWatch:
         last = self._last_warning
         may_warn = last is None or episode.start - last >= PHANTOM_REPORT_EVERY_S
         if event.kind == "started":
-            if may_warn and sdk_sound is None:
+            if may_warn:  # even when a play_sound start may explain it: it may run long
                 self._list(episode)
             return
         span = (episode.loud_s, _wall(episode.start), _wall(episode.end_or_last))
@@ -751,10 +823,12 @@ class PhantomWatch:
             push = "nothing pushed since the app started"
         else:
             push = f"last push {episode.last_push_age_s:.0f} s before"
-        pad = self.pad.summary(episode.start - 1.0, end)
-        if pad == "no buffers" and not self.pad.attached:
-            pad = "not probed"
-        fired = self.wobbler.fired(episode.start - 1.0, end)
+        probed = self.pad.probed_from(episode.start - 1.0, end)
+        if probed is None:
+            pad = "speech sink pad: not probed"
+        else:
+            summary = self.pad.summary(max(probed, episode.start - 1.0), end)
+            pad = f"speech sink pad, probed from {_wall(probed)}: {summary}"
         inputs, source = episode.inputs if episode.inputs is not None else ([], "not listed")
         if source in ("pw-dump", "pactl"):
             listed = f"sink inputs ({source}): {describe_sink_inputs(inputs)}"
@@ -764,6 +838,5 @@ class PhantomWatch:
         return (
             f"Phantom speech: the speaker played {episode.loud_s:.1f} s loud "
             f"from {_wall(episode.start)} to {_wall(end)} ({cause}) with no push from the app "
-            f"({push}) and no motif; speech sink pad: {pad}; head wobbler fired {fired} times; "
-            f"{_describe_playbin(audio)}; {listed}"
+            f"({push}) and no motif; {pad}; {_describe_playbin(audio)}; {listed}"
         )

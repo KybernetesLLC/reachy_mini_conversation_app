@@ -4,7 +4,7 @@ At 05:22 the speaker replayed speech from a conversation at 20:03 the night befo
 the app logged no push and the head did not move. The detector logs any such
 episode: the speaker's monitor loud while the app pushed nothing and no motif
 played, with every sink input, whether the app's own speech sink carried sound,
-and whether the head wobbler fired. RMS numbers only; no audio is kept.
+RMS numbers only; no audio is kept.
 """
 
 from __future__ import annotations
@@ -310,30 +310,6 @@ def test_a_failing_measurement_never_reaches_the_streaming_thread() -> None:
     assert level._on_probe(pad, info) == Gst.PadProbeReturn.OK
 
 
-# --- the head wobbler: did it fire ----------------------------------------------------------
-
-
-def test_the_wobbler_watch_counts_nonzero_offsets_and_passes_them_on() -> None:
-    """Each nonzero head offset is counted and still applied; a new wobbler is watched too."""
-    applied: list[tuple[float, ...]] = []
-    wobbler = SimpleNamespace(_apply_offsets=applied.append)
-    audio = SimpleNamespace(_head_wobbler=wobbler)
-    watch = ps.WobblerWatch(clock=lambda: 50.0)
-    assert watch.keep(audio) is True
-    assert watch.keep(audio) is True  # wrapped once, not twice
-    wobbler._apply_offsets((0.0,) * 6)
-    wobbler._apply_offsets((0.001, 0.0, 0.0, 0.0, 0.0, 0.0))
-    assert applied == [(0.0,) * 6, (0.001, 0.0, 0.0, 0.0, 0.0, 0.0)]
-    assert watch.fired(49.0, 51.0) == 1
-    assert watch.fired(51.0, 52.0) == 0
-    newer = SimpleNamespace(_apply_offsets=applied.append)
-    audio._head_wobbler = newer
-    watch.keep(audio)
-    newer._apply_offsets((0.0, 0.002, 0.0, 0.0, 0.0, 0.0))
-    assert watch.fired(49.0, 51.0) == 2
-    assert ps.WobblerWatch().keep(SimpleNamespace(_head_wobbler=None)) is False
-
-
 # --- motifs: open and closed, from the fork's own watcher --------------------------------
 
 
@@ -362,7 +338,6 @@ def test_watch_motif_marks_the_motif_active_until_it_ends() -> None:
 class _Fakes:
     def __init__(self) -> None:
         self.pad = ps.PadLevel()
-        self.wobbler = ps.WobblerWatch()
         self.snapshots = 0
 
     def list_inputs(self) -> tuple[list[dict[str, Any]], str]:
@@ -370,16 +345,18 @@ class _Fakes:
         return ps.sink_inputs_from_pw_dump(ROBOT_DUMP, own_pid=1330), "pw-dump"
 
 
-def test_an_episode_is_reported_once_with_the_sink_inputs_the_pad_and_the_wobbler(
+def test_an_episode_is_reported_once_with_the_sink_inputs_and_the_pad(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """One WARNING at the episode's end, with what was listed at its start."""
+    _gst()
     fakes = _Fakes()
+    fakes.pad = ps.PadLevel(clock=lambda: 99.5)
+    fakes.pad.attach(SimpleNamespace(get_static_pad=lambda name: _FakePad()))
     watch = ps.PhantomWatch(
         motif=lambda: (False, None),
         list_inputs=fakes.list_inputs,
         pad=fakes.pad,
-        wobbler=fakes.wobbler,
     )
     watch.pushed(10.0, 1.0)
     for i in range(20):
@@ -399,8 +376,8 @@ def test_an_episode_is_reported_once_with_the_sink_inputs_the_pad_and_the_wobble
     assert "2.0 s loud" in line
     assert "last push 90 s before" in line
     assert "node 108 serial 1347 16000 Hz pid 1330 (this app)" in line
-    assert "speech sink pad: 20 buffers, 0 loud" in line
-    assert "head wobbler fired 0 times" in line
+    assert "speech sink pad, probed from " in line and ": 20 buffers, 0 loud" in line
+    assert "wobbler" not in line
     assert "no motif playbin" in line
     assert fakes.snapshots == 1
 
@@ -414,7 +391,6 @@ def test_a_second_episode_within_the_minute_is_one_info_line(
         motif=lambda: (False, None),
         list_inputs=fakes.list_inputs,
         pad=fakes.pad,
-        wobbler=fakes.wobbler,
     )
     audio = SimpleNamespace(_playbin=None)
     with caplog.at_level(logging.INFO, logger=ps.logger.name):
@@ -641,16 +617,19 @@ def _probe_rig(monkeypatch: pytest.MonkeyPatch, playing: list[bool]) -> tuple[An
 
 
 def test_the_probe_is_on_only_while_the_app_is_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A push removes it before the reply's buffers flow; quiet puts it back."""
+    """A push removes it before the reply's buffers flow; a later suspicion puts it back."""
     _gst()
     audio, pad = _probe_rig(monkeypatch, [True])
     watch = ps.PhantomWatch(motif=lambda: (False, None))
+    _suspect(watch, 99.7, 100.0)  # loud with nothing ever pushed: suspected
     watch.keep(audio, 100.0)
-    assert len(pad.probes) == 1  # nothing ever pushed: quiet
+    assert len(pad.probes) == 1
     watch.pushed(101.0, 2.0)
     assert pad.probes == {}  # removed at the push, before the audio reaches the sink
-    watch.keep(audio, 104.0)  # the reply plays until 103, quiet only from 106
+    _monitor(watch.detector, 103.5, 104.0, loud=True)  # the reply's sound: not suspected
+    watch.keep(audio, 104.0)
     assert pad.probes == {}
+    _suspect(watch, 106.0, 106.5)  # loud again once the app is quiet (from 106)
     watch.keep(audio, 106.5)
     assert len(pad.probes) == 1
 
@@ -661,7 +640,9 @@ def test_the_probe_comes_off_when_the_pipeline_stops(monkeypatch: pytest.MonkeyP
     playing = [True]
     audio, pad = _probe_rig(monkeypatch, playing)
     watch = ps.PhantomWatch(motif=lambda: (False, None))
+    _suspect(watch, 99.7, 100.0)
     watch.keep(audio, 100.0)
+    assert len(pad.probes) == 1
     playing[0] = False
     watch.keep(audio, 101.0)
     assert pad.probes == {} and not watch.pad.attached
@@ -793,6 +774,7 @@ def test_a_keep_that_checked_quiet_before_a_push_cannot_attach_after_it(
         return result
 
     monkeypatch.setattr(watch.detector, "app_quiet", slow_quiet)
+    _suspect(watch, 99.7, 100.0)
     keeper = threading.Thread(target=watch.keep, args=(audio, 100.0))
     keeper.start()
     assert inside.wait(2.0)
@@ -803,3 +785,192 @@ def test_a_keep_that_checked_quiet_before_a_push_cannot_attach_after_it(
     keeper.join(2.0)
     pusher.join(2.0)
     assert pad.probes == {}  # the push's detach came after the attach
+
+
+# --- /code-review fixes ------------------------------------------------------------------------
+
+
+def test_a_reply_pushed_but_not_yet_heard_is_never_a_phantom() -> None:
+    """A reply the server plays 50 s late is the app's own: ReplyTracker still has it pending."""
+    tracker = ph.ReplyTracker(rebuilt_at=lambda: None)
+    tracker.pushed(10.0, 2.0, 2.0)
+    det = ps.PhantomDetector(motif=lambda: (False, None), pending=tracker.pending)
+    det.pushed(10.0, 2.0)
+    _monitor(det, 60.0, 62.0, loud=True)  # the late reply, at last
+    assert det.take() == []
+
+
+def _suspect(watch: ps.PhantomWatch, start: float, end: float) -> None:
+    _monitor(watch.detector, start, end, loud=True)
+
+
+def test_an_idle_stretch_with_a_quiet_monitor_attaches_no_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No Python per buffer on the speech sink while nothing is suspected."""
+    _gst()
+    audio, pad = _probe_rig(monkeypatch, [True])
+    watch = ps.PhantomWatch(motif=lambda: (False, None))
+    for t in range(100, 400, 1):
+        _monitor(watch.detector, float(t), t + 1.0, loud=False)
+        watch.keep(audio, t + 1.0)
+    assert pad.probes == {}
+
+
+def test_the_probe_is_on_from_a_suspected_onset_until_the_episode_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On at a suspected onset, off when the episode ends."""
+    _gst()
+    audio, pad = _probe_rig(monkeypatch, [True])
+    watch = ps.PhantomWatch(motif=lambda: (False, None))
+    _suspect(watch, 100.0, 100.3)  # loud while quiet: a candidate, not yet an episode
+    watch.keep(audio, 100.3)
+    assert len(pad.probes) == 1
+    _suspect(watch, 100.3, 104.0)
+    _monitor(watch.detector, 104.0, 106.5, loud=False)  # the episode ends at 104
+    watch.keep(audio, 106.5)
+    assert pad.probes == {}
+
+
+def test_the_probe_comes_off_after_30_s_of_one_suspicion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One suspicion keeps the probe on PROBE_MAX_S at most."""
+    _gst()
+    audio, pad = _probe_rig(monkeypatch, [True])
+    watch = ps.PhantomWatch(motif=lambda: (False, None))
+    _suspect(watch, 100.0, 101.0)
+    watch.keep(audio, 101.0)
+    assert len(pad.probes) == 1
+    _suspect(watch, 101.0, 140.0)
+    watch.keep(audio, 132.0)
+    assert pad.probes == {}
+    watch.keep(audio, 140.0)  # the same episode: it stays off
+    assert pad.probes == {}
+
+
+def test_the_report_says_from_when_the_pad_was_probed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The WARNING says from when the speech sink was measured."""
+    _gst()
+    audio, pad = _probe_rig(monkeypatch, [True])
+    clock = [100.5]
+    fakes = _Fakes()
+    watch = ps.PhantomWatch(
+        motif=lambda: (False, None),
+        list_inputs=fakes.list_inputs,
+        pad=ps.PadLevel(clock=lambda: clock[0]),
+    )
+    _suspect(watch, 100.0, 100.5)
+    watch.keep(audio, 100.5)
+    _suspect(watch, 100.5, 102.0)
+    events = watch.take()
+    line = watch.report(events[0].episode, audio)
+    assert "speech sink pad, probed from " in line
+
+
+def test_an_episode_closes_when_the_monitor_stops() -> None:
+    """Capture off or sleep closes the episode at its last loud buffer."""
+    det = ps.PhantomDetector(motif=lambda: (False, None))
+    _monitor(det, 100.0, 103.0, loud=True)
+    det.monitor_stopped(110.0)
+    events = det.take()
+    assert [e.kind for e in events] == ["started", "ended"]
+    assert events[1].episode.end == pytest.approx(103.0)
+    assert "monitor" in events[1].episode.end_cause
+
+
+def test_an_episode_closes_after_120_s_with_no_monitor_buffers() -> None:
+    """A monitor that went silent without stopping closes it after MONITOR_GONE_S."""
+    det = ps.PhantomDetector(motif=lambda: (False, None))
+    _monitor(det, 100.0, 103.0, loud=True)
+    det.expire(200.0)
+    assert [e.kind for e in det.take()] == ["started"]
+    det.expire(223.1)
+    (ended,) = det.take()
+    assert ended.episode.end == pytest.approx(103.0)
+
+
+def test_an_episode_a_push_closes_ends_at_its_last_loud_buffer() -> None:
+    """The pad window ends at the sound, not at the push."""
+    det = ps.PhantomDetector(motif=lambda: (False, None))
+    _monitor(det, 100.0, 101.0, loud=True)
+    _monitor(det, 101.0, 102.5, loud=False)
+    det.pushed(102.5, 1.0)
+    ended = det.take()[-1]
+    assert ended.episode.end == pytest.approx(101.0)
+
+
+def test_a_missing_speaker_sink_is_never_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sink not found yet is looked up again next time."""
+    sinks = [None, "sink"]
+    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: sinks.pop(0))
+    monkeypatch.setattr(ph, "_playing", lambda pipeline: True)
+    audio = SimpleNamespace(_pipeline="p")
+    cache: dict[str, Any] = {}
+    assert ph.current_speaker_sink(audio, cache) == (True, None)
+    assert ph.current_speaker_sink(audio, cache) == (True, "sink")
+
+
+def test_play_sound_replaced_on_the_same_audio_is_wrapped_again() -> None:
+    """wrap_once runs each tick, so a fresh method is wrapped again."""
+    played: list[str] = []
+    audio = SimpleNamespace(_playbin=None, _pipeline=None, play_sound=played.append)
+    watch = ps.PhantomWatch(motif=lambda: (False, None))
+    watch.keep(audio, 1.0)
+    audio.play_sound = played.append  # the same audio object, a fresh method
+    watch.keep(audio, 2.0)
+    audio.play_sound("x.wav")
+    assert played == ["x.wav"] and len(watch.sounds.starts()) == 1
+
+
+def test_an_episode_a_play_sound_may_explain_is_still_listed_at_its_start() -> None:
+    """The listing at the start does not wait on the play_sound judgement."""
+    fakes = _Fakes()
+    clock = [99.5]
+    audio = SimpleNamespace(_playbin=None, play_sound=lambda path: None)
+    watch = ps.PhantomWatch(motif=lambda: (False, None), list_inputs=fakes.list_inputs)
+    watch.sounds = ps.SoundStarts(clock=lambda: clock[0])
+    watch.sounds.install(audio)
+    audio.play_sound("express.wav")
+    _monitor(watch.detector, 100.0, 101.0, loud=True)
+    for event in watch.take():
+        watch.act(event, audio)
+    assert fakes.snapshots == 1
+
+
+def test_the_head_wobbler_is_left_alone() -> None:
+    """AGENTS.md: no monkey-patching of SDK internals."""
+    apply = print
+    audio = SimpleNamespace(_head_wobbler=SimpleNamespace(_apply_offsets=apply), _pipeline=None)
+    ps.PhantomWatch(motif=lambda: (False, None)).keep(audio, 1.0)
+    assert audio._head_wobbler._apply_offsets is apply
+
+
+def test_probe_errors_are_counted_and_logged_once_a_minute(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Errors in the probe are counted and logged at most once a minute."""
+    Gst = _gst()
+    watch = ps.PhantomWatch(motif=lambda: (False, None))
+    bad = SimpleNamespace(type=Gst.PadProbeType.BUFFER, get_buffer=lambda: None)
+    for _ in range(3):
+        assert watch.pad._on_probe(None, bad) == Gst.PadProbeReturn.OK
+    audio = SimpleNamespace(_pipeline=None)
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
+        watch.keep(audio, 100.0)
+        watch.keep(audio, 130.0)
+        watch.keep(audio, 161.0)
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1 and "3" in warnings[0] and "probe" in warnings[0]
+
+
+def test_monitor_errors_are_counted_not_raised(caplog: pytest.LogCaptureFixture) -> None:
+    """An error in the monitor callback is counted and logged, never raised."""
+
+    def broken() -> Any:
+        raise RuntimeError("boom")
+
+    watch = ps.PhantomWatch(motif=broken)
+    watch.monitored(1.0, 0.1, 0.1)  # no exception into GStreamer
+    with caplog.at_level(logging.INFO, logger=ps.logger.name):
+        watch.keep(SimpleNamespace(_pipeline=None), 100.0)
+    assert any("monitor" in w and "RuntimeError" in w for w in _warnings(caplog))
