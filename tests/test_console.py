@@ -1388,6 +1388,15 @@ async def test_change_voice_reports_handler_failure() -> None:
     assert "Failed to change voice" in result
 
 
+def _monitor_unavailable(monitor: Any, audio: Any, now: float, found: Any = None) -> str:
+    """Stand in for keep_monitor: no speaker monitor."""
+    return "unavailable"
+
+
+def _on_main_thread() -> bool:
+    return threading.current_thread() is threading.main_thread()
+
+
 def _audio_robot(**media_attrs: Any) -> SimpleNamespace:
     """Return a robot whose media exposes only the attributes a test drives."""
     return SimpleNamespace(media=SimpleNamespace(audio=None, backend=None, **media_attrs))
@@ -3665,6 +3674,37 @@ def test_the_sound_wrapper_is_installed_at_startup() -> None:
     assert stream._phantom.sounds.starts()
 
 
+def test_one_speaker_sink_lookup_serves_the_monitor_and_the_phantom_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One lookup (one MEDIA_LOCK) per hop, handed to both."""
+    from reachy_mini_conversation_app import playback_health
+
+    robot = _audio_robot()
+    stream = LocalStream(MagicMock(), robot)
+    lookups: list[Any] = []
+    found = (True, "sink")
+
+    def lookup(audio: Any, cache: Any = None) -> Any:
+        lookups.append(audio)
+        return found
+
+    seen: list[Any] = []
+    monkeypatch.setattr(playback_health, "current_speaker_sink", lookup)
+    monkeypatch.setattr(
+        playback_health,
+        "keep_monitor",
+        lambda monitor, audio, now, found=None: seen.append(("monitor", found)) or "running",
+    )
+    stream._phantom = SimpleNamespace(
+        keep=lambda audio, now, found=None: seen.append(("phantom", found)),
+        monitor_stopped=lambda now: seen.append(("stopped", now)),
+    )
+    stream._keep_speaker_watches("audio", 5.0)
+    assert lookups == ["audio"]
+    assert seen == [("monitor", found), ("phantom", found)]
+
+
 def test_a_monitor_buffer_reaches_the_reply_tracker_and_the_phantom_watch() -> None:
     """Each monitor buffer feeds the reply tracker and the phantom watch."""
     robot = _audio_robot()
@@ -3687,7 +3727,7 @@ async def test_the_playback_guard_keeps_the_phantom_probes_and_reports_off_the_e
     robot.media.audio = SimpleNamespace(_pipeline=None)
     stream = LocalStream(MagicMock(), robot)
     stream._replies = SimpleNamespace(tick=lambda now: [], unheard_in_a_row=0, armed=True)
-    monkeypatch.setattr(playback_health, "keep_monitor", lambda monitor, audio, now: "unavailable")
+    monkeypatch.setattr(playback_health, "keep_monitor", _monitor_unavailable)
     events = [["an event"]]
     acted: list[tuple[Any, Any, bool]] = []
     kept: list[bool] = []
@@ -3700,7 +3740,8 @@ async def test_the_playback_guard_keeps_the_phantom_probes_and_reports_off_the_e
     stream._phantom = SimpleNamespace(
         take=lambda: events.pop() if events else [],
         act=act,
-        keep=lambda audio, now: kept.append(threading.current_thread() is threading.main_thread()),
+        keep=lambda audio, now, found=None: kept.append(_on_main_thread()),
+        monitor_stopped=lambda now: None,
     )
     await asyncio.wait_for(stream.playback_guard_loop(interval_s=0.01), timeout=2.0)
     await asyncio.gather(*stream._background)
@@ -3722,7 +3763,7 @@ async def test_the_playback_guard_rebuilds_off_the_event_loop_after_unheard_repl
     stream._replies = SimpleNamespace(
         tick=lambda now: verdicts.pop() if verdicts else [], unheard_in_a_row=0, armed=True
     )
-    monkeypatch.setattr(playback_health, "keep_monitor", lambda monitor, audio, now: "unavailable")
+    monkeypatch.setattr(playback_health, "keep_monitor", _monitor_unavailable)
     rebuilt: list[tuple[Any, str, str, bool]] = []
     loop = asyncio.get_running_loop()
 
@@ -3760,7 +3801,7 @@ async def test_a_reply_heard_late_is_logged_and_never_rebuilds(
         return verdicts.pop()
 
     stream._replies = SimpleNamespace(tick=tick, unheard_in_a_row=0, armed=True)
-    monkeypatch.setattr(playback_health, "keep_monitor", lambda monitor, audio, now: "unavailable")
+    monkeypatch.setattr(playback_health, "keep_monitor", _monitor_unavailable)
     rebuilt: list[str] = []
     monkeypatch.setattr(playback_health.GOVERNOR, "rebuild", lambda audio, trigger, cause: rebuilt.append(trigger))
     with caplog.at_level(logging.INFO):

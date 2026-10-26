@@ -337,7 +337,9 @@ class LocalStream:
         # The unheard-reply trigger: replies pushed, judged against the speaker's monitor.
         self._replies = playback_health.ReplyTracker()
         # The phantom-speech detector (2026-10-26): speaker sound the app did not push.
-        self._phantom = phantom_speech.PhantomWatch()
+        # A reply pushed but not yet heard may still play late: the app's own sound.
+        self._phantom = phantom_speech.PhantomWatch(pending=lambda now: self._replies.pending(now))
+        self._speaker_sink_cache: dict[str, Any] = {}
         # Every play_sound caller is seen from the start (the app tools use it directly).
         try:
             sdk_audio = getattr(getattr(robot, "media", None), "audio", None)
@@ -1086,13 +1088,23 @@ class LocalStream:
                 self._run_off_loop(self._phantom.act, event, audio)
 
     def _keep_speaker_watches(self, audio: Any, now: float) -> None:
-        """Keep the speaker monitor and the phantom watch's probes on, in one worker hop."""
+        """Keep the speaker monitor and the phantom watch's probes on, in one worker hop.
+
+        The speaker sink is looked up once (one MEDIA_LOCK) and handed to both.
+        """
         try:
-            playback_health.keep_monitor(self._speaker_monitor, audio, now)
+            found = playback_health.current_speaker_sink(audio, self._speaker_sink_cache)
+        except Exception:
+            logger.warning("Speaker sink lookup failed", exc_info=True)
+            return
+        try:
+            kept = playback_health.keep_monitor(self._speaker_monitor, audio, now, found=found)
+            if kept in ("stopped", "unavailable"):
+                self._phantom.monitor_stopped(now)
         except Exception:
             logger.warning("Speaker monitor check failed", exc_info=True)
         try:
-            self._phantom.keep(audio, now)
+            self._phantom.keep(audio, now, found=found)
         except Exception:
             logger.warning("Phantom speech probe check failed", exc_info=True)
 
