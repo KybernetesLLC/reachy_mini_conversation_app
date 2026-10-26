@@ -1439,33 +1439,6 @@ def test_a_sound_started_during_a_teardown_is_not_orphaned(monkeypatch: pytest.M
     assert old.states == [Gst.State.NULL] and new.states == []
 
 
-# The idle refresh (2026-10-18): a session opening after REFRESH_IDLE_S with nothing
-# pushed rebuilds the speaker stream first.
-
-
-@pytest.mark.parametrize(
-    ("fresh_at", "idle_s", "action"),
-    [
-        ((None, None, 0.0), 600.0, "refresh"),  # 1000 s since the stream started, nothing since
-        ((500.0, None, 0.0), 600.0, "ok"),  # a reply pushed 500 s ago
-        ((None, 450.0, 0.0), 600.0, "ok"),  # a rebuild 550 s ago
-        ((399.0, None, 0.0), 600.0, "refresh"),  # 601 s since the last push
-        ((None, None, None), 600.0, "ok"),  # nothing known
-        ((None, None, 0.0), 0.0, "ok"),  # off
-    ],
-)
-def test_the_idle_refresh_counts_from_the_latest_of_push_rebuild_and_start(
-    fresh_at: tuple[float | None, ...], idle_s: float, action: str
-) -> None:
-    """Idle counts from the latest push, rebuild or start; past the threshold, a refresh."""
-    assert ph.refresh_decision(1000.0, fresh_at, idle_s).action == action
-
-
-def test_the_idle_refresh_cause_is_in_minutes() -> None:
-    """The cause reads as the log line's "N min idle"."""
-    assert ph.refresh_decision(4500.0, (0.0,), 600.0).cause == "75 min idle"
-
-
 def test_the_reply_tracker_keeps_the_last_push_time() -> None:
     """The open reads when a reply was last pushed."""
     tracker = ph.ReplyTracker(rebuilt_at=lambda: None)
@@ -1475,37 +1448,121 @@ def test_the_reply_tracker_keeps_the_last_push_time() -> None:
     assert tracker.last_pushed_at == 12.5
 
 
-def test_the_idle_refresh_rebuilds_through_the_governor_and_logs_it(
+# One idle policy, two callers. The idle refresh (2026-10-18): a session opening after
+# 10 minutes with nothing pushed rebuilds the speaker stream first. The periodic idle
+# rebuild (2026-10-26): a speech stream with no write for hours lets pipewire-pulse's read
+# index run 2^31 bytes ahead of its write index (9 h 19 m at 64,000 B/s), and the server
+# replays the last 4 MiB written; the watchdog's tick rebuilds it after 3 h, unless a
+# reply, a session or a sound holds it back.
+
+OPEN = ph.IdlePolicy("idle refresh", 600.0)
+TICK = ph.IdlePolicy("idle rebuild", 10800.0, backoff_s=600.0)
+
+
+@pytest.mark.parametrize(
+    ("fresh_at", "idle_s", "action"),
+    [
+        ((None, None, 0.0), 600.0, "rebuild"),  # 1000 s since the stream started, nothing since
+        ((500.0, None, 0.0), 600.0, "ok"),  # a reply pushed 500 s ago
+        ((None, 450.0, 0.0), 600.0, "ok"),  # a rebuild 550 s ago
+        ((399.0, None, 0.0), 600.0, "rebuild"),  # 601 s since the last push
+        ((None, None, None), 600.0, "ok"),  # nothing known
+        ((None, None, 0.0), 0.0, "ok"),  # off
+    ],
+)
+def test_idle_counts_from_the_latest_of_push_rebuild_and_start(
+    fresh_at: tuple[float | None, ...], idle_s: float, action: str
+) -> None:
+    """Idle counts from the latest push, rebuild or start; past the threshold, a rebuild."""
+    governor = ph.RebuildGovernor(clock=lambda: 1000.0)
+    policy = ph.IdlePolicy("idle refresh", idle_s)
+    assert governor.idle_verdict(1000.0, policy, fresh_at).action == action
+
+
+@pytest.mark.parametrize(
+    ("fresh_at", "held", "action"),
+    [
+        ((None, None, 0.0), (), "rebuild"),  # 3 h 20 min since the stream started
+        ((1000.0, None, 0.0), (), "rebuild"),  # 3 h 3 min since the last push
+        ((2000.0, None, 0.0), (), "ok"),  # 2 h 47 min: not yet
+        ((None, 1500.0, 0.0), (), "ok"),  # a rebuild 2 h 55 min ago, this one or another
+        ((None, None, 0.0), ("a reply is playing",), "ok"),
+        ((None, None, 0.0), ("a session is open",), "ok"),
+        ((None, None, 0.0), ("a sound is playing",), "ok"),
+    ],
+)
+def test_the_tick_rebuilds_after_hours_with_no_write_and_nothing_holding_it(
+    fresh_at: tuple[float | None, ...], held: tuple[str, ...], action: str
+) -> None:
+    """Due 3 h after the last write; a reply, a session or a sound holds it back."""
+    governor = ph.RebuildGovernor(clock=lambda: 12000.0)
+    assert governor.idle_verdict(12000.0, TICK, fresh_at, held).action == action
+
+
+def test_an_idle_verdict_says_why_it_ran_and_why_it_waited() -> None:
+    """The cause is the log line's "N min idle"; a hold names what held it."""
+    governor = ph.RebuildGovernor(clock=lambda: 12000.0)
+    assert governor.idle_verdict(4500.0, OPEN, (0.0,)).cause == "75 min idle"
+    assert governor.idle_verdict(12000.0, TICK, (0.0,)).cause == "200 min idle"
+    held = governor.idle_verdict(12000.0, TICK, (0.0,), ("a session is open", "a sound is playing"))
+    assert held.cause == "held: a session is open, a sound is playing"
+
+
+def test_a_tried_rebuild_backs_the_tick_off_but_not_the_open() -> None:
+    """A rebuild skipped or held back is tried again by the tick 10 min on, not each minute."""
+    governor = ph.RebuildGovernor(clock=lambda: 12000.0)
+    capture_off = SimpleNamespace(_pipeline=_Pipeline(playing=False))
+    assert governor.rebuild(capture_off, "idle rebuild", "x") is False
+    assert governor.last_attempt_at == 12000.0
+    for t, action in ((12060.0, "ok"), (12599.0, "ok"), (12601.0, "rebuild")):
+        assert governor.idle_verdict(t, TICK, (0.0,)).action == action, t
+    assert governor.idle_verdict(12060.0, OPEN, (0.0,)).action == "rebuild"  # no back-off
+
+
+def test_the_rebuilding_line_level_comes_from_the_trigger(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The refresh is the governor's rebuild, with its own trigger, then the "refreshed" line."""
+    """The tick's rebuild is routine (INFO); the open's and the fault triggers' are WARNINGs."""
     audio = SimpleNamespace(_pipeline=_Pipeline())
     monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
     monkeypatch.setattr(ph, "rebuild_sink", lambda sink: True)
-    governor = ph.RebuildGovernor(clock=lambda: 100.0)
+    now = [100.0]
+    governor = ph.RebuildGovernor(clock=lambda: now[0])
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
-        assert ph.refresh_after_idle(audio, "75 min idle", governor) is True
-    messages = [r.getMessage() for r in caplog.records]
-    assert any("trigger: idle refresh" in m for m in messages)
-    assert "Speaker stream refreshed after 75 min idle" in messages
+        for trigger in ("idle rebuild", "idle refresh", "unheard replies"):
+            assert governor.rebuild(audio, trigger, "x")
+            now[0] += 1000.0
+    rebuilding = [r for r in caplog.records if r.getMessage().startswith("Rebuilding the speaker")]
+    assert [r.levelno for r in rebuilding] == [logging.INFO, logging.WARNING, logging.WARNING]
+    assert "trigger: idle rebuild" in rebuilding[0].getMessage()
 
 
-def test_an_idle_refresh_that_did_not_run_is_not_logged_as_refreshed(
+def test_a_skipped_rebuild_is_logged_with_its_cause(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Capture off: the governor skips, and no "refreshed" line claims otherwise."""
+    """Capture off or no speaker sink: one INFO line each, and the attempt is recorded."""
     audio = SimpleNamespace(_pipeline=_Pipeline(playing=False))
-    governor = ph.RebuildGovernor(clock=lambda: 100.0)
+    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: None)
+    now = [100.0]
+    governor = ph.RebuildGovernor(clock=lambda: now[0])
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
-        assert ph.refresh_after_idle(audio, "75 min idle", governor) is False
-    assert not any("refreshed" in r.getMessage() for r in caplog.records)
+        assert governor.rebuild(audio, "idle rebuild", "x") is False
+        now[0] = 200.0
+        audio._pipeline.playing = True
+        assert governor.rebuild(audio, "idle rebuild", "x") is False
+    skips = [r.getMessage() for r in caplog.records if "skipped" in r.getMessage()]
+    assert skips == [
+        "Speaker stream rebuild skipped (trigger: idle rebuild): the pipeline is not playing",
+        "Speaker stream rebuild skipped (trigger: idle rebuild): no speaker sink",
+    ]
+    assert governor.last_attempt_at == 200.0 and governor.last_rebuild_at is None
 
 
 def test_pair_idle_refresh_and_the_unheard_trigger_share_one_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
     """Refresh x the watchdog's cooldown: the unheard trigger rebuilds 30 s after a refresh.
 
     A refresh that did not help leaves the unheard trigger its rebuild 30 s later, not
-    sooner; and a watchdog rebuild makes the stream fresh for the next open.
+    sooner; and a watchdog rebuild makes the stream fresh for the next open and tick.
     """
     now = [100.0]
     rebuilt: list[str] = []
@@ -1513,57 +1570,19 @@ def test_pair_idle_refresh_and_the_unheard_trigger_share_one_cooldown(monkeypatc
     monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
     monkeypatch.setattr(ph, "rebuild_sink", lambda sink: rebuilt.append(sink) or True)
     governor = ph.RebuildGovernor(clock=lambda: now[0])
-    assert ph.refresh_after_idle(audio, "75 min idle", governor)
+    assert governor.rebuild(audio, "idle refresh", "75 min idle")
     now[0] = 120.0  # 3 unheard replies can not come sooner than this after an open
     assert governor.rebuild(audio, "unheard replies", "3 in a row") is False
     now[0] = 131.0
     assert governor.rebuild(audio, "unheard replies", "3 in a row") is True
     assert rebuilt == ["sink", "sink"]
-    # The next open, 5 minutes on with nothing pushed: the watchdog's rebuild counts as fresh.
-    assert ph.refresh_decision(431.0, (None, governor.last_rebuild_at, 0.0)).action == "ok"
+    fresh = (None, governor.last_rebuild_at, 0.0)
+    assert governor.idle_verdict(431.0, OPEN, fresh).action == "ok"
+    assert governor.idle_verdict(10931.0, TICK, fresh).action == "ok"  # 3 h less 1 min
+    assert governor.idle_verdict(11000.0, TICK, fresh).action == "rebuild"
 
 
-# The periodic idle rebuild (2026-10-26): a speech stream with no write for hours lets
-# pipewire-pulse's read index run 2^31 bytes ahead of its write index (9 h 19 m at
-# 64,000 B/s), and the server replays the last 4 MiB written. The watchdog rebuilds the
-# stream after IDLE_REBUILD_S with no write, when nothing of the app's is playing.
-
-
-@pytest.mark.parametrize(
-    ("fresh_at", "busy", "action"),
-    [
-        ((None, None, 0.0), {}, "rebuild"),  # 3 h 20 min since the stream started
-        ((1000.0, None, 0.0), {}, "rebuild"),  # 3 h 3 min since the last push
-        ((2000.0, None, 0.0), {}, "ok"),  # 2 h 47 min: not yet
-        ((None, 1500.0, 0.0), {}, "ok"),  # a rebuild 2 h 55 min ago, this one or another
-        ((None, None, 0.0), {"reply": True}, "ok"),
-        ((None, None, 0.0), {"session": True}, "ok"),
-        ((None, None, 0.0), {"sound": True}, "ok"),
-    ],
-)
-def test_the_idle_rebuild_is_due_after_hours_with_no_write_and_nothing_playing(
-    fresh_at: tuple[float | None, ...], busy: dict[str, bool], action: str
-) -> None:
-    """Due IDLE_REBUILD_S after the last write; never mid reply, session or sound."""
-    assert ph.idle_rebuild_decision(12000.0, fresh_at, ph.IDLE_REBUILD_S, **busy).action == action
-
-
-def test_the_idle_rebuild_says_why_it_ran_and_why_it_waited() -> None:
-    """The cause tells the periodic rebuild from the open-time refresh in the journal."""
-    due = ph.idle_rebuild_decision(12000.0, (0.0,), 10800.0)
-    assert due.cause == "200 min idle with no write to the speech stream (periodic rebuild)"
-    held = ph.idle_rebuild_decision(12000.0, (0.0,), 10800.0, session=True, sound=True)
-    assert held.cause == "held: a session is open, a sound is playing"
-    assert ph.idle_rebuild_decision(12000.0, (0.0,), 0.0).action == "ok"  # 0 turns it off
-
-
-@pytest.mark.parametrize(
-    ("env", "default"),
-    [
-        ("REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S", 600.0),
-        ("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", 10800.0),
-    ],
-)
+@pytest.mark.parametrize("setting", [ph.REFRESH_IDLE, ph.IDLE_REBUILD])
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -1577,85 +1596,23 @@ def test_the_idle_rebuild_says_why_it_ran_and_why_it_waited() -> None:
     ],
 )
 def test_the_idle_thresholds_come_from_the_environment(
-    env: str, default: float, raw: str | None, expected: float | None
+    setting: tuple[str, float], raw: str | None, expected: float | None
 ) -> None:
     """Seconds, 0 for off; anything missing or invalid keeps the default."""
-    assert ph.REFRESH_IDLE_ENV == "REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S"
-    assert ph.IDLE_REBUILD_ENV == "REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S"
-    assert (ph.REFRESH_IDLE_S, ph.IDLE_REBUILD_S) == (600.0, 10800.0)
+    assert ph.REFRESH_IDLE == ("REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S", 600.0)
+    assert ph.IDLE_REBUILD == ("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", 10800.0)
+    env, default = setting
     environ = {} if raw is None else {env: raw}
-    assert ph.seconds_from_env(env, default, environ) == (default if expected is None else expected)
+    assert ph.seconds_from_env(setting, environ) == (default if expected is None else expected)
 
 
-def test_the_idle_rebuild_runs_through_the_governor_and_its_cooldown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Rebuild x the other triggers: one governor, one cooldown; the rebuild freshens the stream."""
-    now = [20000.0]
-    rebuilt: list[str] = []
-    audio = SimpleNamespace(_pipeline=_Pipeline())
-    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
-    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: rebuilt.append(sink) or True)
-    governor = ph.RebuildGovernor(clock=lambda: now[0])
-    due = ph.idle_rebuild_decision(now[0], (None, None, 0.0))
-    assert ph.refresh_after_idle(audio, due.cause, governor)
-    now[0] = 20010.0  # the unheard trigger 10 s on is held back by the shared cooldown
-    assert governor.rebuild(audio, "unheard replies", "3 in a row") is False
-    assert rebuilt == ["sink"]
-    # The next check, an hour on: fresh from the rebuild, so not due again for 3 h.
-    fresh = (None, governor.last_rebuild_at, 0.0)
-    assert ph.idle_rebuild_decision(23600.0, fresh).action == "ok"
-    assert ph.idle_rebuild_decision(30801.0, fresh).action == "rebuild"
-
-
-# The replay check: a journal excerpt in, every speech stream idle past the threshold out.
-
-
-def _journal(stamp: str, source: str, message: str) -> str:
-    """One journal line as the robot writes it (journalctl -o short-iso)."""
-    day, clock = stamp.split()
-    return (
-        f"{day}T{clock}-04:00 brain python[1173]: runner - WARNING - {stamp},000 INFO "
-        f"reachy_mini_conversation_app.{source} | {message}"
+def test_the_two_policies_come_from_the_environment() -> None:
+    """The open's refresh never backs off; the tick backs off 10 min after an attempt."""
+    environ = {"REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S": "7200"}
+    assert ph.idle_policies(environ) == (
+        ph.IdlePolicy("idle refresh", 600.0),
+        ph.IdlePolicy("idle rebuild", 7200.0, backoff_s=600.0),
     )
-
-
-_LAG = "Playback latency: last reply heard after 0.21 s"
-_JOURNAL = [
-    _journal("2026-10-25 19:44:45", "playback_health:252", "Speaker stream rebuilt (trigger: x)"),
-    _journal("2026-10-25 20:03:14", "console:1093", "Reply heard after 0.21 s (first push to ...)"),
-    _journal("2026-10-25 21:00:00", "playback_health:325", f"{_LAG}, 3406 s ago"),
-    _journal("2026-10-26 05:22:40", "playback_health:325", f"{_LAG}, 33566 s ago"),
-    _journal("2026-10-26 06:38:29", "playback_health:252", "Speaker stream rebuilt (trigger: x)"),
-    _journal("2026-10-26 06:40:00", "console:1360", "Audio capture stopped via /rpc"),
-    _journal("2026-10-26 12:40:00", "console:1360", "Audio capture started via /rpc"),
-    _journal("2026-10-26 13:00:00", "console:1093", "Reply not heard (1 in a row): 0.00 s heard"),
-    _journal("2026-10-26 17:00:00", "playback_health:325", f"{_LAG}, 14400 s ago"),
-]
-
-
-def test_the_replay_check_finds_every_speech_stream_idle_past_the_threshold() -> None:
-    """10-25: 10 h 35 min from the last reply to the next rebuild; capture off is no idle."""
-    import datetime
-
-    found = ph.idle_stretches(_JOURNAL, 3 * 3600.0)
-    at = datetime.datetime.fromisoformat
-    assert found == [
-        ph.IdleStretch(at("2026-10-25 20:03:14"), at("2026-10-26 06:38:29"), ongoing=False),
-        ph.IdleStretch(at("2026-10-26 13:00:00"), at("2026-10-26 17:00:00"), ongoing=True),
-    ]
-    assert [round(s.seconds) for s in found] == [38115, 14400]
-    assert ph.idle_stretches(_JOURNAL, 12 * 3600.0) == []
-
-
-def test_the_replay_check_reads_the_classic_journal_format() -> None:
-    """Without -o short-iso, the app's own timestamp inside the line is used."""
-    lines = [
-        "Oct 25 20:03:14 brain python[1]: 2026-10-25 20:03:14,483 INFO x | Reply heard after 0.2 s",
-        "Oct 26 05:22:40 brain python[1]: 2026-10-26 05:22:40,001 INFO x | Playback latency",
-    ]
-    (stretch,) = ph.idle_stretches(lines, 3600.0)
-    assert stretch.ongoing and round(stretch.seconds) == 33566
 
 
 # --- review round (2026-10-26) ----------------------------------------------------------
@@ -1704,77 +1661,3 @@ def test_a_sound_ending_as_the_next_starts_leaves_the_newer_sound_alone(
     closes = [r.getMessage() for r in caplog.records if "Sound stream closed" in r.getMessage()]
     left = "the sound ended, then replaced or stopped, left to the SDK"
     assert closes == [f"Sound stream closed ({left}): old.wav"]
-
-
-def test_the_periodic_rebuild_is_an_info_line_and_other_triggers_stay_warnings(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """An expected rebuild every 3 h does not crowd the journal's warnings."""
-    audio = SimpleNamespace(_pipeline=_Pipeline())
-    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
-    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: True)
-    now = [100.0]
-    governor = ph.RebuildGovernor(clock=lambda: now[0])
-    with caplog.at_level(logging.INFO, logger=ph.logger.name):
-        periodic = "200 min idle (periodic rebuild)"
-        assert ph.refresh_after_idle(audio, periodic, governor, logging.INFO)
-        now[0] = 1000.0
-        assert ph.refresh_after_idle(audio, "75 min idle", governor)
-    rebuilding = [r for r in caplog.records if r.getMessage().startswith("Rebuilding the speaker")]
-    assert [r.levelno for r in rebuilding] == [logging.INFO, logging.WARNING]
-    assert "(periodic rebuild)" in rebuilding[0].getMessage()
-
-
-def test_a_skipped_rebuild_is_logged_once_per_cause(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """No speaker sink, tick after tick: one INFO line until the cause changes or a rebuild runs."""
-    pipeline = _Pipeline()
-    audio = SimpleNamespace(_pipeline=pipeline)
-    sinks: list[Any] = [None]
-    monkeypatch.setattr(ph, "speaker_sink", lambda p: sinks[0])
-    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: True)
-    now = [100.0]
-    governor = ph.RebuildGovernor(clock=lambda: now[0])
-    with caplog.at_level(logging.INFO, logger=ph.logger.name):
-        for _ in range(3):
-            assert governor.rebuild(audio, "idle refresh", "x") is False
-        pipeline.playing = False
-        assert governor.rebuild(audio, "idle refresh", "x") is False  # a new cause
-        pipeline.playing, sinks[0] = True, "sink"
-        assert governor.rebuild(audio, "idle refresh", "x") is True
-        sinks[0] = None
-        now[0] = 2000.0
-        assert governor.rebuild(audio, "idle refresh", "x") is False  # after a rebuild: again
-    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
-    skips = [m for m in infos if "skipped" in m]
-    assert skips == [
-        "Speaker stream rebuild skipped (trigger: idle refresh): no speaker sink",
-        "Speaker stream rebuild skipped (trigger: idle refresh): the pipeline is not playing",
-        "Speaker stream rebuild skipped (trigger: idle refresh): no speaker sink",
-    ]
-
-
-def test_the_replay_check_counts_a_capture_start_and_the_first_line_as_writes() -> None:
-    """The stream is new at capture on, and nothing before the excerpt is known."""
-    import datetime
-
-    at = datetime.datetime.fromisoformat
-    lag = "Playback latency: none"
-    first = [
-        _journal("2026-10-26 01:00:00", "playback_health:325", lag),
-        _journal("2026-10-26 05:00:00", "playback_health:325", lag),
-    ]
-    assert ph.idle_stretches(first, 3 * 3600.0) == [
-        ph.IdleStretch(at("2026-10-26 01:00:00"), at("2026-10-26 05:00:00"), ongoing=True)
-    ]
-    capture = [
-        _journal("2026-10-26 01:00:00", "console:1093", "Reply heard after 0.2 s"),
-        _journal("2026-10-26 01:30:00", "console:1360", "Audio capture stopped via /rpc"),
-        _journal("2026-10-26 03:00:00", "console:1360", "Audio capture started via /rpc"),
-        _journal("2026-10-26 05:00:00", "playback_health:325", lag),
-    ]
-    assert ph.idle_stretches(capture, 3 * 3600.0) == []  # 2 h since capture on
-    assert ph.idle_stretches(capture, 1.5 * 3600.0) == [
-        ph.IdleStretch(at("2026-10-26 03:00:00"), at("2026-10-26 05:00:00"), ongoing=True)
-    ]

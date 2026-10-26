@@ -16,7 +16,7 @@ import contextlib
 from typing import Any, List, Optional
 from pathlib import Path
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import numpy as np
 
@@ -352,12 +352,8 @@ class LocalStream:
         self._speaker_monitor = playback_health.SpeakerMonitor(self._on_monitor_buffer)
         # The idle refresh: when the speaker stream last started (here, or capture on).
         self._speaker_started_at: float | None = self._now()
-        self._refresh_idle_s = playback_health.seconds_from_env(
-            playback_health.REFRESH_IDLE_ENV, playback_health.REFRESH_IDLE_S
-        )
-        self._idle_rebuild_s = playback_health.seconds_from_env(
-            playback_health.IDLE_REBUILD_ENV, playback_health.IDLE_REBUILD_S
-        )
+        # The speech stream's idle rebuilds: at a session's open, and on the watchdog's tick.
+        self._open_policy, self._tick_policy = playback_health.idle_policies()
         self._preroll_clock = preroll_clock
         # Where the pre-roll counts back from, on _preroll_clock: the wake word's
         # peak when the opener said when it was, else None (the connect).
@@ -685,47 +681,47 @@ class LocalStream:
         self._session_wanted.set()
         self._session_gate_changed.set()
 
-    def _refresh_speaker_if_idle(self) -> None:
-        """Rebuild the speaker stream, off the event loop, if nothing has played on it for long.
+    def _speaker_fresh_at(self) -> tuple[float | None, float | None, float | None]:
+        """Return when the speech stream last carried a reply, was rebuilt, and was started."""
+        rebuilt_at = playback_health.GOVERNOR.last_rebuild_at
+        return (self._replies.last_pushed_at, rebuilt_at, self._speaker_started_at)
 
-        Through GOVERNOR, so it shares the unheard-reply trigger's cooldown. Not awaited:
-        the rebuild (about 40 ms, at most its 2 s block wait) runs while the session
+    def _rebuild_speaker_if_idle(
+        self, audio: Any, policy: playback_health.IdlePolicy, held: Sequence[str] = ()
+    ) -> None:
+        """Rebuild the speaker stream off the event loop if ``policy`` finds it idle for long.
+
+        Through GOVERNOR, so every trigger shares one cooldown. Not awaited: at a session's
+        open the rebuild (about 40 ms, at most its 2 s block wait) runs while the session
         connects, and a reply pushed meanwhile only completes the block early.
         """
-        verdict = playback_health.refresh_decision(
-            self._now(),
-            (self._replies.last_pushed_at, playback_health.GOVERNOR.last_rebuild_at, self._speaker_started_at),
-            self._refresh_idle_s,
-        )
-        if verdict.action != "refresh":
-            return
+        governor = playback_health.GOVERNOR
+        verdict = governor.idle_verdict(self._now(), policy, self._speaker_fresh_at(), held)
+        if verdict.action == "rebuild":
+            self._run_off_loop(governor.rebuild, audio, policy.trigger, verdict.cause)
+
+    def _refresh_speaker_if_idle(self) -> None:
+        """Run the idle refresh at a session's open: nothing holds it back."""
         audio = getattr(getattr(self._robot, "media", None), "audio", None)
-        if audio is None:
-            return
-        self._run_off_loop(playback_health.refresh_after_idle, audio, verdict.cause)
+        if audio is not None:
+            self._rebuild_speaker_if_idle(audio, self._open_policy)
 
-    def _rebuild_speaker_if_idle(self, audio: Any) -> None:
-        """Run the periodic idle rebuild from the watchdog's tick, off the event loop.
+    def _tick_speaker_rebuild(self, audio: Any) -> None:
+        """Run the periodic idle rebuild from the watchdog's tick.
 
-        Through GOVERNOR, and only with capture on: with it off the pipeline is NULL and
-        its stream closed. Logged at INFO: it is routine. Upstream's mode keeps a session
-        wanted all the time, so it never runs there; the companion parks the app (R-36).
+        A reply, a session or a sound holds it back. Only with capture on: with it off the
+        pipeline is NULL and its stream closed, and every tried rebuild would log a skip.
+        Upstream's mode keeps a session wanted all the time, so it never runs there; the
+        companion parks the app (R-36).
         """
         if not self._capture_on:
             return
-        now = self._now()
-        rebuilt_at = playback_health.GOVERNOR.last_rebuild_at
-        verdict = playback_health.idle_rebuild_decision(
-            now,
-            (self._replies.last_pushed_at, rebuilt_at, self._speaker_started_at),
-            self._idle_rebuild_s,
-            reply=self._replies.pending(now),
-            session=self._session_wanted.is_set() or self._backend_connected(),
-            sound=playback_health.SOUNDS.state()[0],
+        busy = (
+            (self._replies.pending(self._now()), "a reply is playing"),
+            (self._session_wanted.is_set() or self._backend_connected(), "a session is open"),
+            (playback_health.SOUNDS.state()[0], "a sound is playing"),
         )
-        if verdict.action == "rebuild":
-            refresh = playback_health.refresh_after_idle
-            self._run_off_loop(refresh, audio, verdict.cause, None, logging.INFO)  # routine: INFO
+        self._rebuild_speaker_if_idle(audio, self._tick_policy, [why for on, why in busy if on])
 
     async def _on_handler_loop(self, coro: Any) -> Any:
         """Run `coro` on the handler's own loop, from any loop.
@@ -1094,7 +1090,7 @@ class LocalStream:
             if pipeline is None:
                 continue
             try:
-                self._rebuild_speaker_if_idle(audio)
+                self._tick_speaker_rebuild(audio)
             except Exception:
                 logger.warning("Idle speaker rebuild check failed", exc_info=True)
             try:

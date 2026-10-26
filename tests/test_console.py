@@ -3939,7 +3939,7 @@ def _refresh_stream(monkeypatch: pytest.MonkeyPatch, started_at: float, now: flo
     stream._robot.media.audio = SimpleNamespace(_pipeline="pipeline")
     stream._now = lambda: now
     stream._speaker_started_at = started_at
-    stream._refresh_idle_s = 600.0
+    stream._open_policy = playback_health.IdlePolicy("idle refresh", 600.0)
     monkeypatch.setattr(playback_health.GOVERNOR, "last_rebuild_at", None)
     refreshed: list[Any] = []
     return stream, refreshed
@@ -3951,14 +3951,14 @@ async def test_an_open_after_long_idle_refreshes_the_speaker_off_the_loop(monkey
     from reachy_mini_conversation_app import playback_health
 
     stream, refreshed = _refresh_stream(monkeypatch, started_at=0.0, now=4500.0)
-    monkeypatch.setattr(
-        playback_health,
-        "refresh_after_idle",
-        lambda audio, cause: refreshed.append((audio, cause, threading.current_thread() is threading.main_thread())),
-    )
+    def rebuild(audio: Any, trigger: str, cause: str) -> None:
+        on_loop = threading.current_thread() is threading.main_thread()
+        refreshed.append((audio, trigger, cause, on_loop))
+
+    monkeypatch.setattr(playback_health.GOVERNOR, "rebuild", rebuild)
     await stream.open_session()
     await asyncio.gather(*stream._background)
-    assert refreshed == [(stream._robot.media.audio, "75 min idle", False)]
+    assert refreshed == [(stream._robot.media.audio, "idle refresh", "75 min idle", False)]
     assert stream._session_wanted.is_set()
 
 
@@ -3971,7 +3971,7 @@ async def test_pair_idle_refresh_and_the_cold_open_never_waits_for_the_rebuild(
 
     stream, _ = _refresh_stream(monkeypatch, started_at=0.0, now=4500.0)
     release = threading.Event()
-    monkeypatch.setattr(playback_health, "refresh_after_idle", lambda audio, cause: release.wait(5.0))
+    monkeypatch.setattr(playback_health.GOVERNOR, "rebuild", lambda *args: release.wait(5.0))
     await asyncio.wait_for(stream.open_session(preroll=True, glance=True), timeout=1.0)
     assert stream._session_wanted.is_set()
     assert stream._background  # the rebuild, still running
@@ -3986,7 +3986,7 @@ async def test_an_open_after_a_recent_reply_does_not_refresh(monkeypatch: pytest
 
     stream, refreshed = _refresh_stream(monkeypatch, started_at=0.0, now=4500.0)
     stream._replies.pushed(4000.0, 1.0, 1.0)
-    monkeypatch.setattr(playback_health, "refresh_after_idle", lambda audio, cause: refreshed.append(cause))
+    monkeypatch.setattr(playback_health.GOVERNOR, "rebuild", lambda *a: refreshed.append(a[2]))
     await stream.open_session()
     await asyncio.gather(*stream._background)
     assert refreshed == []
@@ -4002,7 +4002,7 @@ async def test_pair_idle_refresh_and_a_usb_recovery_restart(monkeypatch: pytest.
     from reachy_mini_conversation_app import playback_health
 
     refreshed: list[str] = []
-    monkeypatch.setattr(playback_health, "refresh_after_idle", lambda audio, cause: refreshed.append(cause))
+    monkeypatch.setattr(playback_health.GOVERNOR, "rebuild", lambda *a: refreshed.append(a[2]))
     monkeypatch.setattr(playback_health.GOVERNOR, "last_rebuild_at", None)
     restarted = _gate_stream()  # a fresh app: its stream started now
     restarted._session_wanted.clear()
@@ -4017,7 +4017,7 @@ async def test_pair_idle_refresh_and_a_usb_recovery_restart(monkeypatch: pytest.
     stream = LocalStream(handler, robot, settings_app=app)
     stream._init_settings_ui_if_needed()
     stream._session_wanted.clear()
-    stream._refresh_idle_s = 600.0
+    stream._open_policy = playback_health.IdlePolicy("idle refresh", 600.0)
     stream._speaker_started_at = 0.0
     stream._now = lambda: 4500.0
     stream._capture_on = False
@@ -4035,7 +4035,7 @@ async def test_an_open_on_an_open_session_does_not_refresh(monkeypatch: pytest.M
 
     stream, refreshed = _refresh_stream(monkeypatch, started_at=0.0, now=4500.0)
     stream._session_wanted.set()
-    monkeypatch.setattr(playback_health, "refresh_after_idle", lambda audio, cause: refreshed.append(cause))
+    monkeypatch.setattr(playback_health.GOVERNOR, "rebuild", lambda *a: refreshed.append(a[2]))
     await stream.open_session()
     assert refreshed == []
 
@@ -4107,16 +4107,17 @@ def _idle_watchdog_stream(
     stream._robot.media.audio = SimpleNamespace(_pipeline="pipeline")
     stream._now = lambda: now
     stream._speaker_started_at = 0.0
-    stream._idle_rebuild_s = 10800.0
+    stream._tick_policy = playback_health.IdlePolicy("idle rebuild", 10800.0, backoff_s=600.0)
     monkeypatch.setattr(playback_health.GOVERNOR, "last_rebuild_at", None)
+    monkeypatch.setattr(playback_health.GOVERNOR, "last_attempt_at", None)
     monkeypatch.setattr(playback_health.SOUNDS, "state", lambda: (False, None))
     rebuilt: list[Any] = []
 
-    def refresh(audio: Any, cause: str, governor: Any = None, level: int = logging.WARNING) -> None:
+    def rebuild(audio: Any, trigger: str, cause: str) -> None:
         on_loop = threading.current_thread() is threading.main_thread()
-        rebuilt.append((audio, cause, on_loop, logging.getLevelName(level)))
+        rebuilt.append((audio, trigger, cause, on_loop))
 
-    monkeypatch.setattr(playback_health, "refresh_after_idle", refresh)
+    monkeypatch.setattr(playback_health.GOVERNOR, "rebuild", rebuild)
 
     def check(pipeline: Any, replies: Any = None) -> Any:
         stream._stop_event.set()
@@ -4130,21 +4131,26 @@ def _idle_watchdog_stream(
 async def test_the_watchdog_rebuilds_a_speech_stream_idle_for_hours_off_the_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """3 h 20 min with no write: one rebuild through the idle refresh, in a worker."""
-    from reachy_mini_conversation_app import playback_health
-
+    """3 h 20 min with no write: one rebuild by the tick's trigger, in a worker."""
     stream, rebuilt = _idle_watchdog_stream(monkeypatch, now=12000.0)
     await asyncio.wait_for(stream.playback_watchdog_loop(interval_s=0.01), timeout=2.0)
     await asyncio.gather(*stream._background)
-    cause = "200 min idle with no write to the speech stream (periodic rebuild)"
-    assert rebuilt == [(stream._robot.media.audio, cause, False, "INFO")]
-    assert playback_health.IDLE_REBUILD_ENV == "REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S"
+    assert rebuilt == [(stream._robot.media.audio, "idle rebuild", "200 min idle", False)]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "busy",
-    ["session", "connected", "sound", "reply", "capture off", "recent push", "recent rebuild"],
+    [
+        "session",
+        "connected",
+        "sound",
+        "reply",
+        "capture off",
+        "recent push",
+        "recent rebuild",
+        "recent attempt",
+    ],
 )
 async def test_pair_idle_rebuild_never_runs_while_the_app_is_busy_or_fresh(
     monkeypatch: pytest.MonkeyPatch, busy: str
@@ -4165,8 +4171,10 @@ async def test_pair_idle_rebuild_never_runs_while_the_app_is_busy_or_fresh(
         stream._capture_on = False
     elif busy == "recent push":
         stream._replies.pushed(5000.0, 1.0, 1.0)
-    else:
+    elif busy == "recent rebuild":
         monkeypatch.setattr(playback_health.GOVERNOR, "last_rebuild_at", 2000.0)
+    else:  # a rebuild tried 5 min ago and skipped or held back: the tick backs off
+        monkeypatch.setattr(playback_health.GOVERNOR, "last_attempt_at", 11700.0)
     await asyncio.wait_for(stream.playback_watchdog_loop(interval_s=0.01), timeout=2.0)
     await asyncio.gather(*stream._background)
     assert rebuilt == []
@@ -4177,6 +4185,17 @@ def test_the_idle_rebuild_threshold_is_read_from_the_environment(
 ) -> None:
     """REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S, read the way the idle refresh's is."""
     monkeypatch.setenv("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", "7200")
-    assert _gate_stream()._idle_rebuild_s == 7200.0
+    assert _gate_stream()._tick_policy.idle_s == 7200.0
     monkeypatch.setenv("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", "soon")
-    assert _gate_stream()._idle_rebuild_s == 10800.0
+    assert _gate_stream()._tick_policy.idle_s == 10800.0
+
+
+def test_one_fresh_at_serves_both_idle_callers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The last push, the last rebuild and the stream's start, read in one place."""
+    from reachy_mini_conversation_app import playback_health
+
+    stream = _gate_stream()
+    stream._speaker_started_at = 5.0
+    stream._replies.pushed(7.0, 1.0, 1.0)
+    monkeypatch.setattr(playback_health.GOVERNOR, "last_rebuild_at", 6.0)
+    assert stream._speaker_fresh_at() == (7.0, 6.0, 5.0)

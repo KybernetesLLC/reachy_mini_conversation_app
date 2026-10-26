@@ -26,14 +26,12 @@ the watchdog logs the last measured lag and its age.
 
 from __future__ import annotations
 import os
-import re
 import math
 import time
 import logging
-import datetime
 import functools
 import threading
-from typing import Any, TypeVar, Callable, Iterable, Sequence, NamedTuple
+from typing import Any, TypeVar, Callable, Sequence, NamedTuple
 
 
 logger = logging.getLogger(__name__)
@@ -205,6 +203,61 @@ def restart_speaker_clock(audio: Any) -> bool:
     return False
 
 
+# Settings in seconds, as (environment variable, default); 0 turns each off.
+Setting = tuple[str, float]
+# The idle refresh (2026-10-18, 18:40): after 75 minutes with nothing played, the first
+# four replies of a wake were pushed but not heard, until the unheard-reply trigger
+# rebuilt the stream 33 s in. So a session that opens after this long with nothing
+# pushed rebuilds the speaker stream first.
+REFRESH_IDLE: Setting = ("REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S", 600.0)
+# The periodic idle rebuild (2026-10-26, 05:22): a speech stream with no write for hours
+# replayed the last 65 s it carried. With prebuf 0, pipewire-pulse advances the stream's
+# read index through an underrun; 2^31 bytes on (9 h 19 m at 64,000 B/s) the 32-bit
+# difference to the write index wraps, and the server plays the last 4 MiB written. So
+# the watchdog's tick rebuilds the stream after this long with no write.
+IDLE_REBUILD: Setting = ("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", 3 * 3600.0)
+# Triggers whose rebuild is routine: their "Rebuilding" line is INFO, not a WARNING.
+ROUTINE_TRIGGERS = frozenset({"idle rebuild"})
+
+
+def seconds_from_env(setting: Setting, environ: Any = os.environ) -> float:
+    """Return a setting's seconds from the environment, or its default if missing or invalid."""
+    name, default = setting
+    raw = str(environ.get(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not math.isfinite(value) or value < 0:
+        logger.warning("%s=%r is not a number of seconds >= 0; using %.0f", name, raw, default)
+        return default
+    return value
+
+
+class IdlePolicy(NamedTuple):
+    """When a speech stream left idle is rebuilt, and how soon a tried rebuild is tried again."""
+
+    trigger: str
+    idle_s: float
+    backoff_s: float = 0.0
+
+
+def idle_policies(environ: Any = os.environ) -> tuple[IdlePolicy, IdlePolicy]:
+    """Return (the session open's refresh, the watchdog tick's rebuild), from the environment."""
+    return (
+        IdlePolicy("idle refresh", seconds_from_env(REFRESH_IDLE, environ)),
+        IdlePolicy("idle rebuild", seconds_from_env(IDLE_REBUILD, environ), REBUILD_COOLDOWN_MAX_S),
+    )
+
+
+def _skipped(trigger: str, why: str) -> bool:
+    """Log a rebuild that did not run, and return False."""
+    logger.info("Speaker stream rebuild skipped (trigger: %s): %s", trigger, why)
+    return False
+
+
 class RebuildGovernor:
     """Run speaker-stream rebuilds for every trigger, under one cooldown, each logged with its trigger."""
 
@@ -212,28 +265,46 @@ class RebuildGovernor:
         """Start with no rebuild history; ``clock`` is injectable for tests."""
         self._clock = clock
         self._history: list[float] = []
-        self._skipped: str | None = None  # the last skip's line, logged once until it changes
         self.last_rebuild_at: float | None = None
+        self.last_attempt_at: float | None = None  # every call, run, skipped or held back
 
-    def _skip(self, trigger: str, why: str) -> bool:
-        """Log a skipped rebuild at INFO once per cause, then at DEBUG. Holds MEDIA_LOCK."""
-        line = f"Speaker stream rebuild skipped (trigger: {trigger}): {why}"
-        logger.log(logging.DEBUG if line == self._skipped else logging.INFO, "%s", line)
-        self._skipped = line
-        return False
+    def idle_verdict(
+        self,
+        now: float,
+        policy: IdlePolicy,
+        fresh_at: Sequence[float | None],
+        held: Sequence[str] = (),
+    ) -> Verdict:
+        """Decide whether ``policy`` rebuilds a stream idle since the latest of ``fresh_at``.
 
-    def rebuild(self, audio: Any, trigger: str, cause: str, level: int = logging.WARNING) -> bool:
+        ``fresh_at``: when the stream last carried a reply, was rebuilt, or was started;
+        None for what has not happened. ``held`` names what of the app's holds it back.
+        """
+        if held:
+            return Verdict("ok", "held: " + ", ".join(held))
+        tried = self.last_attempt_at
+        if policy.backoff_s > 0 and tried is not None and now - tried < policy.backoff_s:
+            return Verdict("ok", f"a rebuild was tried {now - tried:.0f} s ago")
+        known = [t for t in fresh_at if t is not None]
+        if policy.idle_s <= 0 or not known:
+            return Verdict("ok", "off" if policy.idle_s <= 0 else "nothing known about the stream")
+        idle = now - max(known)
+        if idle > policy.idle_s:
+            return Verdict("rebuild", f"{idle / 60:.0f} min idle")
+        return Verdict("ok", f"{idle:.0f} s idle, under {policy.idle_s:.0f} s")
+
+    def rebuild(self, audio: Any, trigger: str, cause: str) -> bool:
         """Rebuild the speaker stream for ``trigger`` unless the cooldown holds it back.
 
         Returns whether a rebuild ran and the sink came back. A pipeline that is not
-        PLAYING (capture off) is left alone and uses no cooldown. ``level`` is the
-        "Rebuilding" line's: a fault's rebuild is a WARNING, a routine one need not be.
+        PLAYING (capture off) is left alone and uses no cooldown. Every call is an attempt.
         """
         with MEDIA_LOCK:
+            now = self._clock()
+            self.last_attempt_at = now
             pipeline = getattr(audio, "_pipeline", None)
             if not _playing(pipeline):
-                return self._skip(trigger, "the pipeline is not playing")
-            now = self._clock()
+                return _skipped(trigger, "the pipeline is not playing")
             verdict = rebuild_decision(now, self._history)
             if verdict.action != "rebuild":
                 logger.info(
@@ -242,12 +313,11 @@ class RebuildGovernor:
                 return False
             sink = speaker_sink(pipeline)
             if sink is None:
-                return self._skip(trigger, "no speaker sink")
-            self._skipped = None
+                return _skipped(trigger, "no speaker sink")
             self._history = [t for t in self._history if now - t < REBUILD_WINDOW_S] + [now]
             self.last_rebuild_at = now
             logger.log(
-                level,
+                logging.INFO if trigger in ROUTINE_TRIGGERS else logging.WARNING,
                 "Rebuilding the speaker stream (trigger: %s, cause: %s; rebuild %d in the last %.0f s)",
                 trigger,
                 cause,
@@ -267,145 +337,6 @@ class RebuildGovernor:
 
 
 GOVERNOR = RebuildGovernor()
-
-# The idle refresh (2026-10-18, 18:40): after 75 minutes with nothing played, the
-# first four replies of a wake were pushed but not heard, until the unheard-reply
-# trigger rebuilt the stream 33 s in. So a session that opens after this long with
-# nothing pushed rebuilds the speaker stream first, through GOVERNOR. 0 turns it off.
-REFRESH_IDLE_ENV = "REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S"
-REFRESH_IDLE_S = 600.0
-
-
-def seconds_from_env(name: str, default: float, environ: Any = os.environ) -> float:
-    """Return a threshold in seconds from the environment variable ``name``; 0 means off."""
-    raw = str(environ.get(name, "")).strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        value = -1.0
-    if not math.isfinite(value) or value < 0:
-        logger.warning("%s=%r is not a number of seconds >= 0; using %.0f", name, raw, default)
-        return default
-    return value
-
-
-def refresh_decision(now: float, fresh_at: Sequence[float | None], idle_s: float = REFRESH_IDLE_S) -> Verdict:
-    """Decide whether a session opening at ``now`` rebuilds the speaker stream first. Pure.
-
-    ``fresh_at``: when the stream last carried a reply, was rebuilt, or was started;
-    None for what has not happened.
-    """
-    known = [t for t in fresh_at if t is not None]
-    if idle_s <= 0 or not known:
-        return Verdict("ok", "the idle refresh is off" if idle_s <= 0 else "nothing known about the stream")
-    idle = now - max(known)
-    if idle > idle_s:
-        return Verdict("refresh", f"{idle / 60:.0f} min idle")
-    return Verdict("ok", f"{idle:.0f} s idle, under {idle_s:.0f} s")
-
-
-def refresh_after_idle(
-    audio: Any, cause: str, governor: RebuildGovernor | None = None, level: int = logging.WARNING
-) -> bool:
-    """Rebuild the speaker stream for the idle refresh, and log whether it was refreshed."""
-    ok = (governor or GOVERNOR).rebuild(audio, "idle refresh", cause, level)
-    if ok:
-        logger.info("Speaker stream refreshed after %s", cause)
-    return ok
-
-
-# The periodic idle rebuild (2026-10-26, 05:22): a speech stream with no write for hours
-# replayed the last 65 s it carried. With prebuf 0, pipewire-pulse advances the stream's
-# read index through an underrun; 2^31 bytes on (9 h 19 m at 64,000 B/s) the 32-bit
-# difference to the write index wraps, and the server plays the last 4 MiB written. So
-# the watchdog rebuilds the stream after this long with no write, through GOVERNOR, when
-# no reply, session or sound is playing. 0 turns it off.
-IDLE_REBUILD_ENV = "REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S"
-IDLE_REBUILD_S = 3 * 3600.0
-
-
-def idle_rebuild_decision(
-    now: float,
-    fresh_at: Sequence[float | None],
-    idle_s: float = IDLE_REBUILD_S,
-    *,
-    reply: bool = False,
-    session: bool = False,
-    sound: bool = False,
-) -> Verdict:
-    """Decide whether the watchdog rebuilds a speech stream left idle. Pure.
-
-    ``fresh_at`` as for refresh_decision; ``reply``, ``session`` and ``sound`` say what
-    of the app's is playing or open, and any of them holds the rebuild back.
-    """
-    busy = (
-        (reply, "a reply is playing"),
-        (session, "a session is open"),
-        (sound, "a sound is playing"),
-    )
-    held = [why for on, why in busy if on]
-    if held:
-        return Verdict("ok", "held: " + ", ".join(held))
-    verdict = refresh_decision(now, fresh_at, idle_s)
-    if verdict.action != "refresh":
-        return verdict
-    cause = f"{verdict.cause} with no write to the speech stream (periodic rebuild)"
-    return Verdict("rebuild", cause)
-
-
-# The replay check: journal lines that mean the speech stream was written to or made new,
-# and the line that closes it (capture off sets the pipeline to NULL).
-STREAM_WRITE_LINES = (
-    "Reply heard after",
-    "Reply not heard",
-    "Speaker stream rebuilt",
-    "Audio capture started",
-)
-STREAM_CLOSE_LINES = ("Audio capture stopped",)
-_STAMP = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
-
-
-class IdleStretch(NamedTuple):
-    """A stretch with the speech stream open and nothing written to it."""
-
-    start: datetime.datetime
-    end: datetime.datetime
-    ongoing: bool  # still idle at the excerpt's last line
-
-    @property
-    def seconds(self) -> float:
-        """The stretch's length."""
-        return (self.end - self.start).total_seconds()
-
-
-def idle_stretches(lines: Iterable[str], idle_s: float) -> list[IdleStretch]:
-    """Return every stretch of a journal excerpt with the speech stream idle over ``idle_s``. Pure.
-
-    The excerpt's first timed line counts as a write: what came before it is not known.
-    Reads ``journalctl -o short-iso`` or the classic format, by the app's own timestamp.
-    """
-    found: list[IdleStretch] = []
-    last_write: datetime.datetime | None = None
-    seen = False
-    at: datetime.datetime | None = None
-    for line in lines:
-        stamp = _STAMP.search(line)
-        if stamp is None:
-            continue
-        at = datetime.datetime.fromisoformat(f"{stamp[1]} {stamp[2]}")
-        writes = any(key in line for key in STREAM_WRITE_LINES)
-        closes = any(key in line for key in STREAM_CLOSE_LINES)
-        if not seen:
-            seen, last_write = True, at
-        if writes or closes:
-            if last_write is not None and (at - last_write).total_seconds() > idle_s:
-                found.append(IdleStretch(last_write, at, ongoing=False))
-            last_write = at if writes else None
-    if at is not None and last_write is not None and (at - last_write).total_seconds() > idle_s:
-        found.append(IdleStretch(last_write, at, ongoing=True))
-    return found
 
 
 def lag_report(last: tuple[float, float] | None, now: float) -> str:
