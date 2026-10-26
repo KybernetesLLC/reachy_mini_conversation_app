@@ -1252,22 +1252,26 @@ class LocalStream:
             # now=True sends while the person is speaking (the mid-speech note test).
             now = bool(params.get("now", False))
 
-            async def _add_note() -> None:
+            async def _add_note() -> bool:
                 if now:
-                    self.handler.add_note(text, now=True)
-                else:
-                    self.handler.add_note(text)
+                    # Awaited here, on the handler's loop: the answer is whether it was sent.
+                    return bool(await self.handler.add_note(text, now=True))
+                self.handler.add_note(text)
+                return True
 
             # On the handler's own loop: add_note's asyncio.create_task must bind to
             # the loop that owns the websocket, not the RPC server's, or the eventual
             # conversation.item.create becomes the cross-thread send that corrupted
             # OpenSSL's state (the say defect, plan 3, 2026-10-07).
             try:
-                await self._on_handler_loop(_add_note())
+                sent = await self._on_handler_loop(_add_note())
             except RuntimeError:
                 # The session closed between the check above and the hop onto the
                 # handler's loop: add_note's own "no active session" (fix round 1).
                 return {"queued": False, "reason": "no session"}
+            if not sent:
+                reason = getattr(self.handler, "note_drop_reason", None)
+                return {"queued": False, "reason": str(reason or "dropped")}
             return {"queued": True}
 
         @rpc.method("conversation.session")  # type: ignore[untyped-decorator]

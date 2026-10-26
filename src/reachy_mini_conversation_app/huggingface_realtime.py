@@ -431,7 +431,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._first_reply_at: float | None = None
         self._user_speaking = False
         self._last_speech_at = 0.0  # monotonic; the session's open counts as speech
-        self._note_tasks: set[asyncio.Task[None]] = set()
+        self._note_tasks: set[asyncio.Task[Any]] = set()
+        # Why the last note was dropped, for the RPC to report (a now note's answer).
+        self.note_drop_reason: str | None = None
         # The tool-call-log brief: a capped, in-memory backlog of conversation.tool
         # reports, drained through console.py's /rpc dispatch (see set_tool_call_observer).
         self._tool_report_queue: "deque[dict[str, Any]]" = deque(maxlen=TOOL_REPORT_QUEUE_MAX)
@@ -1228,7 +1230,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._note_tasks:
             await asyncio.gather(*list(self._note_tasks), return_exceptions=True)
 
-    def add_note(self, text: str, now: bool = False) -> "asyncio.Task[None]":
+    def add_note(self, text: str, now: bool = False) -> "asyncio.Task[Any]":
         """Add a companion note at the next quiet moment, with no response of its own.
 
         Who has joined, who is no longer in view. A user-role item: system items
@@ -1237,24 +1239,38 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         With now=True the note is sent at once, even while the person is speaking. It is
         still refused while a response is active or queued, and then dropped, never held.
+        The task's result is then True once the note was sent and False if it was dropped
+        (the reason is in note_drop_reason).
         """
         if not self.connection:
             raise RuntimeError("add_note: no active session")
         # A note belongs to the session it was asked for (fix round 1, the review):
         # recorded here, and checked again after the quiet wait.
         session = self.connection
-        coro = self._note_text_now(text, session) if now else self._note_text_when_quiet(text, session)
+        if now:
+            coro = self._note_text_now(text, session)
+        else:
+            coro = self._note_text_when_quiet(text, session)
         task = asyncio.create_task(coro, name="companion-note")
         self._note_tasks.add(task)
         task.add_done_callback(self._note_tasks.discard)
         return task
 
-    async def _note_text_now(self, text: str, session: "AsyncRealtimeConnection") -> None:
-        """Send a note now, while the person may be speaking; drop it if a response is in the way."""
+    async def _note_text_now(self, text: str, session: "AsyncRealtimeConnection") -> bool:
+        """Send a note now, even mid-speech; drop it if a response is in the way.
+
+        True if the note was sent, False if it was dropped.
+        """
+        # Not airtight: _response_done_event is cleared on response.created, so between a
+        # response.create being sent and response.created arriving this check still passes.
         if not self._response_done_event.is_set() or not self._pending_responses.empty():
-            logger.info("Companion note dropped: a response is active or pending")
-            return
-        await self._send_note(text, session)
+            return self._note_dropped("response active")
+        return await self._send_note(text, session)
+
+    def _note_dropped(self, reason: str) -> bool:
+        self.note_drop_reason = reason
+        logger.info("Companion note dropped: %s", reason)
+        return False
 
     async def _note_text_when_quiet(self, text: str, session: "AsyncRealtimeConnection") -> None:
         started = time.monotonic()
@@ -1269,13 +1285,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             await asyncio.sleep(_NOTE_POLL_SECONDS)
         await self._send_note(text, session)
 
-    async def _send_note(self, text: str, session: "AsyncRealtimeConnection") -> None:
+    async def _send_note(self, text: str, session: "AsyncRealtimeConnection") -> bool:
         if not self.connection:
-            logger.info("Companion note dropped: session closed")
-            return
+            return self._note_dropped("session closed")
         if self.connection is not session:
-            logger.info("Companion note dropped: session changed")
-            return
+            return self._note_dropped("session changed")
         try:
             await self.connection.conversation.item.create(
                 item={
@@ -1285,7 +1299,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 },
             )
         except Exception as exc:
-            logger.info("Companion note dropped: %s", exc)
+            return self._note_dropped(str(exc))
+        return True
 
     def open_settled(self) -> None:
         """Start the greeting's hold: the console has finished this open, its pre-roll sent."""

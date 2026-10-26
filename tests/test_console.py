@@ -2930,8 +2930,13 @@ def test_a_note_over_the_rpc_passes_now_only_when_asked() -> None:
     stream, _manager, app = _pose_stream()
     calls: list[tuple[str, dict[str, object]]] = []
 
-    def add_note(text: str, **kwargs: object) -> None:
+    def add_note(text: str, **kwargs: object) -> "asyncio.Future[bool]":
         calls.append((text, kwargs))
+
+        async def done() -> bool:
+            return True
+
+        return asyncio.ensure_future(done())
 
     stream.handler.add_note = add_note
     stream.handler._is_connected.return_value = True
@@ -2943,6 +2948,32 @@ def test_a_note_over_the_rpc_passes_now_only_when_asked() -> None:
     finally:
         _stop_loop(loop, thread)
     assert calls == [("a", {}), ("b", {"now": True})]
+
+
+def test_a_now_note_reports_whether_it_was_sent() -> None:
+    """With now, the RPC waits for the handler's answer: sent, or refused with the reason."""
+    stream, _manager, app = _pose_stream()
+    outcome = {"sent": False}
+
+    def add_note(text: str, now: bool = False) -> "asyncio.Future[bool]":
+        async def done() -> bool:
+            return outcome["sent"]
+
+        return asyncio.ensure_future(done())
+
+    stream.handler.add_note = add_note
+    stream.handler.note_drop_reason = "response active"
+    stream.handler._is_connected.return_value = True
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    try:
+        refused = _rpc_call(app, "conversation.note", {"text": "a", "now": True})
+        outcome["sent"] = True
+        sent = _rpc_call(app, "conversation.note", {"text": "b", "now": True})
+    finally:
+        _stop_loop(loop, thread)
+    assert refused.get("result") == {"queued": False, "reason": "response active"}
+    assert sent.get("result") == {"queued": True}
 
 
 def test_a_note_needs_text() -> None:
