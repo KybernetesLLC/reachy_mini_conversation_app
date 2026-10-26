@@ -18,6 +18,7 @@ from pathlib import Path
 from collections import deque
 from collections.abc import Callable
 
+import gi
 import numpy as np
 
 from reachy_mini import ReachyMini
@@ -57,6 +58,10 @@ from reachy_mini_conversation_app.personality_routes import (
 from reachy_mini_conversation_app.profile_tool_routes import register_profile_tool_methods
 from reachy_mini_conversation_app.audio.startup_config import apply_audio_startup_config
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
+
+
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst  # noqa: E402
 
 
 try:
@@ -183,8 +188,6 @@ def _flush_appsrc(appsrc: Any) -> None:
     task for good, so those buffers are dropped as they leave each queue below the
     mixer, up to the running time of the barge-in. Later audio is untouched.
     """
-    from gi.repository import Gst
-
     barge_in_at = appsrc.get_current_running_time()
     appsrc.send_event(Gst.Event.new_flush_start())
     appsrc.send_event(Gst.Event.new_flush_stop(False))
@@ -195,8 +198,6 @@ def _flush_appsrc(appsrc: Any) -> None:
 
 def _next_elements(element: Any) -> list[Any]:
     """Return the elements linked to ``element``'s source pads, walked with next() (no gst-python overrides)."""
-    from gi.repository import Gst
-
     found: list[Any] = []
     pads = element.iterate_src_pads()
     while True:
@@ -237,8 +238,6 @@ _DROP_PROBES_LOCK = threading.Lock()
 
 def _drop_until(pad: Any, running_time: int) -> None:
     """Drop buffers leaving ``pad`` that end by ``running_time``; remove itself at the first later one."""
-    from gi.repository import Gst
-
     key = pad.get_path_string()
     probe_id: list[int] = []
 
@@ -703,6 +702,8 @@ class LocalStream:
 
         def rebuild() -> bool:
             with playback_health.MEDIA_LOCK:
+                # A session opened during the ~40 ms rebuild still meets it: accepted, since
+                # the rebuild is short and the speech it might clip has not started yet.
                 held = holds()
                 if held:
                     logger.info(
@@ -1968,8 +1969,6 @@ class LocalStream:
         pipeline = getattr(audio, "_pipeline", None)
         if pipeline is not None:
             try:
-                from gi.repository import Gst
-
                 # Walked with next(): a Gst.Iterator is not a Python iterable without
                 # gst-python's overrides, which the robot does not have.
                 elements = pipeline.iterate_elements()

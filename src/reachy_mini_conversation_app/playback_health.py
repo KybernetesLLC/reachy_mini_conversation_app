@@ -865,7 +865,8 @@ def keep_monitor(
 # one on the default context for its pipeline's bus), so there is no thread per sound.
 # A replacement is closed by the wrap, a stop by stop_sound. One sweep on the same loop
 # closes a sound set to NULL outside the wrap (the SDK's stop_playing, or a play_sound
-# that failed to make its playbin) and a sound with no end by its bound. Closing sets
+# that failed to make its playbin), one left in READY by a failed start, one whose watch
+# could not be added, at its end, and a sound with no end by its bound. Closing sets
 # that sound's own playbin to NULL on the one reaper thread, never on the GLib loop;
 # audio._playbin is the SDK's.
 
@@ -873,6 +874,8 @@ SOUND_SLACK_S = 5.0  # past its duration by this much, a sound whose position st
 SOUND_MAX_S = 1800.0  # the bound for a sound of unknown duration, and the cap for every sound
 SOUND_SWEEP_S = 3.0  # the sweep looks at the open sounds this often
 STOP_WAIT_S = 5.0  # a stop waits this long for the sound's playbin to reach NULL
+# A sound with no bus watch has ended when its position stopped this close to its duration.
+SOUND_END_SLACK_S = 0.25
 
 # Held by the play_sound wrap around its read of the SDK's handle, the SDK's call and the
 # open, so two callers at once each open their own sound and close the one they replaced.
@@ -894,6 +897,7 @@ class SoundEnd(enum.Enum):
     REPLACED = "replaced by a newer sound"
     STOPPED = "stopped"
     OUTSIDE = "closed outside"
+    FAILED_START = "left in READY by a failed start"
 
 
 @dataclass(eq=False)
@@ -907,6 +911,7 @@ class _Sound:
     timed: bool = False  # the duration was read, once, at preroll
     position: int | None = None  # its position in ns, at preroll or at the last overdue sweep
     late: bool = False  # it played on past its bound, and that was logged
+    watched: bool = True  # False: adding its bus watch failed, and only the sweep closes it
 
 
 class SoundActivity:
@@ -955,20 +960,33 @@ class SoundActivity:
             return bool(self._open), self._closed_at
 
     def sweep(self) -> bool:
-        """Close each sound set to NULL outside the wrap, or with no end by its bound.
+        """Close each sound that ended where no watch saw it, or with no end by its bound.
 
         Runs on the GLib main loop every SOUND_SWEEP_S while a sound is open, and stops
-        when none is; the next open starts it again. A sound past its bound whose
-        position still moves plays on, logged once, up to SOUND_MAX_S.
+        when none is; the next open starts it again. It closes a sound set to NULL outside
+        the wrap, one left in READY by a failed start, and one with no watch whose position
+        stopped at its end. A sound past its bound whose position still moves plays on,
+        logged once, up to SOUND_MAX_S.
         """
         now = self.clock()
         for sound in self.open_sounds():
             try:
                 _, current, pending = sound.playbin.get_state(0)
-                stopped = current in (Gst.State.NULL, Gst.State.READY)
-                if stopped and pending == Gst.State.VOID_PENDING:  # not on its way up
-                    close_sound(sound.playbin, SoundEnd.OUTSIDE)
-                    continue
+                if pending == Gst.State.VOID_PENDING:  # not on its way up
+                    if current == Gst.State.NULL:
+                        close_sound(sound.playbin, SoundEnd.OUTSIDE)
+                        continue
+                    if current == Gst.State.READY:
+                        close_sound(sound.playbin, SoundEnd.FAILED_START)
+                        continue
+                if not sound.watched:  # no EOS reaches it: an end is a position stopped at the end
+                    timed, duration = sound.playbin.query_duration(Gst.Format.TIME)
+                    found, position = sound.playbin.query_position(Gst.Format.TIME)
+                    last, sound.position = sound.position, (position if found else None)
+                    end = duration - SOUND_END_SLACK_S * Gst.SECOND
+                    if timed and found and position >= end and position == last:
+                        close_sound(sound.playbin, SoundEnd.ENDED, "seen by the sweep")
+                        continue
                 age = now - sound.opened_at
                 if age <= sound.bound_s:
                     continue
@@ -1022,17 +1040,22 @@ def _reap(job: Callable[[], Any]) -> None:
 def open_sound(playbin: Any, path: Any) -> None:
     """Watch a sound's bus on the GLib main loop, then mark it open; an open sound is left.
 
-    If marking it open fails, the watch is removed again and the error raised.
+    A sound whose watch cannot be added is still marked open, and the sweep closes it. If
+    marking it open fails, the watch is removed again and the error raised.
     """
     if SOUNDS.is_open(playbin):
         return
     sound = _Sound(playbin, path, opened_at=SOUNDS.clock(), bound_s=SOUND_MAX_S)
-    bus = playbin.get_bus()
-    bus.add_watch(GLib.PRIORITY_DEFAULT, _on_sound_message, sound)
+    try:
+        playbin.get_bus().add_watch(GLib.PRIORITY_DEFAULT, _on_sound_message, sound)
+    except Exception:
+        sound.watched = False
+        logger.warning("Could not watch the sound %s: the sweep closes it", path, exc_info=True)
     try:
         SOUNDS.opened(sound)
     except Exception:
-        bus.remove_watch()
+        if sound.watched:
+            playbin.get_bus().remove_watch()
         raise
     logger.info("Sound stream opened: %s (a second speaker stream)", path)
 
@@ -1062,11 +1085,12 @@ def close_sound(playbin: Any, end: SoundEnd, detail: str = "") -> bool:
     is queued for the reaper thread: set_state(NULL) waits for the playbin's streaming
     threads, and the GLib loop that runs the watches and the sweep must not wait with it.
     A replaced playbin, or one set to NULL outside the wrap, is left as the SDK set it.
+    A sound ended by the sweep had no watch; its playbin is set to NULL like any other.
     """
     sound = SOUNDS.take(playbin)
     if sound is None:
         return False
-    if end not in (SoundEnd.ENDED, SoundEnd.ERROR):  # the watch removes itself on those
+    if sound.watched and end not in (SoundEnd.ENDED, SoundEnd.ERROR):  # it removes itself on those
         playbin.get_bus().remove_watch()
     if end not in (SoundEnd.REPLACED, SoundEnd.OUTSIDE):
         _reap(functools.partial(playbin.set_state, Gst.State.NULL))
@@ -1124,8 +1148,15 @@ def install_sound_wrap(audio: Any) -> bool:
         return False
     with PLAY_SOUND_LOCK:
         playbin = getattr(audio, "_playbin", None)
-        if playbin is not None and playbin.get_state(0)[1] != Gst.State.NULL:
-            open_sound(playbin, "(a sound started before the wrap)")
+        try:
+            if playbin is not None and playbin.get_state(0)[1] != Gst.State.NULL:
+                open_sound(playbin, "(a sound started before the wrap)")
+        except Exception:
+            logger.warning(
+                "play_sound is wrapped, but the sound playing before the wrap could not be tracked:"
+                " it is not closed at its end",
+                exc_info=True,
+            )
     return True
 
 

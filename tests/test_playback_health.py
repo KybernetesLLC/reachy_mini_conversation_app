@@ -1870,8 +1870,12 @@ class _RecordingBus:
 def test_a_bookkeeping_failure_never_breaks_play_sound(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failing: str
 ) -> None:
-    """The SDK's result comes back, nothing is left open, and what was done is undone."""
+    """The SDK's result comes back, with one WARNING.
+
+    A failed watch still records the sound, for the sweep; a failed record undoes the watch.
+    """
     _gst()
+    monkeypatch.setattr(ph, "SOUND_SWEEP_S", 3600.0)  # no sweep runs during the test
     audio = _SdkAudio()
     audio.bus = _RecordingBus(fail=failing == "the watch")
     if failing == "the record":
@@ -1883,10 +1887,33 @@ def test_a_bookkeeping_failure_never_breaks_play_sound(
     ph.install_sound_wrap(audio)
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
         assert audio.play_sound("ring.wav") == "the SDK's result"
-    assert ph.SOUNDS.state()[0] is False
+    assert ph.SOUNDS.state()[0] is (failing == "the watch")
     assert audio.bus.calls == ([] if failing == "the watch" else ["add", "remove"])
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1 and "ring.wav" in warnings[0].getMessage()
+
+
+def test_a_sound_with_no_watch_is_closed_by_the_sweep_at_its_end(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The watch failed: the sweep sees the position stop at the duration, and closes it."""
+    Gst = _gst()
+    now = [0.0]
+    monkeypatch.setattr(ph, "SOUNDS", ph.SoundActivity(clock=lambda: now[0]))
+    monkeypatch.setattr(ph, "SOUND_SWEEP_S", 3600.0)  # the test sweeps by hand
+    audio = _SdkAudio(duration_s=2.0)
+    audio.bus = _RecordingBus(fail=True)
+    ph.install_sound_wrap(audio)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        audio.play_sound("ring.wav")
+        playbin = audio.made[0]
+        for second, position in enumerate((1.0, 2.0, 2.0), start=1):
+            now[0], playbin.position_s = float(second), position
+            ph.SOUNDS.sweep()
+            assert ph.SOUNDS.state()[0] is (second < 3)  # open until the position stops at the end
+    assert _until(lambda: playbin.states == [Gst.State.NULL])  # queued through the reaper
+    ((level, line),) = _closes(caplog)
+    assert level == logging.INFO and line.startswith("Sound stream closed (the sound ended")
 
 
 def test_a_sound_still_playing_past_its_bound_is_never_cut_off(
@@ -1944,6 +1971,25 @@ def test_a_sound_set_to_null_outside_the_wrap_is_closed_by_the_sweep(
         assert playbin.states == [Gst.State.NULL]  # the SDK's, and no second one
     else:
         assert ph.SOUNDS.state()[0] is True and _closes(caplog) == []
+
+
+def test_a_playbin_left_in_ready_by_a_failed_start_is_set_to_null(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """READY with nothing pending: the start failed. The sweep closes it and queues the NULL."""
+    Gst = _gst()
+    monkeypatch.setattr(ph, "SOUND_SWEEP_S", 3600.0)  # the test sweeps by hand
+    audio = _SdkAudio()
+    ph.install_sound_wrap(audio)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        audio.play_sound("ring.wav")
+        playbin = audio.made[0]
+        playbin.state = Gst.State.READY
+        ph.SOUNDS.sweep()
+    assert ph.SOUNDS.state()[0] is False
+    assert _until(lambda: playbin.states == [Gst.State.NULL])
+    line = "Sound stream closed (left in READY by a failed start): ring.wav"
+    assert _closes(caplog) == [(logging.INFO, line)]
 
 
 def test_a_slow_teardown_never_holds_up_the_glib_loop(glib_loop: Any) -> None:
@@ -2035,3 +2081,23 @@ def test_a_stop_stops_only_an_open_sound(glib_loop: Any, caplog: pytest.LogCaptu
     assert audio._playbin is playbin and playbin.states == [Gst.State.NULL]
     nothing = [r for r in caplog.records if "no sound playbin" in r.getMessage()]
     assert [r.levelno for r in nothing] == [logging.INFO, logging.INFO]
+
+
+def test_a_sound_before_the_wrap_that_cannot_be_tracked_says_so(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The wrap is installed; the WARNING says only the earlier sound went untracked."""
+    _gst()
+
+    def opened(sound: Any) -> None:
+        raise RuntimeError("no record")
+
+    monkeypatch.setattr(ph.SOUNDS, "opened", opened)
+    audio = SimpleNamespace(_playbin=_SoundPlaybin("wake_up"), play_sound=lambda path: None)
+    with caplog.at_level(logging.INFO, logger=ph.logger.name):
+        assert ph.install_sound_wrap(audio) is True
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == [
+        "play_sound is wrapped, but the sound playing before the wrap could not be tracked:"
+        " it is not closed at its end"
+    ]
