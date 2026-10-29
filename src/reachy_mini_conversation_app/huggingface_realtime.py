@@ -264,7 +264,8 @@ def usage_line(usage: Any, *, images: int, image_bytes: int) -> str | None:
 # 10-26, at 13.5k to 26.8k input tokens, mostly 3.5 to 4 minutes apart): a response's input
 # falls back to the bare session's. The companion's memory block carries the recent turns word
 # for word, so the instructions are sent again; a drop is a fall of more than this from the
-# session's peak to within it of the session's first response.
+# peak since the instructions went to within it of the least since (the bare session's, an
+# opening glance's image never counted in it).
 CONTEXT_DROP_TOKENS = 1500
 
 
@@ -440,10 +441,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # and the glance at open against the first reply to a person's turn (monotonic).
         self._session_images = 0
         self._usage_missing_logged = False
-        # The in-band input tokens: the first response's since the instructions were sent, and
-        # the most since (context_dropped).
+        # The in-band input tokens since the instructions were sent: the least and the most
+        # (context_dropped); the instructions sent, and a wish to send them again with why.
         self._ctx_base: int | None = None
         self._ctx_peak: int | None = None
+        self._instructions_sent: str | None = None
+        self._instructions_wanted: str | None = None
+        self._instructions_task: asyncio.Task[None] | None = None
         self._session_image_bytes = 0
         self._session_creates = 0
         self._open_glance_at: float | None = None
@@ -1228,7 +1232,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             logger.info("Context: the server reported no token usage")
 
     def _watch_context(self, usage: Any) -> bool:
-        """An in-band response's input tokens: True when the backend dropped the conversation."""
+        """An in-band response's input tokens: True when the backend dropped the conversation.
+        A drop measures afresh at once, so the replies before the instructions land count once."""
         tokens = getattr(usage, "input_tokens", None)
         if not isinstance(tokens, int) or tokens <= 0:
             return False
@@ -1241,26 +1246,52 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._ctx_peak,
                 tokens,
             )
+            self._ctx_base = self._ctx_peak = None
             return True
+        self._ctx_base = min(self._ctx_base, tokens)
         self._ctx_peak = max(self._ctx_peak, tokens)
         return False
 
+    def want_instructions(self, why: str) -> None:
+        self._instructions_wanted = why
+
+    def _after_reply(self, usage: Any) -> None:
+        """At an in-band reply's end, on the handler's loop: the instructions go again when
+        wanted (a session opened on this connection, or a drop), one send at a time."""
+        if self._watch_context(usage):
+            self._instructions_wanted = "the conversation was dropped"
+        why = self._instructions_wanted
+        if why is None or (self._instructions_task is not None and not self._instructions_task.done()):
+            return
+        self._instructions_wanted = None
+        self._instructions_task = asyncio.create_task(self.refresh_instructions(why))
+
     async def refresh_instructions(self, why: str) -> None:
-        """Send the session's instructions again, the companion's memory block re-read: after a
-        drop, or when a session opens on a connection already live (10-29: the second of two
+        """Send the session's instructions again, the companion's memory block re-read (off the
+        loop), when they changed since they were last sent (10-29: the second of two
         back-to-back sessions kept the instructions sent before the first one's words)."""
-        if self.connection is None:
+        connection = self.connection
+        if connection is None:
             return
         try:
-            instructions = get_session_instructions(self.instance_path)
-            await self.connection.session.update(
-                session=RealtimeSessionCreateRequestParam(type="realtime", instructions=instructions)
-            )
+            instructions = await asyncio.to_thread(get_session_instructions, self.instance_path)
+            if instructions == self._instructions_sent:
+                logger.debug("Instructions unchanged (%s): not sent again", why)
+                return
+            await self._send_instructions(connection, instructions)
         except Exception as exc:
             logger.warning("Instructions not sent again (%s): %s", why, exc)
             return
-        self._ctx_base = self._ctx_peak = None  # the next response measures afresh
+        if connection is self.connection:
+            self._ctx_base = self._ctx_peak = None  # the next reply measures afresh
         logger.info("Instructions sent again (%s): %d chars", why, len(instructions))
+
+    async def _send_instructions(self, connection: Any, instructions: str) -> None:
+        """The instructions alone, as a live session.update."""
+        await connection.session.update(
+            session=RealtimeSessionCreateRequestParam(type="realtime", instructions=instructions)
+        )
+        self._instructions_sent = instructions
 
     def _count_image(self, b64_jpeg: str) -> None:
         self._session_images += 1
@@ -1717,6 +1748,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             try:
                 session_config = self._get_session_config(tool_specs)
                 await conn.session.update(session=session_config)
+                self._instructions_sent = session_config.get("instructions")
                 logger.info(
                     "Realtime session initialized with profile=%r voice=%r",
                     getattr(config, "REACHY_MINI_CUSTOM_PROFILE", None),
@@ -1750,6 +1782,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._session_images = self._session_image_bytes = self._session_creates = 0
             self._usage_missing_logged = False  # each session says once whether usage comes
             self._ctx_base = self._ctx_peak = None
+            self._instructions_wanted = None  # a new connection sends them fresh
             self._open_glance_at = self._first_reply_at = None
             # A turn left open by the session before is not this session's first turn
             # (the review: its greeting would be judged as the first reply).
@@ -1843,8 +1876,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("Response done: id=%s", getattr(getattr(event, "response", None), "id", None))
                         usage = getattr(getattr(event, "response", None), "usage", None)
                         self._log_usage(usage)
-                        if _companion_tag(event) is None and self._watch_context(usage):
-                            asyncio.create_task(self.refresh_instructions("the conversation was dropped"))
+                        if _companion_tag(event) is None:
+                            self._after_reply(usage)
                         if not self._gate_transcript_done and (self._gate_text or self._gate_had_audio):
                             # Parsed by counting: keep the wording. Measuring only; the
                             # fallback below is unchanged.

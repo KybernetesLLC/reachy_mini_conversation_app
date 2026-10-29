@@ -678,11 +678,12 @@ class LocalStream:
         to flush anything.
         """
         if self._session_wanted.is_set():
-            # A session opening on the live connection (10-29): send the instructions again, so
-            # the memory block carries what was said since it connected.
-            refresh = getattr(self.handler, "refresh_instructions", None)
-            if inspect.iscoroutinefunction(refresh):  # the hosted handler's (others have none)
-                await refresh("a session opened on a live connection")
+            # A session opening on the live connection (10-29): its instructions go again at the
+            # next reply's end, on the handler's own loop, so the memory block carries what was
+            # said since it connected. Only the wish is marked here (this may be the RPC thread).
+            want = getattr(self.handler, "want_instructions", None)  # every ConversationHandler
+            if want is not None:
+                want("a session opened on a live connection")
             return
         self._glance_on_connect = glance
         # The greeting only when this open asks for it (the companion's setting, the

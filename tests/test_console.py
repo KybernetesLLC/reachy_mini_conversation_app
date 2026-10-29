@@ -4270,10 +4270,10 @@ async def test_an_open_on_a_live_connection_sends_the_instructions_again(
 ) -> None:
     """The companion, 10-29: back-to-back sessions share one connection, and the second kept
     the instructions (the memory block) sent before the first one's words."""
-    from unittest.mock import AsyncMock
+    from unittest.mock import MagicMock
 
     stream, _ = _refresh_stream(monkeypatch, started_at=0.0, now=4500.0)
     stream._session_wanted.set()
-    stream.handler.refresh_instructions = AsyncMock()
-    await stream.open_session()
-    stream.handler.refresh_instructions.assert_awaited_once_with("a session opened on a live connection")
+    stream.handler.want_instructions = MagicMock()
+    await stream.open_session()  # only the wish is marked: no websocket write from this thread
+    stream.handler.want_instructions.assert_called_once_with("a session opened on a live connection")

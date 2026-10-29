@@ -3866,20 +3866,35 @@ def test_a_dropped_conversation_is_told_from_this_mornings_numbers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_drop_sends_the_instructions_again_and_measures_afresh() -> None:
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock
+async def test_a_drop_or_a_wish_sends_the_instructions_once_at_a_reply_end(monkeypatch) -> None:
+    """Review of the refresh: on the handler's loop at a reply's end, one send at a time, only
+    when they changed; a drop measures afresh at once; the least since is the base."""
+    from reachy_mini_conversation_app import huggingface_realtime as hr
 
     handler = _handler()
     handler.connection = SimpleNamespace(session=SimpleNamespace(update=AsyncMock()))
-    seen = [handler._watch_context(SimpleNamespace(input_tokens=t)) for t in (11401, 13000, 15410, 11601)]
-    assert seen == [False, False, False, True]
-    await handler.refresh_instructions("the conversation was dropped")
-    sent = handler.connection.session.update.await_args.kwargs["session"]
-    assert sent["type"] == "realtime" and isinstance(sent["instructions"], str)
-    assert handler._ctx_base is None and handler._ctx_peak is None
+    text = {"now": "memory A"}
+    monkeypatch.setattr(hr, "get_session_instructions", lambda *_: text["now"])
+    handler._instructions_sent = "memory A"
+    u = lambda t: SimpleNamespace(input_tokens=t)  # noqa: E731
+    for t in (12900, 11401, 15410):  # an opening glance's reply first: the least is the base
+        handler._after_reply(u(t))
+    assert handler._ctx_base == 11401 and handler._instructions_task is None
+    text["now"] = "memory B"
+    handler._after_reply(u(11601))  # the drop
+    handler._after_reply(u(11650))  # the next reply before it lands: measured afresh, no second
+    await handler._instructions_task
+    handler.connection.session.update.assert_awaited_once()
+    assert handler.connection.session.update.await_args.kwargs["session"]["instructions"] == "memory B"
+    handler.want_instructions("a session opened on a live connection")
+    handler._after_reply(u(11700))
+    await handler._instructions_task  # unchanged since sent: nothing goes
+    handler.connection.session.update.assert_awaited_once()
+    text["now"] = "memory C"
     handler.connection.session.update = AsyncMock(side_effect=RuntimeError("closed"))
-    await handler.refresh_instructions("x")  # a failure is logged, never raised
+    handler.want_instructions("x")
+    handler._after_reply(u(11700))
+    await handler._instructions_task  # a failure is logged, never raised
 
 
 def _handler():

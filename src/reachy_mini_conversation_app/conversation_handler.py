@@ -185,6 +185,11 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         """Change the current voice."""
         ...
 
+    def want_instructions(self, why: str) -> None:
+        """Ask for the session's instructions to be sent again when it is safe (the companion,
+        10-29). Any thread may call it: it only marks the wish. A backend whose session cannot
+        be updated live ignores it."""
+
     @abstractmethod
     async def say(self, text: str) -> None:
         """Make the robot speak ``text`` now (injected turn; not verbatim TTS).
