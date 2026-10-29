@@ -260,6 +260,21 @@ def usage_line(usage: Any, *, images: int, image_bytes: int) -> str | None:
     )
 
 
+# The hosted backend drops the conversation now and then (the companion, 10-29: 27 times since
+# 10-26, at 13.5k to 26.8k input tokens, mostly 3.5 to 4 minutes apart): a response's input
+# falls back to the bare session's. The companion's memory block carries the recent turns word
+# for word, so the instructions are sent again; a drop is a fall of more than this from the
+# session's peak to within it of the session's first response.
+CONTEXT_DROP_TOKENS = 1500
+
+
+def context_dropped(base: int | None, peak: int | None, tokens: int) -> bool:
+    """Whether an in-band response's input shows the conversation dropped by the backend."""
+    if base is None or peak is None:
+        return False
+    return tokens < peak - CONTEXT_DROP_TOKENS and tokens <= base + CONTEXT_DROP_TOKENS
+
+
 def _companion_tag(event: Any) -> str | None:
     """Return the companion tag of a response.created/done event's response, if any."""
     metadata = getattr(getattr(event, "response", None), "metadata", None)
@@ -425,6 +440,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # and the glance at open against the first reply to a person's turn (monotonic).
         self._session_images = 0
         self._usage_missing_logged = False
+        # The in-band input tokens: the first response's since the instructions were sent, and
+        # the most since (context_dropped).
+        self._ctx_base: int | None = None
+        self._ctx_peak: int | None = None
         self._session_image_bytes = 0
         self._session_creates = 0
         self._open_glance_at: float | None = None
@@ -1208,6 +1227,41 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._usage_missing_logged = True
             logger.info("Context: the server reported no token usage")
 
+    def _watch_context(self, usage: Any) -> bool:
+        """An in-band response's input tokens: True when the backend dropped the conversation."""
+        tokens = getattr(usage, "input_tokens", None)
+        if not isinstance(tokens, int) or tokens <= 0:
+            return False
+        if self._ctx_base is None or self._ctx_peak is None:
+            self._ctx_base = self._ctx_peak = tokens
+            return False
+        if context_dropped(self._ctx_base, self._ctx_peak, tokens):
+            logger.info(
+                "Context: the backend dropped the conversation (%d to %d input tokens)",
+                self._ctx_peak,
+                tokens,
+            )
+            return True
+        self._ctx_peak = max(self._ctx_peak, tokens)
+        return False
+
+    async def refresh_instructions(self, why: str) -> None:
+        """Send the session's instructions again, the companion's memory block re-read: after a
+        drop, or when a session opens on a connection already live (10-29: the second of two
+        back-to-back sessions kept the instructions sent before the first one's words)."""
+        if self.connection is None:
+            return
+        try:
+            instructions = get_session_instructions(self.instance_path)
+            await self.connection.session.update(
+                session=RealtimeSessionCreateRequestParam(type="realtime", instructions=instructions)
+            )
+        except Exception as exc:
+            logger.warning("Instructions not sent again (%s): %s", why, exc)
+            return
+        self._ctx_base = self._ctx_peak = None  # the next response measures afresh
+        logger.info("Instructions sent again (%s): %d chars", why, len(instructions))
+
     def _count_image(self, b64_jpeg: str) -> None:
         self._session_images += 1
         self._session_image_bytes += (len(b64_jpeg) * 3) // 4
@@ -1695,6 +1749,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._last_speech_at = time.monotonic()
             self._session_images = self._session_image_bytes = self._session_creates = 0
             self._usage_missing_logged = False  # each session says once whether usage comes
+            self._ctx_base = self._ctx_peak = None
             self._open_glance_at = self._first_reply_at = None
             # A turn left open by the session before is not this session's first turn
             # (the review: its greeting would be judged as the first reply).
@@ -1786,7 +1841,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._greeting_live = False
                         # Checked against the function call's response_id on the robot (2026-10-23).
                         logger.debug("Response done: id=%s", getattr(getattr(event, "response", None), "id", None))
-                        self._log_usage(getattr(getattr(event, "response", None), "usage", None))
+                        usage = getattr(getattr(event, "response", None), "usage", None)
+                        self._log_usage(usage)
+                        if _companion_tag(event) is None and self._watch_context(usage):
+                            asyncio.create_task(self.refresh_instructions("the conversation was dropped"))
                         if not self._gate_transcript_done and (self._gate_text or self._gate_had_audio):
                             # Parsed by counting: keep the wording. Measuring only; the
                             # fallback below is unchanged.

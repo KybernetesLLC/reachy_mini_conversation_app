@@ -3851,3 +3851,36 @@ async def test_a_json_call_that_closes_after_the_timer_released_its_audio_flushe
     assert "leaked tool call: recall (json) cut; executed=False" in caplog.messages
     assert tools["recall"].runs == 0
     assert [(r["name"], r["status"], r["source"]) for r in reports] == [("recall", "cut", "leaked")]
+
+
+def test_a_dropped_conversation_is_told_from_this_mornings_numbers() -> None:
+    """The companion, 10-29 07:41-07:55: base 11401, peaks 15410, 14562, 13562, each followed by
+    a fall to about 11600; growth and the out-of-band 4489s are not drops."""
+    from reachy_mini_conversation_app.huggingface_realtime import context_dropped
+
+    assert context_dropped(11401, 15410, 11601)
+    assert context_dropped(11401, 14562, 11679)
+    assert not context_dropped(11401, 15410, 15000)  # a small dip
+    assert not context_dropped(11401, 12100, 11700)  # under the margin from the peak
+    assert not context_dropped(None, None, 11601)  # no base yet
+
+
+@pytest.mark.asyncio
+async def test_a_drop_sends_the_instructions_again_and_measures_afresh() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    handler = _handler()
+    handler.connection = SimpleNamespace(session=SimpleNamespace(update=AsyncMock()))
+    seen = [handler._watch_context(SimpleNamespace(input_tokens=t)) for t in (11401, 13000, 15410, 11601)]
+    assert seen == [False, False, False, True]
+    await handler.refresh_instructions("the conversation was dropped")
+    sent = handler.connection.session.update.await_args.kwargs["session"]
+    assert sent["type"] == "realtime" and isinstance(sent["instructions"], str)
+    assert handler._ctx_base is None and handler._ctx_peak is None
+    handler.connection.session.update = AsyncMock(side_effect=RuntimeError("closed"))
+    await handler.refresh_instructions("x")  # a failure is logged, never raised
+
+
+def _handler():
+    return HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
