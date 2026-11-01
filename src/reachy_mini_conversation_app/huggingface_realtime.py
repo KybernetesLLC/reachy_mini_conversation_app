@@ -809,6 +809,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             logger.info("response.create: merged %d queued create(s) into the one being sent", dropped)
         return dropped
 
+    async def request_reply(self) -> bool:
+        """Ask for a reply in-band, after a companion note (speaking first at a silence): only
+        while no response is active or queued and nobody has started speaking; otherwise the
+        moment has passed and nothing is asked. True when it was asked."""
+        busy = not self._response_done_event.is_set() or not self._pending_responses.empty()
+        if busy or self._user_speaking:
+            logger.info("Reply after a note not asked: the moment passed")
+            return False
+        await self._safe_response_create()
+        return True
+
     async def _safe_response_create(self, **kwargs: Any) -> None:
         """Enqueue a response.create() kwargs for the sender worker _response_sender_loop().
 

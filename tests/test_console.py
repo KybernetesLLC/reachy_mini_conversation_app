@@ -2959,6 +2959,38 @@ def test_a_note_over_the_rpc_passes_now_only_when_asked() -> None:
     assert calls == [("a", {}), ("b", {"now": True})]
 
 
+def test_a_note_that_asks_for_a_reply_gets_one_only_when_it_was_sent() -> None:
+    """The companion's control loop (unit 9): speaking first at a silence is a note sent now
+    and then a reply asked for in-band; a note dropped asks for nothing."""
+    stream, _manager, app = _pose_stream()
+    outcome = {"sent": True}
+    asked: list[str] = []
+
+    def add_note(text: str, now: bool = False) -> "asyncio.Future[bool]":
+        async def done() -> bool:
+            return outcome["sent"]
+
+        return asyncio.ensure_future(done())
+
+    async def request_reply() -> None:
+        asked.append("reply")
+
+    stream.handler.add_note = add_note
+    stream.handler.request_reply = request_reply
+    stream.handler.note_drop_reason = "response active"
+    stream.handler._is_connected.return_value = True
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    try:
+        sent = _rpc_call(app, "conversation.note", {"text": "x", "respond": True})
+        outcome["sent"] = False
+        dropped = _rpc_call(app, "conversation.note", {"text": "y", "respond": True})
+    finally:
+        _stop_loop(loop, thread)
+    assert sent["result"] == {"queued": True} and dropped["result"]["queued"] is False
+    assert asked == ["reply"]
+
+
 def test_a_now_note_reports_whether_it_was_sent() -> None:
     """With now, the RPC waits for the handler's answer: sent, or refused with the reason."""
     stream, _manager, app = _pose_stream()

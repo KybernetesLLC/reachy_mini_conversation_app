@@ -3899,3 +3899,19 @@ async def test_a_drop_or_a_wish_sends_the_instructions_once_at_a_reply_end(monke
 
 def _handler():
     return HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+
+@pytest.mark.asyncio
+async def test_a_reply_after_a_note_is_asked_only_while_nothing_else_speaks() -> None:
+    """The companion's control loop (unit 9): speaking first at a silence asks a reply only
+    while no response is active or queued and nobody has started speaking."""
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
+    handler._response_done_event.set()
+    assert await handler.request_reply() is True
+    assert handler._pending_responses.qsize() == 1
+    assert await handler.request_reply() is False  # one already queued
+    handler._pending_responses.get_nowait()
+    handler._user_speaking = True
+    assert await handler.request_reply() is False

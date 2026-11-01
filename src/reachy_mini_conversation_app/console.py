@@ -1367,8 +1367,17 @@ class LocalStream:
 
             # now=True sends while the person is speaking (the mid-speech note test).
             now = bool(params.get("now", False))
+            # respond=True (the companion's control loop, unit 9: speaking first at a silence):
+            # sent now, then a reply asked for in-band, as the warm-up test did. Never while a
+            # response is active: the note is dropped then, and no reply is asked.
+            respond = bool(params.get("respond", False))
 
             async def _add_note() -> bool:
+                if respond:
+                    sent = bool(await self.handler.add_note(text, now=True))
+                    if sent:
+                        await self.handler.request_reply()
+                    return sent
                 if now:
                     # Awaited here, on the handler's loop: the answer is whether it was sent.
                     return bool(await self.handler.add_note(text, now=True))
