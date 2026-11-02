@@ -1151,3 +1151,20 @@ def test_a_set_that_lands_after_a_breathing_move_is_queued_still_reaches_it() ->
     move = manager.state.current_move
     assert isinstance(move, BreathingMove)
     assert (move.rate_scale, move.depth_scale, move.pitch_offset) == (0.8, 1.2, 0.04)
+
+
+def test_a_body_yaw_past_160_is_held_at_160_and_the_head_turns_back_with_it() -> None:
+    """11-02: with automatic body yaw off the daemon passes the body yaw to the motor
+    unclamped; an emotion's +62 on a body at 140 must stop at 160, head and body together."""
+    import math
+
+    from reachy_mini.utils import create_head_pose
+    from reachy_mini_conversation_app.moves import BODY_YAW_MAX, _within_body_range
+
+    head = create_head_pose(0, 0, 0, 0, 0, math.radians(200), degrees=False)
+    out, body = _within_body_range(head, math.radians(202))
+    assert body == BODY_YAW_MAX
+    head_yaw = math.atan2(out[1, 0], out[0, 0])
+    assert math.degrees(head_yaw) == pytest.approx(158.0)  # 2 degrees off the body, as recorded
+    same, inside = _within_body_range(head, 1.0)
+    assert inside == 1.0 and same is head

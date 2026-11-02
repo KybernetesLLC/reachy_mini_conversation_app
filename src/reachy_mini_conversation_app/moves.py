@@ -76,6 +76,20 @@ def _idle_setting(name: str, default: float) -> float:
     return value
 
 
+# The companion (11-02): with automatic body yaw off, the daemon passes a body yaw straight
+# to the motor, unclamped. 160 degrees is the SDK's own bound (max_body_yaw).
+BODY_YAW_MAX = math.radians(160.0)
+
+
+def _within_body_range(head: NDArray[np.float64], body_yaw: float) -> Tuple[NDArray[np.float64], float]:
+    """Hold the body within BODY_YAW_MAX each way; the head turns back by the same amount,
+    so a recorded move keeps its head-to-body shape (an emotion's +62 on a body at 140)."""
+    clipped = min(max(float(body_yaw), -BODY_YAW_MAX), BODY_YAW_MAX)
+    if clipped == body_yaw:
+        return head, body_yaw
+    return _turned(np.asarray(head, dtype=np.float64), clipped - float(body_yaw)), clipped
+
+
 def _turned(pose: NDArray[np.float64], yaw: float) -> NDArray[np.float64]:
     """Turn `pose` by `yaw` about the vertical axis.
 
@@ -1089,6 +1103,7 @@ class MovementManager:
         self, head: NDArray[np.float32], antennas: Tuple[float, float], body_yaw: float
     ) -> None:
         """Send the pose to the robot with throttled error logging."""
+        head, body_yaw = _within_body_range(head, body_yaw)
         try:
             self.current_robot.set_target(head=head, antennas=antennas, body_yaw=body_yaw)
         except Exception as e:
