@@ -187,6 +187,12 @@ def run(
             logger.error("Please check your configuration and try again.")
             sys.exit(1)
 
+    # The companion (11-02): the supervisor owns the body's yaw, so the daemon must not
+    # turn the body to absorb head yaw. ReachyMini() turns it on by default and the
+    # daemon keeps the last value, so it goes off here, before any move.
+    robot.set_automatic_body_yaw(False)
+    logger.info("automatic body yaw: off")
+
     # The companion (R-36): an app the supervisor starts on its own moves nothing
     # until the supervisor says so -- no wake-up from the fold, no breathing.
     still = not startup.motion_on_start()
