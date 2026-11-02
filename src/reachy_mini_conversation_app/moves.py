@@ -580,8 +580,12 @@ class MovementManager:
         target_antennas: Tuple[float, float],
         duration: float,
         body_yaw: float | None = None,
+        only_over_a_hold: bool = False,
     ) -> None:
         """Hold the body in a target pose, replacing any current or queued move.
+
+        `only_over_a_hold` (the companion's gaze in conversation, 11-02): applied only while
+        a hold is all that plays, so a gaze never cuts an emotion, a cue or a micro-move.
 
         `body_yaw` None keeps the last commanded body yaw: a hold used to turn
         the body back to 0 (HoldPoseMove's default), which the companion's
@@ -591,7 +595,9 @@ class MovementManager:
         also seeds the interpolation start from the last commanded pose, so a
         hold that replaces a previous hold picks up from wherever it had got to.
         """
-        self._command_queue.put(("hold_pose", (target_head_pose, target_antennas, duration, body_yaw)))
+        self._command_queue.put(
+            ("hold_pose", (target_head_pose, target_antennas, duration, body_yaw, only_over_a_hold))
+        )
 
     def turn_idle_body(self, yaw: float, duration: float) -> None:
         """Turn the body, with the breathing head, to `yaw` over `duration` s.
@@ -619,6 +625,14 @@ class MovementManager:
         untouched. Thread-safe via the command queue.
         """
         self._command_queue.put(("release_hold", None))
+
+    def _only_a_hold_plays(self) -> bool:
+        """A hold is the current move, nothing waits behind it and nothing is set aside."""
+        return (
+            isinstance(self.state.current_move, HoldPoseMove)
+            and not self.move_queue
+            and self._held_aside is None
+        )
 
     def is_holding(self) -> bool:
         """Return True while a HoldPoseMove is the current or a queued move, or set aside."""
@@ -754,6 +768,9 @@ class MovementManager:
                 logger.warning("Ignored hold_pose command with invalid payload: %s", payload)
                 return
             body_yaw = rest[0] if rest else None
+            if len(rest) > 1 and rest[1] and not self._only_a_hold_plays():
+                logger.debug("A gaze hold was skipped: a move is playing")
+                return
             self._end_tracking_for_the_posture()
             start_head_pose, start_antennas, start_body_yaw = self._last_commanded_pose
             hold_move = HoldPoseMove(

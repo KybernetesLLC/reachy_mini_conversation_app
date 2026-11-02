@@ -709,7 +709,7 @@ def test_a_still_start_holds_the_robots_present_pose_before_anything_moves() -> 
     manager = MovementManager(_robot(0.4))
     manager._seed_from_robot()
     manager._queue_hold_still()
-    name, (head, antennas, duration, body_yaw) = manager._command_queue.get_nowait()
+    name, (head, antennas, duration, body_yaw, _) = manager._command_queue.get_nowait()
     assert name == "hold_pose"
     np.testing.assert_allclose(head, create_head_pose(0, 0, 0, 0, 0, 0.4, degrees=False))
     assert antennas == (-0.1745, 0.1745) and body_yaw == pytest.approx(0.4)
@@ -1168,3 +1168,25 @@ def test_a_body_yaw_past_160_is_held_at_160_and_the_head_turns_back_with_it() ->
     assert math.degrees(head_yaw) == pytest.approx(158.0)  # 2 degrees off the body, as recorded
     same, inside = _within_body_range(head, 1.0)
     assert inside == 1.0 and same is head
+
+
+def test_a_gaze_hold_never_cuts_a_playing_move() -> None:
+    """The companion's gaze in conversation (11-02): over a hold it replaces the hold; over
+    anything else playing (an emotion, a cue) it is skipped."""
+    robot = MagicMock()
+    robot.get_current_joint_positions.return_value = ([0.0] * 6, [0.0, 0.0])
+    robot.get_current_head_pose.return_value = np.eye(4)
+    manager = MovementManager(robot)
+    pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+    gazed = create_head_pose(0, 0, 0, 0, 0, 12, degrees=True)
+    t0 = manager._now()
+    manager._handle_command("hold_pose", (pose, (0.2, -0.2), 1.0, None), t0)
+    manager._manage_move_queue(t0)
+    manager._handle_command("hold_pose", (gazed, (0.2, -0.2), 0.3, None, True), t0)
+    assert len(manager.move_queue) == 1  # over a hold: the gaze replaces it
+
+    manager._manage_move_queue(t0)
+    emotion = MagicMock(duration=2.0)
+    manager.state.current_move = emotion  # an emotion is playing
+    manager._handle_command("hold_pose", (gazed, (0.2, -0.2), 0.3, None, True), t0)
+    assert manager.state.current_move is emotion and not manager.move_queue

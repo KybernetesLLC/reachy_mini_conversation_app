@@ -1509,7 +1509,15 @@ class LocalStream:
 
             body_yaw = _body_yaw(params["body_yaw"]) if "body_yaw" in params else None
             target_head_pose = create_head_pose(x, y, z, roll, pitch, yaw, degrees=False)
-            manager.hold_pose(target_head_pose, target_antennas, duration, body_yaw=body_yaw)
+            # the companion's gaze in conversation (11-02): never over an emotion or a cue
+            only_over_a_hold = params.get("only_over_a_hold") is True
+            manager.hold_pose(
+                target_head_pose,
+                target_antennas,
+                duration,
+                body_yaw=body_yaw,
+                only_over_a_hold=only_over_a_hold,
+            )
             if body_yaw is None:
                 return {"holding": True}
             return {"holding": True, "body_yaw": body_yaw}
