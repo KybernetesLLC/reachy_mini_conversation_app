@@ -1601,8 +1601,10 @@ class LocalStream:
             library = await asyncio.to_thread(play_emotion.emotions_library)
             if not isinstance(name, str) or name not in library.list_moves():
                 raise JsonRpcError(f"unknown cue {name!r}", reason="unknown_cue", code=-32602)
-            manager.queue_move(play_emotion.EmotionQueueMove(name, library))
-            return {"queued": name}
+            move = play_emotion.EmotionQueueMove(name, library)
+            manager.queue_move(move)
+            # its length, so the companion counts it as his own motion, not a touch
+            return {"queued": name, "seconds": move.duration}
 
         @rpc.method("backend.config")  # type: ignore[untyped-decorator]
         def _rpc_backend_config(params: dict[str, object]) -> dict[str, object]:

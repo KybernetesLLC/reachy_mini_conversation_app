@@ -2448,7 +2448,8 @@ def test_a_cue_over_rpc_queues_the_named_emotion_silently(monkeypatch: pytest.Mo
 
     resp = _rpc_call(app, "conversation.cue", {"name": "inquiring2"})
 
-    assert resp["result"] == {"queued": "inquiring2"}
+    assert resp["result"]["queued"] == "inquiring2"
+    assert resp["result"]["seconds"] > 0  # its length: the companion's tap gate counts it as his motion
     _drive_manager(manager)
     assert manager.state.current_move.emotion_name == "inquiring2"
 
@@ -2674,7 +2675,7 @@ def test_the_cue_loads_the_library_off_the_apps_loop(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(play_emotion, "emotions_library", library)
     _stream, _manager, app = _pose_stream()
-    assert _rpc_call(app, "conversation.cue", {"name": "inquiring2"})["result"] == {"queued": "inquiring2"}
+    assert _rpc_call(app, "conversation.cue", {"name": "inquiring2"})["result"]["queued"] == "inquiring2"
     assert threads == ["off the loop"]
 
 
