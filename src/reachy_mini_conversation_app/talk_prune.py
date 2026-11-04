@@ -23,6 +23,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 CHECK_S = 60.0
+LAG_S = 60.0  # an item arrives before its transcript is stamped: this much older than up_to
 LEDGER_MAX = 2000
 KEY = "talk_summary"
 PREFIX = "Earlier in this talk, in short: "
@@ -66,6 +67,8 @@ class TalkPrune:
         if item_id and isinstance(text, str) and text.startswith(PREFIX):
             self.summary_item = item_id
             return
+        if getattr(item, "type", "message") != "message" or getattr(item, "role", None) == "system":
+            return  # a tool call and its output stay paired, and instructions stay (the review)
         if item_id and item_id not in self.items and item_id != self.summary_item:
             self.items[item_id] = time.time() if at is None else at
             while len(self.items) > LEDGER_MAX:
@@ -82,10 +85,15 @@ class TalkPrune:
         """Delete the items older than the summary's up_to and put the summary in; the count
         deleted. Nothing without a newer summary."""
         self.checked_at = time.monotonic()
-        if summary is None or summary[0] <= self.up_to:
+        if summary is None:  # cleared (a forget, the talk's end): its item goes too
+            if self.summary_item is not None:
+                await conn.conversation.item.delete(item_id=self.summary_item)
+                self.summary_item, self.up_to = None, 0.0
+            return 0
+        if summary[0] <= self.up_to:
             return 0
         up_to, text = summary
-        old = [i for i, at in self.items.items() if at < up_to]
+        old = [i for i, at in self.items.items() if at < up_to - LAG_S]
         for item_id in old:
             await conn.conversation.item.delete(item_id=item_id)
             self.items.pop(item_id, None)

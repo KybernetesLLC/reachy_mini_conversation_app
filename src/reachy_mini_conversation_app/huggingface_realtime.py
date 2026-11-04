@@ -1439,8 +1439,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         wanted (a session opened on this connection, or a drop), one send at a time."""
         if self._watch_context(usage):
             self._instructions_wanted = "the conversation was dropped"
-        if self._prune.due(time.monotonic()) and (
-            self._prune_task is None or self._prune_task.done()
+        if (
+            self._prune.due(time.monotonic())
+            and (self._prune_task is None or self._prune_task.done())
+            # never while a response.create waits for its answer: an error there wakes it
+            and self._response_started_or_rejected_event.is_set()
         ):
             self._prune_task = asyncio.create_task(self._prune_now())
         why = self._instructions_wanted

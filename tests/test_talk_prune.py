@@ -21,8 +21,8 @@ class Conn:
         self.created.append(item)
 
 
-def _item(item_id: str, text: str = "hi") -> SimpleNamespace:
-    return SimpleNamespace(id=item_id, content=[SimpleNamespace(text=text)])
+def _item(item_id: str, text: str = "hi", type_: str = "message") -> SimpleNamespace:
+    return SimpleNamespace(id=item_id, type=type_, role="user", content=[SimpleNamespace(text=text)])
 
 
 def test_items_older_than_the_summary_go_and_the_summary_replaces_the_last(tmp_path) -> None:
@@ -33,14 +33,17 @@ def test_items_older_than_the_summary_go_and_the_summary_replaces_the_last(tmp_p
                 (json.dumps({"session": 1.0, "up_to": 150.0, "text": "Alli asked about ferries."}),))
     con.commit()
     prune, conn = tp.TalkPrune(), Conn()
-    prune.seen(_item("a"), at=100.0)
+    prune.seen(_item("a"), at=50.0)
     prune.seen(_item("b"), at=200.0)
+    prune.seen(_item("call", type_="function_call"), at=10.0)  # never deleted
     assert asyncio.run(prune.apply(conn, tp.read_summary(p))) == 1
     assert conn.deleted == ["a"] and conn.created[0]["role"] == "system"
     assert conn.created[0]["content"][0]["text"] == tp.PREFIX + "Alli asked about ferries."
     prune.seen(_item("s1", tp.PREFIX + "Alli asked about ferries."), at=210.0)
     assert prune.summary_item == "s1" and "s1" not in prune.items
     assert asyncio.run(prune.apply(conn, tp.read_summary(p))) == 0  # no newer summary
-    assert asyncio.run(prune.apply(conn, (250.0, "More."))) == 1
+    assert asyncio.run(prune.apply(conn, (300.0, "More."))) == 1
     assert conn.deleted == ["a", "b", "s1"]  # the old summary goes with them
+    prune.seen(_item("s2", tp.PREFIX + "More."), at=310.0)
+    assert asyncio.run(prune.apply(conn, None)) == 0 and conn.deleted[-1] == "s2"  # cleared
     assert tp.read_summary(tmp_path / "none.db") is None
