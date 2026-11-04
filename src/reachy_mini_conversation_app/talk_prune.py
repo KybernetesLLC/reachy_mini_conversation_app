@@ -55,6 +55,8 @@ class TalkPrune:
 
     def __init__(self) -> None:
         self.items: OrderedDict[str, float] = OrderedDict()
+        # a tool call and its output by call_id: [(item id, arrival) of the call, of the output]
+        self.calls: OrderedDict[str, list] = OrderedDict()
         self.summary_item: str | None = None
         self.up_to = 0.0
         self.checked_at = float("-inf")
@@ -67,8 +69,17 @@ class TalkPrune:
         if item_id and isinstance(text, str) and text.startswith(PREFIX):
             self.summary_item = item_id
             return
-        if getattr(item, "type", "message") != "message" or getattr(item, "role", None) == "system":
-            return  # a tool call and its output stay paired, and instructions stay (the review)
+        kind = getattr(item, "type", "message")
+        if kind in ("function_call", "function_call_output"):  # pruned only as a pair (11-04)
+            call = getattr(item, "call_id", None)
+            if item_id and call:
+                pair = self.calls.setdefault(call, [None, None])
+                pair[0 if kind == "function_call" else 1] = (item_id, time.time() if at is None else at)
+                while len(self.calls) > LEDGER_MAX:
+                    self.calls.popitem(last=False)
+            return
+        if kind != "message" or getattr(item, "role", None) == "system":
+            return  # instructions stay
         if item_id and item_id not in self.items and item_id != self.summary_item:
             self.items[item_id] = time.time() if at is None else at
             while len(self.items) > LEDGER_MAX:
@@ -93,10 +104,18 @@ class TalkPrune:
         if summary[0] <= self.up_to:
             return 0
         up_to, text = summary
-        old = [i for i, at in self.items.items() if at < up_to - LAG_S]
+        cut = up_to - LAG_S
+        old = [i for i, at in self.items.items() if at < cut]
         for item_id in old:
             await conn.conversation.item.delete(item_id=item_id)
             self.items.pop(item_id, None)
+        pairs = [c for c, (call, out) in self.calls.items()
+                 if call and out and call[1] < cut and out[1] < cut]  # fmt: skip
+        for c in pairs:  # both halves older than the cutoff: the summary says what was found
+            call, out = self.calls.pop(c)
+            await conn.conversation.item.delete(item_id=call[0])
+            await conn.conversation.item.delete(item_id=out[0])
+
         if self.summary_item is not None:
             await conn.conversation.item.delete(item_id=self.summary_item)
             self.summary_item = None  # the new one's id comes back in its created event
@@ -107,5 +126,6 @@ class TalkPrune:
             }
         )  # fmt: skip
         self.up_to = up_to
-        logger.info("Talk prune: %d items older than the summary deleted", len(old))
-        return len(old)
+        logger.info("Talk prune: %d messages and %d tool call pairs older than the summary deleted",
+                    len(old), len(pairs))  # fmt: skip
+        return len(old) + len(pairs)
