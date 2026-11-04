@@ -46,16 +46,24 @@ from reachy_mini_conversation_app.config import (
     get_hf_connection_selection,
     refresh_runtime_config_from_env,
 )
-from reachy_mini_conversation_app.prompts import get_session_voice, get_session_instructions
+from reachy_mini_conversation_app.prompts import (
+    get_session_voice,
+    get_session_instructions,
+)
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_float32
-from reachy_mini_conversation_app.startup_settings import read_startup_settings, write_startup_settings
+from reachy_mini_conversation_app.startup_settings import (
+    read_startup_settings,
+    write_startup_settings,
+)
 from reachy_mini_conversation_app.tools.core_tools import initialize_tools
 from reachy_mini_conversation_app.tool_space_routes import register_tool_space_methods
 from reachy_mini_conversation_app.personality_routes import (
     build_personality_ops,
     register_personality_methods,
 )
-from reachy_mini_conversation_app.profile_tool_routes import register_profile_tool_methods
+from reachy_mini_conversation_app.profile_tool_routes import (
+    register_profile_tool_methods,
+)
 from reachy_mini_conversation_app.audio.startup_config import apply_audio_startup_config
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
 
@@ -88,9 +96,13 @@ def _detach_framework_root_routes(app: "FastAPI") -> None:
     survivors = []
     for route in routes:
         path = getattr(route, "path", None)
-        is_catch_all = isinstance(path, str) and path.startswith("/{") and path.endswith(":path}")
+        is_catch_all = (
+            isinstance(path, str) and path.startswith("/{") and path.endswith(":path}")
+        )
         if path in ("/", "/static") or is_catch_all:
-            logger.debug("detaching framework-provided route %r (%s)", path, type(route).__name__)
+            logger.debug(
+                "detaching framework-provided route %r (%s)", path, type(route).__name__
+            )
             continue
         survivors.append(route)
     routes[:] = survivors
@@ -119,7 +131,11 @@ def _body_yaw(value: object) -> float:
     """Parse a body yaw in radians within the SDK's limit, or raise invalid_params."""
     yaw = _finite_float(value, "pose body_yaw must be numeric")
     if abs(yaw) > _BODY_YAW_LIMIT:
-        raise JsonRpcError("pose body_yaw is past the body's limit", reason="invalid_params", code=-32602)
+        raise JsonRpcError(
+            "pose body_yaw is past the body's limit",
+            reason="invalid_params",
+            code=-32602,
+        )
     return yaw
 
 
@@ -256,7 +272,9 @@ def _drop_until(pad: Any, running_time: int) -> None:
     with _DROP_PROBES_LOCK:
         previous = _DROP_PROBES.pop(key, None)
         if previous is not None:
-            pad.remove_probe(previous)  # superseded: this barge-in's running time is later
+            pad.remove_probe(
+                previous
+            )  # superseded: this barge-in's running time is later
         probe_id.append(pad.add_probe(Gst.PadProbeType.BUFFER, probe))
         _DROP_PROBES[key] = probe_id[0]
 
@@ -337,7 +355,9 @@ class LocalStream:
         self._replies = playback_health.ReplyTracker()
         # The phantom-speech detector (2026-10-26): speaker sound the app did not push.
         # A reply pushed but not yet heard may still play late: the app's own sound.
-        self._phantom = phantom_speech.PhantomWatch(pending=lambda now: self._replies.pending(now))
+        self._phantom = phantom_speech.PhantomWatch(
+            pending=lambda now: self._replies.pending(now)
+        )
         self._speaker_sink_cache: dict[str, Any] = {}
         # Every play_sound caller is seen from the start (the app tools use it directly),
         # and each sound's playbin is closed at its end: the SDK leaves its stream open.
@@ -371,7 +391,9 @@ class LocalStream:
         self._instance_path: Optional[str] = instance_path
         self._settings_initialized = False
         self._asyncio_loop = None
-        self._mic_muted = False  # mic starts live; the UI toggles it via the settings API
+        self._mic_muted = (
+            False  # mic starts live; the UI toggles it via the settings API
+        )
         self._backend_connection_state = "not_started"
         self._backend_error: str | None = None
         self._backend_retry_delay = BACKEND_RETRY_DELAY_SECONDS
@@ -410,7 +432,12 @@ class LocalStream:
             self.handler.on_sight = self._dispatch_sight
 
     def _dispatch_transcript(
-        self, role: str, text: str, final: bool, artifact: str | None = None, item_id: str | None = None
+        self,
+        role: str,
+        text: str,
+        final: bool,
+        artifact: str | None = None,
+        item_id: str | None = None,
     ) -> None:
         """Push a conversation.transcript notification to JSON-RPC clients. A reply the
         output gate cut carries its kind as "artifact": the supervisor never keeps it. A user
@@ -431,7 +458,9 @@ class LocalStream:
         the frame is not sent anywhere, and no note is written.
         """
         if self._rpc is None or not self._rpc._clients:
-            logger.info("Sight frame (%s) not handed over: no companion attached", source)
+            logger.info(
+                "Sight frame (%s) not handed over: no companion attached", source
+            )
             return
         self._rpc.broadcast_threadsafe(
             "conversation.sight",
@@ -471,7 +500,9 @@ class LocalStream:
         except Exception:
             return
         level = max(0.0, min(1.0, rms * self._LEVEL_GAIN))
-        self._rpc.broadcast_threadsafe("conversation.level", {"role": role, "rms": round(level, 3)})
+        self._rpc.broadcast_threadsafe(
+            "conversation.level", {"role": role, "rms": round(level, 3)}
+        )
 
     # Map backend activity reasons to the orb's turn states (mirrors the old
     # browser orb's mapActivityToState so the orb reliably reaches listening/
@@ -511,7 +542,9 @@ class LocalStream:
     def _emit_phase(self, phase: str, reason: Optional[str] = None) -> None:
         """Push a conversation.phase notification to JSON-RPC clients."""
         if self._rpc is not None:
-            self._rpc.broadcast_threadsafe("conversation.phase", {"phase": phase, "reason": reason})
+            self._rpc.broadcast_threadsafe(
+                "conversation.phase", {"phase": phase, "reason": reason}
+            )
 
     def seconds_since_activity(self) -> float:
         """Seconds since the live handler last saw conversation activity."""
@@ -617,7 +650,9 @@ class LocalStream:
             asyncio.ensure_future(self._session_gate_changed.wait()),
         ]
         try:
-            done, pending = await asyncio.wait(waiters, timeout=delay, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(
+                waiters, timeout=delay, return_when=asyncio.FIRST_COMPLETED
+            )
         finally:
             for waiter in waiters:
                 if not waiter.done():
@@ -634,11 +669,16 @@ class LocalStream:
             return
         self._set_backend_connection_state("session_closed")
         self._session_parked.set()
-        logger.info("Realtime session closed on request; waiting for conversation.session.")
+        logger.info(
+            "Realtime session closed on request; waiting for conversation.session."
+        )
         try:
             while not self._stop_event.is_set() and not self._session_wanted.is_set():
                 try:
-                    await asyncio.wait_for(self._session_wanted.wait(), timeout=self._session_closed_keepalive)
+                    await asyncio.wait_for(
+                        self._session_wanted.wait(),
+                        timeout=self._session_closed_keepalive,
+                    )
                 except asyncio.TimeoutError:
                     pass
                 # Not _mark_activity: that notifies the activity observer, and a keepalive
@@ -681,7 +721,9 @@ class LocalStream:
             # A session opening on the live connection (10-29): its instructions go again at the
             # next reply's end, on the handler's own loop, so the memory block carries what was
             # said since it connected. Only the wish is marked here (this may be the RPC thread).
-            want = getattr(self.handler, "want_instructions", None)  # every ConversationHandler
+            want = getattr(
+                self.handler, "want_instructions", None
+            )  # every ConversationHandler
             if want is not None:
                 want("a session opened on a live connection")
             return
@@ -748,7 +790,10 @@ class LocalStream:
         """Name what holds the periodic idle rebuild back: a reply, a session or a sound."""
         busy = (
             (self._replies.pending(self._now()), "a reply is playing"),
-            (self._session_wanted.is_set() or self._backend_connected(), "a session is open"),
+            (
+                self._session_wanted.is_set() or self._backend_connected(),
+                "a session is open",
+            ),
             (playback_health.SOUNDS.state()[0], "a sound is playing"),
         )
         return [why for on, why in busy if on]
@@ -807,7 +852,9 @@ class LocalStream:
         # The capture takes about 1 s: a session closed and reopened meanwhile does not
         # get this one's frame (the review, 2026-10-17).
         session = getattr(self.handler, "connection", None)
-        jpeg, luma, why_not = await asyncio.to_thread(camera_tool.fresh_jpeg, self._robot.media)
+        jpeg, luma, why_not = await asyncio.to_thread(
+            camera_tool.fresh_jpeg, self._robot.media
+        )
         if jpeg is None:
             reason = why_not or "no frame"
             # Nothing reaches the model, so there is nothing to tell it; logged for the stats.
@@ -909,7 +956,9 @@ class LocalStream:
             return f"{type(error).__name__}: {message}"
         return type(error).__name__
 
-    def _set_backend_connection_state(self, state: str, error: BaseException | str | None = None) -> None:
+    def _set_backend_connection_state(
+        self, state: str, error: BaseException | str | None = None
+    ) -> None:
         """Update backend connection status exposed through the settings UI."""
         self._backend_connection_state = state
         if error is not None:
@@ -936,8 +985,12 @@ class LocalStream:
 
     def _persist_env_values(self, updates: dict[str, str]) -> None:
         """Persist non-empty environment values in memory and in the instance `.env`."""
-        normalized_updates = {name: (value or "").strip() for name, value in updates.items()}
-        normalized_updates = {name: value for name, value in normalized_updates.items() if value}
+        normalized_updates = {
+            name: (value or "").strip() for name, value in updates.items()
+        }
+        normalized_updates = {
+            name: value for name, value in normalized_updates.items() if value
+        }
         if not normalized_updates:
             return
 
@@ -965,7 +1018,9 @@ class LocalStream:
                     lines.append(f"{env_name}={value}")
             final_text = "\n".join(lines) + "\n"
             env_path.write_text(final_text, encoding="utf-8")
-            logger.info("Persisted %s to %s", ", ".join(sorted(normalized_updates)), env_path)
+            logger.info(
+                "Persisted %s to %s", ", ".join(sorted(normalized_updates)), env_path
+            )
 
             try:
                 from dotenv import load_dotenv
@@ -975,11 +1030,15 @@ class LocalStream:
                 pass
             refresh_runtime_config_from_env()
         except Exception as e:
-            logger.warning("Failed to persist %s: %s", ", ".join(sorted(normalized_updates)), e)
+            logger.warning(
+                "Failed to persist %s: %s", ", ".join(sorted(normalized_updates)), e
+            )
 
     def _remove_persisted_env_values(self, env_names: tuple[str, ...]) -> None:
         """Remove keys from the instance `.env` without mutating the current runtime."""
-        normalized_names = tuple(sorted({name.strip() for name in env_names if name and name.strip()}))
+        normalized_names = tuple(
+            sorted({name.strip() for name in env_names if name and name.strip()})
+        )
         if not normalized_names or not self._instance_path:
             return
 
@@ -992,7 +1051,10 @@ class LocalStream:
             filtered_lines = [
                 line
                 for line in lines
-                if not any(line.strip().startswith(f"{env_name}=") for env_name in normalized_names)
+                if not any(
+                    line.strip().startswith(f"{env_name}=")
+                    for env_name in normalized_names
+                )
             ]
             if filtered_lines == lines:
                 return
@@ -1016,10 +1078,14 @@ class LocalStream:
 
     def _persist_hf_allocator_connection(self) -> None:
         """Persist the deployed Hugging Face allocator mode."""
-        self._persist_env_values({HF_REALTIME_CONNECTION_MODE_ENV: HF_DEPLOYED_CONNECTION_MODE})
+        self._persist_env_values(
+            {HF_REALTIME_CONNECTION_MODE_ENV: HF_DEPLOYED_CONNECTION_MODE}
+        )
         self._remove_persisted_env_values(("HF_REALTIME_SESSION_URL",))
 
-    def _persist_personality(self, profile: Optional[str], voice_override: Optional[str] = None) -> None:
+    def _persist_personality(
+        self, profile: Optional[str], voice_override: Optional[str] = None
+    ) -> None:
         """Persist startup profile and voice in instance-local UI settings."""
         if LOCKED_PROFILE is not None:
             return
@@ -1036,7 +1102,10 @@ class LocalStream:
                 voice=normalized_voice_override,
             )
             self._remove_persisted_env_values(LEGACY_STARTUP_ENV_NAMES)
-            logger.info("Persisted startup personality settings to %s", Path(self._instance_path))
+            logger.info(
+                "Persisted startup personality settings to %s",
+                Path(self._instance_path),
+            )
         except Exception as e:
             logger.warning("Failed to persist startup personality settings: %s", e)
 
@@ -1088,7 +1157,9 @@ class LocalStream:
             if isinstance(current_voice, str) and current_voice.strip():
                 self._voice_override = current_voice
         except Exception as e:
-            logger.debug("Could not sync LocalStream voice override after voice change: %s", e)
+            logger.debug(
+                "Could not sync LocalStream voice override after voice change: %s", e
+            )
         if self._voice_override:
             self._persist_voice_override(self._voice_override)
         return status
@@ -1099,7 +1170,9 @@ class LocalStream:
             return
         try:
             existing = read_startup_settings(self._instance_path)
-            write_startup_settings(self._instance_path, profile=existing.profile, voice=voice)
+            write_startup_settings(
+                self._instance_path, profile=existing.profile, voice=voice
+            )
         except Exception as e:
             logger.warning("Failed to persist startup voice: %s", e)
 
@@ -1115,7 +1188,9 @@ class LocalStream:
         self._robot.media.start_recording()
         self._robot.media.start_playing()
 
-    async def playback_watchdog_loop(self, interval_s: float = playback_health.CHECK_INTERVAL_S) -> None:
+    async def playback_watchdog_loop(
+        self, interval_s: float = playback_health.CHECK_INTERVAL_S
+    ) -> None:
         """Log the last measured reply lag once per interval (playback_health.check_playback).
 
         Off the event loop. A lag over the bound is the playback guard's WARNING. Each
@@ -1136,7 +1211,9 @@ class LocalStream:
             except Exception:
                 logger.warning("Idle speaker rebuild check failed", exc_info=True)
             try:
-                await asyncio.to_thread(playback_health.check_playback, pipeline, replies=self._replies)
+                await asyncio.to_thread(
+                    playback_health.check_playback, pipeline, replies=self._replies
+                )
             except Exception:
                 logger.warning("Playback latency check failed", exc_info=True)
 
@@ -1171,12 +1248,16 @@ class LocalStream:
         except Exception:
             logger.warning("Could not wrap the SDK's play_sound", exc_info=True)
         try:
-            found = playback_health.current_speaker_sink(audio, self._speaker_sink_cache)
+            found = playback_health.current_speaker_sink(
+                audio, self._speaker_sink_cache
+            )
         except Exception:
             logger.warning("Speaker sink lookup failed", exc_info=True)
             return
         try:
-            kept = playback_health.keep_monitor(self._speaker_monitor, audio, now, found=found)
+            kept = playback_health.keep_monitor(
+                self._speaker_monitor, audio, now, found=found
+            )
             # Only "stopped" means the monitor went away; "unavailable" can be a rebuild in
             # progress (the sink has no device while it is NULL), which must not close an episode.
             if kept == "stopped":
@@ -1200,15 +1281,29 @@ class LocalStream:
                 logger.info(
                     "Reply not heard (%d in a row%s): %s",
                     self._replies.unheard_in_a_row,
-                    "" if self._replies.armed else "; not counted until a reply is heard",
+                    (
+                        ""
+                        if self._replies.armed
+                        else "; not counted until a reply is heard"
+                    ),
                     verdict.cause,
                 )
             elif verdict.action == "rebuild":
-                self._run_off_loop(playback_health.GOVERNOR.rebuild, audio, "unheard replies", verdict.cause)
+                self._run_off_loop(
+                    playback_health.GOVERNOR.rebuild,
+                    audio,
+                    "unheard replies",
+                    verdict.cause,
+                )
             elif verdict.action == "heard_after":
-                logger.info("Reply heard after %s (first push to sound on the speaker's monitor)", verdict.cause)
+                logger.info(
+                    "Reply heard after %s (first push to sound on the speaker's monitor)",
+                    verdict.cause,
+                )
             elif verdict.action == "heard_late":
-                logger.warning("Reply heard late: %s (logged only, no rebuild)", verdict.cause)
+                logger.warning(
+                    "Reply heard late: %s (logged only, no rebuild)", verdict.cause
+                )
             else:
                 logger.debug("Reply %s: %s", verdict.action, verdict.cause)
 
@@ -1233,7 +1328,9 @@ class LocalStream:
 
         if hasattr(settings_app, "mount"):
             try:
-                settings_app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+                settings_app.mount(
+                    "/static", StaticFiles(directory=str(static_dir)), name="static"
+                )
             except Exception:
                 logger.exception("Failed to mount settings UI static assets")
                 raise
@@ -1286,7 +1383,9 @@ class LocalStream:
         async def _rpc_say(params: dict[str, object]) -> dict[str, object]:
             text = str(params.get("text", "")).strip()
             if not text:
-                raise JsonRpcError("say requires 'text'", reason="invalid_params", code=-32602)
+                raise JsonRpcError(
+                    "say requires 'text'", reason="invalid_params", code=-32602
+                )
             if not self.handler._is_connected():
                 raise JsonRpcError("no active session", reason="not_running")
             self.clear_audio_queue()  # barge in if mid-utterance
@@ -1301,10 +1400,27 @@ class LocalStream:
                 raise JsonRpcError("movement manager unavailable", reason="not_running")
             # A field the call leaves out keeps its stored value.
             kept_rate, kept_depth, kept_pitch = manager.breathing_feel
-            rate = _clamp(_finite_float(params.get("rate_scale", kept_rate), "rate_scale must be numeric"), 0.7, 1.3)
-            depth = _clamp(_finite_float(params.get("depth_scale", kept_depth), "depth_scale must be numeric"), 0.7, 1.3)
+            rate = _clamp(
+                _finite_float(
+                    params.get("rate_scale", kept_rate), "rate_scale must be numeric"
+                ),
+                0.7,
+                1.3,
+            )
+            depth = _clamp(
+                _finite_float(
+                    params.get("depth_scale", kept_depth), "depth_scale must be numeric"
+                ),
+                0.7,
+                1.3,
+            )
             pitch = _clamp(
-                _finite_float(params.get("pitch_offset", kept_pitch), "pitch_offset must be numeric"), -0.05, 0.05
+                _finite_float(
+                    params.get("pitch_offset", kept_pitch),
+                    "pitch_offset must be numeric",
+                ),
+                -0.05,
+                0.05,
             )
             manager.set_breathing(rate, depth, pitch)
             return {"rate_scale": rate, "depth_scale": depth, "pitch_offset": pitch}
@@ -1314,7 +1430,9 @@ class LocalStream:
             # Type to Reachy (the companion, 2026-10-08): text as if spoken.
             text = str(params.get("text", "")).strip()
             if not text:
-                raise JsonRpcError("type requires 'text'", reason="invalid_params", code=-32602)
+                raise JsonRpcError(
+                    "type requires 'text'", reason="invalid_params", code=-32602
+                )
             if not self.handler._is_connected():
                 raise JsonRpcError("no active session", reason="not_running")
             self.clear_audio_queue()  # as speaking over him would
@@ -1327,7 +1445,9 @@ class LocalStream:
                 raise JsonRpcError("no active session", reason="not_running")
             self.clear_audio_queue()
             self._last_turn_state = "listening"
-            rpc.broadcast_threadsafe("conversation.turn", {"state": "listening", "reason": "interrupted"})
+            rpc.broadcast_threadsafe(
+                "conversation.turn", {"state": "listening", "reason": "interrupted"}
+            )
             return {"ok": True}
 
         @rpc.method("conversation.mic")  # type: ignore[untyped-decorator]
@@ -1341,7 +1461,9 @@ class LocalStream:
                     # stops buffering while muted, but does not itself
                     # discard whatever was already there.
                     self._clear_preroll()
-                logger.info("Microphone %s via /rpc", "muted" if self._mic_muted else "unmuted")
+                logger.info(
+                    "Microphone %s via /rpc", "muted" if self._mic_muted else "unmuted"
+                )
                 if self._mic_muted and not was_muted:
                     await self._end_user_turn()
             return {"muted": self._mic_muted}
@@ -1435,7 +1557,9 @@ class LocalStream:
                     if wanted:
                         media.start_recording()
                         media.start_playing()
-                        self._speaker_started_at = self._now()  # a new stream: no idle refresh due
+                        self._speaker_started_at = (
+                            self._now()
+                        )  # a new stream: no idle refresh due
                     else:
                         media.stop_recording()
                         media.stop_playing()
@@ -1444,7 +1568,9 @@ class LocalStream:
                         # a later session.
                         self._clear_preroll()
                     self._capture_on = wanted
-                    logger.info("Audio capture %s via /rpc", "started" if wanted else "stopped")
+                    logger.info(
+                        "Audio capture %s via /rpc", "started" if wanted else "stopped"
+                    )
             return {"on": self._capture_on}
 
         @rpc.method("conversation.pose")  # type: ignore[untyped-decorator]
@@ -1467,9 +1593,15 @@ class LocalStream:
                 # The companion (decision 026): released to idle breathing,
                 # turned to face this way, min-jerk over `duration`.
                 turn_yaw = _body_yaw(params["body_yaw"])
-                turn_seconds = _finite_float(params.get("duration", 1.0), "pose duration must be numeric")
+                turn_seconds = _finite_float(
+                    params.get("duration", 1.0), "pose duration must be numeric"
+                )
                 if turn_seconds <= 0:
-                    raise JsonRpcError("pose duration must be > 0", reason="invalid_params", code=-32602)
+                    raise JsonRpcError(
+                        "pose duration must be > 0",
+                        reason="invalid_params",
+                        code=-32602,
+                    )
                 manager.release_hold()
                 manager.turn_idle_body(turn_yaw, turn_seconds)
                 return {"holding": False, "body_yaw": turn_yaw}
@@ -1486,7 +1618,11 @@ class LocalStream:
 
             antennas_raw = params.get("antennas")
             if not isinstance(antennas_raw, (list, tuple)) or len(antennas_raw) != 2:
-                raise JsonRpcError("pose requires 'antennas' as [right, left]", reason="invalid_params", code=-32602)
+                raise JsonRpcError(
+                    "pose requires 'antennas' as [right, left]",
+                    reason="invalid_params",
+                    code=-32602,
+                )
             target_antennas = (
                 _finite_float(antennas_raw[0], "pose antennas must be numeric"),
                 _finite_float(antennas_raw[1], "pose antennas must be numeric"),
@@ -1494,7 +1630,11 @@ class LocalStream:
 
             head_pose_params = params.get("head_pose") or {}
             if not isinstance(head_pose_params, dict):
-                raise JsonRpcError("pose head_pose must be an object", reason="invalid_params", code=-32602)
+                raise JsonRpcError(
+                    "pose head_pose must be an object",
+                    reason="invalid_params",
+                    code=-32602,
+                )
             head_pose_error = "pose head_pose fields must be numeric"
             x = _finite_float(head_pose_params.get("x", 0.0), head_pose_error)
             y = _finite_float(head_pose_params.get("y", 0.0), head_pose_error)
@@ -1503,12 +1643,18 @@ class LocalStream:
             pitch = _finite_float(head_pose_params.get("pitch", 0.0), head_pose_error)
             yaw = _finite_float(head_pose_params.get("yaw", 0.0), head_pose_error)
 
-            duration = _finite_float(params.get("duration", 1.0), "pose duration must be numeric")
+            duration = _finite_float(
+                params.get("duration", 1.0), "pose duration must be numeric"
+            )
             if duration <= 0:
-                raise JsonRpcError("pose duration must be > 0", reason="invalid_params", code=-32602)
+                raise JsonRpcError(
+                    "pose duration must be > 0", reason="invalid_params", code=-32602
+                )
 
             body_yaw = _body_yaw(params["body_yaw"]) if "body_yaw" in params else None
-            target_head_pose = create_head_pose(x, y, z, roll, pitch, yaw, degrees=False)
+            target_head_pose = create_head_pose(
+                x, y, z, roll, pitch, yaw, degrees=False
+            )
             # the companion's gaze in conversation (11-02): never over an emotion or a cue
             only_over_a_hold = params.get("only_over_a_hold") is True
             manager.hold_pose(
@@ -1532,12 +1678,18 @@ class LocalStream:
             the speech pipeline.
             """
             media = self._robot.media
-            if params.get("stop"):  # off the loop: the stop waits for the playbin's NULL
+            if params.get(
+                "stop"
+            ):  # off the loop: the stop waits for the playbin's NULL
                 await asyncio.to_thread(playback_health.stop_sound)
                 return {"playing": False}
             path = params.get("file")
             if not isinstance(path, str) or not os.path.isfile(path):
-                raise JsonRpcError("sound requires 'file', an existing path", reason="invalid_params", code=-32602)
+                raise JsonRpcError(
+                    "sound requires 'file', an existing path",
+                    reason="invalid_params",
+                    code=-32602,
+                )
             # The SDK's playbin is a second speaker stream it never tears down (2026-10-15):
             # the play_sound wrap closes it at its end, as for every other caller.
             await asyncio.to_thread(media.play_sound, path)
@@ -1556,32 +1708,59 @@ class LocalStream:
                 raise JsonRpcError("movement manager unavailable", reason="not_running")
             raw = params.get("frames")
             if not isinstance(raw, list) or not raw:
-                raise JsonRpcError("micro requires 'frames', a non-empty list", reason="invalid_params", code=-32602)
+                raise JsonRpcError(
+                    "micro requires 'frames', a non-empty list",
+                    reason="invalid_params",
+                    code=-32602,
+                )
             frames = []
             for item in raw:
                 if not isinstance(item, dict):
-                    raise JsonRpcError("micro frames must be objects", reason="invalid_params", code=-32602)
+                    raise JsonRpcError(
+                        "micro frames must be objects",
+                        reason="invalid_params",
+                        code=-32602,
+                    )
                 antennas_raw = item.get("antennas")
-                if not isinstance(antennas_raw, (list, tuple)) or len(antennas_raw) != 2:
-                    raise JsonRpcError("micro frames need 'antennas' as [right, left]", reason="invalid_params", code=-32602)
+                if (
+                    not isinstance(antennas_raw, (list, tuple))
+                    or len(antennas_raw) != 2
+                ):
+                    raise JsonRpcError(
+                        "micro frames need 'antennas' as [right, left]",
+                        reason="invalid_params",
+                        code=-32602,
+                    )
                 head = item.get("head_pose") or {}
                 if not isinstance(head, dict):
-                    raise JsonRpcError("micro head_pose must be an object", reason="invalid_params", code=-32602)
+                    raise JsonRpcError(
+                        "micro head_pose must be an object",
+                        reason="invalid_params",
+                        code=-32602,
+                    )
                 error = "micro frame fields must be numeric"
                 move = _finite_float(item.get("move", 0.0), error)
                 pause = _finite_float(item.get("pause", 0.0), error)
                 if move <= 0 or pause < 0:
                     raise JsonRpcError(
-                        "micro frames need move > 0 and pause >= 0", reason="invalid_params", code=-32602
+                        "micro frames need move > 0 and pause >= 0",
+                        reason="invalid_params",
+                        code=-32602,
                     )
                 pose = create_head_pose(
-                    *(_finite_float(head.get(k, 0.0), error) for k in ("x", "y", "z", "roll", "pitch", "yaw")),
+                    *(
+                        _finite_float(head.get(k, 0.0), error)
+                        for k in ("x", "y", "z", "roll", "pitch", "yaw")
+                    ),
                     degrees=False,
                 )
                 frames.append(
                     (
                         pose,
-                        (_finite_float(antennas_raw[0], error), _finite_float(antennas_raw[1], error)),
+                        (
+                            _finite_float(antennas_raw[0], error),
+                            _finite_float(antennas_raw[1], error),
+                        ),
                         _body_yaw(item["body_yaw"]) if "body_yaw" in item else None,
                         move,
                         pause,
@@ -1608,7 +1787,9 @@ class LocalStream:
             # (the companion's review, 2026-10-06).
             library = await asyncio.to_thread(play_emotion.emotions_library)
             if not isinstance(name, str) or name not in library.list_moves():
-                raise JsonRpcError(f"unknown cue {name!r}", reason="unknown_cue", code=-32602)
+                raise JsonRpcError(
+                    f"unknown cue {name!r}", reason="unknown_cue", code=-32602
+                )
             move = play_emotion.EmotionQueueMove(name, library)
             manager.queue_move(move)
             # its length, so the companion counts it as his own motion, not a touch
@@ -1619,25 +1800,47 @@ class LocalStream:
             hf_selection = get_hf_connection_selection()
             hf_mode = str(params.get("hf_mode") or hf_selection.mode).strip().lower()
             if hf_mode == HF_LOCAL_CONNECTION_MODE:
-                existing_host, existing_port = parse_hf_direct_target(hf_selection.direct_ws_url)
+                existing_host, existing_port = parse_hf_direct_target(
+                    hf_selection.direct_ws_url
+                )
                 host = str(params.get("hf_host") or "").strip() or existing_host or ""
                 if not host:
-                    raise JsonRpcError("Hugging Face host required", reason="empty_hf_host", code=-32602)
+                    raise JsonRpcError(
+                        "Hugging Face host required",
+                        reason="empty_hf_host",
+                        code=-32602,
+                    )
                 if "://" in host or "/" in host or "?" in host or "#" in host:
-                    raise JsonRpcError("invalid Hugging Face host", reason="invalid_hf_host", code=-32602)
+                    raise JsonRpcError(
+                        "invalid Hugging Face host",
+                        reason="invalid_hf_host",
+                        code=-32602,
+                    )
                 raw_port = params.get("hf_port")
-                port = int(raw_port) if isinstance(raw_port, (int, float, str)) else (existing_port or 8765)
+                port = (
+                    int(raw_port)
+                    if isinstance(raw_port, (int, float, str))
+                    else (existing_port or 8765)
+                )
                 if port < 1 or port > 65535:
-                    raise JsonRpcError("invalid Hugging Face port", reason="invalid_hf_port", code=-32602)
+                    raise JsonRpcError(
+                        "invalid Hugging Face port",
+                        reason="invalid_hf_port",
+                        code=-32602,
+                    )
                 self._persist_hf_direct_connection(host, port)
             elif hf_mode == HF_DEPLOYED_CONNECTION_MODE:
                 if not bool(get_hf_session_url()):
                     raise JsonRpcError(
-                        "missing Hugging Face session url", reason="missing_hf_session_url", code=-32602
+                        "missing Hugging Face session url",
+                        reason="missing_hf_session_url",
+                        code=-32602,
                     )
                 self._persist_hf_allocator_connection()
             else:
-                raise JsonRpcError("invalid Hugging Face mode", reason="invalid_hf_mode", code=-32602)
+                raise JsonRpcError(
+                    "invalid Hugging Face mode", reason="invalid_hf_mode", code=-32602
+                )
 
             if self._can_rebuild_handler():
                 self._mark_restart_requested("backend_config_changed")
@@ -1664,7 +1867,9 @@ class LocalStream:
             # clients drive personalities the same way, one control surface.
             register_personality_methods(rpc, personality_ops)
         except Exception:
-            logger.exception("Failed to register personality methods; the personality UI will be unavailable")
+            logger.exception(
+                "Failed to register personality methods; the personality UI will be unavailable"
+            )
 
         try:
             register_tool_space_methods(
@@ -1674,7 +1879,9 @@ class LocalStream:
                 instance_path=self._instance_path,
             )
         except Exception:
-            logger.exception("Failed to register Tool Space methods; remote tool settings will be unavailable")
+            logger.exception(
+                "Failed to register Tool Space methods; remote tool settings will be unavailable"
+            )
 
         try:
             register_profile_tool_methods(
@@ -1684,7 +1891,9 @@ class LocalStream:
                 instance_path=self._instance_path,
             )
         except Exception:
-            logger.exception("Failed to register profile tool methods; personality tool settings will be unavailable")
+            logger.exception(
+                "Failed to register profile tool methods; personality tool settings will be unavailable"
+            )
 
         self._settings_initialized = True
 
@@ -1741,7 +1950,10 @@ class LocalStream:
             while self._preroll:
                 frame = self._preroll.popleft()
                 timestamp = self._preroll_times.popleft()
-                if anchor - timestamp > PREROLL_SECONDS or now - timestamp > PREROLL_BUFFER_SECONDS:
+                if (
+                    anchor - timestamp > PREROLL_SECONDS
+                    or now - timestamp > PREROLL_BUFFER_SECONDS
+                ):
                     continue
                 try:
                     await self.handler.receive(frame)
@@ -1879,14 +2091,19 @@ class LocalStream:
 
         # If the Hugging Face target is still missing -> wait until provided via the settings UI
         if not has_hf_realtime_target():
-            self._set_backend_connection_state("waiting_for_config", f"{HF_REALTIME_WS_URL_ENV} is not configured.")
+            self._set_backend_connection_state(
+                "waiting_for_config", f"{HF_REALTIME_WS_URL_ENV} is not configured."
+            )
             if self._settings_app is None:
                 logger.error(
                     "%s not found. Set it in the app .env before starting the Hugging Face backend.",
                     HF_REALTIME_WS_URL_ENV,
                 )
                 return
-            logger.warning("%s not found. Open the app settings page to configure it.", HF_REALTIME_WS_URL_ENV)
+            logger.warning(
+                "%s not found. Open the app settings page to configure it.",
+                HF_REALTIME_WS_URL_ENV,
+            )
             # Poll until a target becomes available (set via the settings UI)
             try:
                 while not self._stop_event.is_set() and not has_hf_realtime_target():
@@ -1906,16 +2123,22 @@ class LocalStream:
             loop = asyncio.get_running_loop()
             self._asyncio_loop = loop  # type: ignore[assignment]
             # Connect the backend first so it overlaps the warmup and audio config below.
-            handler_task = asyncio.create_task(self._run_handler_startup_loop(), name="realtime-handler")
+            handler_task = asyncio.create_task(
+                self._run_handler_startup_loop(), name="realtime-handler"
+            )
             self._tasks = [handler_task]
             await asyncio.gather(
                 asyncio.sleep(1),  # give the pipelines time to start
-                asyncio.to_thread(apply_audio_startup_config, self._robot, logger=logger),
+                asyncio.to_thread(
+                    apply_audio_startup_config, self._robot, logger=logger
+                ),
             )
             self._tasks += [
                 asyncio.create_task(self.record_loop(), name="stream-record-loop"),
                 asyncio.create_task(self.play_loop(), name="stream-play-loop"),
-                asyncio.create_task(self.playback_watchdog_loop(), name="playback-watchdog"),
+                asyncio.create_task(
+                    self.playback_watchdog_loop(), name="playback-watchdog"
+                ),
                 asyncio.create_task(self.playback_guard_loop(), name="playback-guard"),
             ]
             try:
@@ -1994,7 +2217,9 @@ class LocalStream:
             rms = 0.0
         self._last_frame_at = now
         self._recent_frames.append((now, rms))
-        while self._recent_frames and now - self._recent_frames[0][0] > _HEALTH_WINDOW_S:
+        while (
+            self._recent_frames and now - self._recent_frames[0][0] > _HEALTH_WINDOW_S
+        ):
             self._recent_frames.popleft()
 
     def audio_health(self) -> dict[str, object]:
@@ -2024,18 +2249,22 @@ class LocalStream:
                         requested = element.get_property("device")
                         current = element.get_property("current-device")
             except Exception:
-                logger.debug("audio_health: could not read the capture element", exc_info=True)
+                logger.debug(
+                    "audio_health: could not read the capture element", exc_info=True
+                )
         return {
             "capture": self._capture_on,
             "muted": self._mic_muted,
             "requested_source": requested,
             "current_source": current,
-            "last_frame_age_s": None if self._last_frame_at is None else now - self._last_frame_at,
+            "last_frame_age_s": (
+                None if self._last_frame_at is None else now - self._last_frame_at
+            ),
             "frames_5s": len(recent),
             "rms_5s": float(np.mean(recent)) if recent else 0.0,
         }
 
-    def clear_audio_queue(self) -> float | None:
+    def clear_audio_queue(self) -> tuple[float, float] | None:
         """Flush queued playback audio immediately on user barge-in.
 
         On the local GStreamer backend, flushes the playback appsrc alone, since
@@ -2045,9 +2274,9 @@ class LocalStream:
         already queued for the speaker), and older SDKs ``clear_output_buffer()``.
         """
         logger.info("User intervention: flushing player queue")
-        cut = self._replies.flushed(self._now())  # dropped audio is not unheard
-        if cut is not None and cut[1] > 0.0:  # a day of these says whether the ends are cut (11-03)
-            logger.info("barge-in: %.1f s of a %.1f s reply unplayed", cut[1], cut[0])
+        cut = self._replies.flushed(
+            self._now()
+        )  # dropped audio is not unheard; (seconds, unplayed)
         self._phantom.flushed(self._now())
         audio = getattr(self._robot.media, "audio", None)
         if audio is not None:
@@ -2063,13 +2292,15 @@ class LocalStream:
                 _flush_appsrc(appsrc)
             elif hasattr(audio, "clear_player") and callable(audio.clear_player):
                 audio.clear_player()
-            elif hasattr(audio, "clear_output_buffer") and callable(audio.clear_output_buffer):
+            elif hasattr(audio, "clear_output_buffer") and callable(
+                audio.clear_output_buffer
+            ):
                 # Older SDK without clear_player(); best-effort.
                 audio.clear_output_buffer()
         # Drain the handler's pending output in place — do NOT replace the
         # queue object, since emit() may be awaiting it (wait_for_item).
         self._drain_output_queue()
-        return None if cut is None else cut[1]
+        return cut
 
     def _drain_output_queue(self) -> None:
         """Empty the handler's output queue in place without replacing it."""
@@ -2188,7 +2419,9 @@ class LocalStream:
         def done(f: "asyncio.Future[Any]") -> None:
             self._background.discard(f)
             if not f.cancelled() and f.exception() is not None:
-                logger.warning("%s failed", getattr(func, "__name__", func), exc_info=f.exception())
+                logger.warning(
+                    "%s failed", getattr(func, "__name__", func), exc_info=f.exception()
+                )
 
         future.add_done_callback(done)
 
@@ -2230,7 +2463,9 @@ class LocalStream:
                 # Cast if needed
                 audio_frame = audio_to_float32(audio_data)
 
-                seconds, speech = playback_health.loud_seconds(audio_frame, int(handler_output[0] or 0))
+                seconds, speech = playback_health.loud_seconds(
+                    audio_frame, int(handler_output[0] or 0)
+                )
                 # First: the speech-sink probe comes off before the reply can reach the sink.
                 now = self._now()
                 self._phantom.pushed(now, seconds)

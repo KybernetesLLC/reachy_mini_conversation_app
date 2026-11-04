@@ -82,7 +82,9 @@ logger = logging.getLogger(__name__)
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 MID_REPLY_LEFT_S = 0.5  # a barge-in this far from his reply's end cut it mid-way
-_OWED_OUTPUT_TIMEOUT: float = _RESPONSE_DONE_TIMEOUT  # longest hold of an in-band create
+_OWED_OUTPUT_TIMEOUT: float = (
+    _RESPONSE_DONE_TIMEOUT  # longest hold of an in-band create
+)
 # Carries a say() announcement's text (a timer, a greeting) on its queued create: spoken as
 # its own reply, never merged with another create. The sender adds the text as a user item
 # just before the create, so a tool's follow-up reply never sees it (2026-10-16, 15:18:45:
@@ -105,9 +107,14 @@ RETIRED_LEAK_SAFE = ("idle_do_nothing",)
 
 def gate_tool_names(tool_specs: list[ToolSpec], registry: dict[str, Any]) -> ToolNames:
     """Build the output gate's names: the session's tools, leak_safe from each tool's class, then the retired ones."""
-    loaded = [(spec["name"], bool(getattr(registry.get(spec["name"]), "leak_safe", False))) for spec in tool_specs]
+    loaded = [
+        (spec["name"], bool(getattr(registry.get(spec["name"]), "leak_safe", False)))
+        for spec in tool_specs
+    ]
     names = {name for name, _ in loaded}
-    return ToolNames(loaded + [(name, True) for name in RETIRED_LEAK_SAFE if name not in names])
+    return ToolNames(
+        loaded + [(name, True) for name in RETIRED_LEAK_SAFE if name not in names]
+    )
 
 
 def to_realtime_tools_config(tool_specs: list[ToolSpec]) -> RealtimeToolsConfigParam:
@@ -161,7 +168,12 @@ def _build_openai_compatible_client_from_realtime_url(
 # itself (an out-of-band audio response, tagged), and a response that promises a lookup
 # without a call gets one nudge per user turn.
 FILLER_TAG = {"companion": "filler"}
-FILLER_LINES = ("Let me check.", "One moment.", "Let me look that up.", "Just a second.")
+FILLER_LINES = (
+    "Let me check.",
+    "One moment.",
+    "Let me look that up.",
+    "Just a second.",
+)
 FILLER_AFTER_S = 1.0  # a lookup tool still running this long gets a filler
 SEARCH_TOOLS = ("search_web", "web_search")  # by name ending: always slow enough
 # Matched by name ending: "weather" is the companion's tool (2026-10-24) and Pollen's get_weather.
@@ -220,7 +232,10 @@ GREETING_TAG = {"companion": "greeting"}
 
 
 def _out_of_band_request(
-    tag: dict[str, str], modalities: list[str], instructions: str, content: list[dict[str, Any]]
+    tag: dict[str, str],
+    modalities: list[str],
+    instructions: str,
+    content: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Build a tagged response.create body outside the conversation (a filler)."""
     return {
@@ -235,7 +250,8 @@ def _out_of_band_request(
 
 def session_size(session: Any) -> str:
     """What a session.update sends, sized: instructions and tool definitions, with a rough
-    token count (4 characters a token). The owner, 2026-10-20: leaks grew with the context."""
+    token count (4 characters a token). The owner, 2026-10-20: leaks grew with the context.
+    """
     instructions = str(session.get("instructions") or "")
     tools = list(session.get("tools") or [])
     tools_chars = len(json.dumps(tools, default=str))
@@ -331,7 +347,9 @@ def _tool_duration_ms_and_bytes(completed: ToolNotification) -> tuple[float, int
     return ms, size
 
 
-def _tool_report_status_and_reason(completed: ToolNotification) -> Tuple[str, Optional[str]]:
+def _tool_report_status_and_reason(
+    completed: ToolNotification,
+) -> Tuple[str, Optional[str]]:
     """Map a finished call to the conversation.tool report's status + a short reason.
 
     A tool that refuses (the companion's stay_quiet, express, or a quiet-hours
@@ -373,7 +391,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         self.client: AsyncOpenAI
         self.connection: "AsyncRealtimeConnection | None" = None
-        self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue()
+        self.output_queue: (
+            "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]"
+        ) = asyncio.Queue()
 
         self.instance_path = instance_path
         self._voice_override: str | None = self._normalize_startup_voice(startup_voice)
@@ -463,7 +483,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self.note_drop_reason: str | None = None
         # The tool-call-log brief: a capped, in-memory backlog of conversation.tool
         # reports, drained through console.py's /rpc dispatch (see set_tool_call_observer).
-        self._tool_report_queue: "deque[dict[str, Any]]" = deque(maxlen=TOOL_REPORT_QUEUE_MAX)
+        self._tool_report_queue: "deque[dict[str, Any]]" = deque(
+            maxlen=TOOL_REPORT_QUEUE_MAX
+        )
         self._tool_reports_dropped = 0
         # The audio cut: this response's gate ("pass", "hold", "open" or "cut"), its
         # transcript so far, audio held back, whether any was released, and the timer.
@@ -485,7 +507,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._leak_tasks: set[asyncio.Task[None]] = set()
 
     @staticmethod
-    def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
+    def _sanitize_tool_result_for_model(
+        tool_name: str, tool_result: dict[str, Any]
+    ) -> dict[str, Any]:
         """Remove bulky transport-only fields before echoing tool output back to the model."""
         if tool_name == "camera" and "b64_im" in tool_result:
             sanitized = dict(tool_result)
@@ -525,7 +549,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if not voice_value:
             return fallback
 
-        voice_by_lowercase = {candidate.lower(): candidate for candidate in available_voices}
+        voice_by_lowercase = {
+            candidate.lower(): candidate for candidate in available_voices
+        }
         normalized_voice = voice_by_lowercase.get(voice_value.lower())
         if normalized_voice is not None:
             return normalized_voice
@@ -539,7 +565,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
         return fallback
 
-    def _get_session_config(self, tool_specs: list[ToolSpec]) -> RealtimeSessionCreateRequestParam:
+    def _get_session_config(
+        self, tool_specs: list[ToolSpec]
+    ) -> RealtimeSessionCreateRequestParam:
         """Return the Hugging Face OpenAI-compatible session config."""
         return RealtimeSessionCreateRequestParam(
             type="realtime",
@@ -553,7 +581,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         model="gpt-4o-transcribe",
                         language=config.REALTIME_TRANSCRIPTION_LANGUAGE,
                     ),
-                    turn_detection=ServerVad(type="server_vad", interrupt_response=True),
+                    turn_detection=ServerVad(
+                        type="server_vad", interrupt_response=True
+                    ),
                 ),
                 output=RealtimeAudioConfigOutputParam(
                     format=_native_rate_audio_pcm(),  # type: ignore[typeddict-item]
@@ -584,7 +614,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Change only the voice, updating the active session when possible."""
         default_voice = get_default_voice()
         resolved_voice = (
-            self._resolve_backend_voice(voice, source="requested voice", fallback=default_voice) or default_voice
+            self._resolve_backend_voice(
+                voice, source="requested voice", fallback=default_voice
+            )
+            or default_voice
         )
         self._voice_override = resolved_voice
         if self.connection is not None:
@@ -609,7 +642,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Return the voice currently selected for this handler."""
         default_voice = get_default_voice()
         voice = self._voice_override or get_session_voice(default=default_voice)
-        return self._resolve_backend_voice(voice, source="session voice", fallback=default_voice) or default_voice
+        return (
+            self._resolve_backend_voice(
+                voice, source="session voice", fallback=default_voice
+            )
+            or default_voice
+        )
 
     async def apply_personality(self, profile: str | None) -> str:
         """Apply a personality to the active or next realtime connection."""
@@ -637,7 +675,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         ),
                     ),
                 )
-                logger.info("Applied personality via live update: %s", profile or "default")
+                logger.info(
+                    "Applied personality via live update: %s", profile or "default"
+                )
             except Exception as exc:
                 logger.warning("Live update failed; will restart session: %s", exc)
 
@@ -654,14 +694,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         )
         return "Applied personality. Will take effect on next connection."
 
-    async def _emit_debounced_partial(self, transcript: str, item_id: str, sequence_counter: int) -> None:
+    async def _emit_debounced_partial(
+        self, transcript: str, item_id: str, sequence_counter: int
+    ) -> None:
         """Emit partial transcript after debounce delay."""
         try:
             await asyncio.sleep(self.partial_debounce_delay)
 
             input_transcript = self.input_transcript_chunks_by_item
-            if input_transcript.item_id == item_id and len(input_transcript.deltas) - 1 == sequence_counter:
-                await self.output_queue.put(AdditionalOutputs({"role": "user_partial", "content": transcript}))
+            if (
+                input_transcript.item_id == item_id
+                and len(input_transcript.deltas) - 1 == sequence_counter
+            ):
+                await self.output_queue.put(
+                    AdditionalOutputs({"role": "user_partial", "content": transcript})
+                )
                 logger.debug(f"Debounced partial emitted: {transcript}")
         except asyncio.CancelledError:
             logger.debug("Debounced partial cancelled")
@@ -689,7 +736,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 return
             except ConnectionClosedError as e:
                 # Abrupt close (e.g., "no close frame received or sent") → retry
-                logger.warning("Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
+                logger.warning(
+                    "Realtime websocket closed unexpectedly (attempt %d/%d): %s",
+                    attempt,
+                    max_attempts,
+                    e,
+                )
                 if attempt < max_attempts:
                     self.client = await self._build_realtime_client()
                     # exponential backoff with jitter
@@ -733,12 +785,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             except Exception:
                 pass
             self.client = await self._build_realtime_client()
-            asyncio.create_task(self._run_realtime_session(), name="realtime-session-restart")
+            asyncio.create_task(
+                self._run_realtime_session(), name="realtime-session-restart"
+            )
             try:
                 await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
                 logger.info("Realtime session restarted and connected.")
             except asyncio.TimeoutError:
-                logger.warning("Realtime session restart timed out; continuing in background.")
+                logger.warning(
+                    "Realtime session restart timed out; continuing in background."
+                )
         except Exception as e:
             logger.warning("_restart_session failed: %s", e)
 
@@ -750,18 +806,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         when the user's turn began: the output can land before the refusal, 11-03 19:14), and
         once per user turn: a dropped output, or a tool past the 30 s hold, made every retry be
         refused again. True when the reply is taken care of (sent here, or a follow-up already
-        on its way), so the refusal is no error to show (11-03: five "[error]" lines)."""
-        if self._followup_pending or self._followup_live or not self._pending_responses.empty():
+        on its way), so the refusal is no error to show (11-03: five "[error]" lines). A follow-up
+        whose create was sent and refused is not on its way (the review, 11-03)."""
+        if self._followup_live or not self._pending_responses.empty():
             logger.info("a reply the server refused: a reply is already on its way")
             return True
         if not (self._owed_outputs or self._turn_began_owing):
-            logger.info("a reply the server refused with no tool output owed here: not retried")
+            logger.info(
+                "a reply the server refused with no tool output owed here: not retried"
+            )
             return False
         if self._reply_recovered_this_turn:
             logger.info("a reply the server refused again this turn: not retried")
             return False
         self._reply_recovered_this_turn = True
-        logger.info("a reply the server refused while tool outputs were owed: sending it once they are in")
+        logger.info(
+            "a reply the server refused while tool outputs were owed: sending it once they are in"
+        )
         await self._safe_response_create()
         return True
 
@@ -790,20 +851,33 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         Out-of-band creates (fillers) are not checked by the server and go at once.
         """
-        if self._no_outputs_owed.is_set() or kwargs.get("response", {}).get("conversation") == "none":
+        if (
+            self._no_outputs_owed.is_set()
+            or kwargs.get("response", {}).get("conversation") == "none"
+        ):
             return False
-        logger.info("response.create deferred: %d function call output(s) owed", len(self._owed_outputs))
+        logger.info(
+            "response.create deferred: %d function call output(s) owed",
+            len(self._owed_outputs),
+        )
         try:
-            await asyncio.wait_for(self._no_outputs_owed.wait(), timeout=_OWED_OUTPUT_TIMEOUT)
+            await asyncio.wait_for(
+                self._no_outputs_owed.wait(), timeout=_OWED_OUTPUT_TIMEOUT
+            )
         except asyncio.TimeoutError:
             logger.warning(
-                "Function call outputs still owed after %.0f s; sending response.create", _OWED_OUTPUT_TIMEOUT
+                "Function call outputs still owed after %.0f s; sending response.create",
+                _OWED_OUTPUT_TIMEOUT,
             )
             return True
         logger.info("response.create released: function call outputs sent")
         return True
 
-    def _requeue(self, keep: Callable[[dict[str, Any]], bool], front: dict[str, Any] | None = None) -> int:
+    def _requeue(
+        self,
+        keep: Callable[[dict[str, Any]], bool],
+        front: dict[str, Any] | None = None,
+    ) -> int:
         """Drain the queue and put back `front`, then the entries `keep` accepts, in order.
 
         Returns how many entries were dropped (merged into the create being sent).
@@ -819,14 +893,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         for queued in kept:
             self._pending_responses.put_nowait(queued)
         if dropped:
-            logger.info("response.create: merged %d queued create(s) into the one being sent", dropped)
+            logger.info(
+                "response.create: merged %d queued create(s) into the one being sent",
+                dropped,
+            )
         return dropped
 
     async def request_reply(self) -> bool:
         """Ask for a reply in-band, after a companion note (speaking first at a silence): only
         while no response is active or queued and nobody has started speaking; otherwise the
         moment has passed and nothing is asked. True when it was asked."""
-        busy = not self._response_done_event.is_set() or not self._pending_responses.empty()
+        busy = (
+            not self._response_done_event.is_set()
+            or not self._pending_responses.empty()
+        )
         if busy or self._user_speaking:
             logger.info("Reply after a note not asked: the moment passed")
             return False
@@ -911,7 +991,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Already heard, so too late to cut: counted as played, never run (10-20 22:59:
             # a bare express{...} left no gate event at all).
             for heard in verdict.calls:
-                self._gate_leak(Verdict(PLAY_AND_LOG, kind=heard.kind, tool=heard.tool, shape=heard.shape))
+                self._gate_leak(
+                    Verdict(
+                        PLAY_AND_LOG,
+                        kind=heard.kind,
+                        tool=heard.tool,
+                        shape=heard.shape,
+                    )
+                )
         if self._gate not in ("hold", "open"):
             return
         if verdict.action in (CUT, CUT_AND_EXECUTE):
@@ -944,11 +1031,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Log one leaked call, report it (source "leaked"), and run it if leak_safe."""
         name = verdict.tool or ""
         if verdict.action == PLAY_AND_LOG:
-            logger.warning("possible leaked tool call: %s (%s) played", name, verdict.shape)
+            logger.warning(
+                "possible leaked tool call: %s (%s) played", name, verdict.shape
+            )
             self._report_tool_call(self._leak_report(name, "played"))
             return
         executed = verdict.action == CUT_AND_EXECUTE
-        logger.warning("leaked tool call: %s (%s) cut; executed=%s", name, verdict.shape, executed)
+        logger.warning(
+            "leaked tool call: %s (%s) cut; executed=%s", name, verdict.shape, executed
+        )
         if not executed:
             self._report_tool_call(self._leak_report(name, "cut"))
             return
@@ -956,7 +1047,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._leak_tasks.add(task)
         task.add_done_callback(self._leak_tasks.discard)
 
-    def _leak_report(self, name: str, status: str, ms: float = 0.0, error: str | None = None) -> dict[str, Any]:
+    def _leak_report(
+        self, name: str, status: str, ms: float = 0.0, error: str | None = None
+    ) -> dict[str, Any]:
         return {
             "name": name,
             "args": {},
@@ -987,7 +1080,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except Exception as exc:  # a report, never a crash
             status, error = "error", f"{type(exc).__name__}: {exc}"
             logger.warning("leaked tool call: %s failed: %s", name, error)
-        self._report_tool_call(self._leak_report(name, status, (time.monotonic() - started) * 1000, error))
+        self._report_tool_call(
+            self._leak_report(name, status, (time.monotonic() - started) * 1000, error)
+        )
 
     def _gate_audio(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
         self._gate_had_audio = True
@@ -1007,7 +1102,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _gate_timeout(self) -> None:
         await asyncio.sleep(SPOKEN_ARTIFACT_HOLD_S)
         if self._gate == "hold":
-            logger.info("reply audio released after %.0f ms with no transcript", SPOKEN_ARTIFACT_HOLD_S * 1000)
+            logger.info(
+                "reply audio released after %.0f ms with no transcript",
+                SPOKEN_ARTIFACT_HOLD_S * 1000,
+            )
             self._gate_timer = None  # this task: not cancelled by the release
             self._gate_release("open")
 
@@ -1084,7 +1182,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             await self._play_filler()
         elif name.endswith(LOOKUP_TOOLS):
             task = asyncio.create_task(self._filler_if_slow(call_id))
-            self._filler_tasks.add(task)  # held until done, so it is not collected early
+            self._filler_tasks.add(
+                task
+            )  # held until done, so it is not collected early
             task.add_done_callback(self._filler_tasks.discard)
 
     async def _filler_if_slow(self, call_id: str) -> None:
@@ -1094,7 +1194,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _play_filler(self) -> None:
         """Speak one short line in his voice, once per turn, never over his own audio."""
-        if self._turn_filled or self._turn_first_audio_at is not None or not self.connection:
+        if (
+            self._turn_filled
+            or self._turn_first_audio_at is not None
+            or not self.connection
+        ):
             return
         self._turn_filled = True
         line = random.choice([x for x in FILLER_LINES if x != self._last_filler])
@@ -1111,7 +1215,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _log_tool_latency(self, completed: Any) -> None:
         ms, size = _tool_duration_ms_and_bytes(completed)
         # Parsed by the companion's tools/search_stats.py: keep the wording.
-        logger.info("tool latency: %s %.0f ms, %d bytes, %s", completed.tool_name, ms, size, completed.status.value)
+        logger.info(
+            "tool latency: %s %.0f ms, %d bytes, %s",
+            completed.tool_name,
+            ms,
+            size,
+            completed.status.value,
+        )
 
     def _build_tool_report(self, completed_tool: ToolNotification) -> dict[str, Any]:
         """Build the conversation.tool /rpc payload for one finished (or refused) call."""
@@ -1168,7 +1278,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             try:
                 delivered = observer(item)
             except Exception:
-                logger.debug("tool-call observer raised; will retry later", exc_info=True)
+                logger.debug(
+                    "tool-call observer raised; will retry later", exc_info=True
+                )
                 return
             if not delivered:
                 return
@@ -1208,7 +1320,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         try:
             self.deps.movement_manager.set_listening(False)
         except Exception:
-            logger.debug("end_user_turn: could not release the listening pose", exc_info=True)
+            logger.debug(
+                "end_user_turn: could not release the listening pose", exc_info=True
+            )
         # No input_audio_buffer.clear: the hosted backend answers it "Unknown or invalid
         # event" (2026-10-09, 11:22), and the muted microphone sends nothing more anyway.
 
@@ -1249,7 +1363,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": GLANCE_CONTEXT_NOTE},
-                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64_jpeg}"},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{b64_jpeg}",
+                    },
                 ],
             },
         )
@@ -1266,10 +1383,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         try:
             sink(b64_jpeg, source)
         except Exception:
-            logger.warning("A frame was not handed over for its sight note", exc_info=True)
+            logger.warning(
+                "A frame was not handed over for its sight note", exc_info=True
+            )
 
     def _log_usage(self, usage: Any) -> None:
-        line = usage_line(usage, images=self._session_images, image_bytes=self._session_image_bytes)
+        line = usage_line(
+            usage, images=self._session_images, image_bytes=self._session_image_bytes
+        )
         if line is not None:
             logger.info(line)
         elif not self._usage_missing_logged:
@@ -1278,7 +1399,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _watch_context(self, usage: Any) -> bool:
         """An in-band response's input tokens: True when the backend dropped the conversation.
-        A drop measures afresh at once, so the replies before the instructions land count once."""
+        A drop measures afresh at once, so the replies before the instructions land count once.
+        """
         tokens = getattr(usage, "input_tokens", None)
         if not isinstance(tokens, int) or tokens <= 0:
             return False
@@ -1306,7 +1428,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._watch_context(usage):
             self._instructions_wanted = "the conversation was dropped"
         why = self._instructions_wanted
-        if why is None or (self._instructions_task is not None and not self._instructions_task.done()):
+        if why is None or (
+            self._instructions_task is not None and not self._instructions_task.done()
+        ):
             return
         self._instructions_wanted = None
         self._instructions_task = asyncio.create_task(self.refresh_instructions(why))
@@ -1314,12 +1438,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def refresh_instructions(self, why: str) -> None:
         """Send the session's instructions again, the companion's memory block re-read (off the
         loop), when they changed since they were last sent (10-29: the second of two
-        back-to-back sessions kept the instructions sent before the first one's words)."""
+        back-to-back sessions kept the instructions sent before the first one's words).
+        """
         connection = self.connection
         if connection is None:
             return
         try:
-            instructions = await asyncio.to_thread(get_session_instructions, self.instance_path)
+            instructions = await asyncio.to_thread(
+                get_session_instructions, self.instance_path
+            )
             if instructions == self._instructions_sent:
                 logger.debug("Instructions unchanged (%s): not sent again", why)
                 return
@@ -1336,7 +1463,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _send_instructions(self, connection: Any, instructions: str) -> None:
         """The instructions alone, as a live session.update."""
         await connection.session.update(
-            session=RealtimeSessionCreateRequestParam(type="realtime", instructions=instructions)
+            session=RealtimeSessionCreateRequestParam(
+                type="realtime", instructions=instructions
+            )
         )
         self._instructions_sent = instructions
 
@@ -1349,13 +1478,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         now = time.monotonic()
         self._open_glance_at = now
         if self._first_reply_at is not None:
-            logger.warning("First reply created %.1f s before the glance", now - self._first_reply_at)
+            logger.warning(
+                "First reply created %.1f s before the glance",
+                now - self._first_reply_at,
+            )
 
     def _first_reply_created(self) -> None:
         now = time.monotonic()
         self._first_reply_at = now
         if self._open_glance_at is not None:
-            logger.info("Glance in %.1f s before the first reply", now - self._open_glance_at)
+            logger.info(
+                "Glance in %.1f s before the first reply", now - self._open_glance_at
+            )
 
     async def _wait_notes(self) -> None:
         """Wait for the pending companion notes to be queued or dropped (the tests)."""
@@ -1388,14 +1522,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         task.add_done_callback(self._note_tasks.discard)
         return task
 
-    async def _note_text_now(self, text: str, session: "AsyncRealtimeConnection") -> bool:
+    async def _note_text_now(
+        self, text: str, session: "AsyncRealtimeConnection"
+    ) -> bool:
         """Send a note now, even mid-speech; drop it if a response is in the way.
 
         True if the note was sent, False if it was dropped.
         """
         # Not airtight: _response_done_event is cleared on response.created, so between a
         # response.create being sent and response.created arriving this check still passes.
-        if not self._response_done_event.is_set() or not self._pending_responses.empty():
+        if (
+            not self._response_done_event.is_set()
+            or not self._pending_responses.empty()
+        ):
             return self._note_dropped("response active")
         return await self._send_note(text, session)
 
@@ -1404,15 +1543,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         logger.info("Companion note dropped: %s", reason)
         return False
 
-    async def _note_text_when_quiet(self, text: str, session: "AsyncRealtimeConnection") -> None:
+    async def _note_text_when_quiet(
+        self, text: str, session: "AsyncRealtimeConnection"
+    ) -> None:
         started = time.monotonic()
         while True:
             now = time.monotonic()
-            quiet = not self._user_speaking and now - self._last_speech_at >= NOTE_QUIET_SECONDS
+            quiet = (
+                not self._user_speaking
+                and now - self._last_speech_at >= NOTE_QUIET_SECONDS
+            )
             if quiet and self._response_done_event.is_set():
                 break
             if now - started >= COMPANION_NOTE_WAIT_S:
-                logger.info("Companion note dropped: no quiet moment in %.0f s", COMPANION_NOTE_WAIT_S)
+                logger.info(
+                    "Companion note dropped: no quiet moment in %.0f s",
+                    COMPANION_NOTE_WAIT_S,
+                )
                 return
             await asyncio.sleep(_NOTE_POLL_SECONDS)
         await self._send_note(text, session)
@@ -1466,7 +1613,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._mark_activity("startup_greeting_prompt")
         await self._safe_response_create(
             response=_out_of_band_request(
-                GREETING_TAG, ["audio"], greeting_prompt, [{"type": "input_text", "text": "(Say the line now.)"}]
+                GREETING_TAG,
+                ["audio"],
+                greeting_prompt,
+                [{"type": "input_text", "text": "(Say the line now.)"}],
             )
         )
         logger.info("Queued startup greeting prompt")
@@ -1531,7 +1681,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         timeout=_RESPONSE_DONE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.info("Timed out waiting for previous response to finish; forcing ahead")
+                    logger.info(
+                        "Timed out waiting for previous response to finish; forcing ahead"
+                    )
                     self._response_done_event.set()
 
                 if not self.connection:
@@ -1543,18 +1695,26 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             item={
                                 "type": "message",
                                 "role": "user",
-                                "content": [{"type": "input_text", "text": announcement}],
+                                "content": [
+                                    {"type": "input_text", "text": announcement}
+                                ],
                             },
                         )
                     except Exception as e:
-                        logger.warning("Announcement dropped: its item could not be added (%s)", e)
+                        logger.warning(
+                            "Announcement dropped: its item could not be added (%s)", e
+                        )
                         break
                     announcement_added = True
 
-                greeting = (kwargs.get("response") or {}).get("metadata") == GREETING_TAG
+                greeting = (kwargs.get("response") or {}).get(
+                    "metadata"
+                ) == GREETING_TAG
                 if greeting:
                     if self._spoke_since_open:
-                        logger.info("Startup greeting dropped at send: the person has started speaking")
+                        logger.info(
+                            "Startup greeting dropped at send: the person has started speaking"
+                        )
                         break
                     self._greeting_live = True
                 self._last_response_rejected = False
@@ -1570,7 +1730,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         kind = "announcement"
                     else:
                         kind = "follow-up" if self._followup_pending else "plain"
-                    logger.info("response.create sent (%s, attempt %d)", kind, attempts + 1)
+                    logger.info(
+                        "response.create sent (%s, attempt %d)", kind, attempts + 1
+                    )
                 except Exception as e:
                     logger.info("_response_sender_loop: send failed: %s", e)
                     self._response_done_event.set()
@@ -1582,15 +1744,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         timeout=_RESPONSE_DONE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.info("Timed out waiting for response.created or response rejection")
+                    logger.info(
+                        "Timed out waiting for response.created or response rejection"
+                    )
 
                 # Check if the receiver loop observed an asynchronous rejection.
                 if self._last_response_rejected:
                     attempts += 1
                     if attempts >= max_retries:
-                        logger.info("response.create rejected %d times; giving up", attempts)
+                        logger.info(
+                            "response.create rejected %d times; giving up", attempts
+                        )
                         break
-                    logger.info("response.create was rejected; retrying (%d/%d)", attempts, max_retries)
+                    logger.info(
+                        "response.create was rejected; retrying (%d/%d)",
+                        attempts,
+                        max_retries,
+                    )
                     await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
                     continue
 
@@ -1600,7 +1770,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         timeout=_RESPONSE_DONE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.info("Timed out waiting for response.done; assuming response completed")
+                    logger.info(
+                        "Timed out waiting for response.done; assuming response completed"
+                    )
                     self._response_done_event.set()
                     break
 
@@ -1625,7 +1797,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         elif completed_tool.result is not None:
             tool_result = completed_tool.result
             tool_result_for_model = (
-                self._sanitize_tool_result_for_model(completed_tool.tool_name, tool_result)
+                self._sanitize_tool_result_for_model(
+                    completed_tool.tool_name, tool_result
+                )
                 if isinstance(tool_result, dict)
                 else tool_result
             )
@@ -1634,10 +1808,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 completed_tool.tool_name,
                 completed_tool.id,
             )
-            logger.debug("Tool '%s' model-visible result: %s", completed_tool.tool_name, tool_result_for_model)
+            logger.debug(
+                "Tool '%s' model-visible result: %s",
+                completed_tool.tool_name,
+                tool_result_for_model,
+            )
         else:
             logger.warning(
-                "Tool '%s' (id=%s) returned no result and no error", completed_tool.tool_name, completed_tool.id
+                "Tool '%s' (id=%s) returned no result and no error",
+                completed_tool.tool_name,
+                completed_tool.id,
             )
             tool_result = {"error": "No result returned from tool execution"}
             tool_result_for_model = tool_result
@@ -1698,7 +1878,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
 
             sight_note: str | None = None
-            if model_result_submitted and completed_tool.tool_name == "camera" and "b64_im" in tool_result:
+            if (
+                model_result_submitted
+                and completed_tool.tool_name == "camera"
+                and "b64_im" in tool_result
+            ):
                 # use raw base64, don't json.dumps (which adds quotes)
                 b64_im = tool_result["b64_im"]
                 if not isinstance(b64_im, str):
@@ -1708,7 +1892,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 image_width = tool_result.get("image_width")
                 image_height = tool_result.get("image_height")
                 jpeg_bytes_value = tool_result.get("jpeg_bytes")
-                jpeg_bytes = jpeg_bytes_value if isinstance(jpeg_bytes_value, int) else (len(b64_im) * 3) // 4
+                jpeg_bytes = (
+                    jpeg_bytes_value
+                    if isinstance(jpeg_bytes_value, int)
+                    else (len(b64_im) * 3) // 4
+                )
                 self._count_image(b64_im)
                 await self.connection.conversation.item.create(
                     item={
@@ -1740,7 +1928,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             tool = core_tools.get_tools().get(completed_tool.tool_name)
             # Always surface errors, skip the spoken follow-up for tools that opt out.
-            if model_result_submitted and (completed_tool.error is not None or tool is None or tool.needs_response):
+            if model_result_submitted and (
+                completed_tool.error is not None or tool is None or tool.needs_response
+            ):
                 self._tool_batch_needs_response = True
                 if not self._spoke_and_only_gestured(completed_tool):
                     self._tool_batch_only_gestured = False
@@ -1758,7 +1948,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     )
                 else:
                     self._followup_pending = True
-                    logger.info("follow-up reply queued after %s", completed_tool.tool_name)
+                    logger.info(
+                        "follow-up reply queued after %s", completed_tool.tool_name
+                    )
                     await self._safe_response_create()
                 self._tool_batch_only_gestured = True
             if sight_note is not None:
@@ -1790,7 +1982,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             connect_kwargs["extra_query"] = self._realtime_connect_query
         # 2026-10-16: the server echoes image data URLs back in conversation.item.created;
         # the websockets default of 1 MiB closed the session with 1009. Upstream's value.
-        connect_kwargs["websocket_connection_options"] = {"max_size": REALTIME_MAX_MESSAGE_BYTES}
+        connect_kwargs["websocket_connection_options"] = {
+            "max_size": REALTIME_MAX_MESSAGE_BYTES
+        }
         async with self.client.realtime.connect(**connect_kwargs) as conn:
             try:
                 session_config = self._get_session_config(tool_specs)
@@ -1827,7 +2021,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._user_speaking = False
             self._last_speech_at = time.monotonic()
             self._session_images = self._session_image_bytes = self._session_creates = 0
-            self._usage_missing_logged = False  # each session says once whether usage comes
+            self._usage_missing_logged = (
+                False  # each session says once whether usage comes
+            )
             self._ctx_base = self._ctx_peak = None
             self._instructions_wanted = None  # a new connection sends them fresh
             self._open_glance_at = self._first_reply_at = None
@@ -1845,13 +2041,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             try:
                 # Start the background tool manager
                 self.tool_manager.start_up(
-                    tool_callbacks=[self._handle_tool_result], dropped_callbacks=[self._report_dropped_tool]
+                    tool_callbacks=[self._handle_tool_result],
+                    dropped_callbacks=[self._report_dropped_tool],
                 )
 
                 # Start the response sender worker
-                response_sender_task = asyncio.create_task(self._response_sender_loop(), name="response-sender")
+                response_sender_task = asyncio.create_task(
+                    self._response_sender_loop(), name="response-sender"
+                )
                 if self.greet_at_open:
-                    greeting_task = asyncio.create_task(self._greet_into_silence(), name="startup-greeting")
+                    greeting_task = asyncio.create_task(
+                        self._greet_into_silence(), name="startup-greeting"
+                    )
 
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
@@ -1860,14 +2061,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._new_user_turn()
                         self._user_speaking = True
                         self._last_speech_at = time.monotonic()
-                        self._mark_activity("user_speech_started", getattr(event, "item_id", None))
+                        self._mark_activity(
+                            "user_speech_started", getattr(event, "item_id", None)
+                        )
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
                         self._gate_drop_held()
-                        left = self._clear_queue() if self._clear_queue else None
+                        cut = self._clear_queue() if self._clear_queue else None
+                        left = cut[1] if isinstance(cut, tuple) else 0.0
+                        if (
+                            left > 0.0
+                        ):  # a day of these says whether the ends are cut (11-03)
+                            logger.info(
+                                "barge-in: %.1f s of a %.1f s reply unplayed",
+                                left,
+                                cut[0],
+                            )
                         # his reply cut mid-way: if the turn proves empty, he goes on (11-03)
-                        self._cut_mid_reply = isinstance(left, float) and left > MID_REPLY_LEFT_S
+                        self._cut_mid_reply = left > MID_REPLY_LEFT_S
                         if self._greeting_live:
                             await self._cancel_greeting()
                         self.deps.movement_manager.set_listening(True)
@@ -1876,9 +2088,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "input_audio_buffer.speech_stopped":
                         self._user_speaking = False
                         self._last_speech_at = time.monotonic()
-                        self._mark_activity("user_speech_stopped", getattr(event, "item_id", None))
+                        self._mark_activity(
+                            "user_speech_stopped", getattr(event, "item_id", None)
+                        )
                         self.deps.movement_manager.set_listening(False)
-                        logger.debug("User speech stopped - server will auto-commit with VAD")
+                        logger.debug(
+                            "User speech stopped - server will auto-commit with VAD"
+                        )
 
                     if event.type == "response.output_audio.done":
                         self.deps.movement_manager.set_speaking(False)
@@ -1894,18 +2110,32 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "response.created":
                         self._response_done_event.clear()
                         self._response_started_or_rejected_event.set()
+                        self._cut_mid_reply = (
+                            False  # answered: an empty turn asks for no other reply
+                        )
                         if self._followup_pending and _companion_tag(event) is None:
                             self._followup_pending, self._followup_live = False, True
                         self._response_started()
                         self._gate_start()
-                        if _companion_tag(event) == GREETING_TAG["companion"] and self._spoke_since_open:
+                        if (
+                            _companion_tag(event) == GREETING_TAG["companion"]
+                            and self._spoke_since_open
+                        ):
                             await self._cancel_greeting()  # speech came between its create and now
                         self._mark_activity("response_created")
                         self.deps.movement_manager.set_speaking(True)
-                        if self._turn_user_done_at is not None and self._turn_response_created_at is None:
+                        if (
+                            self._turn_user_done_at is not None
+                            and self._turn_response_created_at is None
+                        ):
                             self._turn_response_created_at = time.perf_counter()
-                            delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
-                            logger.info("Turn latency: response.created %.0f ms after user transcript", delta_ms)
+                            delta_ms = (
+                                self._turn_response_created_at - self._turn_user_done_at
+                            ) * 1000
+                            logger.info(
+                                "Turn latency: response.created %.0f ms after user transcript",
+                                delta_ms,
+                            )
                             if self._first_reply_at is None:
                                 self._first_reply_created()
                         logger.info("Response created (active)")
@@ -1921,12 +2151,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         elif _companion_tag(event) == GREETING_TAG["companion"]:
                             self._greeting_live = False
                         # Checked against the function call's response_id on the robot (2026-10-23).
-                        logger.debug("Response done: id=%s", getattr(getattr(event, "response", None), "id", None))
+                        logger.debug(
+                            "Response done: id=%s",
+                            getattr(getattr(event, "response", None), "id", None),
+                        )
                         usage = getattr(getattr(event, "response", None), "usage", None)
                         self._log_usage(usage)
                         if _companion_tag(event) is None:
                             self._after_reply(usage)
-                        if not self._gate_transcript_done and (self._gate_text or self._gate_had_audio):
+                        if not self._gate_transcript_done and (
+                            self._gate_text or self._gate_had_audio
+                        ):
                             # Parsed by counting: keep the wording. Measuring only; the
                             # fallback below is unchanged.
                             logger.warning(
@@ -1937,14 +2172,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 self._gate,
                             )
                         # With no transcript.done this is the whole reply: judged as final (the review).
-                        self._gate_transcript(self._gate_text, final=not self._gate_transcript_done)
-                        if self._gate == "hold":  # no transcript at all: a reply, not an artifact
+                        self._gate_transcript(
+                            self._gate_text, final=not self._gate_transcript_done
+                        )
+                        if (
+                            self._gate == "hold"
+                        ):  # no transcript at all: a reply, not an artifact
                             self._gate_release("pass")
                         # Before the first await: a finished tool waits on this response's done.
                         self._record_spoken_response(event)
                         await self._response_finished(event)
 
-                    if event.type == "conversation.item.input_audio_transcription.delta":
+                    if (
+                        event.type
+                        == "conversation.item.input_audio_transcription.delta"
+                    ):
                         self._mark_activity("user_transcription_delta")
                         logger.debug(f"User partial transcript: {event.delta}")
 
@@ -1952,7 +2194,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         delta = event.delta or ""
 
                         input_transcript = self.input_transcript_chunks_by_item
-                        self._record_partial_transcript_delta(input_transcript, item_id, delta)
+                        self._record_partial_transcript_delta(
+                            input_transcript, item_id, delta
+                        )
 
                         current_partial = "".join(input_transcript.deltas)
                         sequence_counter = len(input_transcript.deltas) - 1
@@ -1961,18 +2205,34 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         # Start new debounce timer with the last delta
                         self.partial_transcript_task = asyncio.create_task(
-                            self._emit_debounced_partial(current_partial, item_id, sequence_counter)
+                            self._emit_debounced_partial(
+                                current_partial, item_id, sequence_counter
+                            )
                         )
 
                     # A failed transcription has no completion. The companion pairs each user
                     # speech window with its item's completion, so it hears of this one too.
-                    if event.type == "conversation.item.input_audio_transcription.failed":
-                        self._mark_activity("user_transcription_failed", getattr(event, "item_id", None))
-                        logger.warning("User transcription failed for item %s", getattr(event, "item_id", None))
+                    if (
+                        event.type
+                        == "conversation.item.input_audio_transcription.failed"
+                    ):
+                        self._mark_activity(
+                            "user_transcription_failed", getattr(event, "item_id", None)
+                        )
+                        logger.warning(
+                            "User transcription failed for item %s",
+                            getattr(event, "item_id", None),
+                        )
 
                     # Handle completed transcription (user finished speaking)
-                    if event.type == "conversation.item.input_audio_transcription.completed":
-                        self._mark_activity("user_transcription_completed", getattr(event, "item_id", None))
+                    if (
+                        event.type
+                        == "conversation.item.input_audio_transcription.completed"
+                    ):
+                        self._mark_activity(
+                            "user_transcription_completed",
+                            getattr(event, "item_id", None),
+                        )
                         raw_transcript = event.transcript or ""
                         transcript = raw_transcript.strip()
                         logger.debug("User transcript: %s", raw_transcript)
@@ -1986,7 +2246,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 # 11-03 19:39-19:42: VAD fired on no speech 1-3 s into his reply,
                                 # the reply was dropped, and 11-36 s of silence followed
                                 self._cut_mid_reply = False
-                                logger.info("an empty turn cut his reply mid-way: replying again")
+                                logger.info(
+                                    "an empty turn cut his reply mid-way: replying again"
+                                )
                                 await self._safe_response_create()
                             continue
                         self._cut_mid_reply = False
@@ -1999,14 +2261,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._tool_batch_only_gestured = True
                         self._start_user_turn()
 
-                        await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
-                        self._emit_transcript("user", transcript, True, item_id=getattr(event, "item_id", None))
+                        await self.output_queue.put(
+                            AdditionalOutputs({"role": "user", "content": transcript})
+                        )
+                        self._emit_transcript(
+                            "user",
+                            transcript,
+                            True,
+                            item_id=getattr(event, "item_id", None),
+                        )
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.delta":
                         if getattr(event, "delta", ""):
                             self._response_spoke()
-                        self._gate_transcript(self._gate_text + (getattr(event, "delta", "") or ""))
+                        self._gate_transcript(
+                            self._gate_text + (getattr(event, "delta", "") or "")
+                        )
 
                     if event.type == "response.output_audio_transcript.done":
                         self._mark_activity("assistant_transcript_done")
@@ -2014,28 +2285,51 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._gate_transcript(event.transcript or "", final=True)
                         logger.debug(f"Assistant transcript: {event.transcript}")
                         await self.output_queue.put(
-                            AdditionalOutputs({"role": "assistant", "content": event.transcript})
+                            AdditionalOutputs(
+                                {"role": "assistant", "content": event.transcript}
+                            )
                         )
                         said = event.transcript or ""
                         said = self._ssml_spoken(said)  # 11-03: "<speak>" read aloud
-                        kept = said if self._gate_cut_kind else without_calls(said, self._gate_tools)  # 2026-10-20
+                        kept = (
+                            said
+                            if self._gate_cut_kind
+                            else without_calls(said, self._gate_tools)
+                        )  # 2026-10-20
                         if kept or not said:
-                            self._emit_transcript("assistant", kept, True, artifact=self._gate_cut_kind)
+                            self._emit_transcript(
+                                "assistant", kept, True, artifact=self._gate_cut_kind
+                            )
                         else:  # played, but only markup: logged by the supervisor, never kept (the review)
-                            self._emit_transcript("assistant", said, True, artifact="leaked tool call")
+                            self._emit_transcript(
+                                "assistant", said, True, artifact="leaked tool call"
+                            )
                         self._response_transcript(event.transcript or "")
 
                     # Handle audio delta
                     if event.type == "response.output_audio.delta":
                         decoded_pcm_bytes = base64.b64decode(event.delta)
-                        decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
+                        decoded_pcm = np.frombuffer(
+                            decoded_pcm_bytes, dtype=np.int16
+                        ).reshape(1, -1)
                         self._mark_activity("assistant_audio_delta")
                         self._response_spoke()
-                        if self._turn_user_done_at is not None and self._turn_first_audio_at is None:
+                        if (
+                            self._turn_user_done_at is not None
+                            and self._turn_first_audio_at is None
+                        ):
                             self._turn_first_audio_at = time.perf_counter()
-                            delta_ms = (self._turn_first_audio_at - self._turn_user_done_at) * 1000
-                            logger.info("Turn latency: first audio delta %.0f ms after user transcript", delta_ms)
-                        if self._search_answer_pending and self._turn_user_done_at is not None:
+                            delta_ms = (
+                                self._turn_first_audio_at - self._turn_user_done_at
+                            ) * 1000
+                            logger.info(
+                                "Turn latency: first audio delta %.0f ms after user transcript",
+                                delta_ms,
+                            )
+                        if (
+                            self._search_answer_pending
+                            and self._turn_user_done_at is not None
+                        ):
                             self._search_answer_pending = False
                             logger.info(
                                 "search answer: first audio %.0f ms after the user's transcript",
@@ -2056,7 +2350,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             args_json_str,
                         )
 
-                        if not isinstance(tool_name, str) or not isinstance(args_json_str, str):
+                        if not isinstance(tool_name, str) or not isinstance(
+                            args_json_str, str
+                        ):
                             logger.error(
                                 "Invalid tool call: tool_name=%s (type=%s), args=%s (type=%s), call_id=%s",
                                 tool_name,
@@ -2106,7 +2402,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     # server error
                     if event.type == "error":
                         err = getattr(event, "error", None)
-                        msg = getattr(err, "message", str(err) if err else "unknown error")
+                        msg = getattr(
+                            err, "message", str(err) if err else "unknown error"
+                        )
                         code = getattr(err, "code", "") or getattr(err, "type", "")
 
                         if code == "conversation_already_has_active_response":
@@ -2115,14 +2413,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             # response finishes it will wake up and see this flag.
                             self._last_response_rejected = True
                             self._response_started_or_rejected_event.set()
-                            logger.info("response.create rejected; worker will retry after active response finishes")
+                            logger.info(
+                                "response.create rejected; worker will retry after active response finishes"
+                            )
                         else:
                             self._response_started_or_rejected_event.set()
                             if "function call outputs are pending" in str(msg):
-                                if await self._recover_refused_reply():  # a race, handled
-                                    logger.info("Realtime refusal [%s], reply in hand: %s", code, msg)
+                                if (
+                                    await self._recover_refused_reply()
+                                ):  # a race, handled
+                                    logger.info(
+                                        "Realtime refusal [%s], reply in hand: %s",
+                                        code,
+                                        msg,
+                                    )
                                     continue
-                            logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
+                            logger.error(
+                                "Realtime error [%s]: %s (raw=%s)", code, msg, err
+                            )
 
                         if code == "input_audio_buffer_commit_empty":
                             self.deps.movement_manager.set_listening(False)
@@ -2131,9 +2439,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if code not in (
                             "input_audio_buffer_commit_empty",
                             "conversation_already_has_active_response",
-                        ) and "cancel" not in str(code):  # a say's cancel that came late
+                        ) and "cancel" not in str(
+                            code
+                        ):  # a say's cancel that came late
                             await self.output_queue.put(
-                                AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
+                                AdditionalOutputs(
+                                    {"role": "assistant", "content": f"[error] {msg}"}
+                                )
                             )
             finally:
                 logger.info(
@@ -2242,20 +2554,26 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         direct_realtime_url = get_hf_direct_ws_url()
         if connection_selection.mode == HF_LOCAL_CONNECTION_MODE:
             if not direct_realtime_url:
-                raise RuntimeError("HF_REALTIME_WS_URL must be set when HF_REALTIME_CONNECTION_MODE=local")
+                raise RuntimeError(
+                    "HF_REALTIME_WS_URL must be set when HF_REALTIME_CONNECTION_MODE=local"
+                )
             client, connect_query = _build_openai_compatible_client_from_realtime_url(
                 direct_realtime_url,
                 configured_bearer_token,
             )
             self._realtime_connect_query = connect_query
-            logger.info("Using direct Hugging Face realtime endpoint %s", direct_realtime_url)
+            logger.info(
+                "Using direct Hugging Face realtime endpoint %s", direct_realtime_url
+            )
             return client
 
         session_url = connection_selection.session_url
         if not session_url:
             raise RuntimeError("Built-in Hugging Face session proxy URL is unavailable")
         if direct_realtime_url:
-            logger.info("HF_REALTIME_CONNECTION_MODE=deployed; ignoring HF_REALTIME_WS_URL.")
+            logger.info(
+                "HF_REALTIME_CONNECTION_MODE=deployed; ignoring HF_REALTIME_WS_URL."
+            )
 
         bearer_token = configured_bearer_token or (get_token() or "").strip()
         allocator_headers = {"User-Agent": "reachy-mini-conversation-app"}
@@ -2263,27 +2581,39 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             allocator_headers["X-Reachy-Mini-Authorization"] = f"Bearer {bearer_token}"
         allocator_payload: dict[str, str] = {}
         try:
-            hardware_id = self.deps.reachy_mini.client.get_status(wait=False).hardware_id
+            hardware_id = self.deps.reachy_mini.client.get_status(
+                wait=False
+            ).hardware_id
         except (AssertionError, ConnectionError, TimeoutError) as e:
-            logger.warning("Daemon status unavailable for realtime session allocation: %s", e)
+            logger.warning(
+                "Daemon status unavailable for realtime session allocation: %s", e
+            )
         else:
             if hardware_id:
                 allocator_payload["hardware_id"] = hardware_id
 
         async with httpx.AsyncClient(timeout=10.0) as http_client:
-            response = await http_client.post(session_url, headers=allocator_headers, json=allocator_payload)
+            response = await http_client.post(
+                session_url, headers=allocator_headers, json=allocator_payload
+            )
             response.raise_for_status()
             payload = response.json()
 
         connect_url = payload.get("connect_url")
         if not isinstance(connect_url, str) or not connect_url:
-            raise RuntimeError(f"Session allocator response did not contain a valid connect_url: {payload!r}")
+            raise RuntimeError(
+                f"Session allocator response did not contain a valid connect_url: {payload!r}"
+            )
 
         parsed_connect_url = parse_hf_realtime_url(connect_url)
         if not parsed_connect_url.has_realtime_path:
-            raise ValueError(f"Expected realtime connect URL ending with /realtime, got: {connect_url}")
+            raise ValueError(
+                f"Expected realtime connect URL ending with /realtime, got: {connect_url}"
+            )
 
-        logger.info("Allocated realtime session %s", payload.get("session_id") or "<unknown>")
+        logger.info(
+            "Allocated realtime session %s", payload.get("session_id") or "<unknown>"
+        )
         client, connect_query = _build_openai_compatible_client_from_realtime_url(
             connect_url,
             bearer_token,

@@ -17,7 +17,10 @@ from reachy_mini_conversation_app.config import config, get_default_voice
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
-from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolNotification
+from reachy_mini_conversation_app.tools.background_tool_manager import (
+    ToolState,
+    ToolNotification,
+)
 
 
 HF_DEFAULT_VOICE = get_default_voice()
@@ -89,7 +92,9 @@ def _make_fake_realtime_client(
                     item = next(self._events)
                 except StopIteration:
                     raise StopAsyncIteration
-                if callable(item):  # a probe or pause between events: run it, yield nothing
+                if callable(
+                    item
+                ):  # a probe or pause between events: run it, yield nothing
                     result = item()
                     if asyncio.iscoroutine(result):
                         await result
@@ -154,13 +159,21 @@ def _fake_allocator(
 
 
 def _plain_handler() -> HuggingFaceRealtimeHandler:
-    return HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    return HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
 
 
-def _session_handler(monkeypatch: Any, events: tuple[Any, ...]) -> HuggingFaceRealtimeHandler:
+def _session_handler(
+    monkeypatch: Any, events: tuple[Any, ...]
+) -> HuggingFaceRealtimeHandler:
     """Build a handler wired to a fake realtime client yielding `events`, ready to run a session."""
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+    monkeypatch.setattr(
+        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+    )
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
+    )
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
     monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
     handler = _plain_handler()
@@ -200,16 +213,28 @@ def _report_payload(name: str) -> dict[str, Any]:
 @pytest.mark.asyncio
 async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> None:
     """Partial transcription snapshots should replace older snapshots for the same item."""
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(
+        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+    )
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden"
+    )
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
 
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
     handler.client = _make_fake_realtime_client(
         events=(
-            _FakeEvent("conversation.item.input_audio_transcription.delta", item_id="item-1", delta="Hey"),
             _FakeEvent(
-                "conversation.item.input_audio_transcription.delta", item_id="item-1", delta="Hey, how are you?"
+                "conversation.item.input_audio_transcription.delta",
+                item_id="item-1",
+                delta="Hey",
+            ),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.delta",
+                item_id="item-1",
+                delta="Hey, how are you?",
             ),
         )
     )
@@ -229,7 +254,9 @@ async def test_emit_skips_idle_signal_while_response_active(monkeypatch: Any) ->
     movement_manager.is_idle.return_value = True
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager)
     handler = HuggingFaceRealtimeHandler(deps)
-    handler.last_activity_time = time.monotonic() - (handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0)
+    handler.last_activity_time = time.monotonic() - (
+        handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0
+    )
     handler._response_done_event.clear()
 
     send_idle_signal = AsyncMock()
@@ -245,14 +272,24 @@ async def test_emit_skips_idle_signal_while_response_active(monkeypatch: Any) ->
 @pytest.mark.asyncio
 async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> None:
     """Parallel tool calls in one turn should yield one response, not one per completed tool."""
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(
+        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+    )
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden"
+    )
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
 
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
     handler.connection = AsyncMock()
     handler.output_queue = asyncio.Queue()
-    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        handler,
+        "_wait_for_response_done_before_tool_result",
+        AsyncMock(return_value=True),
+    )
     create = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create)
 
@@ -286,9 +323,13 @@ def test_handler_uses_hf_startup_voice_at_startup(monkeypatch: Any) -> None:
 
 def test_handler_ignores_unsupported_hf_profile_voice(monkeypatch: Any) -> None:
     """Unsupported profile voices should not be sent to the Hugging Face backend."""
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "cedar")
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "cedar"
+    )
 
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
 
     assert handler.get_current_voice() == HF_DEFAULT_VOICE
     session = handler._get_session_config([])
@@ -297,23 +338,37 @@ def test_handler_ignores_unsupported_hf_profile_voice(monkeypatch: Any) -> None:
 
 def test_handler_normalizes_hf_voice_case(monkeypatch: Any) -> None:
     """Lowercase Hugging Face speaker names should resolve to the curated UI value."""
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "serena")
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "serena"
+    )
 
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
 
     assert handler.get_current_voice() == "Serena"
 
 
 @pytest.mark.asyncio
-async def test_run_realtime_session_uses_default_voice_for_lb_allocated_sessions(monkeypatch: Any) -> None:
+async def test_run_realtime_session_uses_default_voice_for_lb_allocated_sessions(
+    monkeypatch: Any,
+) -> None:
     """Use the backend default speaker when no profile voice is selected for the hf LB."""
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+    monkeypatch.setattr(
+        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+    )
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
+    )
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
-    monkeypatch.setattr(config, "HF_REALTIME_SESSION_URL", "https://lb.example.test/session")
+    monkeypatch.setattr(
+        config, "HF_REALTIME_SESSION_URL", "https://lb.example.test/session"
+    )
 
     captured_update: dict[str, Any] = {}
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
     handler.client = _make_fake_realtime_client(captured_update=captured_update)
 
     await handler._run_realtime_session()
@@ -326,10 +381,14 @@ async def test_run_realtime_session_uses_default_voice_for_lb_allocated_sessions
     assert session["audio"]["output"]["voice"] == HF_DEFAULT_VOICE
 
 
-def test_huggingface_session_uses_configured_transcription_language(monkeypatch: Any) -> None:
+def test_huggingface_session_uses_configured_transcription_language(
+    monkeypatch: Any,
+) -> None:
     """Hugging Face realtime sessions should forward the configured transcription language."""
     monkeypatch.setattr(config, "REALTIME_TRANSCRIPTION_LANGUAGE", "zh")
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
 
     session = handler._get_session_config([])
 
@@ -337,14 +396,22 @@ def test_huggingface_session_uses_configured_transcription_language(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_run_realtime_session_passes_allocated_session_query(monkeypatch: Any) -> None:
+async def test_run_realtime_session_passes_allocated_session_query(
+    monkeypatch: Any,
+) -> None:
     """Hugging Face sessions must forward the allocated session token to the websocket connect call."""
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+    monkeypatch.setattr(
+        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+    )
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
+    )
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
 
     captured_connect: dict[str, Any] = {}
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
     handler.client = _make_fake_realtime_client(captured_connect=captured_connect)
     handler._realtime_connect_query = {"session_token": "abc123"}
 
@@ -357,12 +424,18 @@ async def test_run_realtime_session_passes_allocated_session_query(monkeypatch: 
 @pytest.mark.asyncio
 async def test_run_realtime_session_raises_the_receive_limit(monkeypatch: Any) -> None:
     """The server echoes image data URLs back; 1 MiB (the websockets default) closed with 1009."""
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+    monkeypatch.setattr(
+        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+    )
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
+    )
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
 
     captured_connect: dict[str, Any] = {}
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
     handler.client = _make_fake_realtime_client(captured_connect=captured_connect)
 
     await handler._run_realtime_session()
@@ -370,7 +443,9 @@ async def test_run_realtime_session_raises_the_receive_limit(monkeypatch: Any) -
     assert captured_connect["websocket_connection_options"] == {"max_size": 16 * 2**20}
 
 
-@pytest.mark.parametrize(("hf_token", "expected_api_key"), [(None, "DUMMY"), ("hf-secret", "hf-secret")])
+@pytest.mark.parametrize(
+    ("hf_token", "expected_api_key"), [(None, "DUMMY"), ("hf-secret", "hf-secret")]
+)
 @pytest.mark.asyncio
 async def test_build_realtime_client_local_uses_explicit_hf_token_only(
     monkeypatch: Any,
@@ -381,12 +456,16 @@ async def test_build_realtime_client_local_uses_explicit_hf_token_only(
     client_kwargs: dict[str, Any] = {}
 
     def _no_allocator(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("session allocator should not be called in direct websocket mode")
+        raise AssertionError(
+            "session allocator should not be called in direct websocket mode"
+        )
 
     monkeypatch.setattr(hf_mod, "AsyncOpenAI", _fake_openai_client(client_kwargs))
     monkeypatch.setattr(hf_mod.httpx, "AsyncClient", _no_allocator)
     monkeypatch.setattr(config, "HF_REALTIME_CONNECTION_MODE", "local")
-    monkeypatch.setattr(config, "HF_REALTIME_SESSION_URL", "https://lb.example.test/session")
+    monkeypatch.setattr(
+        config, "HF_REALTIME_SESSION_URL", "https://lb.example.test/session"
+    )
     monkeypatch.setattr(config, "HF_TOKEN", hf_token)
     monkeypatch.setattr(hf_mod, "get_token", lambda: "hf-cached")
     monkeypatch.setattr(
@@ -395,7 +474,9 @@ async def test_build_realtime_client_local_uses_explicit_hf_token_only(
         "ws://127.0.0.1:8765/v1/realtime?session_token=abc123&model=ignored-by-sdk",
     )
 
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
 
     client = await handler._build_realtime_client()
 
@@ -441,7 +522,15 @@ async def test_build_realtime_client_local_uses_explicit_hf_token_only(
             "hf-cached",
             {},
         ),
-        (None, None, None, None, {"User-Agent": "reachy-mini-conversation-app"}, "DUMMY", {}),
+        (
+            None,
+            None,
+            None,
+            None,
+            {"User-Agent": "reachy-mini-conversation-app"},
+            "DUMMY",
+            {},
+        ),
         (
             None,
             None,
@@ -470,9 +559,13 @@ async def test_build_realtime_client_deployed_resolves_hf_token(
     posts: list[tuple[str, dict[str, str] | None, dict[str, str] | None]] = []
     connect_url = "wss://hf.example.test/v1/realtime?session_token=allocated"
     monkeypatch.setattr(hf_mod, "AsyncOpenAI", _fake_openai_client(client_kwargs))
-    monkeypatch.setattr(hf_mod.httpx, "AsyncClient", _fake_allocator(connect_url, posts))
+    monkeypatch.setattr(
+        hf_mod.httpx, "AsyncClient", _fake_allocator(connect_url, posts)
+    )
     monkeypatch.setattr(config, "HF_REALTIME_CONNECTION_MODE", "deployed")
-    monkeypatch.setattr(config, "HF_REALTIME_SESSION_URL", "https://lb.example.test/session")
+    monkeypatch.setattr(
+        config, "HF_REALTIME_SESSION_URL", "https://lb.example.test/session"
+    )
     # A stale local URL must be ignored in deployed mode.
     monkeypatch.setattr(config, "HF_REALTIME_WS_URL", "ws://127.0.0.1:8765/v1/realtime")
     monkeypatch.setattr(config, "HF_TOKEN", hf_token)
@@ -482,15 +575,21 @@ async def test_build_realtime_client_deployed_resolves_hf_token(
     reachy_mini.client.get_status.return_value.hardware_id = hardware_id
     if status_error:
         reachy_mini.client.get_status.side_effect = status_error
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=reachy_mini, movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=reachy_mini, movement_manager=MagicMock())
+    )
 
     client = await handler._build_realtime_client()
 
     assert client is not None
-    assert posts == [("https://lb.example.test/session", expected_header, expected_payload)]
+    assert posts == [
+        ("https://lb.example.test/session", expected_header, expected_payload)
+    ]
     reachy_mini.client.get_status.assert_called_once_with(wait=False)
     if status_error:
-        assert "Daemon status unavailable for realtime session allocation" in caplog.text
+        assert (
+            "Daemon status unavailable for realtime session allocation" in caplog.text
+        )
     assert client_kwargs["api_key"] == expected_api_key
     assert client_kwargs["base_url"] == "https://hf.example.test/v1"
     assert client_kwargs["websocket_base_url"] == "wss://hf.example.test/v1"
@@ -498,11 +597,21 @@ async def test_build_realtime_client_deployed_resolves_hf_token(
 
 
 @pytest.mark.asyncio
-async def test_apply_personality_uses_selected_voice_for_lb_allocated_sessions(monkeypatch: Any) -> None:
+async def test_apply_personality_uses_selected_voice_for_lb_allocated_sessions(
+    monkeypatch: Any,
+) -> None:
     """Live personality updates should honor the selected Qwen CustomVoice speaker."""
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "new instructions")
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Serena")
-    monkeypatch.setattr(config, "HF_REALTIME_SESSION_URL", "https://lb.example.test/session")
+    monkeypatch.setattr(
+        hf_mod,
+        "get_session_instructions",
+        lambda _instance_path=None: "new instructions",
+    )
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Serena"
+    )
+    monkeypatch.setattr(
+        config, "HF_REALTIME_SESSION_URL", "https://lb.example.test/session"
+    )
 
     captured_update: dict[str, Any] = {}
 
@@ -513,7 +622,9 @@ async def test_apply_personality_uses_selected_voice_for_lb_allocated_sessions(m
     class FakeConnection:
         session = FakeSession()
 
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
     handler.connection = FakeConnection()
     monkeypatch.setattr(handler, "_restart_session", AsyncMock(return_value=None))
 
@@ -526,7 +637,9 @@ async def test_apply_personality_uses_selected_voice_for_lb_allocated_sessions(m
 
 
 @pytest.mark.asyncio
-async def test_apply_personality_restores_profile_when_tools_fail(monkeypatch: Any) -> None:
+async def test_apply_personality_restores_profile_when_tools_fail(
+    monkeypatch: Any,
+) -> None:
     """A failed tool reload should leave the previous profile selected."""
     selected_profiles: list[str | None] = []
 
@@ -539,9 +652,15 @@ async def test_apply_personality_restores_profile_when_tools_fail(monkeypatch: A
 
     monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "default")
     monkeypatch.setattr(hf_mod, "set_custom_profile", select_profile)
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "new instructions")
+    monkeypatch.setattr(
+        hf_mod,
+        "get_session_instructions",
+        lambda _instance_path=None: "new instructions",
+    )
     monkeypatch.setattr(hf_mod.core_tools, "initialize_tools", fail_tool_reload)
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
 
     result = await handler.apply_personality("broken")
 
@@ -551,7 +670,9 @@ async def test_apply_personality_restores_profile_when_tools_fail(monkeypatch: A
 
 
 @pytest.mark.asyncio
-async def test_change_voice_updates_live_hf_session_without_restart(monkeypatch: Any) -> None:
+async def test_change_voice_updates_live_hf_session_without_restart(
+    monkeypatch: Any,
+) -> None:
     """Changing Hugging Face voice should update the active session in place."""
     captured_update: dict[str, Any] = {}
 
@@ -562,7 +683,9 @@ async def test_change_voice_updates_live_hf_session_without_restart(monkeypatch:
     class FakeConnection:
         session = FakeSession()
 
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
     handler.connection = FakeConnection()
     restart = AsyncMock(return_value=None)
     monkeypatch.setattr(handler, "_restart_session", restart)
@@ -581,7 +704,9 @@ async def test_run_session_decodes_audio_delta(monkeypatch: Any) -> None:
     """An audio delta is base64-decoded and enqueued as an (rate, int16) frame."""
     pcm = np.array([1, 2, 3, 4], dtype=np.int16)
     delta = base64.b64encode(pcm.tobytes()).decode("utf-8")
-    handler = _session_handler(monkeypatch, (_FakeEvent("response.output_audio.delta", delta=delta),))
+    handler = _session_handler(
+        monkeypatch, (_FakeEvent("response.output_audio.delta", delta=delta),)
+    )
 
     await handler._run_realtime_session()
 
@@ -597,7 +722,12 @@ async def test_run_session_emits_completed_transcript(monkeypatch: Any) -> None:
     """A non-empty completed transcript is enqueued as a user message and stops listening."""
     handler = _session_handler(
         monkeypatch,
-        (_FakeEvent("conversation.item.input_audio_transcription.completed", transcript="Hello there"),),
+        (
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                transcript="Hello there",
+            ),
+        ),
     )
 
     await handler._run_realtime_session()
@@ -611,12 +741,19 @@ async def test_run_session_skips_empty_completed_transcript(monkeypatch: Any) ->
     """An empty completed transcript is ignored but still stops listening."""
     handler = _session_handler(
         monkeypatch,
-        (_FakeEvent("conversation.item.input_audio_transcription.completed", transcript="   "),),
+        (
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                transcript="   ",
+            ),
+        ),
     )
 
     await handler._run_realtime_session()
 
-    assert [msg for msg in _messages(_drain(handler)) if msg.get("role") == "user"] == []
+    assert [
+        msg for msg in _messages(_drain(handler)) if msg.get("role") == "user"
+    ] == []
     handler.deps.movement_manager.set_listening.assert_any_call(False)
 
 
@@ -626,40 +763,62 @@ async def test_a_failed_transcription_is_reported_as_activity(monkeypatch: Any) 
     transcription failed has no completion, so it is reported as its own activity."""
     handler = _session_handler(
         monkeypatch,
-        (_FakeEvent("conversation.item.input_audio_transcription.failed", item_id="item_1"),),
+        (
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.failed", item_id="item_1"
+            ),
+        ),
     )
     seen: list[tuple[str, Any]] = []
-    handler.set_activity_observer(lambda reason, item_id=None: seen.append((reason, item_id)))
+    handler.set_activity_observer(
+        lambda reason, item_id=None: seen.append((reason, item_id))
+    )
 
     await handler._run_realtime_session()
 
     assert ("user_transcription_failed", "item_1") in seen
-    assert [msg for msg in _messages(_drain(handler)) if msg.get("role") == "user"] == []
+    assert [
+        msg for msg in _messages(_drain(handler)) if msg.get("role") == "user"
+    ] == []
 
 
 @pytest.mark.asyncio
-async def test_a_user_turns_item_id_travels_with_its_speech_and_transcript(monkeypatch: Any) -> None:
+async def test_a_user_turns_item_id_travels_with_its_speech_and_transcript(
+    monkeypatch: Any,
+) -> None:
     """Who-is-speaking joins a turn's speech window to its transcript by the realtime item_id."""
     handler = _session_handler(
         monkeypatch,
         (
             _FakeEvent("input_audio_buffer.speech_started", item_id="item_2"),
             _FakeEvent("input_audio_buffer.speech_stopped", item_id="item_2"),
-            _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="item_2", transcript="Hi"),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="item_2",
+                transcript="Hi",
+            ),
         ),
     )
     seen: list[tuple[str, Any]] = []
     said: list[tuple[str, str, Any]] = []
-    handler.set_activity_observer(lambda reason, item_id=None: seen.append((reason, item_id)))
+    handler.set_activity_observer(
+        lambda reason, item_id=None: seen.append((reason, item_id))
+    )
     handler.set_transcript_observer(
-        lambda role, text, final, artifact=None, item_id=None: said.append((role, text, item_id))
+        lambda role, text, final, artifact=None, item_id=None: said.append(
+            (role, text, item_id)
+        )
     )
     sessions: list[str] = []
     handler.set_session_observer(sessions.append)
 
     await handler._run_realtime_session()
 
-    for reason in ("user_speech_started", "user_speech_stopped", "user_transcription_completed"):
+    for reason in (
+        "user_speech_started",
+        "user_speech_stopped",
+        "user_transcription_completed",
+    ):
         assert (reason, "item_2") in seen
     assert ("user", "Hi", "item_2") in said
     assert sessions == ["started"]  # each realtime session, the restarts included
@@ -678,7 +837,11 @@ async def test_run_session_generic_error_is_surfaced(monkeypatch: Any) -> None:
     """A generic realtime error is forwarded to the UI as an assistant message."""
     handler = _session_handler(
         monkeypatch,
-        (_FakeEvent("error", error=SimpleNamespace(message="bad", code="server_error")),),
+        (
+            _FakeEvent(
+                "error", error=SimpleNamespace(message="bad", code="server_error")
+            ),
+        ),
     )
 
     await handler._run_realtime_session()
@@ -691,7 +854,14 @@ async def test_run_session_commit_empty_error_is_internal(monkeypatch: Any) -> N
     """A commit-empty error stops listening and is not surfaced to the UI."""
     handler = _session_handler(
         monkeypatch,
-        (_FakeEvent("error", error=SimpleNamespace(message="empty", code="input_audio_buffer_commit_empty")),),
+        (
+            _FakeEvent(
+                "error",
+                error=SimpleNamespace(
+                    message="empty", code="input_audio_buffer_commit_empty"
+                ),
+            ),
+        ),
     )
 
     await handler._run_realtime_session()
@@ -701,11 +871,20 @@ async def test_run_session_commit_empty_error_is_internal(monkeypatch: Any) -> N
 
 
 @pytest.mark.asyncio
-async def test_run_session_active_response_error_flags_rejection(monkeypatch: Any) -> None:
+async def test_run_session_active_response_error_flags_rejection(
+    monkeypatch: Any,
+) -> None:
     """A duplicate-response error is recorded for the sender worker, not surfaced."""
     handler = _session_handler(
         monkeypatch,
-        (_FakeEvent("error", error=SimpleNamespace(message="x", code="conversation_already_has_active_response")),),
+        (
+            _FakeEvent(
+                "error",
+                error=SimpleNamespace(
+                    message="x", code="conversation_already_has_active_response"
+                ),
+            ),
+        ),
     )
 
     await handler._run_realtime_session()
@@ -719,7 +898,14 @@ async def test_run_session_dispatches_valid_tool_call(monkeypatch: Any) -> None:
     """A valid function call starts a background tool and announces it."""
     handler = _session_handler(
         monkeypatch,
-        (_FakeEvent("response.function_call_arguments.done", name="dance", arguments="{}", call_id="c1"),),
+        (
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="dance",
+                arguments="{}",
+                call_id="c1",
+            ),
+        ),
     )
     start_tool = AsyncMock(return_value=SimpleNamespace(tool_id="dance-1"))
     monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
@@ -727,7 +913,9 @@ async def test_run_session_dispatches_valid_tool_call(monkeypatch: Any) -> None:
     await handler._run_realtime_session()
 
     start_tool.assert_awaited_once()
-    assert any("Used tool dance" in msg["content"] for msg in _messages(_drain(handler)))
+    assert any(
+        "Used tool dance" in msg["content"] for msg in _messages(_drain(handler))
+    )
 
 
 @pytest.mark.asyncio
@@ -735,7 +923,14 @@ async def test_run_session_ignores_invalid_tool_call(monkeypatch: Any) -> None:
     """A function call with a non-string name is ignored."""
     handler = _session_handler(
         monkeypatch,
-        (_FakeEvent("response.function_call_arguments.done", name=None, arguments="{}", call_id="c1"),),
+        (
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name=None,
+                arguments="{}",
+                call_id="c1",
+            ),
+        ),
     )
     start_tool = AsyncMock()
     monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
@@ -748,14 +943,19 @@ async def test_run_session_ignores_invalid_tool_call(monkeypatch: Any) -> None:
 
 def test_sanitize_tool_result_strips_camera_image() -> None:
     """Camera results drop the raw image bytes and flag that an image was attached."""
-    sanitized = HuggingFaceRealtimeHandler._sanitize_tool_result_for_model("camera", {"b64_im": "x", "seen": "cat"})
+    sanitized = HuggingFaceRealtimeHandler._sanitize_tool_result_for_model(
+        "camera", {"b64_im": "x", "seen": "cat"}
+    )
     assert sanitized == {"seen": "cat", "image_attached": True}
 
 
 def test_sanitize_tool_result_passthrough_for_non_camera() -> None:
     """Non-camera results are returned unchanged."""
     result = {"status": "ok"}
-    assert HuggingFaceRealtimeHandler._sanitize_tool_result_for_model("dance", result) == result
+    assert (
+        HuggingFaceRealtimeHandler._sanitize_tool_result_for_model("dance", result)
+        == result
+    )
 
 
 class _FakeConnection:
@@ -768,11 +968,19 @@ async def test_handle_tool_result_error_is_reported_and_prompts_response() -> No
     """A failed tool reports its error to the UI and requests a spoken follow-up."""
     handler = _plain_handler()
     handler.connection = _FakeConnection()
-    note = ToolNotification(id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.FAILED, error="boom")
+    note = ToolNotification(
+        id="c1",
+        tool_name="dance",
+        is_idle_tool_call=False,
+        status=ToolState.FAILED,
+        error="boom",
+    )
 
     await handler._handle_tool_result(note)
 
-    assert {"role": "assistant", "content": json.dumps({"error": "boom"})} in _messages(_drain(handler))
+    assert {"role": "assistant", "content": json.dumps({"error": "boom"})} in _messages(
+        _drain(handler)
+    )
     assert not handler._pending_responses.empty()
     handler.connection.conversation.item.create.assert_awaited()
 
@@ -783,7 +991,11 @@ async def test_handle_tool_result_no_connection_is_dropped() -> None:
     handler = _plain_handler()
     handler.connection = None
     note = ToolNotification(
-        id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": 1}
+        id="c1",
+        tool_name="dance",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"ok": 1},
     )
 
     await handler._handle_tool_result(note)
@@ -796,7 +1008,9 @@ async def test_handle_tool_result_missing_result_reports_error() -> None:
     """A tool that returns neither result nor error is reported as a failure."""
     handler = _plain_handler()
     handler.connection = _FakeConnection()
-    note = ToolNotification(id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.COMPLETED)
+    note = ToolNotification(
+        id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.COMPLETED
+    )
 
     await handler._handle_tool_result(note)
 
@@ -830,16 +1044,33 @@ def test_cut_long_strings_truncates_nested_values() -> None:
 def test_tool_report_status_maps_completed_failed_cancelled() -> None:
     """ok/error/cancelled map directly from the BackgroundTool's ToolState."""
     completed = ToolNotification(
-        id="1", tool_name="t", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": 1}
+        id="1",
+        tool_name="t",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"ok": 1},
     )
-    failed = ToolNotification(id="1", tool_name="t", is_idle_tool_call=False, status=ToolState.FAILED, error="boom")
+    failed = ToolNotification(
+        id="1",
+        tool_name="t",
+        is_idle_tool_call=False,
+        status=ToolState.FAILED,
+        error="boom",
+    )
     cancelled = ToolNotification(
-        id="1", tool_name="t", is_idle_tool_call=False, status=ToolState.CANCELLED, error="Tool cancelled"
+        id="1",
+        tool_name="t",
+        is_idle_tool_call=False,
+        status=ToolState.CANCELLED,
+        error="Tool cancelled",
     )
 
     assert hf_mod._tool_report_status_and_reason(completed) == ("ok", None)
     assert hf_mod._tool_report_status_and_reason(failed) == ("error", "boom")
-    assert hf_mod._tool_report_status_and_reason(cancelled) == ("cancelled", "Tool cancelled")
+    assert hf_mod._tool_report_status_and_reason(cancelled) == (
+        "cancelled",
+        "Tool cancelled",
+    )
 
 
 def test_tool_report_status_refused_via_result_marker() -> None:
@@ -859,20 +1090,38 @@ def test_a_result_with_ok_false_is_reported_refused_with_its_why() -> None:
 
     def done(result):
         return ToolNotification(
-            id="1", tool_name="t", is_idle_tool_call=False, status=ToolState.COMPLETED, result=result
+            id="1",
+            tool_name="t",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result=result,
         )
 
-    assert hf_mod._tool_report_status_and_reason(done({"ok": False, "why": "no such timer"})) == (
+    assert hf_mod._tool_report_status_and_reason(
+        done({"ok": False, "why": "no such timer"})
+    ) == (
         "refused",
         "no such timer",
     )
-    assert hf_mod._tool_report_status_and_reason(done({"ok": False, "reason": "busy"})) == ("refused", "busy")
-    assert hf_mod._tool_report_status_and_reason(done({"ok": False, "why": "a", "reason": "b"})) == ("refused", "a")
+    assert hf_mod._tool_report_status_and_reason(
+        done({"ok": False, "reason": "busy"})
+    ) == ("refused", "busy")
+    assert hf_mod._tool_report_status_and_reason(
+        done({"ok": False, "why": "a", "reason": "b"})
+    ) == ("refused", "a")
     assert hf_mod._tool_report_status_and_reason(done({"ok": False})) == ("refused", "")
-    assert hf_mod._tool_report_status_and_reason(done({"ok": True, "why": "x"})) == ("ok", None)
+    assert hf_mod._tool_report_status_and_reason(done({"ok": True, "why": "x"})) == (
+        "ok",
+        None,
+    )
     assert hf_mod._tool_report_status_and_reason(done({"why": "x"})) == ("ok", None)
     failed = ToolNotification(
-        id="1", tool_name="t", is_idle_tool_call=False, status=ToolState.FAILED, error="boom", result={"ok": False}
+        id="1",
+        tool_name="t",
+        is_idle_tool_call=False,
+        status=ToolState.FAILED,
+        error="boom",
+        result={"ok": False},
     )
     assert hf_mod._tool_report_status_and_reason(failed) == ("error", "boom")
 
@@ -880,7 +1129,11 @@ def test_a_result_with_ok_false_is_reported_refused_with_its_why() -> None:
 def test_tool_report_status_ok_result_without_marker_stays_ok() -> None:
     """A successful result with no refusal marker stays 'ok' (no tool sets one today)."""
     ok = ToolNotification(
-        id="1", tool_name="express", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"played": "x"}
+        id="1",
+        tool_name="express",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"played": "x"},
     )
     assert hf_mod._tool_report_status_and_reason(ok) == ("ok", None)
 
@@ -925,7 +1178,13 @@ async def test_handle_tool_result_reports_error_call() -> None:
     handler = _plain_handler()
     handler.connection = _FakeConnection()
     reports = _capture_tool_reports(handler)
-    note = ToolNotification(id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.FAILED, error="boom")
+    note = ToolNotification(
+        id="c1",
+        tool_name="dance",
+        is_idle_tool_call=False,
+        status=ToolState.FAILED,
+        error="boom",
+    )
 
     await handler._handle_tool_result(note)
 
@@ -941,7 +1200,11 @@ async def test_handle_tool_result_reports_cancelled_call() -> None:
     handler.connection = _FakeConnection()
     reports = _capture_tool_reports(handler)
     note = ToolNotification(
-        id="c1", tool_name="flights", is_idle_tool_call=False, status=ToolState.CANCELLED, error="Tool cancelled"
+        id="c1",
+        tool_name="flights",
+        is_idle_tool_call=False,
+        status=ToolState.CANCELLED,
+        error="Tool cancelled",
     )
 
     await handler._handle_tool_result(note)
@@ -979,7 +1242,11 @@ async def test_handle_tool_result_reports_even_without_connection() -> None:
     handler.connection = None
     reports = _capture_tool_reports(handler)
     note = ToolNotification(
-        id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": 1}
+        id="c1",
+        tool_name="dance",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"ok": 1},
     )
 
     await handler._handle_tool_result(note)
@@ -997,7 +1264,11 @@ async def test_handle_tool_result_reports_once_on_connection_closed_error() -> N
     handler.connection = conn
     reports = _capture_tool_reports(handler)
     note = ToolNotification(
-        id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": 1}
+        id="c1",
+        tool_name="dance",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"ok": 1},
     )
 
     await handler._handle_tool_result(note)
@@ -1049,7 +1320,11 @@ def test_report_tool_call_retries_backlog_in_order_without_duplicates() -> None:
     assert len(handler._tool_report_queue) == 2
 
     handler._report_tool_call(_report_payload("c"))
-    assert delivered == [_report_payload("a"), _report_payload("b"), _report_payload("c")]
+    assert delivered == [
+        _report_payload("a"),
+        _report_payload("b"),
+        _report_payload("c"),
+    ]
     assert len(handler._tool_report_queue) == 0
 
 
@@ -1070,7 +1345,9 @@ def test_report_tool_call_stops_draining_on_observer_exception() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_session_turn_based_tool_call_reports_turn_source(monkeypatch: Any) -> None:
+async def test_run_session_turn_based_tool_call_reports_turn_source(
+    monkeypatch: Any,
+) -> None:
     """An ordinary user-turn tool call is started with source='turn' and the response id."""
     handler = _session_handler(
         monkeypatch,
@@ -1095,7 +1372,9 @@ async def test_run_session_turn_based_tool_call_reports_turn_source(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_run_session_guard_nudged_tool_call_reports_missed_call_guard_source(monkeypatch: Any) -> None:
+async def test_run_session_guard_nudged_tool_call_reports_missed_call_guard_source(
+    monkeypatch: Any,
+) -> None:
     """A tool call made while the missed-call guard's nudge is still in force for this turn is reported as such."""
     handler = _session_handler(
         monkeypatch,
@@ -1167,7 +1446,9 @@ async def test_emit_debounced_partial_skips_stale_snapshot() -> None:
 async def test_emit_runs_idle_behavior_when_due(monkeypatch: Any) -> None:
     """Emit runs the idle behavior once the idle thresholds are exceeded and the robot is idle."""
     handler = _plain_handler()
-    handler.last_activity_time = time.monotonic() - (handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0)
+    handler.last_activity_time = time.monotonic() - (
+        handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0
+    )
     handler.last_idle_behavior_time = handler.last_activity_time
     handler.deps.movement_manager.is_idle.return_value = True
     handler._response_done_event.set()
@@ -1186,11 +1467,15 @@ async def test_emit_runs_idle_behavior_when_due(monkeypatch: Any) -> None:
 async def test_emit_keeps_idle_timer_when_idle_behavior_fails(monkeypatch: Any) -> None:
     """A failing idle behavior returns None and does not advance the idle-behavior timer."""
     handler = _plain_handler()
-    handler.last_activity_time = time.monotonic() - (handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0)
+    handler.last_activity_time = time.monotonic() - (
+        handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0
+    )
     handler.last_idle_behavior_time = handler.last_activity_time
     handler.deps.movement_manager.is_idle.return_value = True
     handler._response_done_event.set()
-    monkeypatch.setattr(handler, "send_idle_signal", AsyncMock(side_effect=RuntimeError("closed")))
+    monkeypatch.setattr(
+        handler, "send_idle_signal", AsyncMock(side_effect=RuntimeError("closed"))
+    )
 
     previous = handler.last_idle_behavior_time
     result = await handler.emit()
@@ -1254,7 +1539,9 @@ async def test_receive_ignores_empty_frame() -> None:
     """An empty audio frame is not forwarded to the realtime buffer."""
     handler = _plain_handler()
     append = AsyncMock()
-    handler.connection = SimpleNamespace(input_audio_buffer=SimpleNamespace(append=append))
+    handler.connection = SimpleNamespace(
+        input_audio_buffer=SimpleNamespace(append=append)
+    )
     await handler.receive((16000, np.array([], dtype=np.int16)))
     append.assert_not_awaited()
 
@@ -1264,16 +1551,22 @@ async def test_receive_downmixes_stereo_and_forwards() -> None:
     """A stereo frame is reduced to mono and appended to the realtime buffer."""
     handler = _plain_handler()
     append = AsyncMock()
-    handler.connection = SimpleNamespace(input_audio_buffer=SimpleNamespace(append=append))
+    handler.connection = SimpleNamespace(
+        input_audio_buffer=SimpleNamespace(append=append)
+    )
     stereo = np.array([[1, 10], [2, 20], [3, 30], [4, 40]], dtype=np.int16)
     await handler.receive((16000, stereo))
     append.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_run_session_speech_started_clears_queue_and_listens(monkeypatch: Any) -> None:
+async def test_run_session_speech_started_clears_queue_and_listens(
+    monkeypatch: Any,
+) -> None:
     """User speech start clears the playback queue and enters listening mode."""
-    handler = _session_handler(monkeypatch, (_FakeEvent("input_audio_buffer.speech_started"),))
+    handler = _session_handler(
+        monkeypatch, (_FakeEvent("input_audio_buffer.speech_started"),)
+    )
     clear_queue = MagicMock()
     handler._clear_queue = clear_queue
 
@@ -1284,7 +1577,9 @@ async def test_run_session_speech_started_clears_queue_and_listens(monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_run_session_response_lifecycle_toggles_done_event(monkeypatch: Any) -> None:
+async def test_run_session_response_lifecycle_toggles_done_event(
+    monkeypatch: Any,
+) -> None:
     """response.created clears the done gate and response.done sets it again."""
     handler = _session_handler(
         monkeypatch,
@@ -1307,8 +1602,12 @@ async def test_handler_reopens_a_session_after_shutdown(monkeypatch: Any) -> Non
     upstream exercises shutdown() followed by start_up() on one instance:
     _shutdown_active_handler's callers always rebuild. This pins it down.
     """
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+    monkeypatch.setattr(
+        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+    )
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
+    )
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
 
     handler = _plain_handler()
@@ -1350,7 +1649,9 @@ class _LiveFakeConn:
         """Build a connection with no queued events and an open `close()` gate."""
         self.session = SimpleNamespace(update=AsyncMock())
         self.input_audio_buffer = SimpleNamespace(append=AsyncMock())
-        self.conversation = SimpleNamespace(item=SimpleNamespace(create=AsyncMock(), cancel=AsyncMock()))
+        self.conversation = SimpleNamespace(
+            item=SimpleNamespace(create=AsyncMock(), cancel=AsyncMock())
+        )
         self.response = SimpleNamespace(create=AsyncMock())
         self._closed = asyncio.Event()
 
@@ -1377,7 +1678,9 @@ class _LiveFakeConn:
 
 
 @pytest.mark.asyncio
-async def test_handler_reopens_a_session_after_closing_a_live_connection(monkeypatch: Any) -> None:
+async def test_handler_reopens_a_session_after_closing_a_live_connection(
+    monkeypatch: Any,
+) -> None:
     """shutdown() must close a session that is still open, not just a finished one.
 
     test_handler_reopens_a_session_after_shutdown proves reuse in the natural-end
@@ -1388,8 +1691,12 @@ async def test_handler_reopens_a_session_after_closing_a_live_connection(monkeyp
     that ends it, concurrently with _run_realtime_session() still awaiting the
     next event -- the situation Task 3's close verb actually faces.
     """
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+    monkeypatch.setattr(
+        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+    )
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
+    )
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
 
     handler = _plain_handler()
@@ -1434,7 +1741,9 @@ async def test_handler_reopens_a_session_after_closing_a_live_connection(monkeyp
 
 # --- the startup greeting: only when an open asks, and only into silence (2026-10-24) ---
 
-GREETING_PROMPT = 'Start the conversation by saying exactly this, and nothing else: "Mm?"'
+GREETING_PROMPT = (
+    'Start the conversation by saying exactly this, and nothing else: "Mm?"'
+)
 
 
 class _ScriptedConn(_LiveFakeConn):
@@ -1467,15 +1776,27 @@ class _ScriptedConn(_LiveFakeConn):
         tagged = [
             c
             for c in self.response.create.await_args_list
-            if (c.kwargs.get("response") or {}).get("metadata") == {"companion": "greeting"}
+            if (c.kwargs.get("response") or {}).get("metadata")
+            == {"companion": "greeting"}
         ]
-        sent = [c.kwargs["item"]["content"][0]["text"] for c in self.conversation.item.create.await_args_list]
-        return bool(tagged) or (GREETING_PROMPT in sent and self.response.create.await_count > 0)
+        sent = [
+            c.kwargs["item"]["content"][0]["text"]
+            for c in self.conversation.item.create.await_args_list
+        ]
+        return bool(tagged) or (
+            GREETING_PROMPT in sent and self.response.create.await_count > 0
+        )
 
 
-def _greeting_handler(monkeypatch: Any) -> tuple[HuggingFaceRealtimeHandler, list[_ScriptedConn]]:
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+def _greeting_handler(
+    monkeypatch: Any,
+) -> tuple[HuggingFaceRealtimeHandler, list[_ScriptedConn]]:
+    monkeypatch.setattr(
+        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+    )
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
+    )
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
     monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: GREETING_PROMPT)
     monkeypatch.setattr(hf_mod, "GREETING_HOLD_S", 0.1, raising=False)
@@ -1492,7 +1813,9 @@ def _greeting_handler(monkeypatch: Any) -> tuple[HuggingFaceRealtimeHandler, lis
     return handler, conns
 
 
-async def _connect(handler: HuggingFaceRealtimeHandler, greet: bool | None) -> asyncio.Task[None]:
+async def _connect(
+    handler: HuggingFaceRealtimeHandler, greet: bool | None
+) -> asyncio.Task[None]:
     """One connect; `greet` is what LocalStream.open_session sets (None: a reconnect, no open)."""
     if greet is not None:
         handler.greet_at_open = greet
@@ -1501,7 +1824,9 @@ async def _connect(handler: HuggingFaceRealtimeHandler, greet: bool | None) -> a
     return task
 
 
-async def _disconnect(handler: HuggingFaceRealtimeHandler, task: asyncio.Task[None]) -> None:
+async def _disconnect(
+    handler: HuggingFaceRealtimeHandler, task: asyncio.Task[None]
+) -> None:
     await asyncio.wait_for(handler.shutdown(), timeout=1.0)
     await asyncio.wait_for(task, timeout=1.0)
 
@@ -1564,10 +1889,14 @@ async def test_speech_in_the_pre_roll_gets_no_greeting(monkeypatch: Any) -> None
 
 
 @pytest.mark.asyncio
-async def test_speech_between_the_silence_check_and_the_send_drops_the_greeting(monkeypatch: Any) -> None:
+async def test_speech_between_the_silence_check_and_the_send_drops_the_greeting(
+    monkeypatch: Any,
+) -> None:
     """Re-check at send (re-review 1): the create can wait in the sender's queue."""
     handler, conns = _greeting_handler(monkeypatch)
-    monkeypatch.setattr(hf_mod, "GREETING_SETTLE_WAIT_S", 10.0)  # the test drives the greeting
+    monkeypatch.setattr(
+        hf_mod, "GREETING_SETTLE_WAIT_S", 10.0
+    )  # the test drives the greeting
     task = await _connect(handler, greet=True)
     handler._response_done_event.clear()  # something still in flight: the sender holds the create
     await handler._send_startup_greeting_prompt()  # silence held until now
@@ -1582,7 +1911,9 @@ async def test_speech_between_the_silence_check_and_the_send_drops_the_greeting(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("speech_before_created", [True, False])
-async def test_speech_after_the_send_cancels_the_greeting(monkeypatch: Any, speech_before_created: bool) -> None:
+async def test_speech_after_the_send_cancels_the_greeting(
+    monkeypatch: Any, speech_before_created: bool
+) -> None:
     """Cancel the greeting at once when speech follows its create (re-review 1).
 
     Before or after the server reports it created, as a barge-in does.
@@ -1594,7 +1925,10 @@ async def test_speech_after_the_send_cancels_the_greeting(monkeypatch: Any, spee
     await asyncio.sleep(0.05)
     assert conns[0].greeted()  # sent
     created = _FakeEvent(
-        "response.created", response=SimpleNamespace(id="r1", metadata={"companion": "greeting"}, conversation_id=None)
+        "response.created",
+        response=SimpleNamespace(
+            id="r1", metadata={"companion": "greeting"}, conversation_id=None
+        ),
     )
     speech = _FakeEvent("input_audio_buffer.speech_started")
     for event in (speech, created) if speech_before_created else (created, speech):
@@ -1612,18 +1946,24 @@ async def test_a_greeting_nobody_spoke_over_is_not_cancelled(monkeypatch: Any) -
     task = await _connect(handler, greet=True)
     await handler._send_startup_greeting_prompt()
     await asyncio.sleep(0.05)
-    response = SimpleNamespace(id="r1", metadata={"companion": "greeting"}, conversation_id=None)
+    response = SimpleNamespace(
+        id="r1", metadata={"companion": "greeting"}, conversation_id=None
+    )
     conns[0].push(_FakeEvent("response.created", response=response))
     conns[0].push(_FakeEvent("response.done", response=response))
     await asyncio.sleep(0.05)
-    conns[0].push(_FakeEvent("input_audio_buffer.speech_started"))  # the person, after it played
+    conns[0].push(
+        _FakeEvent("input_audio_buffer.speech_started")
+    )  # the person, after it played
     await asyncio.sleep(0.1)
     conns[0].response.cancel.assert_not_awaited()
     await _disconnect(handler, task)
 
 
 @pytest.mark.asyncio
-async def test_each_asking_open_greets_once_and_a_reconnect_does_not(monkeypatch: Any) -> None:
+async def test_each_asking_open_greets_once_and_a_reconnect_does_not(
+    monkeypatch: Any,
+) -> None:
     """Greet exactly where an open asked for it (the review, M3).
 
     Across open, close and open on one handler, and a reconnect within the conversation.
@@ -1639,7 +1979,9 @@ async def test_each_asking_open_greets_once_and_a_reconnect_does_not(monkeypatch
 # --- the inner monologue: sight notes, written by the companion since 2026-10-17 -----
 
 
-def test_a_frame_is_handed_over_and_nothing_is_asked_of_the_voice_service(monkeypatch: Any) -> None:
+def test_a_frame_is_handed_over_and_nothing_is_asked_of_the_voice_service(
+    monkeypatch: Any,
+) -> None:
     """The cold-open brief: the supervisor writes the note with Claude Haiku."""
     handler = _plain_handler()
     handler.connection = AsyncMock()
@@ -1668,7 +2010,9 @@ def test_a_failing_hand_over_is_logged_not_raised(caplog: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_camera_picture_is_handed_over_and_asks_only_for_the_reply(monkeypatch: Any) -> None:
+async def test_a_camera_picture_is_handed_over_and_asks_only_for_the_reply(
+    monkeypatch: Any,
+) -> None:
     """The camera tool's picture goes into the conversation and to the companion.
 
     The only response.create is the spoken follow-up.
@@ -1676,7 +2020,11 @@ async def test_a_camera_picture_is_handed_over_and_asks_only_for_the_reply(monke
     handler = _plain_handler()
     handler.connection = AsyncMock()
     handler.output_queue = asyncio.Queue()
-    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        handler,
+        "_wait_for_response_done_before_tool_result",
+        AsyncMock(return_value=True),
+    )
     create = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create)
     got: list[tuple[str, str]] = []
@@ -1693,8 +2041,13 @@ async def test_a_camera_picture_is_handed_over_and_asks_only_for_the_reply(monke
         )
     )
 
-    items = [c.kwargs["item"] for c in handler.connection.conversation.item.create.await_args_list]
-    assert items[-1]["content"] == [{"type": "input_image", "image_url": "data:image/jpeg;base64,abc"}]
+    items = [
+        c.kwargs["item"]
+        for c in handler.connection.conversation.item.create.await_args_list
+    ]
+    assert items[-1]["content"] == [
+        {"type": "input_image", "image_url": "data:image/jpeg;base64,abc"}
+    ]
     assert [c.kwargs for c in create.await_args_list] == [{}]
     assert got == [("abc", "camera")]
     assert handler._session_images == 1
@@ -1710,12 +2063,16 @@ async def test_a_text_response_is_never_an_inner_note(monkeypatch: Any) -> None:
         monkeypatch,
         events=(
             _FakeEvent("response.created", response=tagged),
-            _FakeEvent("response.output_text.done", text="I saw a red mug on the table."),
+            _FakeEvent(
+                "response.output_text.done", text="I saw a red mug on the table."
+            ),
             _FakeEvent("response.done", response=tagged),
         ),
     )
     seen: list[tuple[str, str, bool]] = []
-    handler.set_transcript_observer(lambda role, text, final, artifact=None: seen.append((role, text, final)))
+    handler.set_transcript_observer(
+        lambda role, text, final, artifact=None: seen.append((role, text, final))
+    )
     await handler._run_realtime_session()
     assert [s for s in seen if s[0] == "inner"] == []
 
@@ -1755,7 +2112,9 @@ def test_a_first_reply_before_the_glance_is_a_warning(caplog: Any) -> None:
         handler._first_reply_created()
         handler.open_glance_in()
     [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert warning.getMessage().startswith("First reply created 0.0 s before the glance")
+    assert warning.getMessage().startswith(
+        "First reply created 0.0 s before the glance"
+    )
     assert "Glance in" not in caplog.text
 
 
@@ -1768,11 +2127,18 @@ async def test_only_the_first_reply_to_a_person_is_judged_and_each_session_start
 
     spoken = SimpleNamespace(metadata=None, conversation_id="conv_1")
     turn = (
-        _FakeEvent("conversation.item.input_audio_transcription.completed", transcript="hi", item_id="u1"),
+        _FakeEvent(
+            "conversation.item.input_audio_transcription.completed",
+            transcript="hi",
+            item_id="u1",
+        ),
         _FakeEvent("response.created", response=spoken),
         _FakeEvent("response.done", response=spoken),
     )
-    greeting = (_FakeEvent("response.created", response=spoken), _FakeEvent("response.done", response=spoken))
+    greeting = (
+        _FakeEvent("response.created", response=spoken),
+        _FakeEvent("response.done", response=spoken),
+    )
     handler = _session_handler(monkeypatch, events=greeting + turn + turn)
     calls: list[float | None] = []
     real = handler._first_reply_created
@@ -1782,9 +2148,13 @@ async def test_only_the_first_reply_to_a_person_is_judged_and_each_session_start
         real()
 
     monkeypatch.setattr(handler, "_first_reply_created", counted)
-    handler._open_glance_at = handler._first_reply_at = 1.0  # left over from a session before
+    handler._open_glance_at = handler._first_reply_at = (
+        1.0  # left over from a session before
+    )
     await handler._run_realtime_session()
-    assert calls == [None]  # once, for the person's turn, not the greeting; the old glance cleared
+    assert calls == [
+        None
+    ]  # once, for the person's turn, not the greeting; the old glance cleared
 
 
 @pytest.mark.asyncio
@@ -1792,13 +2162,17 @@ async def test_a_turn_left_open_by_the_session_before_does_not_make_the_greeting
     monkeypatch: Any,
 ) -> None:
     """The review (2026-10-17): a transcript with no reply before a close; the next
-    session's greeting would have been judged as its first reply (a false rollback warning)."""
+    session's greeting would have been judged as its first reply (a false rollback warning).
+    """
     from types import SimpleNamespace
 
     spoken = SimpleNamespace(metadata=None, conversation_id="conv_1")
     handler = _session_handler(
         monkeypatch,
-        events=(_FakeEvent("response.created", response=spoken), _FakeEvent("response.done", response=spoken)),
+        events=(
+            _FakeEvent("response.created", response=spoken),
+            _FakeEvent("response.done", response=spoken),
+        ),
     )
     handler._turn_user_done_at = time.perf_counter()
     handler._turn_response_created_at = None
@@ -1807,7 +2181,9 @@ async def test_a_turn_left_open_by_the_session_before_does_not_make_the_greeting
 
 
 @pytest.mark.asyncio
-async def test_a_session_logs_what_it_sent_the_voice_service(monkeypatch: Any, caplog: Any) -> None:
+async def test_a_session_logs_what_it_sent_the_voice_service(
+    monkeypatch: Any, caplog: Any
+) -> None:
     """Images, their bytes and response.create calls per session (the brief's measure)."""
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
@@ -1821,14 +2197,18 @@ async def test_a_session_logs_what_it_sent_the_voice_service(monkeypatch: Any, c
     handler.client = _ordering_client((_traffic,), sent, handler)
     with caplog.at_level(logging.INFO):
         await handler._run_realtime_session()
-    assert "Session to the voice service: 1 images, 3 KB, 1 response.create" in caplog.text
+    assert (
+        "Session to the voice service: 1 images, 3 KB, 1 response.create" in caplog.text
+    )
 
 
 # --- the companion note (task 11, person recognition): who has joined, who left view --
 
 
 @pytest.mark.asyncio
-async def test_a_note_waits_for_quiet_and_asks_for_no_response(monkeypatch: Any) -> None:
+async def test_a_note_waits_for_quiet_and_asks_for_no_response(
+    monkeypatch: Any,
+) -> None:
     """A companion note is a user-role item at the next quiet moment, never a response."""
     handler = _plain_handler()
     handler.connection = AsyncMock()
@@ -1846,7 +2226,10 @@ async def test_a_note_waits_for_quiet_and_asks_for_no_response(monkeypatch: Any)
     item = handler.connection.conversation.item.create.await_args.kwargs["item"]
     assert item["role"] == "user"
     assert item["content"] == [
-        {"type": "input_text", "text": "[Companion note, not spoken: Alli (she/her) has joined.]"}
+        {
+            "type": "input_text",
+            "text": "[Companion note, not spoken: Alli (she/her) has joined.]",
+        }
     ]
     create.assert_not_awaited()
 
@@ -1966,7 +2349,9 @@ async def test_a_notes_text_never_reaches_the_transcript_observer() -> None:
     handler = _plain_handler()
     handler.connection = AsyncMock()
     seen: list[tuple[str, str, bool]] = []
-    handler.set_transcript_observer(lambda role, text, final, artifact=None: seen.append((role, text, final)))
+    handler.set_transcript_observer(
+        lambda role, text, final, artifact=None: seen.append((role, text, final))
+    )
 
     handler.add_note("x")
     await handler._wait_notes()
@@ -1985,11 +2370,16 @@ async def test_a_notes_failed_send_is_dropped_and_logged(caplog: Any) -> None:
         handler.add_note("x")
         await handler._wait_notes()
 
-    assert any("Companion note dropped" in r.getMessage() and "boom" in r.getMessage() for r in caplog.records)
+    assert any(
+        "Companion note dropped" in r.getMessage() and "boom" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio
-async def test_a_note_whose_session_closed_before_quiet_is_dropped_and_logged(monkeypatch: Any, caplog: Any) -> None:
+async def test_a_note_whose_session_closed_before_quiet_is_dropped_and_logged(
+    monkeypatch: Any, caplog: Any
+) -> None:
     """The session ended while the note waited: nothing left to note into."""
     handler = _plain_handler()
     handler.connection = AsyncMock()
@@ -2007,7 +2397,9 @@ async def test_a_note_whose_session_closed_before_quiet_is_dropped_and_logged(mo
 
 
 @pytest.mark.asyncio
-async def test_a_note_dropped_when_the_session_is_replaced_before_quiet(monkeypatch: Any, caplog: Any) -> None:
+async def test_a_note_dropped_when_the_session_is_replaced_before_quiet(
+    monkeypatch: Any, caplog: Any
+) -> None:
     """A note belongs to the session it was asked for (the review, fix round 1).
 
     A reconnect between the ask and the quiet moment is a different session.
@@ -2042,10 +2434,14 @@ async def test_typed_text_is_a_user_turn_answered_and_reported() -> None:
     create = AsyncMock()
     handler._safe_response_create = create
     seen: list[tuple[str, str, bool]] = []
-    handler.set_transcript_observer(lambda role, text, final, artifact=None: seen.append((role, text, final)))
+    handler.set_transcript_observer(
+        lambda role, text, final, artifact=None: seen.append((role, text, final))
+    )
     await handler.type_text("  play it again ")
     item = handler.connection.conversation.item.create.await_args.kwargs["item"]
-    assert item["role"] == "user" and item["content"] == [{"type": "input_text", "text": "play it again"}]
+    assert item["role"] == "user" and item["content"] == [
+        {"type": "input_text", "text": "play it again"}
+    ]
     create.assert_awaited_once()
     assert seen == [("user", "play it again", True)]
 
@@ -2128,7 +2524,9 @@ async def test_a_say_with_no_live_response_cancels_nothing(monkeypatch: Any) -> 
 
 
 @pytest.mark.asyncio
-async def test_a_say_during_a_tools_follow_up_does_not_cancel_it(monkeypatch: Any) -> None:
+async def test_a_say_during_a_tools_follow_up_does_not_cancel_it(
+    monkeypatch: Any,
+) -> None:
     """The follow-up carries the tool's answer: the announcement waits behind it instead."""
     handler = _plain_handler()
     handler.connection = AsyncMock()
@@ -2157,7 +2555,9 @@ def _done(tag: str | None = None) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_a_spoken_promise_with_no_call_is_caught_once(monkeypatch: Any, caplog: Any) -> None:
+async def test_a_spoken_promise_with_no_call_is_caught_once(
+    monkeypatch: Any, caplog: Any
+) -> None:
     """09:50:26: 'Let me check.' and no call; then 'I'm looking it up' and no call again."""
     handler, create = _search_handler(monkeypatch)
     handler._response_started()
@@ -2208,15 +2608,23 @@ async def test_the_apps_own_filler_is_never_guarded(monkeypatch: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_search_call_gets_one_filler_never_over_speech(monkeypatch: Any) -> None:
+async def test_a_search_call_gets_one_filler_never_over_speech(
+    monkeypatch: Any,
+) -> None:
     handler, create = _search_handler(monkeypatch)
-    await handler._tool_started("pollen_robotics_reachy_mini_search_tool__search_web", "c1")
+    await handler._tool_started(
+        "pollen_robotics_reachy_mini_search_tool__search_web", "c1"
+    )
     assert create.await_count == 1
     body = create.await_args.kwargs["response"]
-    assert body["metadata"] == {"companion": "filler"} and body["conversation"] == "none"
+    assert (
+        body["metadata"] == {"companion": "filler"} and body["conversation"] == "none"
+    )
     assert body["output_modalities"] == ["audio"]
     first = handler._last_filler
-    await handler._tool_started("pollen_robotics_reachy_mini_search_tool__search_web", "c2")
+    await handler._tool_started(
+        "pollen_robotics_reachy_mini_search_tool__search_web", "c2"
+    )
     assert create.await_count == 1  # once per turn
     handler._start_user_turn()
     handler._turn_first_audio_at = 1.0  # he already said something this turn
@@ -2225,11 +2633,15 @@ async def test_a_search_call_gets_one_filler_never_over_speech(monkeypatch: Any)
     handler._start_user_turn()
     handler._turn_first_audio_at = None  # the event loop resets it at each user turn
     await handler._tool_started("web_search", "c4")
-    assert create.await_count == 2 and handler._last_filler != first  # not the same twice
+    assert (
+        create.await_count == 2 and handler._last_filler != first
+    )  # not the same twice
 
 
 @pytest.mark.asyncio
-async def test_a_slow_lookup_gets_a_filler_a_quick_one_and_a_song_do_not(monkeypatch: Any) -> None:
+async def test_a_slow_lookup_gets_a_filler_a_quick_one_and_a_song_do_not(
+    monkeypatch: Any,
+) -> None:
     monkeypatch.setattr(hf_mod, "FILLER_AFTER_S", 0.05)
     handler, create = _search_handler(monkeypatch)
     handler._in_flight_tool_calls.add("slow")
@@ -2269,7 +2681,9 @@ def test_every_tool_result_logs_its_latency(caplog: Any) -> None:
     )
     with caplog.at_level(logging.INFO):
         handler._log_tool_latency(done)
-    line = [r.getMessage() for r in caplog.records if "tool latency" in r.getMessage()][0]
+    line = [r.getMessage() for r in caplog.records if "tool latency" in r.getMessage()][
+        0
+    ]
     assert line.startswith("tool latency: web_search 1250 ms") and "completed" in line
 
 
@@ -2303,7 +2717,9 @@ def _reply_events(transcript: str, *, audio_first: bool) -> tuple[Any, ...]:
         *body,
         _FakeEvent("response.output_audio.done"),
         _FakeEvent("response.output_audio_transcript.done", transcript=transcript),
-        _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+        _FakeEvent(
+            "response.done", response=SimpleNamespace(status="completed", output=[])
+        ),
     )
 
 
@@ -2334,7 +2750,10 @@ SPOKEN_ARTIFACT_CASES = [
     ("<|im_end|>", _C),
     # Qwen3, Qwen3.5 / Qwen3-Coder
     ('<tool_call>{"name": "stay_quiet", "arguments": {}}</tool_call>', _C),
-    ("<tool_call><function=stay_quiet><parameter=x>1</parameter></function></tool_call>", _C),
+    (
+        "<tool_call><function=stay_quiet><parameter=x>1</parameter></function></tool_call>",
+        _C,
+    ),
     ("<function=stay_quiet><parameter=x>1</parameter></function>", _C),
     # Gemma 3
     ("[stay_quiet()]", _C),
@@ -2409,7 +2828,9 @@ async def test_a_spoken_artifact_never_reaches_the_player(
     monkeypatch: Any, caplog: Any, transcript: str, kind: str, audio_first: bool
 ) -> None:
     """None of an artifact's audio is queued, nothing is flushed, and the cut is logged."""
-    handler = _session_handler(monkeypatch, _reply_events(transcript, audio_first=audio_first))
+    handler = _session_handler(
+        monkeypatch, _reply_events(transcript, audio_first=audio_first)
+    )
     cleared: list[bool] = []
     handler._clear_queue = lambda: cleared.append(True)
 
@@ -2418,9 +2839,17 @@ async def test_a_spoken_artifact_never_reaches_the_player(
 
     assert _frames(handler) == []
     assert cleared == []  # nothing of it was released, so nothing else is flushed
-    cuts = [r.getMessage() for r in caplog.records if "spoken artifact cut" in r.getMessage()]
+    cuts = [
+        r.getMessage()
+        for r in caplog.records
+        if "spoken artifact cut" in r.getMessage()
+    ]
     assert cuts == [f"spoken artifact cut ({kind}): {transcript!r}"]
-    assert all(r.levelno == logging.WARNING for r in caplog.records if "spoken artifact cut" in r.getMessage())
+    assert all(
+        r.levelno == logging.WARNING
+        for r in caplog.records
+        if "spoken artifact cut" in r.getMessage()
+    )
 
 
 @pytest.mark.asyncio
@@ -2447,7 +2876,9 @@ async def test_a_tag_call_split_across_deltas_is_cut(monkeypatch: Any) -> None:
 @pytest.mark.asyncio
 async def test_a_leaked_tool_call_is_not_executed(monkeypatch: Any) -> None:
     """Spoken "call:stay_quiet{}" starts no tool."""
-    handler = _session_handler(monkeypatch, _reply_events("call:stay_quiet{}", audio_first=False))
+    handler = _session_handler(
+        monkeypatch, _reply_events("call:stay_quiet{}", audio_first=False)
+    )
     start_tool = AsyncMock()
     monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
 
@@ -2468,7 +2899,9 @@ class _FakeTool:
         return {"status": "quiet"}
 
 
-def _leak_session(monkeypatch: Any, events: tuple[Any, ...]) -> tuple[HuggingFaceRealtimeHandler, dict[str, _FakeTool]]:
+def _leak_session(
+    monkeypatch: Any, events: tuple[Any, ...]
+) -> tuple[HuggingFaceRealtimeHandler, dict[str, _FakeTool]]:
     """A session whose live registry is stay_quiet (leak_safe), web_search, dance and recall."""
     handler = _session_handler(monkeypatch, events)
     tools = {
@@ -2477,7 +2910,10 @@ def _leak_session(monkeypatch: Any, events: tuple[Any, ...]) -> tuple[HuggingFac
         "dance": _FakeTool(False),
         "recall": _FakeTool(False),  # the companion's recall is not leak_safe
     }
-    specs = [{"type": "function", "name": name, "description": "", "parameters": {}} for name in tools]
+    specs = [
+        {"type": "function", "name": name, "description": "", "parameters": {}}
+        for name in tools
+    ]
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: specs)
     monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: dict(tools))
     handler._clear_queue = lambda: None
@@ -2498,7 +2934,9 @@ async def test_a_bare_leak_safe_name_is_cut_run_reported_and_marked(
     """20:44:56, 2026-10-17: "stay_quiet" was heard. Now none of it plays; the tool runs
     locally (never start_tool, which owes the server an output); the report says
     "leaked"; and the supervisor is told not to keep it."""
-    handler, tools = _leak_session(monkeypatch, _reply_events("stay_quiet", audio_first=audio_first))
+    handler, tools = _leak_session(
+        monkeypatch, _reply_events("stay_quiet", audio_first=audio_first)
+    )
     reports = _capture_tool_reports(handler)
     seen: list[tuple[Any, ...]] = []
     handler.set_transcript_observer(lambda *args: seen.append(args))
@@ -2509,29 +2947,45 @@ async def test_a_bare_leak_safe_name_is_cut_run_reported_and_marked(
         await _run_with_leaks(handler)
 
     assert _frames(handler) == []
-    assert "leaked tool call: stay_quiet (underscore name) cut; executed=True" in caplog.messages
+    assert (
+        "leaked tool call: stay_quiet (underscore name) cut; executed=True"
+        in caplog.messages
+    )
     assert tools["stay_quiet"].runs == 1
     start_tool.assert_not_awaited()
-    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("stay_quiet", "ok", "leaked")]
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [
+        ("stay_quiet", "ok", "leaked")
+    ]
     assert seen == [("assistant", "stay_quiet", True, "leaked tool call")]
 
 
 @pytest.mark.asyncio
-async def test_a_leaked_tool_that_is_not_leak_safe_is_cut_and_never_run(monkeypatch: Any, caplog: Any) -> None:
-    handler, tools = _leak_session(monkeypatch, _reply_events("Web search.", audio_first=True))
+async def test_a_leaked_tool_that_is_not_leak_safe_is_cut_and_never_run(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    handler, tools = _leak_session(
+        monkeypatch, _reply_events("Web search.", audio_first=True)
+    )
     reports = _capture_tool_reports(handler)
 
     with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
         await _run_with_leaks(handler)
 
     assert _frames(handler) == []
-    assert "leaked tool call: web_search (spoken name) cut; executed=False" in caplog.messages
+    assert (
+        "leaked tool call: web_search (spoken name) cut; executed=False"
+        in caplog.messages
+    )
     assert tools["web_search"].runs == 0
-    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("web_search", "cut", "leaked")]
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [
+        ("web_search", "cut", "leaked")
+    ]
 
 
 @pytest.mark.asyncio
-async def test_a_bare_one_word_call_streamed_in_pieces_is_never_heard(monkeypatch: Any) -> None:
+async def test_a_bare_one_word_call_streamed_in_pieces_is_never_heard(
+    monkeypatch: Any,
+) -> None:
     """2026-10-20 22:59: "express{...}" was heard: "dance" went out before its "{"."""
     said = "dance{x:1}"
     events = (
@@ -2543,7 +2997,9 @@ async def test_a_bare_one_word_call_streamed_in_pieces_is_never_heard(monkeypatc
         _said("{x:1}"),
         _FakeEvent("response.output_audio.done"),
         _FakeEvent("response.output_audio_transcript.done", transcript=said),
-        _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+        _FakeEvent(
+            "response.done", response=SimpleNamespace(status="completed", output=[])
+        ),
     )
     handler, tools = _leak_session(monkeypatch, events)
     reports = _capture_tool_reports(handler)
@@ -2551,10 +3007,14 @@ async def test_a_bare_one_word_call_streamed_in_pieces_is_never_heard(monkeypatc
     await _run_with_leaks(handler)
 
     assert _frames(handler) == []
-    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("dance", "cut", "leaked")]
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [
+        ("dance", "cut", "leaked")
+    ]
 
 
-def test_a_call_heard_before_the_gate_could_judge_it_is_reported_as_played(monkeypatch: Any, caplog: Any) -> None:
+def test_a_call_heard_before_the_gate_could_judge_it_is_reported_as_played(
+    monkeypatch: Any, caplog: Any
+) -> None:
     """The gate's own count missed the 22:59 leaks: judged only after the audio went out."""
     handler, _tools = _leak_session(monkeypatch, ())
     reports = _capture_tool_reports(handler)
@@ -2565,13 +3025,19 @@ def test_a_call_heard_before_the_gate_could_judge_it_is_reported_as_played(monke
         handler._gate_transcript("dance{x:1}", final=True)
 
     assert "possible leaked tool call: dance (markup) played" in caplog.messages
-    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("dance", "played", "leaked")]
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [
+        ("dance", "played", "leaked")
+    ]
     assert handler._gate == "pass"
 
 
 @pytest.mark.asyncio
-async def test_a_single_plain_word_name_plays_whole_and_is_logged(monkeypatch: Any, caplog: Any) -> None:
-    handler, tools = _leak_session(monkeypatch, _reply_events("Dance!", audio_first=False))
+async def test_a_single_plain_word_name_plays_whole_and_is_logged(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    handler, tools = _leak_session(
+        monkeypatch, _reply_events("Dance!", audio_first=False)
+    )
     reports = _capture_tool_reports(handler)
     seen: list[tuple[Any, ...]] = []
     handler.set_transcript_observer(lambda *args: seen.append(args))
@@ -2579,15 +3045,22 @@ async def test_a_single_plain_word_name_plays_whole_and_is_logged(monkeypatch: A
     with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
         await _run_with_leaks(handler)
 
-    assert [list(array.reshape(-1)) for _rate, array in _frames(handler)] == [[1, 2], [3, 4]]
+    assert [list(array.reshape(-1)) for _rate, array in _frames(handler)] == [
+        [1, 2],
+        [3, 4],
+    ]
     assert "possible leaked tool call: dance (plain word) played" in caplog.messages
     assert tools["dance"].runs == 0
-    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("dance", "played", "leaked")]
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [
+        ("dance", "played", "leaked")
+    ]
     assert seen == [("assistant", "Dance!", True, None)]
 
 
 @pytest.mark.asyncio
-async def test_a_spoken_name_split_across_deltas_waits_for_the_whole_reply(monkeypatch: Any) -> None:
+async def test_a_spoken_name_split_across_deltas_waits_for_the_whole_reply(
+    monkeypatch: Any,
+) -> None:
     handler, tools = _leak_session(
         monkeypatch,
         (
@@ -2596,8 +3069,12 @@ async def test_a_spoken_name_split_across_deltas_waits_for_the_whole_reply(monke
             _audio(1, 2),
             _said(" quiet."),
             _audio(3, 4),
-            _FakeEvent("response.output_audio_transcript.done", transcript="Stay quiet."),
-            _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+            _FakeEvent(
+                "response.output_audio_transcript.done", transcript="Stay quiet."
+            ),
+            _FakeEvent(
+                "response.done", response=SimpleNamespace(status="completed", output=[])
+            ),
         ),
     )
 
@@ -2608,7 +3085,9 @@ async def test_a_spoken_name_split_across_deltas_waits_for_the_whole_reply(monke
 
 
 @pytest.mark.asyncio
-async def test_a_reply_with_no_transcript_done_is_logged_and_still_falls_back(monkeypatch: Any, caplog: Any) -> None:
+async def test_a_reply_with_no_transcript_done_is_logged_and_still_falls_back(
+    monkeypatch: Any, caplog: Any
+) -> None:
     """Measuring (c): the response.done fallback logs once, and plays as it always did."""
     handler, _tools = _leak_session(
         monkeypatch,
@@ -2616,7 +3095,9 @@ async def test_a_reply_with_no_transcript_done_is_logged_and_still_falls_back(mo
             _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
             _said("Hello there."),
             _audio(1, 2),
-            _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+            _FakeEvent(
+                "response.done", response=SimpleNamespace(status="completed", output=[])
+            ),
         ),
     )
 
@@ -2624,13 +3105,23 @@ async def test_a_reply_with_no_transcript_done_is_logged_and_still_falls_back(mo
         await _run_with_leaks(handler)
 
     assert [list(array.reshape(-1)) for _rate, array in _frames(handler)] == [[1, 2]]
-    fallbacks = [m for m in caplog.messages if m.startswith("output gate: reply judged at response.done")]
-    assert fallbacks == ["output gate: reply judged at response.done with no transcript.done (12 chars, audio=True, gate=pass)"]
+    fallbacks = [
+        m
+        for m in caplog.messages
+        if m.startswith("output gate: reply judged at response.done")
+    ]
+    assert fallbacks == [
+        "output gate: reply judged at response.done with no transcript.done (12 chars, audio=True, gate=pass)"
+    ]
 
 
 @pytest.mark.asyncio
-async def test_a_reply_with_its_transcript_done_logs_no_fallback(monkeypatch: Any, caplog: Any) -> None:
-    handler, _tools = _leak_session(monkeypatch, _reply_events("Hello there.", audio_first=True))
+async def test_a_reply_with_its_transcript_done_logs_no_fallback(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    handler, _tools = _leak_session(
+        monkeypatch, _reply_events("Hello there.", audio_first=True)
+    )
 
     with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
         await _run_with_leaks(handler)
@@ -2648,21 +3139,32 @@ async def test_a_sentence_that_starts_like_a_name_plays_whole(monkeypatch: Any) 
             _audio(1, 2),
             _said(" warm tonight."),
             _audio(3, 4),
-            _FakeEvent("response.output_audio_transcript.done", transcript="Stay warm tonight."),
-            _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+            _FakeEvent(
+                "response.output_audio_transcript.done", transcript="Stay warm tonight."
+            ),
+            _FakeEvent(
+                "response.done", response=SimpleNamespace(status="completed", output=[])
+            ),
         ),
     )
 
     await _run_with_leaks(handler)
 
-    assert [list(array.reshape(-1)) for _rate, array in _frames(handler)] == [[1, 2], [3, 4]]
+    assert [list(array.reshape(-1)) for _rate, array in _frames(handler)] == [
+        [1, 2],
+        [3, 4],
+    ]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("audio_first", [False, True])
-async def test_a_normal_reply_plays_in_full(monkeypatch: Any, caplog: Any, audio_first: bool) -> None:
+async def test_a_normal_reply_plays_in_full(
+    monkeypatch: Any, caplog: Any, audio_first: bool
+) -> None:
     """A reply with a bracket later on is not an artifact: every frame reaches the player, in order."""
-    handler = _session_handler(monkeypatch, _reply_events("Sure, (I think) yes.", audio_first=audio_first))
+    handler = _session_handler(
+        monkeypatch, _reply_events("Sure, (I think) yes.", audio_first=audio_first)
+    )
 
     with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
         await handler._run_realtime_session()
@@ -2673,7 +3175,9 @@ async def test_a_normal_reply_plays_in_full(monkeypatch: Any, caplog: Any, audio
 
 
 @pytest.mark.asyncio
-async def test_audio_before_the_transcript_is_held_then_released(monkeypatch: Any) -> None:
+async def test_audio_before_the_transcript_is_held_then_released(
+    monkeypatch: Any,
+) -> None:
     """Audio ahead of the first transcript delta waits; the delta that decides releases it."""
     sizes: list[int] = []
     handler: HuggingFaceRealtimeHandler
@@ -2694,7 +3198,9 @@ async def test_audio_before_the_transcript_is_held_then_released(monkeypatch: An
 
 
 @pytest.mark.asyncio
-async def test_the_timeout_releases_audio_when_no_transcript_arrives(monkeypatch: Any) -> None:
+async def test_the_timeout_releases_audio_when_no_transcript_arrives(
+    monkeypatch: Any,
+) -> None:
     """With no transcript delta, held audio goes to the player after the hold timeout."""
     monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
     sizes: list[int] = []
@@ -2716,7 +3222,9 @@ async def test_the_timeout_releases_audio_when_no_transcript_arrives(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_an_artifact_found_after_release_flushes_the_player(monkeypatch: Any, caplog: Any) -> None:
+async def test_an_artifact_found_after_release_flushes_the_player(
+    monkeypatch: Any, caplog: Any
+) -> None:
     """Audio released by the timeout, then a stage direction: the player is flushed, later audio dropped."""
     monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
     handler = _session_handler(
@@ -2736,7 +3244,9 @@ async def test_an_artifact_found_after_release_flushes_the_player(monkeypatch: A
         await handler._run_realtime_session()
 
     assert cleared == [True]
-    assert [list(a.reshape(-1)) for _r, a in _frames(handler)] == [[1, 2]]  # the fake flush drained nothing
+    assert [list(a.reshape(-1)) for _r, a in _frames(handler)] == [
+        [1, 2]
+    ]  # the fake flush drained nothing
     assert "spoken artifact cut (stage direction): '(stops talking)'" in caplog.text
 
 
@@ -2749,7 +3259,9 @@ async def test_the_done_transcript_decides_when_no_delta_came(monkeypatch: Any) 
             _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
             _audio(1, 2),
             _FakeEvent("response.output_audio.done"),
-            _FakeEvent("response.output_audio_transcript.done", transcript="(stays silent)"),
+            _FakeEvent(
+                "response.output_audio_transcript.done", transcript="(stays silent)"
+            ),
         ),
     )
 
@@ -2819,7 +3331,9 @@ async def test_a_cut_reply_is_never_counted_unheard(monkeypatch: Any) -> None:
 # --- function call outputs before response.create (2026-10-16) ---------------------
 
 
-def _ordering_client(events: tuple[Any, ...], sent: list[tuple[str, Any]], handler: Any) -> Any:
+def _ordering_client(
+    events: tuple[Any, ...], sent: list[tuple[str, Any]], handler: Any
+) -> Any:
     """Build a fake realtime client that records items and response.create calls in order."""
 
     async def _item_create(**kw: Any) -> None:
@@ -2876,10 +3390,16 @@ async def test_no_response_create_while_a_function_call_output_is_owed(
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
     monkeypatch.setattr(
-        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="dance-1"))
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="dance-1")),
     )
     done = ToolNotification(
-        id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": True}
+        id="c1",
+        tool_name="dance",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"ok": True},
     )
 
     async def _say() -> None:
@@ -2892,7 +3412,12 @@ async def test_no_response_create_while_a_function_call_output_is_owed(
 
     handler.client = _ordering_client(
         (
-            _FakeEvent("response.function_call_arguments.done", name="dance", arguments="{}", call_id="c1"),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="dance",
+                arguments="{}",
+                call_id="c1",
+            ),
             _say,
             _finish_tool,
         ),
@@ -2904,7 +3429,11 @@ async def test_no_response_create_while_a_function_call_output_is_owed(
         await handler._run_realtime_session()
 
     kinds = [
-        "output" if kind == "item" and payload.get("type") == "function_call_output" else kind
+        (
+            "output"
+            if kind == "item" and payload.get("type") == "function_call_output"
+            else kind
+        )
         for kind, payload in sent
     ]
     assert "response.create" in kinds
@@ -2913,23 +3442,34 @@ async def test_no_response_create_while_a_function_call_output_is_owed(
 
 
 @pytest.mark.asyncio
-async def test_an_out_of_band_create_is_not_held_for_an_owed_output(monkeypatch: Any) -> None:
+async def test_an_out_of_band_create_is_not_held_for_an_owed_output(
+    monkeypatch: Any,
+) -> None:
     """A filler is outside the conversation; the server never checks it."""
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
     monkeypatch.setattr(
-        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="dance-1"))
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="dance-1")),
     )
 
     async def _filler() -> None:
         await handler._safe_response_create(
-            response=hf_mod._out_of_band_request(hf_mod.FILLER_TAG, ["audio"], "Say: One moment.", [])
+            response=hf_mod._out_of_band_request(
+                hf_mod.FILLER_TAG, ["audio"], "Say: One moment.", []
+            )
         )
         await asyncio.sleep(0.05)
 
     handler.client = _ordering_client(
         (
-            _FakeEvent("response.function_call_arguments.done", name="dance", arguments="{}", call_id="c1"),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="dance",
+                arguments="{}",
+                call_id="c1",
+            ),
             _filler,
         ),
         sent,
@@ -2946,7 +3486,9 @@ async def _line_during_a_search(monkeypatch: Any, speak: str) -> list[tuple[str,
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
     monkeypatch.setattr(
-        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="search-1"))
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="search-1")),
     )
     done = ToolNotification(
         id="c1",
@@ -2966,7 +3508,12 @@ async def _line_during_a_search(monkeypatch: Any, speak: str) -> list[tuple[str,
 
     handler.client = _ordering_client(
         (
-            _FakeEvent("response.function_call_arguments.done", name="test__web_search", arguments="{}", call_id="c1"),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="test__web_search",
+                arguments="{}",
+                call_id="c1",
+            ),
             _line,
             _finish_tool,
         ),
@@ -2997,7 +3544,9 @@ def _kinds(sent: list[tuple[str, Any]]) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_an_announcement_during_a_search_is_its_own_reply_after_the_answer(monkeypatch: Any) -> None:
+async def test_an_announcement_during_a_search_is_its_own_reply_after_the_answer(
+    monkeypatch: Any,
+) -> None:
     """2026-10-16, 15:18: a timer's say() during a web_search; the follow-up voiced only the timer.
 
     The follow-up's create goes before the announcement's user item exists; then the
@@ -3009,7 +3558,9 @@ async def test_an_announcement_during_a_search_is_its_own_reply_after_the_answer
 
 
 @pytest.mark.asyncio
-async def test_a_typed_line_during_a_search_merges_with_the_answer(monkeypatch: Any) -> None:
+async def test_a_typed_line_during_a_search_merges_with_the_answer(
+    monkeypatch: Any,
+) -> None:
     """A typed question and the search's result are answered together: one reply."""
     kinds = _kinds(await _line_during_a_search(monkeypatch, "type_text"))
 
@@ -3034,7 +3585,9 @@ async def test_a_say_with_no_tool_running_is_one_reply(monkeypatch: Any) -> None
 
 
 @pytest.mark.asyncio
-async def test_a_held_create_is_released_after_the_timeout(monkeypatch: Any, caplog: pytest.LogCaptureFixture) -> None:
+async def test_a_held_create_is_released_after_the_timeout(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
     """An output that never comes holds a create only up to the timeout."""
     monkeypatch.setattr(hf_mod, "_OWED_OUTPUT_TIMEOUT", 0)
     handler = _plain_handler()
@@ -3052,10 +3605,18 @@ async def test_a_dropped_tool_result_settles_its_owed_output(monkeypatch: Any) -
     """No response.done in time: the output is dropped, and creates are no longer held for it."""
     handler = _plain_handler()
     handler.connection = _FakeConnection()
-    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        handler,
+        "_wait_for_response_done_before_tool_result",
+        AsyncMock(return_value=False),
+    )
     handler._owe_output("c1")
     note = ToolNotification(
-        id="c1", tool_name="dance", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": 1}
+        id="c1",
+        tool_name="dance",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"ok": 1},
     )
 
     await handler._handle_tool_result(note)
@@ -3069,7 +3630,9 @@ async def test_a_dropped_tool_result_settles_its_owed_output(monkeypatch: Any) -
 async def test_owed_outputs_reset_on_reconnect(monkeypatch: Any) -> None:
     """A call owed by the last session holds nothing in the next one."""
     seen: list[set[str]] = []
-    handler = _session_handler(monkeypatch, (lambda: seen.append(set(handler._owed_outputs)),))
+    handler = _session_handler(
+        monkeypatch, (lambda: seen.append(set(handler._owed_outputs)),)
+    )
     handler._owe_output("stale")
 
     await handler._run_realtime_session()
@@ -3079,7 +3642,9 @@ async def test_owed_outputs_reset_on_reconnect(monkeypatch: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_played_reply_reaches_the_supervisor_without_its_call_markup(monkeypatch: Any) -> None:
+async def test_a_played_reply_reaches_the_supervisor_without_its_call_markup(
+    monkeypatch: Any,
+) -> None:
     """2026-10-20: "<call:express{...}/>I'm sorry I'm being glitchy." plays whole, but the
     markup kept in his word-for-word memory taught him to leak more."""
     q = '<|"|>'
@@ -3087,7 +3652,9 @@ async def test_a_played_reply_reaches_the_supervisor_without_its_call_markup(mon
     handler = _session_handler(monkeypatch, _reply_events(text, audio_first=False))
     handler._clear_queue = lambda: None
     seen: list = []
-    handler.set_transcript_observer(lambda role, said, final, artifact=None: seen.append((role, said, artifact)))
+    handler.set_transcript_observer(
+        lambda role, said, final, artifact=None: seen.append((role, said, artifact))
+    )
 
     await handler._run_realtime_session()
 
@@ -3099,7 +3666,10 @@ async def test_a_played_reply_reaches_the_supervisor_without_its_call_markup(mon
 
 
 def test_the_session_size_line_counts_instructions_and_tools() -> None:
-    session = {"instructions": "x" * 400, "tools": [{"type": "function", "name": "look"}]}
+    session = {
+        "instructions": "x" * 400,
+        "tools": [{"type": "function", "name": "look"}],
+    }
     tools_chars = len(json.dumps(session["tools"]))
     assert hf_mod.session_size(session) == (
         f"instructions 400 chars, 1 tools {tools_chars} chars, ~{(400 + tools_chars) // 4} tokens"
@@ -3110,7 +3680,9 @@ def test_the_usage_line_reads_the_servers_counts() -> None:
     usage = SimpleNamespace(
         input_tokens=9100,
         output_tokens=40,
-        input_token_details=SimpleNamespace(text_tokens=8000, audio_tokens=300, image_tokens=800, cached_tokens=7000),
+        input_token_details=SimpleNamespace(
+            text_tokens=8000, audio_tokens=300, image_tokens=800, cached_tokens=7000
+        ),
     )
     assert hf_mod.usage_line(usage, images=2, image_bytes=150_000) == (
         "Context: 9100 input tokens (text 8000, audio 300, image 800, cached 7000), 40 output; "
@@ -3120,8 +3692,12 @@ def test_the_usage_line_reads_the_servers_counts() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_reply_logs_the_context_or_says_once_that_none_came(monkeypatch: Any, caplog: Any) -> None:
-    handler = _session_handler(monkeypatch, _reply_events("Hello there.", audio_first=False))
+async def test_a_reply_logs_the_context_or_says_once_that_none_came(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    handler = _session_handler(
+        monkeypatch, _reply_events("Hello there.", audio_first=False)
+    )
     handler._clear_queue = lambda: None
     with caplog.at_level(logging.INFO, logger=hf_mod.logger.name):
         await handler._run_realtime_session()
@@ -3131,7 +3707,9 @@ async def test_a_reply_logs_the_context_or_says_once_that_none_came(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_an_open_call_with_no_transcript_done_is_judged_whole_and_cut(monkeypatch: Any) -> None:
+async def test_an_open_call_with_no_transcript_done_is_judged_whole_and_cut(
+    monkeypatch: Any,
+) -> None:
     """The review: response.done with no transcript.done judged the reply as unfinished."""
     q = '<|"|>'
     handler = _session_handler(
@@ -3140,7 +3718,9 @@ async def test_an_open_call_with_no_transcript_done_is_judged_whole_and_cut(monk
             _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
             _said(f"<call:idle_do_nothing{{reason:{q}ok{q}}}"),
             _audio(1, 2),
-            _FakeEvent("response.done", response=SimpleNamespace(metadata=None, usage=None)),
+            _FakeEvent(
+                "response.done", response=SimpleNamespace(metadata=None, usage=None)
+            ),
         ),
     )
     handler._clear_queue = lambda: None
@@ -3149,22 +3729,32 @@ async def test_an_open_call_with_no_transcript_done_is_judged_whole_and_cut(monk
 
 
 @pytest.mark.asyncio
-async def test_a_played_reply_of_only_markup_reaches_the_supervisor_marked(monkeypatch: Any) -> None:
+async def test_a_played_reply_of_only_markup_reaches_the_supervisor_marked(
+    monkeypatch: Any,
+) -> None:
     """The review: cleaned to nothing, it vanished; now the supervisor logs it, never keeps it."""
-    handler = _session_handler(monkeypatch, _reply_events("Hello there.", audio_first=False))
+    handler = _session_handler(
+        monkeypatch, _reply_events("Hello there.", audio_first=False)
+    )
     handler._clear_queue = lambda: None
     monkeypatch.setattr(hf_mod, "without_calls", lambda text, tools=None: "")
     seen: list = []
-    handler.set_transcript_observer(lambda role, said, final, artifact=None: seen.append((role, said, artifact)))
+    handler.set_transcript_observer(
+        lambda role, said, final, artifact=None: seen.append((role, said, artifact))
+    )
     await handler._run_realtime_session()
     assert seen == [("assistant", "Hello there.", "leaked tool call")]
 
 
 @pytest.mark.asyncio
-async def test_emit_never_runs_idle_behavior_when_switched_off(monkeypatch: Any) -> None:
+async def test_emit_never_runs_idle_behavior_when_switched_off(
+    monkeypatch: Any,
+) -> None:
     """REACHY_MINI_IDLE_BEHAVIOR=off: the companion's supervisor owns idle (2026-10-21)."""
     handler = _plain_handler()
-    handler.last_activity_time = time.monotonic() - (handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0)
+    handler.last_activity_time = time.monotonic() - (
+        handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0
+    )
     handler.last_idle_behavior_time = handler.last_activity_time
     handler.deps.movement_manager.is_idle.return_value = True
     handler._response_done_event.set()
@@ -3180,7 +3770,9 @@ async def test_emit_never_runs_idle_behavior_when_switched_off(monkeypatch: Any)
 
 def test_a_retired_leak_safe_name_stays_known_to_the_gate() -> None:
     """idle_do_nothing left the tool list on 2026-10-21; a leaked one is still cut as a safe name."""
-    names = hf_mod.gate_tool_names([{"name": "stay_quiet"}], {"stay_quiet": SimpleNamespace(leak_safe=True)})
+    names = hf_mod.gate_tool_names(
+        [{"name": "stay_quiet"}], {"stay_quiet": SimpleNamespace(leak_safe=True)}
+    )
     assert names.find("idle_do_nothing") is not None
     assert names.find("stay_quiet") is not None
 
@@ -3192,7 +3784,9 @@ def test_a_loaded_tool_keeps_its_own_entry_over_a_retired_one() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_leaked_retired_name_is_cut_and_never_run_or_reported(monkeypatch: Any) -> None:
+async def test_a_leaked_retired_name_is_cut_and_never_run_or_reported(
+    monkeypatch: Any,
+) -> None:
     """The review of 2026-10-21: run against a missing tool, it was reported as a failed call."""
     handler = _plain_handler()
     reports: list[dict[str, Any]] = []
@@ -3219,12 +3813,18 @@ async def test_a_reply_the_server_refused_for_an_owed_output_is_sent_once_it_is_
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
     monkeypatch.setattr(
-        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="express-1"))
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="express-1")),
     )
     quiet_tool = SimpleNamespace(needs_response=False, leak_safe=False)
     monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"express": quiet_tool})
     done = ToolNotification(
-        id="c1", tool_name="express", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": True}
+        id="c1",
+        tool_name="express",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"ok": True},
     )
 
     async def _finish_tool() -> None:
@@ -3233,8 +3833,18 @@ async def test_a_reply_the_server_refused_for_an_owed_output_is_sent_once_it_is_
 
     handler.client = _ordering_client(
         (
-            _FakeEvent("response.function_call_arguments.done", name="express", arguments="{}", call_id="c1"),
-            _FakeEvent("error", error=SimpleNamespace(message=_PENDING, type="response_failed", code=None)),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="express",
+                arguments="{}",
+                call_id="c1",
+            ),
+            _FakeEvent(
+                "error",
+                error=SimpleNamespace(
+                    message=_PENDING, type="response_failed", code=None
+                ),
+            ),
             _finish_tool,
         ),
         sent,
@@ -3245,26 +3855,41 @@ async def test_a_reply_the_server_refused_for_an_owed_output_is_sent_once_it_is_
         await handler._run_realtime_session()
 
     kinds = [
-        "output" if kind == "item" and payload.get("type") == "function_call_output" else kind
+        (
+            "output"
+            if kind == "item" and payload.get("type") == "function_call_output"
+            else kind
+        )
         for kind, payload in sent
     ]
     assert kinds.count("response.create") == 1
     assert kinds.index("output") < kinds.index("response.create")
-    assert "a reply the server refused while tool outputs were owed: sending it once they are in" in caplog.text
+    assert (
+        "a reply the server refused while tool outputs were owed: sending it once they are in"
+        in caplog.text
+    )
 
 
 @pytest.mark.asyncio
-async def test_a_tool_with_no_output_owed_and_no_refusal_sends_no_extra_reply(monkeypatch: Any) -> None:
+async def test_a_tool_with_no_output_owed_and_no_refusal_sends_no_extra_reply(
+    monkeypatch: Any,
+) -> None:
     """A quiet tool's output alone never makes a reply: the recovery answers only a refusal."""
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
     monkeypatch.setattr(
-        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="express-1"))
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="express-1")),
     )
     quiet_tool = SimpleNamespace(needs_response=False, leak_safe=False)
     monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"express": quiet_tool})
     done = ToolNotification(
-        id="c1", tool_name="express", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": True}
+        id="c1",
+        tool_name="express",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"ok": True},
     )
 
     async def _finish_tool() -> None:
@@ -3273,7 +3898,12 @@ async def test_a_tool_with_no_output_owed_and_no_refusal_sends_no_extra_reply(mo
 
     handler.client = _ordering_client(
         (
-            _FakeEvent("response.function_call_arguments.done", name="express", arguments="{}", call_id="c1"),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="express",
+                arguments="{}",
+                call_id="c1",
+            ),
             _finish_tool,
         ),
         sent,
@@ -3283,8 +3913,9 @@ async def test_a_tool_with_no_output_owed_and_no_refusal_sends_no_extra_reply(mo
     assert [kind for kind, _ in sent].count("response.create") == 0
 
 
-
-def _recovery_spy(monkeypatch: Any) -> tuple[HuggingFaceRealtimeHandler, list[dict[str, Any]]]:
+def _recovery_spy(
+    monkeypatch: Any,
+) -> tuple[HuggingFaceRealtimeHandler, list[dict[str, Any]]]:
     handler = _plain_handler()
     creates: list[dict[str, Any]] = []
 
@@ -3309,7 +3940,9 @@ async def test_a_refusal_with_no_output_owed_is_never_retried(monkeypatch: Any) 
 
 
 @pytest.mark.asyncio
-async def test_at_most_one_refused_reply_is_recovered_per_user_turn(monkeypatch: Any) -> None:
+async def test_at_most_one_refused_reply_is_recovered_per_user_turn(
+    monkeypatch: Any,
+) -> None:
     """A tool longer than the 30 s hold: each held create was refused and queued again."""
     handler, creates = _recovery_spy(monkeypatch)
     handler._owe_output("c1")
@@ -3322,7 +3955,21 @@ async def test_at_most_one_refused_reply_is_recovered_per_user_turn(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_a_tool_called_inside_an_announcement_gets_its_follow_up(monkeypatch: Any) -> None:
+async def test_a_sent_follow_up_that_is_refused_is_sent_again_once_the_output_is_in(
+    monkeypatch: Any,
+) -> None:
+    """The review (11-03): a follow-up held past 30 s, sent and refused, is not 'on its way'."""
+    handler, creates = _recovery_spy(monkeypatch)
+    handler._owe_output("c1")
+    handler._followup_pending = True  # its create already left the queue
+    assert await handler._recover_refused_reply() is True
+    assert len(creates) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_tool_called_inside_an_announcement_gets_its_follow_up(
+    monkeypatch: Any,
+) -> None:
     """A greeting's say() that makes the model call a tool still gets the tool's follow-up.
 
     2026-10-21 16:51: the weather tool completed and its output was sent, but no follow-up
@@ -3331,7 +3978,9 @@ async def test_a_tool_called_inside_an_announcement_gets_its_follow_up(monkeypat
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
     monkeypatch.setattr(
-        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="w-1"))
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="w-1")),
     )
     done = ToolNotification(
         id="c1",
@@ -3354,7 +4003,10 @@ async def test_a_tool_called_inside_an_announcement_gets_its_follow_up(monkeypat
             _say,
             _FakeEvent("response.created"),
             _FakeEvent(
-                "response.function_call_arguments.done", name="test__get_weather", arguments="{}", call_id="c1"
+                "response.function_call_arguments.done",
+                name="test__get_weather",
+                arguments="{}",
+                call_id="c1",
             ),
             _FakeEvent("response.done"),
             _finish_tool,
@@ -3374,7 +4026,9 @@ async def test_a_tool_called_inside_an_announcement_gets_its_follow_up(monkeypat
 # spoke and only gestured gets no follow-up. Lookups, camera, errors and mixed batches do.
 
 
-def _done_tool(call_id: str, name: str, response_id: str, error: str | None = None) -> ToolNotification:
+def _done_tool(
+    call_id: str, name: str, response_id: str, error: str | None = None
+) -> ToolNotification:
     return ToolNotification(
         id=call_id,
         tool_name=name,
@@ -3386,11 +4040,21 @@ def _done_tool(call_id: str, name: str, response_id: str, error: str | None = No
     )
 
 
-def _response(response_id: str, spoken: str = "", calls: tuple[tuple[str, str], ...] = ()) -> tuple[Any, ...]:
+def _response(
+    response_id: str, spoken: str = "", calls: tuple[tuple[str, str], ...] = ()
+) -> tuple[Any, ...]:
     """One response's events: created, `spoken` as transcript deltas, each (call_id, name), done."""
-    events: list[Any] = [_FakeEvent("response.created", response=SimpleNamespace(id=response_id))]
+    events: list[Any] = [
+        _FakeEvent("response.created", response=SimpleNamespace(id=response_id))
+    ]
     if spoken:
-        events.append(_FakeEvent("response.output_audio_transcript.delta", delta=spoken, response_id=response_id))
+        events.append(
+            _FakeEvent(
+                "response.output_audio_transcript.delta",
+                delta=spoken,
+                response_id=response_id,
+            )
+        )
     for call_id, name in calls:
         events.append(
             _FakeEvent(
@@ -3406,13 +4070,18 @@ def _response(response_id: str, spoken: str = "", calls: tuple[tuple[str, str], 
 
 
 async def _run_with_tools(
-    monkeypatch: Any, events: tuple[Any, ...], done: tuple[ToolNotification, ...], say: str | None = None
+    monkeypatch: Any,
+    events: tuple[Any, ...],
+    done: tuple[ToolNotification, ...],
+    say: str | None = None,
 ) -> list[str]:
     """Run a session: an optional say(), `events`, then each finished tool; return the kinds sent."""
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
     monkeypatch.setattr(
-        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="t-1"))
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="t-1")),
     )
 
     async def _say() -> None:
@@ -3427,7 +4096,9 @@ async def _run_with_tools(
 
         return _finish
 
-    handler.client = _ordering_client((_say, *events, *(_finisher(t) for t in done)), sent, handler)
+    handler.client = _ordering_client(
+        (_say, *events, *(_finisher(t) for t in done)), sent, handler
+    )
     await handler._run_realtime_session()
     return _kinds(sent)
 
@@ -3438,50 +4109,76 @@ async def test_express_in_a_response_that_already_spoke_gets_no_follow_up(
     monkeypatch: Any, caplog: pytest.LogCaptureFixture, say: str | None
 ) -> None:
     """A plain reply and the announcement path: speech plus express, then no second create."""
-    events = _response("r1", "Hello, you two! Good to see you both.", (("c1", "express"),))
+    events = _response(
+        "r1", "Hello, you two! Good to see you both.", (("c1", "express"),)
+    )
 
     with caplog.at_level(logging.INFO, logger=hf_mod.__name__):
-        kinds = await _run_with_tools(monkeypatch, events, (_done_tool("c1", "express", "r1"),), say)
+        kinds = await _run_with_tools(
+            monkeypatch, events, (_done_tool("c1", "express", "r1"),), say
+        )
 
     assert kinds == (["line", "create", "output"] if say else ["output"])
-    assert "tool follow-up skipped: the response already spoke and only gestured" in caplog.text
+    assert (
+        "tool follow-up skipped: the response already spoke and only gestured"
+        in caplog.text
+    )
 
 
 @pytest.mark.asyncio
-async def test_express_in_a_silent_response_still_gets_its_follow_up(monkeypatch: Any) -> None:
+async def test_express_in_a_silent_response_still_gets_its_follow_up(
+    monkeypatch: Any,
+) -> None:
     """A gesture with no speech is the normal case: its spoken answer comes in the follow-up."""
     events = _response("r1", "", (("c1", "express"),))
 
-    kinds = await _run_with_tools(monkeypatch, events, (_done_tool("c1", "express", "r1"),))
+    kinds = await _run_with_tools(
+        monkeypatch, events, (_done_tool("c1", "express", "r1"),)
+    )
 
     assert kinds == ["output", "create"]
 
 
 @pytest.mark.asyncio
-async def test_a_lookup_after_let_me_check_still_gets_its_follow_up(monkeypatch: Any) -> None:
+async def test_a_lookup_after_let_me_check_still_gets_its_follow_up(
+    monkeypatch: Any,
+) -> None:
     """2026-10-09 09:49:19: "Let me check." and search_web in one response; the answer is the follow-up."""
     events = _response("r1", "Let me check.", (("c1", "test__web_search"),))
 
-    kinds = await _run_with_tools(monkeypatch, events, (_done_tool("c1", "test__web_search", "r1"),))
+    kinds = await _run_with_tools(
+        monkeypatch, events, (_done_tool("c1", "test__web_search", "r1"),)
+    )
 
     assert [k for k in kinds if k != "filler"] == ["output", "create"]
 
 
 @pytest.mark.asyncio
-async def test_a_failed_tool_after_speech_still_gets_its_follow_up(monkeypatch: Any) -> None:
+async def test_a_failed_tool_after_speech_still_gets_its_follow_up(
+    monkeypatch: Any,
+) -> None:
     """A failed gesture after speech keeps its follow-up, so the model can report the error."""
     events = _response("r1", "Hello there!", (("c1", "express"),))
 
-    kinds = await _run_with_tools(monkeypatch, events, (_done_tool("c1", "express", "r1", error="no motors"),))
+    kinds = await _run_with_tools(
+        monkeypatch, events, (_done_tool("c1", "express", "r1", error="no motors"),)
+    )
 
     assert kinds == ["output", "create"]
 
 
 @pytest.mark.asyncio
-async def test_a_gesture_with_a_lookup_in_one_batch_keeps_the_follow_up(monkeypatch: Any) -> None:
+async def test_a_gesture_with_a_lookup_in_one_batch_keeps_the_follow_up(
+    monkeypatch: Any,
+) -> None:
     """The lookup's answer still has to be spoken, so the batch keeps its one follow-up."""
-    events = _response("r1", "Good morning!", (("c1", "express"), ("c2", "test__get_weather")))
-    done = (_done_tool("c1", "express", "r1"), _done_tool("c2", "test__get_weather", "r1"))
+    events = _response(
+        "r1", "Good morning!", (("c1", "express"), ("c2", "test__get_weather"))
+    )
+    done = (
+        _done_tool("c1", "express", "r1"),
+        _done_tool("c2", "test__get_weather", "r1"),
+    )
 
     kinds = await _run_with_tools(monkeypatch, events, done)
 
@@ -3489,14 +4186,19 @@ async def test_a_gesture_with_a_lookup_in_one_batch_keeps_the_follow_up(monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("first", "second", "expected"), [("", "Hi!", ["output", "create"]), ("Hi!", "", ["output"])])
+@pytest.mark.parametrize(
+    ("first", "second", "expected"),
+    [("", "Hi!", ["output", "create"]), ("Hi!", "", ["output"])],
+)
 async def test_a_newer_response_starting_does_not_change_the_calling_responses_flag(
     monkeypatch: Any, first: str, second: str, expected: list[str]
 ) -> None:
     """The tool finishes after a second response: the follow-up depends on the response that called it."""
     events = _response("r1", first, (("c1", "express"),)) + _response("r2", second)
 
-    kinds = await _run_with_tools(monkeypatch, events, (_done_tool("c1", "express", "r1"),))
+    kinds = await _run_with_tools(
+        monkeypatch, events, (_done_tool("c1", "express", "r1"),)
+    )
 
     assert kinds == expected
 
@@ -3509,7 +4211,9 @@ async def test_express_finishing_before_response_done_is_still_skipped(
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
     monkeypatch.setattr(
-        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="t-1"))
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="t-1")),
     )
     tasks: list[asyncio.Task[None]] = []
     order: list[str] = []
@@ -3517,7 +4221,11 @@ async def test_express_finishing_before_response_done_is_still_skipped(
 
     async def _handle(tool: ToolNotification) -> None:
         await handler._wait_for_response_done_before_tool_result()
-        order.append("tool resumed, r1 recorded" if "r1" in handler._spoken_responses else "tool resumed first")
+        order.append(
+            "tool resumed, r1 recorded"
+            if "r1" in handler._spoken_responses
+            else "tool resumed first"
+        )
         await real_handle(tool)
 
     async def _finish_early() -> None:
@@ -3527,19 +4235,28 @@ async def test_express_finishing_before_response_done_is_still_skipped(
     async def _settle() -> None:
         await asyncio.sleep(0.05)
 
-    created, spoken, call, done = _response("r1", "Hello, you two!", (("c1", "express"),))
-    handler.client = _ordering_client((created, spoken, call, _finish_early, done, _settle), sent, handler)
+    created, spoken, call, done = _response(
+        "r1", "Hello, you two!", (("c1", "express"),)
+    )
+    handler.client = _ordering_client(
+        (created, spoken, call, _finish_early, done, _settle), sent, handler
+    )
 
     with caplog.at_level(logging.INFO, logger=hf_mod.__name__):
         await handler._run_realtime_session()
 
     assert order == ["tool resumed, r1 recorded"]
     assert _kinds(sent) == ["output"]
-    assert "tool follow-up skipped: the response already spoke and only gestured" in caplog.text
+    assert (
+        "tool follow-up skipped: the response already spoke and only gestured"
+        in caplog.text
+    )
 
 
 @pytest.mark.asyncio
-async def test_a_closed_session_leaves_no_stale_batch_for_the_next(monkeypatch: Any) -> None:
+async def test_a_closed_session_leaves_no_stale_batch_for_the_next(
+    monkeypatch: Any,
+) -> None:
     """A lookup finished while express still ran, then the connection closed.
 
     Session-state hygiene: the next session's batch state starts clean, so a spoken gesture is
@@ -3549,7 +4266,9 @@ async def test_a_closed_session_leaves_no_stale_batch_for_the_next(monkeypatch: 
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
     monkeypatch.setattr(
-        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="t-1"))
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="t-1")),
     )
 
     def _finisher(tool: ToolNotification) -> Any:
@@ -3564,11 +4283,15 @@ async def test_a_closed_session_leaves_no_stale_batch_for_the_next(monkeypatch: 
 
     first = _response("r1", "", (("c1", "express"), ("c2", "test__get_weather")))
     handler.client = _ordering_client(
-        (*first, _finisher(_done_tool("c2", "test__get_weather", "r1")), _close), sent, handler
+        (*first, _finisher(_done_tool("c2", "test__get_weather", "r1")), _close),
+        sent,
+        handler,
     )
     with pytest.raises(ConnectionClosedError):
         await handler._run_realtime_session()
-    assert _kinds(sent) == ["output"]  # express (c1) was still running: no follow-up yet
+    assert _kinds(sent) == [
+        "output"
+    ]  # express (c1) was still running: no follow-up yet
 
     sent.clear()
     second = (
@@ -3601,11 +4324,17 @@ async def test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next(
             await asyncio.sleep(60)
             return {"status": "done"}
 
-    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
-    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default)
+    monkeypatch.setattr(
+        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+    )
+    monkeypatch.setattr(
+        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
+    )
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
     monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
-    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"express": _SlowExpress()})
+    monkeypatch.setattr(
+        hf_mod.core_tools, "get_tools", lambda: {"express": _SlowExpress()}
+    )
     handler = _plain_handler()
     reports = _capture_tool_reports(handler)
     sent: list[tuple[str, Any]] = []
@@ -3613,7 +4342,9 @@ async def test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next(
     async def _settle() -> None:
         await asyncio.sleep(0.1)
 
-    handler.client = _ordering_client((*_response("r1", "", (("c1", "express"),)), _settle), sent, handler)
+    handler.client = _ordering_client(
+        (*_response("r1", "", (("c1", "express"),)), _settle), sent, handler
+    )
     await handler._run_realtime_session()
     assert sent == []  # express was still running when the session closed
 
@@ -3623,7 +4354,9 @@ async def test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next(
 
     assert sent == []
     assert "dropped a tool result from a closed session: express (c1)" in caplog.text
-    assert [(r["name"], r["status"], r["session"]) for r in reports] == [("express", "cancelled", False)]
+    assert [(r["name"], r["status"], r["session"]) for r in reports] == [
+        ("express", "cancelled", False)
+    ]
 
 
 # --- a tool call spoken as JSON (the 10-23 recall leak) ------------------------------
@@ -3642,9 +4375,7 @@ JSON_RECALL = (
     "  ]\n"
     "}"
 )
-JSON_RECALL_ONE_LINE = (
-    '{"tool_calls": [{"function": "recall", "parameters": {"query": "how Matt and Alli met Tony and Roseanne"}}]}'
-)
+JSON_RECALL_ONE_LINE = '{"tool_calls": [{"function": "recall", "parameters": {"query": "how Matt and Alli met Tony and Roseanne"}}]}'
 
 
 def _streamed(*deltas: str, audio_between: bool = True) -> tuple[Any, ...]:
@@ -3659,7 +4390,9 @@ def _streamed(*deltas: str, audio_between: bool = True) -> tuple[Any, ...]:
         *body,
         _FakeEvent("response.output_audio.done"),
         _FakeEvent("response.output_audio_transcript.done", transcript="".join(deltas)),
-        _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+        _FakeEvent(
+            "response.done", response=SimpleNamespace(status="completed", output=[])
+        ),
     )
 
 
@@ -3669,7 +4402,9 @@ def _streamed(*deltas: str, audio_between: bool = True) -> tuple[Any, ...]:
 async def test_a_json_tool_calls_leak_is_cut_from_speech(
     monkeypatch: Any, caplog: Any, text: str, audio_first: bool
 ) -> None:
-    handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=audio_first))
+    handler, tools = _leak_session(
+        monkeypatch, _reply_events(text, audio_first=audio_first)
+    )
     reports = _capture_tool_reports(handler)
 
     with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
@@ -3678,7 +4413,9 @@ async def test_a_json_tool_calls_leak_is_cut_from_speech(
     assert _frames(handler) == []
     assert "leaked tool call: recall (json) cut; executed=False" in caplog.messages
     assert tools["recall"].runs == 0  # recall is not leak_safe: cut, never run
-    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("recall", "cut", "leaked")]
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [
+        ("recall", "cut", "leaked")
+    ]
 
 
 @pytest.mark.asyncio
@@ -3704,7 +4441,9 @@ async def test_a_json_tool_calls_leak_is_cut_from_speech(
         ),
     ],
 )
-async def test_a_json_tool_call_split_across_deltas_is_cut(monkeypatch: Any, deltas: tuple[str, ...]) -> None:
+async def test_a_json_tool_call_split_across_deltas_is_cut(
+    monkeypatch: Any, deltas: tuple[str, ...]
+) -> None:
     assert "".join(deltas) in (JSON_RECALL, JSON_RECALL_ONE_LINE)
     handler, tools = _leak_session(monkeypatch, _streamed(*deltas))
     reports = _capture_tool_reports(handler)
@@ -3713,11 +4452,15 @@ async def test_a_json_tool_call_split_across_deltas_is_cut(monkeypatch: Any, del
 
     assert _frames(handler) == []
     assert tools["recall"].runs == 0
-    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("recall", "cut", "leaked")]
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [
+        ("recall", "cut", "leaked")
+    ]
 
 
 @pytest.mark.asyncio
-async def test_a_bare_json_function_object_is_cut(monkeypatch: Any, caplog: Any) -> None:
+async def test_a_bare_json_function_object_is_cut(
+    monkeypatch: Any, caplog: Any
+) -> None:
     text = '{"name": "dance", "arguments": {"move": "wiggle"}}'  # listed with the markup shapes before 10-23
     handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=True))
     reports = _capture_tool_reports(handler)
@@ -3728,11 +4471,15 @@ async def test_a_bare_json_function_object_is_cut(monkeypatch: Any, caplog: Any)
     assert _frames(handler) == []
     assert "leaked tool call: dance (json) cut; executed=False" in caplog.messages
     assert tools["dance"].runs == 0
-    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("dance", "cut", "leaked")]
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [
+        ("dance", "cut", "leaked")
+    ]
 
 
 @pytest.mark.asyncio
-async def test_a_leaked_json_call_to_a_leak_safe_tool_runs_like_markup(monkeypatch: Any, caplog: Any) -> None:
+async def test_a_leaked_json_call_to_a_leak_safe_tool_runs_like_markup(
+    monkeypatch: Any, caplog: Any
+) -> None:
     text = '{"tool_calls": [{"function": "stay_quiet", "parameters": {"reason": "not addressed to me"}}]}'
     handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=True))
     reports = _capture_tool_reports(handler)
@@ -3746,11 +4493,15 @@ async def test_a_leaked_json_call_to_a_leak_safe_tool_runs_like_markup(monkeypat
     assert "leaked tool call: stay_quiet (json) cut; executed=True" in caplog.messages
     assert tools["stay_quiet"].runs == 1
     start_tool.assert_not_awaited()
-    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("stay_quiet", "ok", "leaked")]
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [
+        ("stay_quiet", "ok", "leaked")
+    ]
 
 
 @pytest.mark.asyncio
-async def test_each_json_call_in_a_list_goes_through_the_leaked_call_path(monkeypatch: Any, caplog: Any) -> None:
+async def test_each_json_call_in_a_list_goes_through_the_leaked_call_path(
+    monkeypatch: Any, caplog: Any
+) -> None:
     text = (
         '{"tool_calls": [{"function": "stay_quiet", "parameters": {}}, '
         '{"function": "teleport", "parameters": {}}, {"name": "dance", "arguments": "{}"}]}'
@@ -3763,11 +4514,16 @@ async def test_each_json_call_in_a_list_goes_through_the_leaked_call_path(monkey
 
     assert _frames(handler) == []
     assert (tools["stay_quiet"].runs, tools["dance"].runs) == (1, 0)
-    assert sorted((r["name"], r["status"]) for r in reports) == [("dance", "cut"), ("stay_quiet", "ok")]
+    assert sorted((r["name"], r["status"]) for r in reports) == [
+        ("dance", "cut"),
+        ("stay_quiet", "ok"),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_an_unknown_json_tool_is_cut_but_not_run(monkeypatch: Any, caplog: Any) -> None:
+async def test_an_unknown_json_tool_is_cut_but_not_run(
+    monkeypatch: Any, caplog: Any
+) -> None:
     text = '{"tool_calls": [{"function": "teleport", "parameters": {"to": "Paris"}}]}'
     handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=True))
     reports = _capture_tool_reports(handler)
@@ -3777,8 +4533,12 @@ async def test_an_unknown_json_tool_is_cut_but_not_run(monkeypatch: Any, caplog:
 
     assert _frames(handler) == []
     assert all(tool.runs == 0 for tool in tools.values())
-    assert reports == []  # as with markup: an unregistered name is cut, with no tool to report
-    assert any(m.startswith("spoken artifact cut (leaked tool call)") for m in caplog.messages)
+    assert (
+        reports == []
+    )  # as with markup: an unregistered name is cut, with no tool to report
+    assert any(
+        m.startswith("spoken artifact cut (leaked tool call)") for m in caplog.messages
+    )
 
 
 @pytest.mark.asyncio
@@ -3791,7 +4551,9 @@ async def test_an_unknown_json_tool_is_cut_but_not_run(monkeypatch: Any, caplog:
         ('{"quoted"', " is how you write it."),
     ],
 )
-async def test_speech_with_braces_that_is_not_a_tool_call_is_spoken(monkeypatch: Any, deltas: tuple[str, ...]) -> None:
+async def test_speech_with_braces_that_is_not_a_tool_call_is_spoken(
+    monkeypatch: Any, deltas: tuple[str, ...]
+) -> None:
     handler, tools = _leak_session(monkeypatch, _streamed(*deltas))
     reports = _capture_tool_reports(handler)
 
@@ -3805,7 +4567,9 @@ async def test_speech_with_braces_that_is_not_a_tool_call_is_spoken(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_markup_leaks_still_behave_as_before(monkeypatch: Any, caplog: Any) -> None:
+async def test_markup_leaks_still_behave_as_before(
+    monkeypatch: Any, caplog: Any
+) -> None:
     """Markup with braces in it stays markup: the JSON rule does not take it."""
     text = '<call:recall{query:<|"|>Tony<|"|>}/>'
     handler, tools = _leak_session(monkeypatch, _reply_events(text, audio_first=True))
@@ -3836,7 +4600,9 @@ async def test_a_json_call_that_closes_after_the_timer_released_its_audio_flushe
             _said('all", "parameters": {"query": "Tony"}}]\n}'),
             _audio(3, 4),
             _FakeEvent("response.output_audio.done"),
-            _FakeEvent("response.done", response=SimpleNamespace(status="completed", output=[])),
+            _FakeEvent(
+                "response.done", response=SimpleNamespace(status="completed", output=[])
+            ),
         ),
     )
     reports = _capture_tool_reports(handler)
@@ -3847,10 +4613,14 @@ async def test_a_json_call_that_closes_after_the_timer_released_its_audio_flushe
         await _run_with_leaks(handler)
 
     assert cleared == [True]
-    assert [list(a.reshape(-1)) for _r, a in _frames(handler)] == [[1, 2]]  # the fake flush drained nothing
+    assert [list(a.reshape(-1)) for _r, a in _frames(handler)] == [
+        [1, 2]
+    ]  # the fake flush drained nothing
     assert "leaked tool call: recall (json) cut; executed=False" in caplog.messages
     assert tools["recall"].runs == 0
-    assert [(r["name"], r["status"], r["source"]) for r in reports] == [("recall", "cut", "leaked")]
+    assert [(r["name"], r["status"], r["source"]) for r in reports] == [
+        ("recall", "cut", "leaked")
+    ]
 
 
 def test_a_dropped_conversation_is_told_from_this_mornings_numbers() -> None:
@@ -3866,7 +4636,9 @@ def test_a_dropped_conversation_is_told_from_this_mornings_numbers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_drop_or_a_wish_sends_the_instructions_once_at_a_reply_end(monkeypatch) -> None:
+async def test_a_drop_or_a_wish_sends_the_instructions_once_at_a_reply_end(
+    monkeypatch,
+) -> None:
     """Review of the refresh: on the handler's loop at a reply's end, one send at a time, only
     when they changed; a drop measures afresh at once; the least since is the base."""
     from reachy_mini_conversation_app import huggingface_realtime as hr
@@ -3877,15 +4649,24 @@ async def test_a_drop_or_a_wish_sends_the_instructions_once_at_a_reply_end(monke
     monkeypatch.setattr(hr, "get_session_instructions", lambda *_: text["now"])
     handler._instructions_sent = "memory A"
     u = lambda t: SimpleNamespace(input_tokens=t)  # noqa: E731
-    for t in (12900, 11401, 15410):  # an opening glance's reply first: the least is the base
+    for t in (
+        12900,
+        11401,
+        15410,
+    ):  # an opening glance's reply first: the least is the base
         handler._after_reply(u(t))
     assert handler._ctx_base == 11401 and handler._instructions_task is None
     text["now"] = "memory B"
     handler._after_reply(u(11601))  # the drop
-    handler._after_reply(u(11650))  # the next reply before it lands: measured afresh, no second
+    handler._after_reply(
+        u(11650)
+    )  # the next reply before it lands: measured afresh, no second
     await handler._instructions_task
     handler.connection.session.update.assert_awaited_once()
-    assert handler.connection.session.update.await_args.kwargs["session"]["instructions"] == "memory B"
+    assert (
+        handler.connection.session.update.await_args.kwargs["session"]["instructions"]
+        == "memory B"
+    )
     handler.want_instructions("a session opened on a live connection")
     handler._after_reply(u(11700))
     await handler._instructions_task  # unchanged since sent: nothing goes
@@ -3898,7 +4679,9 @@ async def test_a_drop_or_a_wish_sends_the_instructions_once_at_a_reply_end(monke
 
 
 def _handler():
-    return HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    return HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
 
 
 @pytest.mark.asyncio
@@ -3921,7 +4704,11 @@ def test_a_tagged_reply_is_counted_and_the_model_told_once_a_session() -> None:
     """11-03 19:31: four "<speak>" replies in a row, each copying the last."""
     from reachy_mini_conversation_app import huggingface_realtime as hr
 
-    cls = next(c for c in vars(hr).values() if isinstance(c, type) and hasattr(c, "_ssml_spoken"))
+    cls = next(
+        c
+        for c in vars(hr).values()
+        if isinstance(c, type) and hasattr(c, "_ssml_spoken")
+    )
     h = cls.__new__(cls)
     notes: list[str] = []
     h.add_note = lambda text, now=False: notes.append(text)
@@ -3940,16 +4727,23 @@ async def test_a_refusal_after_the_owed_output_landed_still_gets_one_reply_and_n
     monkeypatch: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
     """11-03 19:14: the user spoke during an express sound; the output landed, then the
-    server refused its own turn reply. The reply is still sent, once, and no "[error]" line."""
+    server refused its own turn reply. The reply is still sent, once, and no "[error]" line.
+    """
     sent: list[tuple[str, Any]] = []
     handler = _session_handler(monkeypatch, ())
     monkeypatch.setattr(
-        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="express-1"))
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="express-1")),
     )
     quiet_tool = SimpleNamespace(needs_response=False, leak_safe=False)
     monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"express": quiet_tool})
     done = ToolNotification(
-        id="c1", tool_name="express", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": True}
+        id="c1",
+        tool_name="express",
+        is_idle_tool_call=False,
+        status=ToolState.COMPLETED,
+        result={"ok": True},
     )
 
     async def _finish_tool() -> None:
@@ -3961,10 +4755,20 @@ async def test_a_refusal_after_the_owed_output_landed_still_gets_one_reply_and_n
 
     handler.client = _ordering_client(
         (
-            _FakeEvent("response.function_call_arguments.done", name="express", arguments="{}", call_id="c1"),
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="express",
+                arguments="{}",
+                call_id="c1",
+            ),
             _FakeEvent("input_audio_buffer.speech_started", item_id="u1"),
             _finish_tool,
-            _FakeEvent("error", error=SimpleNamespace(message=_PENDING, type="response_failed", code=None)),
+            _FakeEvent(
+                "error",
+                error=SimpleNamespace(
+                    message=_PENDING, type="response_failed", code=None
+                ),
+            ),
             _settle,
         ),
         sent,
@@ -3983,13 +4787,24 @@ async def test_a_refusal_after_the_owed_output_landed_still_gets_one_reply_and_n
 
 
 @pytest.mark.asyncio
-async def test_an_empty_turn_that_cut_his_reply_mid_way_gets_the_reply_again(monkeypatch: Any) -> None:
+async def test_an_empty_turn_that_cut_his_reply_mid_way_gets_the_reply_again(
+    monkeypatch: Any,
+) -> None:
     """11-03 19:39-19:42: VAD fired on no speech 1-3 s into his reply; the reply was dropped
-    and silence followed. Now an empty transcript after a mid-reply cut asks for a reply."""
-    for left, transcript, want in ((3.0, "", 1), (0.1, "", 0), (3.0, "yes", None)):
+    and silence followed. Now an empty transcript after a mid-reply cut asks for a reply.
+    """
+    # the review (11-03): a reply the server made for the empty turn is the only one
+    answered = _FakeEvent("response.created", response=SimpleNamespace(metadata=None))
+    cases = (
+        (3.0, "", (), 1),
+        (0.1, "", (), 0),
+        (3.0, "yes", (), None),
+        (3.0, "", (answered,), 0),
+    )
+    for left, transcript, between, want in cases:
         sent: list[tuple[str, Any]] = []
         handler = _session_handler(monkeypatch, ())
-        handler._clear_queue = lambda left=left: left
+        handler._clear_queue = lambda left=left: (6.0, left)
 
         async def _settle() -> None:
             await asyncio.sleep(0.1)
@@ -3997,6 +4812,7 @@ async def test_an_empty_turn_that_cut_his_reply_mid_way_gets_the_reply_again(mon
         handler.client = _ordering_client(
             (
                 _FakeEvent("input_audio_buffer.speech_started", item_id="u1"),
+                *between,
                 _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="u1",
                            transcript=transcript),  # fmt: skip
                 _settle,

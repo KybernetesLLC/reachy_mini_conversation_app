@@ -41,7 +41,9 @@ _CALL: Final[str] = "leaked tool call"
 _THINKING: Final[str] = "thinking"
 _DIRECTION_MAX = 80  # characters inside a stage direction's brackets
 _UNDECIDED_MAX = 200  # past this much text, an unfinished shape is a reply
-_JSON_UNDECIDED_MAX = 2000  # an open JSON call, its first key already a call's: its query can be long
+_JSON_UNDECIDED_MAX = (
+    2000  # an open JSON call, its first key already a call's: its query can be long
+)
 _GEMMA_QUOTE: Final[str] = '<|"|>'
 _DIRECTION_CLOSERS: Final[dict[str, str]] = {"(": ")", "[": "]", "*": "*", "_": "_"}
 _PAIRS: Final[dict[str, str]] = {"(": ")", "[": "]", "{": "}"}
@@ -76,7 +78,9 @@ _FENCE = re.compile(r"```\s*(tool_code|json)\b(.*?)(```|\Z)", re.IGNORECASE | re
 # no arguments key counts inside {"tool_calls": ...}, and elsewhere only when it names a
 # known tool ({"name": "Matt"} is speech). While open it waits only if its first key could
 # be a call's and is followed by ":"; anything else is released at once.
-_JSON_CALL_KEYS: Final[frozenset[str]] = frozenset({"name", "function", "arguments", "parameters", "type", "id"})
+_JSON_CALL_KEYS: Final[frozenset[str]] = frozenset(
+    {"name", "function", "arguments", "parameters", "type", "id"}
+)
 _JSON_FIRST_KEYS: Final[frozenset[str]] = _JSON_CALL_KEYS | {"tool_calls"}
 _JSON_OPEN = re.compile(r'\{\s*(?:"([^"\\]*)("?))?')
 
@@ -137,7 +141,11 @@ def _calls(value: Any) -> list[dict[str, object]]:
     call's first; inside {"tool_calls": ...} a call with no arguments has null ones.
     """
     wrapped = isinstance(value, dict) and set(value) == {"tool_calls"}
-    items = value["tool_calls"] if wrapped else value if isinstance(value, list) else [value]
+    items = (
+        value["tool_calls"]
+        if wrapped
+        else value if isinstance(value, list) else [value]
+    )
     if not isinstance(items, list):
         return []
     calls: list[dict[str, object]] = []
@@ -152,7 +160,12 @@ def _calls(value: Any) -> list[dict[str, object]]:
             holders.append(function)
             function = function.get("name")
         call: dict[str, object] = {"name": function}
-        arguments = [holder[key] for holder in holders for key in ("arguments", "parameters") if key in holder]
+        arguments = [
+            holder[key]
+            for holder in holders
+            for key in ("arguments", "parameters")
+            if key in holder
+        ]
         if arguments or wrapped:
             call["arguments"] = arguments[0] if arguments else None
         calls.append(call)
@@ -233,7 +246,9 @@ def _tag_call_at(text: str, i: int, final: bool = False) -> tuple[str, int] | No
     if braced:
         after = text[j:].lstrip()
         if after.startswith(("/>", ">")):
-            return _CALL, j + (len(text) - j - len(after)) + (2 if after[0] == "/" else 1)
+            return _CALL, j + (len(text) - j - len(after)) + (
+                2 if after[0] == "/" else 1
+            )
         if after in ("", "/"):
             return (_CALL, j) if final else (_UNDECIDED, -1)
         return _CALL, j
@@ -318,7 +333,9 @@ def _shape_at(
             if names:
                 return _CALL, end, names
         inner = text[i + 1 :].lstrip()
-        if end == -1 and inner.startswith("{"):  # a bare list of JSON calls: an inner "]" is not its end
+        if end == -1 and inner.startswith(
+            "{"
+        ):  # a bare list of JSON calls: an inner "]" is not its end
             return (_UNDECIDED, -1, None) if _could_be_json_call(inner) else None
     named = _NAMED_ARGS.match(text, i)
     if named and _named_call(named.group(), tools):
@@ -328,7 +345,11 @@ def _shape_at(
         if close_at == -1:
             return _UNDECIDED, -1, None
         inner = text[i + 1 : close_at]
-        if inner.strip() and len(inner) <= _DIRECTION_MAX and not set(inner) & set("()[]*{}"):
+        if (
+            inner.strip()
+            and len(inner) <= _DIRECTION_MAX
+            and not set(inner) & set("()[]*{}")
+        ):
             return _STAGE, close_at + 1, None
     return None
 
@@ -370,10 +391,12 @@ def spoken_artifact(text: str, final: bool = False) -> str | None:
 # SSML-like markup the model writes around words (11-03 19:31: "<speak>I'd love to!</speak>",
 # copied reply to reply). The backend's voice reads it aloud, so it cannot be cut from audio
 # already spoken: it is counted, kept out of the stored transcript, and the model told once.
-_SSML = re.compile(
-    r"</?\s*(?:speak|prosody|break|emphasis|say-as|voice|phoneme|sub|audio|lang|mark|p|s)"
-    r"\b[^<>]{0,200}/?>",
-    re.IGNORECASE,
+_SSML = (
+    re.compile(  # a tag as written: no space after "<", attributes only as name="value"
+        r"</?(?:speak|prosody|break|emphasis|say-as|voice|phoneme|sub|audio|lang|mark)"
+        r"""(?:\s+[\w:-]+\s*=\s*(?:"[^"<>]{0,200}"|'[^'<>]{0,200}'))*\s*/?>""",
+        re.IGNORECASE,
+    )
 )
 
 
@@ -443,7 +466,9 @@ _MIN_WAIT = 3  # characters before the start of a reply can wait to become a nam
 _WORD_EDGES: Final[str] = " \t\r\n.!,;?:'\"`*"
 _PLAIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\s-]{0,79}")
 _CALLED_NAME = (
-    re.compile(r"^([A-Za-z_][\w.-]*)\{"),  # first: a name inside the arguments is not it (the review)
+    re.compile(
+        r"^([A-Za-z_][\w.-]*)\{"
+    ),  # first: a name inside the arguments is not it (the review)
     re.compile(r"call:\s*([\w.-]+)", re.IGNORECASE),
     re.compile(r"<function=([\w.-]+)>", re.IGNORECASE),
     re.compile(r'"name"\s*:\s*"([^"]+)"'),
@@ -498,7 +523,12 @@ def _called_name(markup: str) -> str | None:
 
 
 def _leak(tool: LeakTool, shape: str) -> Verdict:
-    return Verdict(CUT_AND_EXECUTE if tool.leak_safe else CUT, kind=_CALL, tool=tool.name, shape=shape)
+    return Verdict(
+        CUT_AND_EXECUTE if tool.leak_safe else CUT,
+        kind=_CALL,
+        tool=tool.name,
+        shape=shape,
+    )
 
 
 def _leaked(*calls: Verdict) -> Verdict:

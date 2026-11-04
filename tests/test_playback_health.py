@@ -58,7 +58,9 @@ MIC_FEED_PAUSE = "/tmp/reachy_mic_feed_paused"
         (65.5, "rebuild"),
     ],
 )
-def test_the_watchdog_decides_from_the_measured_latency(latency_s: float | None, action: str) -> None:
+def test_the_watchdog_decides_from_the_measured_latency(
+    latency_s: float | None, action: str
+) -> None:
     """Over the bound rebuilds; at or under it is fine; no number is no action."""
     verdict = ph.decide(latency_s, limit_s=5.0)
     assert verdict.action == action
@@ -130,7 +132,9 @@ class Rig:
                 else:
                     sink = Gst.ElementFactory.make("fakesink")
                     sink.set_property("sync", True)
-                    sink.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, rig._on_rendered)
+                    sink.get_static_pad("sink").add_probe(
+                        Gst.PadProbeType.BUFFER, rig._on_rendered
+                    )
                 return sink
 
         self.audio = Playback()
@@ -153,7 +157,11 @@ class Rig:
             if result != self.Gst.IteratorResult.OK:
                 return None
             f = element.get_factory()
-            if f is not None and f.get_name() == factory and (name is None or element.get_name() == name):
+            if (
+                f is not None
+                and f.get_name() == factory
+                and (name is None or element.get_name() == name)
+            ):
                 return element
 
     def _on_rendered(self, pad: Any, info: Any) -> Any:
@@ -162,9 +170,17 @@ class Rig:
         ok, mapped = buf.map(Gst.MapFlags.READ)
         if ok:
             fmt = pad.get_current_caps().get_structure(0).get_string("format")
-            kind, scale = {"S16LE": (np.int16, 32768.0), "S32LE": (np.int32, 2.0**31)}.get(fmt, (np.float32, 1.0))
+            kind, scale = {
+                "S16LE": (np.int16, 32768.0),
+                "S32LE": (np.int32, 2.0**31),
+            }.get(fmt, (np.float32, 1.0))
             samples = np.frombuffer(mapped.data, dtype=kind)
-            self.rendered.append((time.monotonic(), float(np.abs(samples).max()) / scale if samples.size else 0.0))
+            self.rendered.append(
+                (
+                    time.monotonic(),
+                    float(np.abs(samples).max()) / scale if samples.size else 0.0,
+                )
+            )
             buf.unmap(mapped)
         return Gst.PadProbeReturn.OK
 
@@ -199,7 +215,9 @@ class Rig:
                     continue
                 b = sample.get_buffer()
                 a = np.frombuffer(b.extract_dup(0, b.get_size()), dtype=np.float32)
-                self.rendered.append((time.monotonic(), float(np.abs(a).max()) if a.size else 0.0))
+                self.rendered.append(
+                    (time.monotonic(), float(np.abs(a).max()) if a.size else 0.0)
+                )
 
         threading.Thread(target=pull, daemon=True).start()
 
@@ -210,7 +228,9 @@ class Rig:
             now = time.monotonic()
             if sample is not None:
                 self.mic_buffers.append(now)
-            on_poll = getattr(self, "on_mic_poll", None)  # (now, got_frame), as the app's record loop polls
+            on_poll = getattr(
+                self, "on_mic_poll", None
+            )  # (now, got_frame), as the app's record loop polls
             if on_poll is not None:
                 on_poll(now, sample is not None)
 
@@ -218,12 +238,16 @@ class Rig:
         """Push a reply of constant ``level`` and return when its push began."""
         pushed_at = time.monotonic()
         tone = np.full((int(seconds * 16000), 2), level, dtype=np.float32)
-        for start in range(0, len(tone), 1600):  # 100 ms chunks, faster than real time, as the app pushes
+        for start in range(
+            0, len(tone), 1600
+        ):  # 100 ms chunks, faster than real time, as the app pushes
             self.audio._push_appsrc_buffer(tone[start : start + 1600])
             time.sleep(0.025)
         return pushed_at
 
-    def heard_after(self, after: float, level: float = 0.3, timeout: float = 3.0) -> float | None:
+    def heard_after(
+        self, after: float, level: float = 0.3, timeout: float = 3.0
+    ) -> float | None:
         """Seconds from ``after`` until the reply at ``level`` is first heard, or None."""
         deadline = after + timeout
         while time.monotonic() < deadline:
@@ -251,10 +275,18 @@ class Rig:
         Gst = self.Gst
         until = time.monotonic() + seconds
         pid = None
-        if kind == "pipewire":  # the daemon itself: capture and speaker together (container only)
-            pid = int(subprocess.run(["pidof", "pipewire"], capture_output=True, text=True).stdout.split()[0])
+        if (
+            kind == "pipewire"
+        ):  # the daemon itself: capture and speaker together (container only)
+            pid = int(
+                subprocess.run(
+                    ["pidof", "pipewire"], capture_output=True, text=True
+                ).stdout.split()[0]
+            )
             os.kill(pid, 19)
-        elif kind == "micfeed":  # a pipe-fed microphone starved, PipeWire healthy (container only)
+        elif (
+            kind == "micfeed"
+        ):  # a pipe-fed microphone starved, PipeWire healthy (container only)
             open(MIC_FEED_PAUSE, "w").close()
         else:  # the capture thread, held in GStreamer: robot-safe
 
@@ -284,7 +316,9 @@ class Rig:
         Gst = self.Gst
         if self.monitor is not None:
             self.monitor.set_state(Gst.State.NULL)
-        threading.Thread(target=self.pipeline.set_state, args=(Gst.State.NULL,), daemon=True).start()
+        threading.Thread(
+            target=self.pipeline.set_state, args=(Gst.State.NULL,), daemon=True
+        ).start()
 
 
 @pytest.fixture(autouse=True)
@@ -341,7 +375,9 @@ def test_playback_latency_stays_bounded_after_a_stall(rig: Rig) -> None:
     converged_after = None
     while time.monotonic() - stalled_at < RECOVERY_S:
         latencies.append(rig.reply_latency(levels[len(latencies) % len(levels)]))
-        if len(latencies) >= 3 and all(lat is not None and lat < 1.0 for lat in latencies[-3:]):
+        if len(latencies) >= 3 and all(
+            lat is not None and lat < 1.0 for lat in latencies[-3:]
+        ):
             converged_after = time.monotonic() - stalled_at
             break
     mic_after = rig.mic_rate()
@@ -349,13 +385,17 @@ def test_playback_latency_stays_bounded_after_a_stall(rig: Rig) -> None:
         f"stall {STALL_KIND} {STALL_S:.0f}s: converged after {converged_after}s, latencies {latencies}, "
         f"mic {mic_before:.0f}/s before, {mic_after:.0f}/s after"
     )
-    assert converged_after is not None, f"no recovery {RECOVERY_S:.0f}s after a {STALL_S:.0f}s stall: {latencies}"
-    assert mic_after > 0.5 * mic_before, (
-        f"the microphone slowed after the stall: {mic_before:.0f}/s, {mic_after:.0f}/s"
-    )
+    assert (
+        converged_after is not None
+    ), f"no recovery {RECOVERY_S:.0f}s after a {STALL_S:.0f}s stall: {latencies}"
+    assert (
+        mic_after > 0.5 * mic_before
+    ), f"the microphone slowed after the stall: {mic_before:.0f}/s, {mic_after:.0f}/s"
 
 
-def test_a_rebuilt_speaker_stream_plays_the_next_reply_and_keeps_the_microphone(rig: Rig) -> None:
+def test_a_rebuilt_speaker_stream_plays_the_next_reply_and_keeps_the_microphone(
+    rig: Rig,
+) -> None:
     """The watchdog's remedy: the speaker sink alone is recreated, nothing else moves."""
     Gst = rig.Gst
     rig.start()
@@ -367,7 +407,9 @@ def test_a_rebuilt_speaker_stream_plays_the_next_reply_and_keeps_the_microphone(
     # The first reply may wait for the new stream to start; the next plays at once.
     assert latencies[0] is not None and latencies[0] < 3.0, latencies
     assert latencies[1] is not None and latencies[1] < 1.0, latencies
-    assert rig.mic_rate(1.0) > 0.5 * mic_before, "the microphone stalled during the rebuild"
+    assert (
+        rig.mic_rate(1.0) > 0.5 * mic_before
+    ), "the microphone stalled during the rebuild"
 
 
 def test_the_watchdog_logs_one_info_line_and_does_nothing_when_healthy(
@@ -375,7 +417,9 @@ def test_the_watchdog_logs_one_info_line_and_does_nothing_when_healthy(
 ) -> None:
     """Drift data from day one: one INFO line per check, no action under the bound."""
     rig.start()
-    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a healthy stream"))
+    monkeypatch.setattr(
+        ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a healthy stream")
+    )
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
         verdict = ph.check_playback(rig.pipeline)
     assert verdict.action in ("ok", "unmeasured")
@@ -414,9 +458,13 @@ def test_a_sound_stream_is_closed_at_its_end_on_the_sdks_own_loop(
         while ph.SOUNDS.state()[0] and time.monotonic() < deadline:
             time.sleep(0.02)
     messages = [r.getMessage() for r in caplog.records if r.name == ph.logger.name]
-    assert f"Sound stream opened: {path} (a second speaker stream)" in messages, messages
+    assert (
+        f"Sound stream opened: {path} (a second speaker stream)" in messages
+    ), messages
     assert f"Sound stream closed (the sound ended): {path}" in messages, messages
-    assert _until(lambda: playbin.get_state(0)[1] == Gst.State.NULL)  # set by the reaper
+    assert _until(
+        lambda: playbin.get_state(0)[1] == Gst.State.NULL
+    )  # set by the reaper
     # Speech is untouched by the second stream's end.
     lat = rig.reply_latency(0.6)
     assert lat is not None and lat < 1.0
@@ -439,7 +487,11 @@ def test_a_replaced_sound_is_closed_once_and_a_stop_ends_the_next(
         time.sleep(0.3)
         assert second.get_state(0)[1] == Gst.State.PLAYING  # the newer sound plays on
         assert ph.stop_sound()
-    closes = [r.getMessage() for r in caplog.records if "Sound stream closed" in r.getMessage()]
+    closes = [
+        r.getMessage()
+        for r in caplog.records
+        if "Sound stream closed" in r.getMessage()
+    ]
     assert closes == [
         f"Sound stream closed (replaced by a newer sound): {path}",
         f"Sound stream closed (stopped): {path}",
@@ -470,11 +522,21 @@ def fresh_governor(monkeypatch: pytest.MonkeyPatch) -> Any:
         (1000.0, (880.0, 940.0), "rebuild"),
         (1000.0, (700.0, 760.0, 890.0), "cooldown"),  # 120 s after the third
         (1000.0, (700.0, 760.0, 870.0), "rebuild"),
-        (5000.0, tuple(4410.0 + 60 * i for i in range(10)), "cooldown"),  # capped at 600 s
-        (1000.0, (100.0, 200.0, 300.0), "rebuild"),  # older than the 600 s window: forgotten
+        (
+            5000.0,
+            tuple(4410.0 + 60 * i for i in range(10)),
+            "cooldown",
+        ),  # capped at 600 s
+        (
+            1000.0,
+            (100.0, 200.0, 300.0),
+            "rebuild",
+        ),  # older than the 600 s window: forgotten
     ],
 )
-def test_rebuilds_share_one_cooldown_that_doubles(now: float, history: tuple[float, ...], action: str) -> None:
+def test_rebuilds_share_one_cooldown_that_doubles(
+    now: float, history: tuple[float, ...], action: str
+) -> None:
     """30 s after a rebuild, doubling with each further rebuild in 600 s, capped at 600 s."""
     verdict = ph.rebuild_decision(now, history)
     assert verdict.action == action
@@ -505,15 +567,25 @@ def test_a_rebuild_is_logged_once_with_its_trigger_and_restarts_the_speaker_cloc
     order: list[str] = []
     audio = SimpleNamespace(_pipeline=_Pipeline())
     monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: "sink")
-    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: order.append(f"rebuild:{sink}") or True)
-    monkeypatch.setattr(ph, "restart_speaker_clock", lambda a: order.append("restart") or True)
+    monkeypatch.setattr(
+        ph, "rebuild_sink", lambda sink: order.append(f"rebuild:{sink}") or True
+    )
+    monkeypatch.setattr(
+        ph, "restart_speaker_clock", lambda a: order.append("restart") or True
+    )
     governor = ph.RebuildGovernor(clock=lambda: 100.0)
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
-        assert governor.rebuild(audio, "unheard replies", "3 replies in a row not heard") is True
+        assert (
+            governor.rebuild(audio, "unheard replies", "3 replies in a row not heard")
+            is True
+        )
     assert order == ["rebuild:sink", "restart"]
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert "unheard replies" in warnings[0] and "3 replies in a row not heard" in warnings[0]
+    assert (
+        "unheard replies" in warnings[0]
+        and "3 replies in a row not heard" in warnings[0]
+    )
 
 
 def test_a_second_trigger_inside_the_cooldown_is_held_back_and_logged(
@@ -538,27 +610,43 @@ def test_a_second_trigger_inside_the_cooldown_is_held_back_and_logged(
     assert rebuilt == ["sink", "sink"]
 
 
-def test_a_rebuild_never_touches_a_pipeline_that_capture_off_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_rebuild_never_touches_a_pipeline_that_capture_off_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A trigger racing conversation.capture {"on": false} finds the pipeline not PLAYING and leaves it."""
     audio = SimpleNamespace(_pipeline=_Pipeline(playing=False))
-    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: pytest.fail("looked for the sink"))
-    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a stopped pipeline"))
+    monkeypatch.setattr(
+        ph, "speaker_sink", lambda pipeline: pytest.fail("looked for the sink")
+    )
+    monkeypatch.setattr(
+        ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a stopped pipeline")
+    )
     governor = ph.RebuildGovernor(clock=lambda: 100.0)
     assert governor.rebuild(audio, "capture gap", "test") is False
-    assert governor.rebuild(audio, "capture gap", "test") is False  # and a skip uses no cooldown
+    assert (
+        governor.rebuild(audio, "capture gap", "test") is False
+    )  # and a skip uses no cooldown
 
 
-def test_the_latency_check_leaves_a_stopped_pipeline_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_latency_check_leaves_a_stopped_pipeline_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """measure_latency_s and the rebuild race a capture off; a pipeline not PLAYING is not read."""
-    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: pytest.fail("walked a stopped pipeline"))
+    monkeypatch.setattr(
+        ph, "speaker_sink", lambda pipeline: pytest.fail("walked a stopped pipeline")
+    )
     assert ph.check_playback(_Pipeline(playing=False)).action == "unmeasured"
 
 
-def test_a_rebuild_waits_for_a_capture_change_in_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_rebuild_waits_for_a_capture_change_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """MEDIA_LOCK: a rebuild requested mid capture-off runs after it, and finds the pipeline stopped."""
     pipeline = _Pipeline()
     audio = SimpleNamespace(_pipeline=pipeline)
-    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt mid capture-off"))
+    monkeypatch.setattr(
+        ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt mid capture-off")
+    )
     in_change = threading.Event()
     result: list[bool] = []
 
@@ -592,7 +680,9 @@ IDLE_S = float(os.environ.get("REACHY_PLAYBACK_TEST_IDLE_S", "15"))
         (75.0, "rebuild"),  # the container's stall
     ],
 )
-def test_a_capture_gap_over_the_bound_asks_for_a_rebuild(gap_s: float, action: str) -> None:
+def test_a_capture_gap_over_the_bound_asks_for_a_rebuild(
+    gap_s: float, action: str
+) -> None:
     """A gap in microphone frames longer than CAPTURE_GAP_S (5 s) rebuilds the speaker stream."""
     verdict = ph.capture_gap_decision(gap_s, limit_s=5.0)
     assert verdict.action == action
@@ -610,13 +700,19 @@ def test_the_capture_gap_cause_names_the_gap() -> None:
     [
         (0.5, False, "ok"),
         (3.0, False, "ok"),
-        (3.01, False, "stalled"),  # no frames for 3 s with capture on: say so, restart the clock
+        (
+            3.01,
+            False,
+            "stalled",
+        ),  # no frames for 3 s with capture on: say so, restart the clock
         (30.0, False, "stalled"),
         (3.01, True, "ok"),  # once per stall
         (30.0, True, "ok"),
     ],
 )
-def test_a_capture_stall_is_reported_once(age_s: float, warned: bool, action: str) -> None:
+def test_a_capture_stall_is_reported_once(
+    age_s: float, warned: bool, action: str
+) -> None:
     """While no frames come, the stall is reported once."""
     assert ph.capture_stall_decision(age_s, warned, stall_s=3.0).action == action
 
@@ -642,11 +738,15 @@ def test_capture_off_is_not_a_gap() -> None:
     watch = ph.CaptureWatch()
     watch.frame(0.0)
     watch.reset()
-    assert watch.idle(100.0).action == "ok"  # the first poll after a restart only starts the wait
+    assert (
+        watch.idle(100.0).action == "ok"
+    )  # the first poll after a restart only starts the wait
     assert watch.frame(100.5).action == "ok"
     watch.reset()
     assert watch.idle(200.0).action == "ok"
-    assert watch.idle(203.5).action == "stalled"  # a pipeline that never delivers is reported
+    assert (
+        watch.idle(203.5).action == "stalled"
+    )  # a pipeline that never delivers is reported
 
 
 def test_short_gaps_never_trigger() -> None:
@@ -658,11 +758,17 @@ def test_short_gaps_never_trigger() -> None:
         assert watch.frame(t).action == "ok"
 
 
-def test_acting_on_a_gap_rebuilds_through_the_governor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_acting_on_a_gap_rebuilds_through_the_governor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """act_on_capture: a gap is a "capture gap" rebuild; a stall restarts the clock and rebuilds nothing."""
     calls: list[tuple[str, str]] = []
-    governor = SimpleNamespace(rebuild=lambda audio, trigger, cause: calls.append((trigger, cause)) or True)
-    monkeypatch.setattr(ph, "restart_speaker_clock", lambda audio: calls.append(("restart", "")) or True)
+    governor = SimpleNamespace(
+        rebuild=lambda audio, trigger, cause: calls.append((trigger, cause)) or True
+    )
+    monkeypatch.setattr(
+        ph, "restart_speaker_clock", lambda audio: calls.append(("restart", "")) or True
+    )
     ph.act_on_capture(ph.capture_stall_decision(3.5, False), "audio", governor)
     ph.act_on_capture(ph.capture_gap_decision(7.2), "audio", governor)
     ph.act_on_capture(ph.Verdict("ok", ""), "audio", governor)
@@ -679,7 +785,9 @@ def _drive_capture_watch(rig: Rig) -> list[ph.Verdict]:
         verdict = watch.frame(now) if got else watch.idle(now)
         if verdict.action != "ok":
             acted.append(verdict)
-            threading.Thread(target=ph.act_on_capture, args=(verdict, rig.audio), daemon=True).start()
+            threading.Thread(
+                target=ph.act_on_capture, args=(verdict, rig.audio), daemon=True
+            ).start()
 
     rig.on_mic_poll = on_poll
     return acted
@@ -705,7 +813,9 @@ def test_the_capture_gap_trigger_rebuilds_the_speaker_once_capture_recovers(
     """Integration: a 6 s capture gap is reported once, then one rebuild when frames return, and replies play."""
     rebuilt: list[Any] = []
     real_rebuild = ph.rebuild_sink
-    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: rebuilt.append(sink) or real_rebuild(sink))
+    monkeypatch.setattr(
+        ph, "rebuild_sink", lambda sink: rebuilt.append(sink) or real_rebuild(sink)
+    )
     rig.start()
     acted = _drive_capture_watch(rig)
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
@@ -716,7 +826,9 @@ def test_the_capture_gap_trigger_rebuilds_the_speaker_once_capture_recovers(
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     rebuilds = [m for m in warnings if "Rebuilding the speaker stream" in m]
     assert len(rebuilds) == 1 and "trigger: capture gap" in rebuilds[0], warnings
-    assert re.search(r"a [5-7]\.\d s gap in microphone frames", rebuilds[0]), rebuilds  # the gap length (6 s held)
+    assert re.search(
+        r"a [5-7]\.\d s gap in microphone frames", rebuilds[0]
+    ), rebuilds  # the gap length (6 s held)
     lat = rig.reply_latency(0.6)
     assert lat is not None and lat < 1.0, lat
 
@@ -737,7 +849,9 @@ def test_the_capture_gap_trigger_stays_quiet_through_speech_barge_ins_and_idle(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Normal replies, a barge-in flush and an idle stretch: no stall, no gap, no rebuild."""
-    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a healthy stream"))
+    monkeypatch.setattr(
+        ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a healthy stream")
+    )
     rig.start()
     acted = _drive_capture_watch(rig)
     for level in (0.4, 0.5):
@@ -774,8 +888,13 @@ def test_a_reply_is_judged_by_the_speech_the_monitor_heard(
     assert verdict.cause
 
 
-@pytest.mark.parametrize(("count", "action"), [(0, "ok"), (1, "ok"), (2, "ok"), (3, "rebuild"), (4, "rebuild")])
-def test_three_unheard_replies_in_a_row_ask_for_a_rebuild(count: int, action: str) -> None:
+@pytest.mark.parametrize(
+    ("count", "action"),
+    [(0, "ok"), (1, "ok"), (2, "ok"), (3, "rebuild"), (4, "rebuild")],
+)
+def test_three_unheard_replies_in_a_row_ask_for_a_rebuild(
+    count: int, action: str
+) -> None:
     """The streak bound is UNHEARD_LIMIT = 3, and the cause carries the count."""
     verdict = ph.unheard_streak_decision(count, limit=3)
     assert verdict.action == action
@@ -791,18 +910,26 @@ def test_speech_seconds_count_only_audio_above_the_floor() -> None:
     assert ph.loud_seconds(np.zeros(0, dtype=np.float32), 16000) == (0.0, 0.0)
 
 
-def _reply(tracker: ph.ReplyTracker, at: float, heard: bool, speech_s: float = 1.0) -> None:
+def _reply(
+    tracker: ph.ReplyTracker, at: float, heard: bool, speech_s: float = 1.0
+) -> None:
     """Push one reply of ``speech_s`` at ``at`` in 100 ms chunks; the monitor hears it, or silence."""
     for i in range(int(speech_s * 10)):
         tracker.pushed(at + 0.025 * i, 0.1, 0.1)
     for i in range(50):  # 5 s of monitor buffers, 100 ms each
         t = at + 0.1 * i
-        tracker.monitored(t, 0.1, 0.1 if heard and 0.2 <= t - at < 0.2 + speech_s else 0.0)
+        tracker.monitored(
+            t, 0.1, 0.1 if heard and 0.2 <= t - at < 0.2 + speech_s else 0.0
+        )
 
 
 def _judge(tracker: ph.ReplyTracker, now: float) -> list[str]:
     """Return the unheard trigger's verdicts; the measured lags are tested on their own."""
-    return [v.action for v in tracker.tick(now) if v.action not in ("heard_after", "heard_late")]
+    return [
+        v.action
+        for v in tracker.tick(now)
+        if v.action not in ("heard_after", "heard_late")
+    ]
 
 
 def test_the_third_unheard_reply_in_a_row_rebuilds_and_starts_the_count_again() -> None:
@@ -893,13 +1020,17 @@ def test_a_stalled_monitor_counts_nothing() -> None:
 # --- the measured lag: first push to sound on the speaker's monitor -------------------------
 
 
-def _push(tracker: ph.ReplyTracker, at: float, seconds: float, chunk_s: float = 0.1) -> None:
+def _push(
+    tracker: ph.ReplyTracker, at: float, seconds: float, chunk_s: float = 0.1
+) -> None:
     """Push ``seconds`` of speech from ``at``, four times faster than real time, as the app does."""
     for i in range(int(round(seconds / chunk_s))):
         tracker.pushed(at + 0.025 * i, chunk_s, chunk_s)
 
 
-def _hear(tracker: ph.ReplyTracker, start: float, end: float, loud: list[tuple[float, float]]) -> None:
+def _hear(
+    tracker: ph.ReplyTracker, start: float, end: float, loud: list[tuple[float, float]]
+) -> None:
     """Monitor buffers of 50 ms from ``start`` to ``end``, loud inside any of the ``loud`` spans."""
     for i in range(int(round((end - start) / 0.05))):
         t = round(start + 0.05 * (i + 1), 3)  # a buffer arrives at the end of its 50 ms
@@ -1082,12 +1213,20 @@ def test_the_minute_check_reports_without_rebuilding(
     _push(tracker, 10.0, 1.0)
     _hear(tracker, 9.0, 18.0, [(16.0, 17.0)])
     tracker.tick(18.0)
-    monkeypatch.setattr(ph, "speaker_sink", lambda pipeline: SimpleNamespace(get_name=lambda: "pulsesink0"))
-    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("the minute check rebuilt"))
+    monkeypatch.setattr(
+        ph,
+        "speaker_sink",
+        lambda pipeline: SimpleNamespace(get_name=lambda: "pulsesink0"),
+    )
+    monkeypatch.setattr(
+        ph, "rebuild_sink", lambda sink: pytest.fail("the minute check rebuilt")
+    )
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
         ph.check_playback(_Pipeline(), replies=tracker, now=40.0)
     lines = [r.getMessage() for r in caplog.records if r.name == ph.logger.name]
-    assert lines == ["Playback latency: last reply heard after 6.00 s, 24 s ago (speaker pulsesink0, bound 5.0 s)"]
+    assert lines == [
+        "Playback latency: last reply heard after 6.00 s, 24 s ago (speaker pulsesink0, bound 5.0 s)"
+    ]
 
 
 def test_only_pulsesink_has_a_monitor_to_hear_on(rig: Rig) -> None:
@@ -1116,7 +1255,9 @@ class _Desync:
         monkeypatch.setattr(ph, "rebuild_sink", rebuild)
 
 
-def _drive_reply_tracker(rig: Rig, stop: threading.Event) -> tuple[ph.ReplyTracker, list[ph.Verdict]]:
+def _drive_reply_tracker(
+    rig: Rig, stop: threading.Event
+) -> tuple[ph.ReplyTracker, list[ph.Verdict]]:
     """Feed a ReplyTracker as the app does: pushes, the speaker heard, a tick every 0.2 s acting on verdicts.
 
     Heard is the app's SpeakerMonitor in the container; locally, the buffers the
@@ -1145,7 +1286,11 @@ def _drive_reply_tracker(rig: Rig, stop: threading.Event) -> tuple[ph.ReplyTrack
             channels = pad.get_current_caps().get_structure(0).get_value("channels")
             seconds, speech = ph.loud_seconds(data.reshape(-1, channels)[:, 0], 16000)
             silenced = getattr(rig, "silenced", None)
-            tracker.monitored(time.monotonic(), seconds, 0.0 if silenced is not None and silenced() else speech)
+            tracker.monitored(
+                time.monotonic(),
+                seconds,
+                0.0 if silenced is not None and silenced() else speech,
+            )
             return Gst.PadProbeReturn.OK
 
         rig.speaker.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, heard)
@@ -1155,9 +1300,13 @@ def _drive_reply_tracker(rig: Rig, stop: threading.Event) -> tuple[ph.ReplyTrack
             for verdict in tracker.tick(time.monotonic()):
                 verdicts.append(verdict)
                 trigger = {"rebuild": "unheard replies"}.get(verdict.action)
-                if trigger is not None:  # as LocalStream._judge_replies does; heard_late only warns
+                if (
+                    trigger is not None
+                ):  # as LocalStream._judge_replies does; heard_late only warns
                     threading.Thread(
-                        target=ph.GOVERNOR.rebuild, args=(rig.audio, trigger, verdict.cause), daemon=True
+                        target=ph.GOVERNOR.rebuild,
+                        args=(rig.audio, trigger, verdict.cause),
+                        daemon=True,
                     ).start()
         if monitor is not None:
             monitor.stop()
@@ -1174,13 +1323,18 @@ def _wait_judged(verdicts: list[ph.Verdict], count: int, timeout: float = 8.0) -
 
 def _judged(verdicts: list[ph.Verdict]) -> list[ph.Verdict]:
     """Return the unheard trigger's verdicts, one per reply."""
-    return [v for v in verdicts if v.action not in ("rebuild", "heard_after", "heard_late")]
+    return [
+        v for v in verdicts if v.action not in ("rebuild", "heard_after", "heard_late")
+    ]
 
 
 def _wait_lags(verdicts: list[ph.Verdict], count: int, timeout: float) -> list[float]:
     """Wait for ``count`` measured lags; return every lag measured."""
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline and len([v for v in verdicts if v.action == "heard_after"]) < count:
+    while (
+        time.monotonic() < deadline
+        and len([v for v in verdicts if v.action == "heard_after"]) < count
+    ):
         time.sleep(0.05)
     return [float(v.cause.split()[0]) for v in verdicts if v.action == "heard_after"]
 
@@ -1190,7 +1344,9 @@ def test_three_unheard_replies_rebuild_the_speaker_and_the_next_is_heard(
 ) -> None:
     """Integration: one heard reply, then the device plays silence; the third unheard reply rebuilds it."""
     if USE_SDK_DEVICES:
-        pytest.skip("the behind case itself is reproduced in test_the_triggers_recover_the_behind_case")
+        pytest.skip(
+            "the behind case itself is reproduced in test_the_triggers_recover_the_behind_case"
+        )
     desync = _Desync(rig, monkeypatch)
     rig.start()
     stop = threading.Event()
@@ -1210,18 +1366,33 @@ def test_three_unheard_replies_rebuild_the_speaker_and_the_next_is_heard(
             _wait_judged(verdicts, 5)
     finally:
         stop.set()
-    actions = [v.action for v in verdicts if v.action not in ("heard_after", "heard_late")]
-    assert actions == ["heard", "unheard", "unheard", "unheard", "rebuild", "heard"], verdicts
+    actions = [
+        v.action for v in verdicts if v.action not in ("heard_after", "heard_late")
+    ]
+    assert actions == [
+        "heard",
+        "unheard",
+        "unheard",
+        "unheard",
+        "rebuild",
+        "heard",
+    ], verdicts
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     rebuilds = [m for m in warnings if "Rebuilding the speaker stream" in m]
-    assert len(rebuilds) == 1 and "trigger: unheard replies" in rebuilds[0] and "3 replies in a row" in rebuilds[0]
+    assert (
+        len(rebuilds) == 1
+        and "trigger: unheard replies" in rebuilds[0]
+        and "3 replies in a row" in rebuilds[0]
+    )
 
 
 def test_the_unheard_trigger_stays_quiet_through_speech_barge_ins_and_idle(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Normal replies, a barge-in mid-reply and an idle stretch: every judged reply heard or flushed."""
-    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a healthy stream"))
+    monkeypatch.setattr(
+        ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a healthy stream")
+    )
     rig.start()
     stop = threading.Event()
     try:
@@ -1243,7 +1414,11 @@ def test_the_unheard_trigger_stays_quiet_through_speech_barge_ins_and_idle(
     actions = [v.action for v in verdicts]
     assert "heard_late" not in actions, verdicts
     actions = [v.action for v in _judged(verdicts)]
-    assert actions[:2] == ["heard", "heard"] and "unheard" not in actions and "rebuild" not in actions, verdicts
+    assert (
+        actions[:2] == ["heard", "heard"]
+        and "unheard" not in actions
+        and "rebuild" not in actions
+    ), verdicts
     assert tracker.unheard_in_a_row == 0
 
 
@@ -1255,7 +1430,9 @@ def test_a_reply_lag_is_measured_during_speech_and_reported_each_minute(
     In the trixie container (REACHY_PLAYBACK_TEST_SINK=sdk) it is the app's SpeakerMonitor
     on pulsesink's monitor source, as on the robot (measured there: about 0.3 s).
     """
-    monkeypatch.setattr(ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a healthy stream"))
+    monkeypatch.setattr(
+        ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a healthy stream")
+    )
     rig.start()
     stop = threading.Event()
     try:
@@ -1272,13 +1449,24 @@ def test_a_reply_lag_is_measured_during_speech_and_reported_each_minute(
     assert all(low <= lag <= 0.5 for lag in lags), lags
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
         ph.check_playback(rig.pipeline, replies=tracker)
-    line = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Playback latency")]
+    line = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("Playback latency")
+    ]
     print(line)
-    assert len(line) == 1 and f"last reply heard after {lags[-1]:.2f} s" in line[0], line
+    assert (
+        len(line) == 1 and f"last reply heard after {lags[-1]:.2f} s" in line[0]
+    ), line
 
 
-@pytest.mark.skipif(not USE_SDK_DEVICES, reason="pulsesink and its monitor: the trixie container or the robot")
-def test_a_reply_heard_over_5_s_late_is_logged_and_never_rebuilds(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.skipif(
+    not USE_SDK_DEVICES,
+    reason="pulsesink and its monitor: the trixie container or the robot",
+)
+def test_a_reply_heard_over_5_s_late_is_logged_and_never_rebuilds(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
     """Integration: a reply heard 6 s late is measured and logged as heard late; the speaker is not rebuilt.
 
     The lag is pulsesink's ts-offset of 6 s: it writes 6 s ahead of the server's read
@@ -1305,15 +1493,25 @@ def test_a_reply_heard_over_5_s_late_is_logged_and_never_rebuilds(rig: Rig, capl
             ph.check_playback(rig.pipeline, replies=tracker)
     finally:
         stop.set()
-    minute = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Playback latency")]
+    minute = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("Playback latency")
+    ]
     print(f"\nmeasured lags: {lags}")
     print(f"verdicts: {verdicts}")
     print(f"minute line: {minute}")
     assert len(lags) >= 2 and 5.5 < lags[1] < 7.0, lags
     late = [v.cause for v in verdicts if v.action == "heard_late"]
-    assert len(late) == 1 and f"heard {lags[1]:.1f} s after its first push, over the 5.0 s bound" in late[0], late
+    assert (
+        len(late) == 1
+        and f"heard {lags[1]:.1f} s after its first push, over the 5.0 s bound"
+        in late[0]
+    ), late
     assert not [m for m in lines if "ebuil" in m], lines
-    assert len(minute) == 1 and f"last reply heard after {lags[1]:.2f} s" in minute[0], minute
+    assert (
+        len(minute) == 1 and f"last reply heard after {lags[1]:.2f} s" in minute[0]
+    ), minute
 
 
 # --- both triggers against the behind case (the trixie container) ---------------------------
@@ -1322,8 +1520,13 @@ def test_a_reply_heard_over_5_s_late_is_logged_and_never_rebuilds(rig: Rig, capl
 BEHIND = os.environ.get("REACHY_PLAYBACK_TEST_BEHIND", "")
 
 
-@pytest.mark.skipif(not (USE_SDK_DEVICES and BEHIND), reason="the trixie container's behind-case reproduction only")
-def test_the_triggers_recover_the_behind_case(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.skipif(
+    not (USE_SDK_DEVICES and BEHIND),
+    reason="the trixie container's behind-case reproduction only",
+)
+def test_the_triggers_recover_the_behind_case(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
     """Both triggers live, the speaker desynced behind the server's read pointer, replies heard again.
 
     Run on the microphone's clock (6522fb7 reverted), where a stall leaves pulsesink
@@ -1340,7 +1543,9 @@ def test_the_triggers_recover_the_behind_case(rig: Rig, caplog: pytest.LogCaptur
         tracker, verdicts = _drive_reply_tracker(rig, stop)
         with caplog.at_level(logging.INFO, logger=ph.logger.name):
             before = rig.reply_latency(0.3)
-            assert before is not None and before < 1.0, f"baseline reply latency {before}"
+            assert (
+                before is not None and before < 1.0
+            ), f"baseline reply latency {before}"
             time.sleep(5.0)
             assert tracker.armed, verdicts
             rig.stall(STALL_KIND, STALL_S)
@@ -1350,25 +1555,44 @@ def test_the_triggers_recover_the_behind_case(rig: Rig, caplog: pytest.LogCaptur
             levels = [round(0.35 + 0.01 * i, 2) for i in range(60)]
             while time.monotonic() - stalled_at < RECOVERY_S:
                 lat = rig.reply_latency(levels[len(latencies) % len(levels)])
-                latencies.append((round(time.monotonic() - stalled_at, 1), None if lat is None else round(lat, 2)))
+                latencies.append(
+                    (
+                        round(time.monotonic() - stalled_at, 1),
+                        None if lat is None else round(lat, 2),
+                    )
+                )
                 time.sleep(1.0)  # a pause: each reply is its own
-                rebuilds = [r for r in caplog.records if "Rebuilding the speaker stream" in r.getMessage()]
+                rebuilds = [
+                    r
+                    for r in caplog.records
+                    if "Rebuilding the speaker stream" in r.getMessage()
+                ]
                 if rebuilds and rebuilt_at is None:
                     rebuilt_at = time.monotonic() - stalled_at
-                heard = [lat for t, lat in latencies if rebuilt_at is not None and t > rebuilt_at]
-                if len(heard) >= 3 and all(lat is not None and lat < 1.0 for lat in heard[-3:]):
+                heard = [
+                    lat
+                    for t, lat in latencies
+                    if rebuilt_at is not None and t > rebuilt_at
+                ]
+                if len(heard) >= 3 and all(
+                    lat is not None and lat < 1.0 for lat in heard[-3:]
+                ):
                     break
     finally:
         stop.set()
     messages = [r.getMessage() for r in caplog.records if r.name == ph.logger.name]
     rebuild_lines = [m for m in messages if "Rebuilding the speaker stream" in m]
     print(f"\nstall {STALL_KIND} {STALL_S:.0f}s; rebuilds: {rebuild_lines}")
-    print(f"capture watch: {[v.action for v in acted]}; reply verdicts: {[v.action for v in verdicts]}")
+    print(
+        f"capture watch: {[v.action for v in acted]}; reply verdicts: {[v.action for v in verdicts]}"
+    )
     print(f"replies after the stall (s after it, push-to-heard s): {latencies}")
     print(f"first rebuild {rebuilt_at} s after the stall")
     assert any(f"trigger: {BEHIND}" in m for m in rebuild_lines), rebuild_lines
     after = [lat for t, lat in latencies if rebuilt_at is not None and t > rebuilt_at]
-    assert len(after) >= 3 and all(lat is not None and lat < 1.0 for lat in after[-3:]), latencies
+    assert len(after) >= 3 and all(
+        lat is not None and lat < 1.0 for lat in after[-3:]
+    ), latencies
 
 
 def test_the_reply_tracker_keeps_the_last_push_time() -> None:
@@ -1394,7 +1618,11 @@ TICK = ph.IdlePolicy("idle rebuild", 10800.0, backoff_s=600.0)
 @pytest.mark.parametrize(
     ("fresh_at", "idle_s", "action"),
     [
-        ((None, None, 0.0), 600.0, "rebuild"),  # 1000 s since the stream started, nothing since
+        (
+            (None, None, 0.0),
+            600.0,
+            "rebuild",
+        ),  # 1000 s since the stream started, nothing since
         ((500.0, None, 0.0), 600.0, "ok"),  # a reply pushed 500 s ago
         ((None, 450.0, 0.0), 600.0, "ok"),  # a rebuild 550 s ago
         ((399.0, None, 0.0), 600.0, "rebuild"),  # 601 s since the last push
@@ -1417,7 +1645,11 @@ def test_idle_counts_from_the_latest_of_push_rebuild_and_start(
         ((None, None, 0.0), (), "rebuild"),  # 3 h 20 min since the stream started
         ((1000.0, None, 0.0), (), "rebuild"),  # 3 h 3 min since the last push
         ((2000.0, None, 0.0), (), "ok"),  # 2 h 47 min: not yet
-        ((None, 1500.0, 0.0), (), "ok"),  # a rebuild 2 h 55 min ago, this one or another
+        (
+            (None, 1500.0, 0.0),
+            (),
+            "ok",
+        ),  # a rebuild 2 h 55 min ago, this one or another
         ((None, None, 0.0), ("a reply is playing",), "ok"),
         ((None, None, 0.0), ("a session is open",), "ok"),
         ((None, None, 0.0), ("a sound is playing",), "ok"),
@@ -1436,7 +1668,9 @@ def test_an_idle_verdict_says_why_it_ran_and_why_it_waited() -> None:
     governor = ph.RebuildGovernor(clock=lambda: 12000.0)
     assert governor.idle_verdict(4500.0, OPEN, (0.0,)).cause == "75 min idle"
     assert governor.idle_verdict(12000.0, TICK, (0.0,)).cause == "200 min idle"
-    held = governor.idle_verdict(12000.0, TICK, (0.0,), ("a session is open", "a sound is playing"))
+    held = governor.idle_verdict(
+        12000.0, TICK, (0.0,), ("a session is open", "a sound is playing")
+    )
     assert held.cause == "held: a session is open, a sound is playing"
 
 
@@ -1448,7 +1682,9 @@ def test_a_tried_rebuild_backs_the_tick_off_but_not_the_open() -> None:
     assert governor.last_attempt_at == 12000.0
     for t, action in ((12060.0, "ok"), (12599.0, "ok"), (12601.0, "rebuild")):
         assert governor.idle_verdict(t, TICK, (0.0,)).action == action, t
-    assert governor.idle_verdict(12060.0, OPEN, (0.0,)).action == "rebuild"  # no back-off
+    assert (
+        governor.idle_verdict(12060.0, OPEN, (0.0,)).action == "rebuild"
+    )  # no back-off
 
 
 def test_the_rebuilding_line_level_comes_from_the_trigger(
@@ -1464,8 +1700,14 @@ def test_the_rebuilding_line_level_comes_from_the_trigger(
         for trigger in ("idle rebuild", "idle refresh", "unheard replies"):
             assert governor.rebuild(audio, trigger, "x")
             now[0] += 1000.0
-    rebuilding = [r for r in caplog.records if r.getMessage().startswith("Rebuilding the speaker")]
-    assert [r.levelno for r in rebuilding] == [logging.INFO, logging.WARNING, logging.WARNING]
+    rebuilding = [
+        r for r in caplog.records if r.getMessage().startswith("Rebuilding the speaker")
+    ]
+    assert [r.levelno for r in rebuilding] == [
+        logging.INFO,
+        logging.WARNING,
+        logging.WARNING,
+    ]
     assert "trigger: idle rebuild" in rebuilding[0].getMessage()
 
 
@@ -1490,7 +1732,9 @@ def test_a_skipped_rebuild_is_logged_with_its_cause(
     assert governor.last_attempt_at == 200.0 and governor.last_rebuild_at is None
 
 
-def test_pair_idle_refresh_and_the_unheard_trigger_share_one_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pair_idle_refresh_and_the_unheard_trigger_share_one_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Refresh x the watchdog's cooldown: the unheard trigger rebuilds 30 s after a refresh.
 
     A refresh that did not help leaves the unheard trigger its rebuild 30 s later, not
@@ -1535,7 +1779,9 @@ def test_the_idle_thresholds_come_from_the_environment(
     assert ph.IDLE_REBUILD == ("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", 10800.0)
     env, default = setting
     environ = {} if raw is None else {env: raw}
-    assert ph.seconds_from_env(setting, environ) == (default if expected is None else expected)
+    assert ph.seconds_from_env(setting, environ) == (
+        default if expected is None else expected
+    )
 
 
 def test_the_two_policies_come_from_the_environment() -> None:
@@ -1662,7 +1908,9 @@ def _closes(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str]]:
     return [(r.levelno, r.getMessage()) for r in closes]
 
 
-@pytest.mark.parametrize(("kind", "cause"), [("eos", "the sound ended"), ("error", "error: boom")])
+@pytest.mark.parametrize(
+    ("kind", "cause"), [("eos", "the sound ended"), ("error", "error: boom")]
+)
 def test_a_sound_is_closed_by_its_end_or_its_error(
     glib_loop: Any, caplog: pytest.LogCaptureFixture, kind: str, cause: str
 ) -> None:
@@ -1679,7 +1927,9 @@ def test_a_sound_is_closed_by_its_end_or_its_error(
         time.sleep(0.2)
     assert playbin.states == [Gst.State.NULL]
     assert audio._playbin is playbin  # the SDK's handle, left alone
-    assert _closes(caplog) == [(logging.INFO, f"Sound stream closed ({cause}): ring.wav")]
+    assert _closes(caplog) == [
+        (logging.INFO, f"Sound stream closed ({cause}): ring.wav")
+    ]
 
 
 def test_a_replaced_sound_is_closed_once_by_the_wrap(
@@ -1737,7 +1987,9 @@ def test_a_stop_closes_the_sound_once_at_once(
         audio.made[0].post("eos")
         time.sleep(0.3)
     assert audio.made[0].states == [Gst.State.NULL]
-    assert _closes(caplog) == [(logging.INFO, "Sound stream closed (stopped): ring.wav")]
+    assert _closes(caplog) == [
+        (logging.INFO, "Sound stream closed (stopped): ring.wav")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1794,7 +2046,9 @@ def test_no_thread_is_made_per_sound(glib_loop: Any) -> None:
 
 
 @pytest.mark.parametrize("caller", ["conversation.sound", "app tools", "play_move"])
-def test_every_play_sound_caller_is_closed_at_its_end(glib_loop: Any, caller: str) -> None:
+def test_every_play_sound_caller_is_closed_at_its_end(
+    glib_loop: Any, caller: str
+) -> None:
     """The route and play_move through the real MediaManager.play_sound, and a direct call."""
     from reachy_mini.media.media_manager import MediaManager
 
@@ -1804,7 +2058,9 @@ def test_every_play_sound_caller_is_closed_at_its_end(glib_loop: Any, caller: st
     if caller == "app tools":
         audio.play_sound("express.wav")
     else:  # conversation.sound's media.play_sound and ReachyMini.play_move both reach this
-        media = SimpleNamespace(audio=audio, logger=ph.logger)  # MediaManager.play_sound's self
+        media = SimpleNamespace(
+            audio=audio, logger=ph.logger
+        )  # MediaManager.play_sound's self
         MediaManager.play_sound(media, "ring.wav")  # type: ignore[arg-type]
     audio.made[0].post("eos")
     assert _until(lambda: audio.made[0].states == [Gst.State.NULL])
@@ -1835,10 +2091,16 @@ def test_a_sound_playing_before_the_wrap_is_watched_from_then(
         assert ph.install_sound_wrap(audio)
         assert ph.SOUNDS.state()[0] is True
         audio.play_sound = lambda path: None
-        assert ph.install_sound_wrap(audio)  # a fresh method: already open, not opened twice
+        assert ph.install_sound_wrap(
+            audio
+        )  # a fresh method: already open, not opened twice
         started.post("eos")
         assert _until(lambda: ph.SOUNDS.state()[0] is False)
-    opened = [r.getMessage() for r in caplog.records if "Sound stream opened" in r.getMessage()]
+    opened = [
+        r.getMessage()
+        for r in caplog.records
+        if "Sound stream opened" in r.getMessage()
+    ]
     before = "(a sound started before the wrap)"
     assert opened == [f"Sound stream opened: {before} (a second speaker stream)"]
     ended = SimpleNamespace(_playbin=_SoundPlaybin("old"), play_sound=lambda path: None)
@@ -1905,7 +2167,12 @@ def test_a_bookkeeping_failure_never_breaks_play_sound(
         (2.0, (1.0, 1.0, 1.0), False),
         (None, (1.0, 2.0, 2.0), False),
     ],
-    ids=["stopped at its end", "stopped just short", "stalled mid-sound", "no duration known"],
+    ids=[
+        "stopped at its end",
+        "stopped just short",
+        "stalled mid-sound",
+        "no duration known",
+    ],
 )
 def test_a_sound_with_no_watch_is_closed_by_the_sweep_at_its_end(
     monkeypatch: pytest.MonkeyPatch,
@@ -1937,12 +2204,18 @@ def test_a_sound_with_no_watch_is_closed_by_the_sweep_at_its_end(
         time.sleep(0.1)
         assert playbin.states == [] and _closes(caplog) == []
         return
-    assert _until(lambda: playbin.states == [Gst.State.NULL])  # queued through the reaper
+    assert _until(
+        lambda: playbin.states == [Gst.State.NULL]
+    )  # queued through the reaper
     ((level, line),) = _closes(caplog)
-    assert level == logging.INFO and line.startswith("Sound stream closed (the sound ended")
+    assert level == logging.INFO and line.startswith(
+        "Sound stream closed (the sound ended"
+    )
 
 
-@pytest.mark.parametrize("preroll_position", [0.0, None], ids=["read at preroll", "unread"])
+@pytest.mark.parametrize(
+    "preroll_position", [0.0, None], ids=["read at preroll", "unread"]
+)
 def test_a_sound_still_playing_past_its_bound_is_never_cut_off(
     glib_loop: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -1974,7 +2247,9 @@ def test_a_sound_still_playing_past_its_bound_is_never_cut_off(
     assert _until(lambda: playbin.states == [Gst.State.NULL])
     late = [r for r in caplog.records if "still playing" in r.getMessage()]
     assert [r.levelno for r in late] == [logging.INFO]
-    assert _closes(caplog) == [(logging.INFO, "Sound stream closed (the sound ended): song.wav")]
+    assert _closes(caplog) == [
+        (logging.INFO, "Sound stream closed (the sound ended): song.wav")
+    ]
 
 
 @pytest.mark.parametrize("how", ["stop_playing", "starting up"])
@@ -2001,7 +2276,9 @@ def test_a_sound_set_to_null_outside_the_wrap_is_closed_by_the_sweep(
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     if how == "stop_playing":
         assert ph.SOUNDS.state()[0] is False
-        assert _closes(caplog) == [(logging.INFO, "Sound stream closed (closed outside): ring.wav")]
+        assert _closes(caplog) == [
+            (logging.INFO, "Sound stream closed (closed outside): ring.wav")
+        ]
         assert playbin.states == [Gst.State.NULL]  # the SDK's, and no second one
     else:
         assert ph.SOUNDS.state()[0] is True and _closes(caplog) == []
@@ -2051,7 +2328,9 @@ def test_two_play_sound_callers_at_once_each_open_their_own_sound(
     Gst = _gst()
     audio = _SdkAudio()
 
-    def play_sound(sound_file: str) -> None:  # the SDK's, slow between its read and its write
+    def play_sound(
+        sound_file: str,
+    ) -> None:  # the SDK's, slow between its read and its write
         if audio._playbin is not None:
             audio._playbin.set_state(Gst.State.NULL)
         time.sleep(0.1)  # building the playbin and its sink
@@ -2069,8 +2348,14 @@ def test_two_play_sound_callers_at_once_each_open_their_own_sound(
         first.join(2.0)
         second.join(2.0)
     a, b = audio.made
-    opened = [r.getMessage() for r in caplog.records if "Sound stream opened" in r.getMessage()]
-    assert opened == [f"Sound stream opened: {p}.wav (a second speaker stream)" for p in "ab"]
+    opened = [
+        r.getMessage()
+        for r in caplog.records
+        if "Sound stream opened" in r.getMessage()
+    ]
+    assert opened == [
+        f"Sound stream opened: {p}.wav (a second speaker stream)" for p in "ab"
+    ]
     replaced = "Sound stream closed (replaced by a newer sound): a.wav"
     assert _closes(caplog) == [(logging.INFO, replaced)]
     assert a.states == [Gst.State.NULL] and b.states == []
@@ -2091,14 +2376,20 @@ def test_a_preroll_racing_a_close_arms_nothing(
         playbin = audio.made[0]
         ((on_message, sound),) = audio.bus.watches
         ph.close_sound(playbin, ph.SoundEnd.STOPPED)
-        on_message(audio.bus, Gst.Message.new_async_done(None, Gst.CLOCK_TIME_NONE), sound)
+        on_message(
+            audio.bus, Gst.Message.new_async_done(None, Gst.CLOCK_TIME_NONE), sound
+        )
         assert _until(lambda: playbin.states != [])
         time.sleep(0.5)
     assert playbin.states == [Gst.State.NULL]
-    assert _closes(caplog) == [(logging.INFO, "Sound stream closed (stopped): ring.wav")]
+    assert _closes(caplog) == [
+        (logging.INFO, "Sound stream closed (stopped): ring.wav")
+    ]
 
 
-def test_a_stop_stops_only_an_open_sound(glib_loop: Any, caplog: pytest.LogCaptureFixture) -> None:
+def test_a_stop_stops_only_an_open_sound(
+    glib_loop: Any, caplog: pytest.LogCaptureFixture
+) -> None:
     """True only for an open sound; with none open it reports so, from SOUNDS, not _playbin."""
     Gst = _gst()
     audio = _SdkAudio()
@@ -2127,7 +2418,9 @@ def test_a_sound_before_the_wrap_that_cannot_be_tracked_says_so(
         raise RuntimeError("no record")
 
     monkeypatch.setattr(ph.SOUNDS, "opened", opened)
-    audio = SimpleNamespace(_playbin=_SoundPlaybin("wake_up"), play_sound=lambda path: None)
+    audio = SimpleNamespace(
+        _playbin=_SoundPlaybin("wake_up"), play_sound=lambda path: None
+    )
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
         assert ph.install_sound_wrap(audio) is True
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
@@ -2183,7 +2476,9 @@ def test_a_sound_the_sweep_cannot_read_never_stops_the_sweep(
     audio.stop_playing()  # the SDK sets ring.wav to NULL outside the wrap
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
         assert ph.SOUNDS.sweep() is True
-    assert _closes(caplog) == [(logging.INFO, "Sound stream closed (closed outside): ring.wav")]
+    assert _closes(caplog) == [
+        (logging.INFO, "Sound stream closed (closed outside): ring.wav")
+    ]
     failed = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert failed == ["Sound sweep failed for broken.wav"]
     assert ph.SOUNDS.state()[0] is True  # broken.wav, still open for the next sweep
@@ -2200,7 +2495,9 @@ def test_a_sound_being_replaced_is_left_to_the_wrap(
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
         audio.play_sound("song.wav")
         old = audio.made[0]
-        with ph.PLAY_SOUND_LOCK:  # a play_sound under way: the SDK has just set it to NULL
+        with (
+            ph.PLAY_SOUND_LOCK
+        ):  # a play_sound under way: the SDK has just set it to NULL
             old.set_state(Gst.State.NULL)
             assert ph.SOUNDS.sweep() is True
             assert ph.SOUNDS.state()[0] is True
@@ -2218,3 +2515,14 @@ def test_a_flush_says_how_much_of_the_reply_was_left() -> None:
     r.pushed(1.0, 6.0, 5.0)
     total, left = r.flushed(2.0)
     assert total == 6.0 and left == 6.0  # never heard yet: all of it unplayed
+    assert r.flushed(2.5) == (6.0, 0.0)  # flushed already: nothing more was cut
+
+
+def test_a_flush_long_after_a_reply_finds_nothing_unplayed() -> None:
+    """The review (11-03): a reply never heard, or heard and flushed, is not unplayed minutes on
+    (room noise then made him speak to nobody)."""
+    from reachy_mini_conversation_app.playback_health import ReplyTracker
+
+    r = ReplyTracker()
+    r.pushed(1.0, 4.0, 3.0)
+    assert r.flushed(600.0) == (4.0, 0.0)

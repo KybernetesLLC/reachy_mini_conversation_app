@@ -83,8 +83,13 @@ def decide(latency_s: float | None, limit_s: float = LATENCY_LIMIT_S) -> Verdict
     if latency_s is None or not math.isfinite(latency_s) or latency_s < 0:
         return Verdict("unmeasured", "no playback stream latency to read")
     if latency_s > limit_s:
-        return Verdict("rebuild", f"playback latency {latency_s:.1f} s is over the {limit_s:.1f} s bound")
-    return Verdict("ok", f"playback latency {latency_s:.3f} s is within the {limit_s:.1f} s bound")
+        return Verdict(
+            "rebuild",
+            f"playback latency {latency_s:.1f} s is over the {limit_s:.1f} s bound",
+        )
+    return Verdict(
+        "ok", f"playback latency {latency_s:.3f} s is within the {limit_s:.1f} s bound"
+    )
 
 
 def latency_bounded(latency_s: float | None, limit_s: float = LATENCY_LIMIT_S) -> bool:
@@ -156,7 +161,10 @@ def rebuild_sink(sink: Any, timeout_s: float = 2.0) -> bool:
     probe = upstream.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, on_block)
     try:
         if not blocked.wait(timeout_s):
-            logger.warning("Speaker stream rebuild: no audio reached the sink in %.1f s to block", timeout_s)
+            logger.warning(
+                "Speaker stream rebuild: no audio reached the sink in %.1f s to block",
+                timeout_s,
+            )
         upstream.unlink(sinkpad)
         sink.set_state(Gst.State.NULL)
         upstream.link(sinkpad)
@@ -190,13 +198,18 @@ def rebuild_decision(
             f"{len(recent)} rebuild(s) in the last {window_s:.0f} s, cooldown {cooldown:.0f} s, "
             f"next allowed in {left:.0f} s",
         )
-    return Verdict("rebuild", f"the {cooldown:.0f} s cooldown after {len(recent)} rebuild(s) has passed")
+    return Verdict(
+        "rebuild",
+        f"the {cooldown:.0f} s cooldown after {len(recent)} rebuild(s) has passed",
+    )
 
 
 def _playing(pipeline: Any) -> bool:
     """Return whether the pipeline is PLAYING now; capture off sets it to NULL."""
     try:
-        return bool(pipeline is not None and pipeline.get_state(0)[1] == Gst.State.PLAYING)
+        return bool(
+            pipeline is not None and pipeline.get_state(0)[1] == Gst.State.PLAYING
+        )
     except Exception:
         return False
 
@@ -234,7 +247,9 @@ def seconds_from_env(setting: Setting, environ: Any = os.environ) -> float:
     except ValueError:
         value = -1.0
     if not math.isfinite(value) or value < 0:
-        logger.warning("%s=%r is not a number of seconds >= 0; using %.0f", name, raw, default)
+        logger.warning(
+            "%s=%r is not a number of seconds >= 0; using %.0f", name, raw, default
+        )
         return default
     return value
 
@@ -251,7 +266,11 @@ def idle_policies(environ: Any = os.environ) -> tuple[IdlePolicy, IdlePolicy]:
     """Return (the session open's refresh, the watchdog tick's rebuild), from the environment."""
     return (
         IdlePolicy("idle refresh", seconds_from_env(REFRESH_IDLE, environ)),
-        IdlePolicy("idle rebuild", seconds_from_env(IDLE_REBUILD, environ), REBUILD_COOLDOWN_MAX_S),
+        IdlePolicy(
+            "idle rebuild",
+            seconds_from_env(IDLE_REBUILD, environ),
+            REBUILD_COOLDOWN_MAX_S,
+        ),
     )
 
 
@@ -269,7 +288,9 @@ class RebuildGovernor:
         self._clock = clock
         self._history: list[float] = []
         self.last_rebuild_at: float | None = None
-        self.last_attempt_at: float | None = None  # every call, run, skipped or held back
+        self.last_attempt_at: float | None = (
+            None  # every call, run, skipped or held back
+        )
 
     def idle_verdict(
         self,
@@ -286,11 +307,17 @@ class RebuildGovernor:
         if held:
             return Verdict("ok", "held: " + ", ".join(held))
         tried = self.last_attempt_at
-        if policy.backoff_s > 0 and tried is not None and now - tried < policy.backoff_s:
+        if (
+            policy.backoff_s > 0
+            and tried is not None
+            and now - tried < policy.backoff_s
+        ):
             return Verdict("ok", f"a rebuild was tried {now - tried:.0f} s ago")
         known = [t for t in fresh_at if t is not None]
         if policy.idle_s <= 0 or not known:
-            return Verdict("ok", "off" if policy.idle_s <= 0 else "nothing known about the stream")
+            return Verdict(
+                "ok", "off" if policy.idle_s <= 0 else "nothing known about the stream"
+            )
         idle = now - max(known)
         if idle > policy.idle_s:
             return Verdict("rebuild", f"{idle / 60:.0f} min idle")
@@ -311,13 +338,18 @@ class RebuildGovernor:
             verdict = rebuild_decision(now, self._history)
             if verdict.action != "rebuild":
                 logger.info(
-                    "Speaker stream rebuild held back (trigger: %s, cause: %s): %s", trigger, cause, verdict.cause
+                    "Speaker stream rebuild held back (trigger: %s, cause: %s): %s",
+                    trigger,
+                    cause,
+                    verdict.cause,
                 )
                 return False
             sink = speaker_sink(pipeline)
             if sink is None:
                 return _skipped(trigger, "no speaker sink")
-            self._history = [t for t in self._history if now - t < REBUILD_WINDOW_S] + [now]
+            self._history = [t for t in self._history if now - t < REBUILD_WINDOW_S] + [
+                now
+            ]
             self.last_rebuild_at = now
             logger.log(
                 logging.INFO if trigger in ROUTINE_TRIGGERS else logging.WARNING,
@@ -331,10 +363,16 @@ class RebuildGovernor:
             try:
                 restarted = restart_speaker_clock(audio)
             except Exception:
-                logger.warning("Could not restart the speaker's clock after the rebuild", exc_info=True)
+                logger.warning(
+                    "Could not restart the speaker's clock after the rebuild",
+                    exc_info=True,
+                )
                 restarted = False
             logger.info(
-                "Speaker stream rebuilt (trigger: %s): sink back=%s%s", trigger, ok, ", primed" if restarted else ""
+                "Speaker stream rebuilt (trigger: %s): sink back=%s%s",
+                trigger,
+                ok,
+                ", primed" if restarted else "",
             )
             return bool(ok)
 
@@ -351,7 +389,10 @@ def lag_report(last: tuple[float, float] | None, now: float) -> str:
 
 
 def check_playback(
-    pipeline: Any, limit_s: float = LATENCY_LIMIT_S, replies: Any = None, now: float | None = None
+    pipeline: Any,
+    limit_s: float = LATENCY_LIMIT_S,
+    replies: Any = None,
+    now: float | None = None,
 ) -> Verdict:
     """Log the minute line, the last measured reply lag; the rebuild belongs to the per-reply trigger."""
     with MEDIA_LOCK:
@@ -393,17 +434,23 @@ def capture_gap_decision(gap_s: float, limit_s: float = CAPTURE_GAP_S) -> Verdic
     return Verdict("ok", f"microphone frames {gap_s:.3f} s apart")
 
 
-def capture_stall_decision(age_s: float, warned: bool, stall_s: float = CAPTURE_STALL_S) -> Verdict:
+def capture_stall_decision(
+    age_s: float, warned: bool, stall_s: float = CAPTURE_STALL_S
+) -> Verdict:
     """Decide while no frame comes: once per stall, past ``stall_s``, it is reported. Pure."""
     if age_s > stall_s and not warned:
-        return Verdict("stalled", f"no microphone frames for {age_s:.1f} s with capture on")
+        return Verdict(
+            "stalled", f"no microphone frames for {age_s:.1f} s with capture on"
+        )
     return Verdict("ok", f"last microphone frame {age_s:.1f} s ago")
 
 
 class CaptureWatch:
     """Track microphone frame arrivals for the record loop; times are passed in, so it is deterministic."""
 
-    def __init__(self, gap_s: float = CAPTURE_GAP_S, stall_s: float = CAPTURE_STALL_S) -> None:
+    def __init__(
+        self, gap_s: float = CAPTURE_GAP_S, stall_s: float = CAPTURE_STALL_S
+    ) -> None:
         """Start with no frame seen."""
         self._gap_s = gap_s
         self._stall_s = stall_s
@@ -432,10 +479,15 @@ class CaptureWatch:
         return verdict
 
 
-def act_on_capture(verdict: Verdict, audio: Any, governor: RebuildGovernor | None = None) -> None:
+def act_on_capture(
+    verdict: Verdict, audio: Any, governor: RebuildGovernor | None = None
+) -> None:
     """Carry out a CaptureWatch verdict, off the event loop: report a stall, or rebuild after a gap."""
     if verdict.action == "stalled":
-        logger.warning("Capture stalled: %s; restarting the speaker's clock in case it stopped", verdict.cause)
+        logger.warning(
+            "Capture stalled: %s; restarting the speaker's clock in case it stopped",
+            verdict.cause,
+        )
         try:
             restart_speaker_clock(audio)
         except Exception:
@@ -462,7 +514,9 @@ UNHEARD_WINDOW_S = 5.0  # a reply is judged this long after its first push
 UNHEARD_LIMIT = 3  # unheard replies in a row before a rebuild
 REPLY_GAP_S = 1.5  # pushes further apart than this start a new reply
 LOUD_RMS = 0.003  # about -50 dBFS: speech, not silence or dither
-HEARD_FRACTION = 0.25  # of the speech pushed (up to the window less 1 s), heard by the deadline
+HEARD_FRACTION = (
+    0.25  # of the speech pushed (up to the window less 1 s), heard by the deadline
+)
 MIN_SPEECH_S = 0.3  # less speech than this is not judged
 
 # The measured lag. Each reply's lag is the time from its first push to the first
@@ -482,7 +536,9 @@ MIN_SPEECH_S = 0.3  # less speech than this is not judged
 # heard late (a WARNING, never a rebuild).
 LAG_WINDOW_S = 90.0
 QUEUE_SLACK_S = 0.3  # a queued reply's sound may arrive this much before the estimate
-REPLY_TAIL_S = 3.0  # a heard reply is the app's own sound until it has played, and this long
+REPLY_TAIL_S = (
+    3.0  # a heard reply is the app's own sound until it has played, and this long
+)
 
 
 def rms(samples: Any) -> float | None:
@@ -516,23 +572,39 @@ def loud_seconds(samples: Any, rate: int) -> tuple[float, float]:
 
 
 def reply_verdict(
-    speech_pushed_s: float, heard_s: float, monitored_s: float, window_s: float = UNHEARD_WINDOW_S
+    speech_pushed_s: float,
+    heard_s: float,
+    monitored_s: float,
+    window_s: float = UNHEARD_WINDOW_S,
 ) -> Verdict:
     """Judge one reply at its deadline, from speech pushed and speech the monitor heard in its window. Pure."""
     expected = min(speech_pushed_s, window_s - 1.0)
     if expected < MIN_SPEECH_S:
-        return Verdict("skip", f"{speech_pushed_s:.2f} s of speech pushed, too little to judge")
+        return Verdict(
+            "skip", f"{speech_pushed_s:.2f} s of speech pushed, too little to judge"
+        )
     if monitored_s < 0.5 * window_s:
-        return Verdict("unmeasured", f"the speaker's monitor delivered {monitored_s:.1f} s of {window_s:.0f} s")
+        return Verdict(
+            "unmeasured",
+            f"the speaker's monitor delivered {monitored_s:.1f} s of {window_s:.0f} s",
+        )
     if heard_s >= HEARD_FRACTION * expected:
-        return Verdict("heard", f"{heard_s:.2f} s of speech heard of {expected:.2f} s expected")
-    return Verdict("unheard", f"{heard_s:.2f} s of speech heard of {expected:.2f} s expected within {window_s:.0f} s")
+        return Verdict(
+            "heard", f"{heard_s:.2f} s of speech heard of {expected:.2f} s expected"
+        )
+    return Verdict(
+        "unheard",
+        f"{heard_s:.2f} s of speech heard of {expected:.2f} s expected within {window_s:.0f} s",
+    )
 
 
 def unheard_streak_decision(count: int, limit: int = UNHEARD_LIMIT) -> Verdict:
     """Decide from the count of unheard replies in a row. Pure."""
     if count >= limit:
-        return Verdict("rebuild", f"{count} replies in a row pushed but not heard within {UNHEARD_WINDOW_S:.0f} s")
+        return Verdict(
+            "rebuild",
+            f"{count} replies in a row pushed but not heard within {UNHEARD_WINDOW_S:.0f} s",
+        )
     return Verdict("ok", f"{count} unheard in a row")
 
 
@@ -558,12 +630,18 @@ class ReplyTracker:
         self._rebuilt_at = rebuilt_at or (lambda: GOVERNOR.last_rebuild_at)
         self._lock = threading.Lock()
         self._replies: list[dict[str, Any]] = []
-        self._monitor: list[tuple[float, float, float]] = []  # (arrival, seconds, speech seconds)
+        self._monitor: list[tuple[float, float, float]] = (
+            []
+        )  # (arrival, seconds, speech seconds)
         self._was_loud = False  # the last monitor buffer had speech in it
-        self._before: dict[str, Any] | None = None  # the last reply heard, which a queued reply waits for
+        self._before: dict[str, Any] | None = (
+            None  # the last reply heard, which a queued reply waits for
+        )
         self._lags: list[float] = []  # measured, not yet reported by tick
         self._last_lag: tuple[float, float] | None = None  # (lag, measured at)
-        self._heard_until: float | None = None  # when the last heard reply has played out
+        self._heard_until: float | None = (
+            None  # when the last heard reply has played out
+        )
         self._heard_at: float | None = None  # when the last heard reply was first heard
         self.unheard_in_a_row = 0
         self.armed = False
@@ -574,7 +652,11 @@ class ReplyTracker:
         with self._lock:
             self.last_pushed_at = now
             current = self._replies[-1] if self._replies else None
-            if current is None or current["flushed"] or now - current["last"] > REPLY_GAP_S:
+            if (
+                current is None
+                or current["flushed"]
+                or now - current["last"] > REPLY_GAP_S
+            ):
                 current = {
                     "start": now,
                     "last": now,
@@ -588,7 +670,9 @@ class ReplyTracker:
             current["last"] = now
             current["seconds"] += seconds
             current["speech"] += speech_s
-            if current["lag"] == "measured":  # heard while still pushed: it plays this much longer
+            if (
+                current["lag"] == "measured"
+            ):  # heard while still pushed: it plays this much longer
                 ends = current["heard_at"] + current["seconds"]
                 self._heard_until = max(self._heard_until or ends, ends)
 
@@ -600,16 +684,36 @@ class ReplyTracker:
             cut = None
             if self._replies:
                 last = self._replies[-1]
-                heard = last.get("heard_at") if last["lag"] == "measured" else None
-                left = last["seconds"] if heard is None else max(0.0, heard + last["seconds"] - now)
+                if (
+                    last["flushed"] or last["lag"] == "none"
+                ):  # dropped already, or long played out
+                    left = 0.0
+                elif last["lag"] == "measured":
+                    ends = min(
+                        last["heard_at"] + last["seconds"],
+                        self._heard_until or float("inf"),
+                    )
+                    left = max(0.0, ends - now)
+                else:  # not heard yet: it plays from its push after about the last measured lag
+                    lag = self._last_lag[0] if self._last_lag else 1.0
+                    left = min(
+                        last["seconds"],
+                        max(0.0, last["start"] + lag + last["seconds"] - now),
+                    )
                 cut = (last["seconds"], left)
             if self._replies and not self._replies[-1]["judged"]:
                 self._replies[-1]["flushed"] = True
-            for reply in self._replies:  # everything queued was dropped: no lag, and nothing to wait for
+            for (
+                reply
+            ) in (
+                self._replies
+            ):  # everything queued was dropped: no lag, and nothing to wait for
                 if reply["lag"] == "pending":
                     reply["lag"] = "none"
             self._before = None
-            if self._heard_until is not None:  # the heard reply's queued rest was dropped too
+            if (
+                self._heard_until is not None
+            ):  # the heard reply's queued rest was dropped too
                 self._heard_until = min(self._heard_until, now)
             return cut
 
@@ -626,16 +730,24 @@ class ReplyTracker:
     def _expire(self, now: float) -> None:
         """Give up on replies past the lag window, and on replies a rebuild cut off. Holds the lock."""
         rebuilt = self._rebuilt_at()
-        if rebuilt is not None and self._before is not None and self._before["heard_at"] < rebuilt:
+        if (
+            rebuilt is not None
+            and self._before is not None
+            and self._before["heard_at"] < rebuilt
+        ):
             self._before = None  # the rebuild dropped whatever of it was still queued
         heard_at, until = self._heard_at, self._heard_until
         if rebuilt is not None and heard_at is not None and until is not None:
             if heard_at < rebuilt < until:
-                self._heard_until = rebuilt  # the rebuild dropped the heard reply's rest too
+                self._heard_until = (
+                    rebuilt  # the rebuild dropped the heard reply's rest too
+                )
         for reply in self._replies:
             if reply["lag"] != "pending":
                 continue
-            if now > reply["start"] + LAG_WINDOW_S or (rebuilt is not None and reply["start"] < rebuilt):
+            if now > reply["start"] + LAG_WINDOW_S or (
+                rebuilt is not None and reply["start"] < rebuilt
+            ):
                 reply["lag"] = "none"
                 self._before = None
 
@@ -646,7 +758,10 @@ class ReplyTracker:
         for candidate in self._replies:
             if candidate["lag"] != "pending":
                 continue
-            if candidate["speech"] < MIN_SPEECH_S and now - candidate["last"] > REPLY_GAP_S:
+            if (
+                candidate["speech"] < MIN_SPEECH_S
+                and now - candidate["last"] > REPLY_GAP_S
+            ):
                 candidate["lag"] = "none"  # finished with too little speech to be heard
                 continue
             reply = candidate
@@ -715,16 +830,23 @@ class ReplyTracker:
                     continue
                 reply["judged"] = True
                 if reply["flushed"]:
-                    verdicts.append(Verdict("flushed", "barge-in: dropped audio, not judged"))
+                    verdicts.append(
+                        Verdict("flushed", "barge-in: dropped audio, not judged")
+                    )
                     continue
                 start, end = reply["start"], reply["start"] + self._window_s
                 window = [m for m in self._monitor if start <= m[0] <= end]
                 verdict = reply_verdict(
-                    reply["speech"], sum(m[2] for m in window), sum(m[1] for m in window), self._window_s
+                    reply["speech"],
+                    sum(m[2] for m in window),
+                    sum(m[1] for m in window),
+                    self._window_s,
                 )
                 verdicts.append(verdict)
                 if verdict.action == "unmeasured" and reply["lag"] == "pending":
-                    reply["lag"] = "none"  # the monitor was down: its sound may come later, or never
+                    reply["lag"] = (
+                        "none"  # the monitor was down: its sound may come later, or never
+                    )
                     self._before = None
                 if verdict.action == "heard":
                     self.unheard_in_a_row = 0
@@ -733,11 +855,15 @@ class ReplyTracker:
                     self.unheard_in_a_row += 1
                     streak = unheard_streak_decision(self.unheard_in_a_row, self._limit)
                     if streak.action == "rebuild":
-                        verdicts.append(Verdict("rebuild", f"{streak.cause}; last: {verdict.cause}"))
+                        verdicts.append(
+                            Verdict("rebuild", f"{streak.cause}; last: {verdict.cause}")
+                        )
                         self.unheard_in_a_row = 0
             horizon = now - 2 * self._window_s
             self._replies = [
-                r for r in self._replies if not r["judged"] or r["last"] > horizon or r["lag"] == "pending"
+                r
+                for r in self._replies
+                if not r["judged"] or r["last"] > horizon or r["lag"] == "pending"
             ]
             self._monitor = [m for m in self._monitor if m[0] > horizon]
         return verdicts
@@ -775,7 +901,10 @@ class SpeakerMonitor:
         src.set_property("device", source)
         src.set_property("buffer-time", 200_000)
         src.set_property("latency-time", 50_000)
-        appsink.set_property("caps", Gst.Caps.from_string("audio/x-raw,format=F32LE,channels=1,rate=16000"))
+        appsink.set_property(
+            "caps",
+            Gst.Caps.from_string("audio/x-raw,format=F32LE,channels=1,rate=16000"),
+        )
         appsink.set_property("sync", False)
         appsink.set_property("drop", True)
         appsink.set_property("max-buffers", 50)
@@ -792,7 +921,9 @@ class SpeakerMonitor:
         self._pipeline = pipeline
         self.source = source
         self.last_buffer_at = time.monotonic()
-        logger.info("Speaker monitor started on %s (heard replies are measured here)", source)
+        logger.info(
+            "Speaker monitor started on %s (heard replies are measured here)", source
+        )
         return True
 
     def _on_sample(self, appsink: Any) -> Any:
@@ -816,7 +947,9 @@ class SpeakerMonitor:
             self.source = None
 
 
-def current_speaker_sink(audio: Any, cache: dict[str, Any] | None = None) -> tuple[bool, Any]:
+def current_speaker_sink(
+    audio: Any, cache: dict[str, Any] | None = None
+) -> tuple[bool, Any]:
     """Return (the app pipeline is playing, its speaker sink or None), under MEDIA_LOCK.
 
     With ``cache``, the sink found for a pipeline is reused while the pipeline is the same:
@@ -829,7 +962,9 @@ def current_speaker_sink(audio: Any, cache: dict[str, Any] | None = None) -> tup
         if cache is not None and cache.get("pipeline") is pipeline:
             return True, cache["sink"]
         sink = speaker_sink(pipeline)
-        if cache is not None and sink is not None:  # a sink not found yet is looked up again
+        if (
+            cache is not None and sink is not None
+        ):  # a sink not found yet is looked up again
             cache.update(pipeline=pipeline, sink=sink)
         return True, sink
 
@@ -859,7 +994,11 @@ def keep_monitor(
     if monitor.source == source and not stale:
         return "running"
     if monitor.source is not None and stale:
-        logger.info("Speaker monitor on %s delivered nothing for %.0f s: restarting it", monitor.source, stale_s)
+        logger.info(
+            "Speaker monitor on %s delivered nothing for %.0f s: restarting it",
+            monitor.source,
+            stale_s,
+        )
     return "started" if monitor.start(source) else "unavailable"
 
 
@@ -879,8 +1018,12 @@ def keep_monitor(
 # that sound's own playbin to NULL on the one reaper thread, never on the GLib loop;
 # audio._playbin is the SDK's.
 
-SOUND_SLACK_S = 5.0  # past its duration by this much, a sound whose position stalled is closed
-SOUND_MAX_S = 1800.0  # the bound for a sound of unknown duration, and the cap for every sound
+SOUND_SLACK_S = (
+    5.0  # past its duration by this much, a sound whose position stalled is closed
+)
+SOUND_MAX_S = (
+    1800.0  # the bound for a sound of unknown duration, and the cap for every sound
+)
 SOUND_SWEEP_S = 3.0  # the sweep looks at the open sounds this often
 STOP_WAIT_S = 5.0  # a stop waits this long for the sound's playbin to reach NULL
 # A sound with no bus watch has ended when its position stopped this close to its duration.
@@ -921,9 +1064,13 @@ class _Sound:
     opened_at: float
     bound_s: float  # SOUND_MAX_S until preroll gives the duration
     timed: bool = False  # the duration was read, once, at preroll
-    position: int | None = None  # its position in ns, at preroll or at the last overdue sweep
+    position: int | None = (
+        None  # its position in ns, at preroll or at the last overdue sweep
+    )
     late: bool = False  # it played on past its bound, and that was logged
-    watched: bool = True  # False: adding its bus watch failed, and only the sweep closes it
+    watched: bool = (
+        True  # False: adding its bus watch failed, and only the sweep closes it
+    )
 
 
 class SoundActivity:
@@ -981,7 +1128,9 @@ class SoundActivity:
         logged once, up to SOUND_MAX_S.
         """
         if not PLAY_SOUND_LOCK.acquire(blocking=False):
-            return True  # a play_sound is replacing a sound: look again at the next round
+            return (
+                True  # a play_sound is replacing a sound: look again at the next round
+            )
         try:
             now = self.clock()
             for sound in self.open_sounds():
@@ -994,13 +1143,19 @@ class SoundActivity:
                         if current == Gst.State.READY:
                             close_sound(sound.playbin, SoundEnd.FAILED_START)
                             continue
-                    if not sound.watched:  # no EOS reaches it: its end is a position stopped there
+                    if (
+                        not sound.watched
+                    ):  # no EOS reaches it: its end is a position stopped there
                         timed, duration = sound.playbin.query_duration(Gst.Format.TIME)
                         found, position = sound.playbin.query_position(Gst.Format.TIME)
-                        last, sound.position = sound.position, (position if found else None)
+                        last, sound.position = sound.position, (
+                            position if found else None
+                        )
                         end = duration - SOUND_END_SLACK_S * Gst.SECOND
                         if timed and found and position >= end and position == last:
-                            close_sound(sound.playbin, SoundEnd.ENDED, "seen by the sweep")
+                            close_sound(
+                                sound.playbin, SoundEnd.ENDED, "seen by the sweep"
+                            )
                             continue
                     age = now - sound.opened_at
                     if age <= sound.bound_s:
@@ -1008,22 +1163,39 @@ class SoundActivity:
                     known, position = sound.playbin.query_position(Gst.Format.TIME)
                     if age > SOUND_MAX_S:
                         why = f"over the {SOUND_MAX_S:.0f} s cap"
-                    elif known and sound.position is None:  # unread at preroll: compare from now
+                    elif (
+                        known and sound.position is None
+                    ):  # unread at preroll: compare from now
                         sound.position = position
                         continue
-                    elif known and sound.position is not None and position > sound.position:
+                    elif (
+                        known
+                        and sound.position is not None
+                        and position > sound.position
+                    ):
                         sound.position = position
                         if not sound.late:
                             sound.late = True
-                            logger.info("Sound stream still playing past its bound: %s", sound.path)
+                            logger.info(
+                                "Sound stream still playing past its bound: %s",
+                                sound.path,
+                            )
                         continue
                     else:
-                        why = "its position stalled" if known else "its position unknown"
+                        why = (
+                            "its position stalled" if known else "its position unknown"
+                        )
                     detail = f"{age:.1f} s after it started, {why}"
                     close_sound(sound.playbin, SoundEnd.OVERDUE, detail)
-                except Exception:  # one sound's failure never stops the others, or the sweep
-                    logger.warning("Sound sweep failed for %s", sound.path, exc_info=True)
-        except Exception:  # an exception out of a GLib callback would end the sweep for good
+                except (
+                    Exception
+                ):  # one sound's failure never stops the others, or the sweep
+                    logger.warning(
+                        "Sound sweep failed for %s", sound.path, exc_info=True
+                    )
+        except (
+            Exception
+        ):  # an exception out of a GLib callback would end the sweep for good
             logger.warning("Sound sweep failed", exc_info=True)
         finally:
             PLAY_SOUND_LOCK.release()
@@ -1055,7 +1227,9 @@ def _reap(job: Callable[[], Any]) -> None:
 
     with _REAPER_LOCK:
         if _reaper is None:
-            _reaper = threading.Thread(target=reap_forever, name="sound reaper", daemon=True)
+            _reaper = threading.Thread(
+                target=reap_forever, name="sound reaper", daemon=True
+            )
             _reaper.start()
     _REAPS.put(job)
 
@@ -1073,7 +1247,9 @@ def open_sound(playbin: Any, path: Any) -> None:
         playbin.get_bus().add_watch(GLib.PRIORITY_DEFAULT, _on_sound_message, sound)
     except Exception:
         sound.watched = False
-        logger.warning("Could not watch the sound %s: the sweep closes it", path, exc_info=True)
+        logger.warning(
+            "Could not watch the sound %s: the sweep closes it", path, exc_info=True
+        )
     try:
         SOUNDS.opened(sound)
     except Exception:
@@ -1113,7 +1289,10 @@ def close_sound(playbin: Any, end: SoundEnd, detail: str = "") -> bool:
     sound = SOUNDS.take(playbin)
     if sound is None:
         return False
-    if sound.watched and end not in (SoundEnd.ENDED, SoundEnd.ERROR):  # it removes itself on those
+    if sound.watched and end not in (
+        SoundEnd.ENDED,
+        SoundEnd.ERROR,
+    ):  # it removes itself on those
         playbin.get_bus().remove_watch()
     if end not in (SoundEnd.REPLACED, SoundEnd.OUTSIDE):
         _reap(functools.partial(playbin.set_state, Gst.State.NULL))
@@ -1123,7 +1302,9 @@ def close_sound(playbin: Any, end: SoundEnd, detail: str = "") -> bool:
     return True
 
 
-def wrap_once(obj: Any, name: str, tag: Any, make_wrapper: Callable[[Any], Any]) -> bool:
+def wrap_once(
+    obj: Any, name: str, tag: Any, make_wrapper: Callable[[Any], Any]
+) -> bool:
     """Replace ``obj.name`` with ``make_wrapper(original)``; returns whether this call wrapped it.
 
     The wrapper is built around the original, captured here before wrapping, so it never
@@ -1162,7 +1343,9 @@ def install_sound_wrap(audio: Any) -> bool:
                         if playbin is not None:
                             open_sound(playbin, sound_file)
                 except Exception:  # it plays on, but nothing closes it at its end
-                    logger.warning("Could not track the sound %s", sound_file, exc_info=True)
+                    logger.warning(
+                        "Could not track the sound %s", sound_file, exc_info=True
+                    )
             return result
 
         return play_sound
@@ -1189,12 +1372,16 @@ def stop_sound() -> bool:
     Reads SOUNDS, not the SDK's _playbin, which still names a sound that has ended. Waits,
     up to STOP_WAIT_S, until the reaper has set the playbin to NULL.
     """
-    stopped = [close_sound(sound.playbin, SoundEnd.STOPPED) for sound in SOUNDS.open_sounds()]
+    stopped = [
+        close_sound(sound.playbin, SoundEnd.STOPPED) for sound in SOUNDS.open_sounds()
+    ]
     if not any(stopped):
         logger.info("Sound stop: no sound playbin open")
         return False
     done = threading.Event()
     _reap(done.set)
     if not done.wait(STOP_WAIT_S):
-        logger.warning("Sound stop: the playbin did not reach NULL in %.0f s", STOP_WAIT_S)
+        logger.warning(
+            "Sound stop: the playbin did not reach NULL in %.0f s", STOP_WAIT_S
+        )
     return True
