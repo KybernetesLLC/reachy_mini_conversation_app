@@ -420,6 +420,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # not cancel it.
         self._followup_pending = False
         self._followup_live = False
+        self._turn_began_owing = False
         # Reliable search: this response's transcript and whether it called a tool; this
         # user turn's guard and filler, each used at most once; the last filler line.
         self._resp_text = ""
@@ -739,25 +740,34 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except Exception as e:
             logger.warning("_restart_session failed: %s", e)
 
-    async def _recover_refused_reply(self) -> None:
+    async def _recover_refused_reply(self) -> bool:
         """Send a reply the server refused while a tool's output was owed, once the outputs are in.
 
         2026-10-21 11:26: "Absolutely." in an express wait went unanswered. The sender holds the
-        create, and a tool's own follow-up merges with it. Only while an output is owed, and once per
-        user turn: a dropped output, or a tool past the 30 s hold, made every retry be refused again.
-        """
-        if not self._owed_outputs:
+        create, and a tool's own follow-up merges with it. Only while an output is owed (or was,
+        when the user's turn began: the output can land before the refusal, 11-03 19:14), and
+        once per user turn: a dropped output, or a tool past the 30 s hold, made every retry be
+        refused again. True when the reply is taken care of (sent here, or a follow-up already
+        on its way), so the refusal is no error to show (11-03: five "[error]" lines)."""
+        if self._followup_pending or self._followup_live or not self._pending_responses.empty():
+            logger.info("a reply the server refused: a reply is already on its way")
+            return True
+        if not (self._owed_outputs or self._turn_began_owing):
             logger.info("a reply the server refused with no tool output owed here: not retried")
-            return
+            return False
         if self._reply_recovered_this_turn:
             logger.info("a reply the server refused again this turn: not retried")
-            return
+            return False
         self._reply_recovered_this_turn = True
         logger.info("a reply the server refused while tool outputs were owed: sending it once they are in")
         await self._safe_response_create()
+        return True
 
     def _new_user_turn(self) -> None:
         self._reply_recovered_this_turn = False
+        # the user spoke while a tool's output was owed (an express sound): the server's own
+        # turn reply may be refused after the output lands, and is still theirs to get
+        self._turn_began_owing = bool(self._owed_outputs)
 
     def _owe_output(self, call_id: str) -> None:
         self._owed_outputs.add(call_id)
@@ -2096,9 +2106,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             logger.info("response.create rejected; worker will retry after active response finishes")
                         else:
                             self._response_started_or_rejected_event.set()
-                            logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
                             if "function call outputs are pending" in str(msg):
-                                await self._recover_refused_reply()
+                                if await self._recover_refused_reply():  # a race, handled
+                                    logger.info("Realtime refusal [%s], reply in hand: %s", code, msg)
+                                    continue
+                            logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
 
                         if code == "input_audio_buffer_commit_empty":
                             self.deps.movement_manager.set_listening(False)

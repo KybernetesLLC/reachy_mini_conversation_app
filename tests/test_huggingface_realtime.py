@@ -3933,3 +3933,50 @@ def test_a_tagged_reply_is_counted_and_the_model_told_once_a_session() -> None:
     h.connection = object()  # a new session: told again if it happens again
     h._ssml_spoken("<speak>Hi</speak>")
     assert len(notes) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_after_the_owed_output_landed_still_gets_one_reply_and_no_error(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """11-03 19:14: the user spoke during an express sound; the output landed, then the
+    server refused its own turn reply. The reply is still sent, once, and no "[error]" line."""
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager), "start_tool", AsyncMock(return_value=SimpleNamespace(tool_id="express-1"))
+    )
+    quiet_tool = SimpleNamespace(needs_response=False, leak_safe=False)
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"express": quiet_tool})
+    done = ToolNotification(
+        id="c1", tool_name="express", is_idle_tool_call=False, status=ToolState.COMPLETED, result={"ok": True}
+    )
+
+    async def _finish_tool() -> None:
+        await handler._handle_tool_result(done)
+        await asyncio.sleep(0.05)
+
+    async def _settle() -> None:
+        await asyncio.sleep(0.1)
+
+    handler.client = _ordering_client(
+        (
+            _FakeEvent("response.function_call_arguments.done", name="express", arguments="{}", call_id="c1"),
+            _FakeEvent("input_audio_buffer.speech_started", item_id="u1"),
+            _finish_tool,
+            _FakeEvent("error", error=SimpleNamespace(message=_PENDING, type="response_failed", code=None)),
+            _settle,
+        ),
+        sent,
+        handler,
+    )
+    with caplog.at_level(logging.INFO, logger=hf_mod.__name__):
+        await handler._run_realtime_session()
+    creates = [kind for kind, _ in sent if kind == "response.create"]
+    assert len(creates) == 1
+    shown = []
+    while not handler.output_queue.empty():
+        item = handler.output_queue.get_nowait()
+        shown.append(str(getattr(item, "args", item)))
+    assert not any("[error]" in x for x in shown)
+    assert "Realtime error" not in caplog.text
