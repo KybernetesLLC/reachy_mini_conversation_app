@@ -30,6 +30,7 @@ from websockets.exceptions import ConnectionClosedError
 from openai.types.realtime.realtime_audio_input_turn_detection_param import ServerVad
 
 from reachy_mini_conversation_app.tools import core_tools
+from reachy_mini_conversation_app import talk_prune
 from reachy_mini_conversation_app.config import (
     HF_LOCAL_CONNECTION_MODE,
     config,
@@ -398,6 +399,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self.instance_path = instance_path
         self._voice_override: str | None = self._normalize_startup_voice(startup_voice)
         self._realtime_connect_query: dict[str, str] = {}
+        self._prune = talk_prune.TalkPrune()  # the companion's context budget (11-04)
+        self._prune_task: asyncio.Task | None = None
 
         # Debouncing for partial transcripts
         self.partial_transcript_task: asyncio.Task[None] | None = None
@@ -1419,6 +1422,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._ctx_peak = max(self._ctx_peak, tokens)
         return False
 
+    async def _prune_now(self) -> None:
+        """The talk kept small (talk_prune): never a failure of the reply."""
+        try:
+            summary = await asyncio.to_thread(talk_prune.read_summary)
+            if self.connection is not None:
+                await self._prune.apply(self.connection, summary)
+        except Exception:
+            logger.exception("Talk prune: not applied")
+
     def want_instructions(self, why: str) -> None:
         self._instructions_wanted = why
 
@@ -1427,6 +1439,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         wanted (a session opened on this connection, or a drop), one send at a time."""
         if self._watch_context(usage):
             self._instructions_wanted = "the conversation was dropped"
+        if self._prune.due(time.monotonic()) and (
+            self._prune_task is None or self._prune_task.done()
+        ):
+            self._prune_task = asyncio.create_task(self._prune_now())
         why = self._instructions_wanted
         if why is None or (
             self._instructions_task is not None and not self._instructions_task.done()
@@ -2010,6 +2026,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._spoke_since_open = self._greeting_live = False
             self._open_settled.clear()
             self.connection = conn
+            self._prune.reset()  # the companion's context budget: this session's items
             self._reset_owed_outputs()
             self._followup_pending = self._followup_live = False
             # Session-state hygiene: the last session's batch is over. Its cancelled tools'
@@ -2056,6 +2073,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
+                    if event.type in ("conversation.item.created", "conversation.item.added"):
+                        self._prune.seen(getattr(event, "item", None))
                     if event.type == "input_audio_buffer.speech_started":
                         self._spoke_since_open = True
                         self._new_user_turn()
