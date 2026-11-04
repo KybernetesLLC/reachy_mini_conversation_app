@@ -390,3 +390,14 @@ def test_a_bare_list_with_a_nested_list_is_still_a_call() -> None:
     assert gate.judge(text[:-1], TOOLS).action == gate.UNDECIDED  # the inner "]" is not the end
     verdict = gate.judge(text, TOOLS)
     assert (verdict.action, verdict.tool, verdict.shape) == (gate.CUT, "remember", "json")
+
+
+def test_ssml_tags_are_counted_and_kept_out_of_the_stored_reply() -> None:
+    """11-03 19:31: "<speak>I'd love to!</speak>", read aloud by the backend's voice."""
+    from reachy_mini_conversation_app.output_gate import without_ssml
+
+    assert without_ssml("<speak>I'd love to!</speak>") == ("I'd love to!", 2)
+    assert without_ssml('Wait <break time="1s"/> there <prosody rate="slow">it is</prosody>.') == (
+        "Wait there it is.", 3)
+    assert without_ssml("I'd say 3 < 5 and <think> is not ours") == (
+        "I'd say 3 < 5 and <think> is not ours", 0)

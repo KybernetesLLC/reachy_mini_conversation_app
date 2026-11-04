@@ -57,6 +57,7 @@ from reachy_mini_conversation_app.output_gate import (  # noqa: F401  (spoken_ar
     judge,
     spoken_artifact,
     without_calls,
+    without_ssml,
 )
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolSpec,
@@ -905,6 +906,27 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._gate_cut(verdict)
         elif verdict.action != UNDECIDED:
             self._gate_release("pass")
+
+    SSML_NOTE = (
+        "Your last reply was wrapped in markup such as <speak>...</speak>, and your voice read "
+        "the tags aloud as words. Write plain spoken words only, never tags."
+    )
+
+    def _ssml_spoken(self, text: str) -> str:
+        """A reply's transcript without SSML-like tags. A tagged reply is counted and logged;
+        the first in a session also gets a note to the model, so it stops copying its own
+        tagged replies (11-03 19:31, four in a row). The audio was already spoken."""
+        cleaned, n = without_ssml(text)
+        if not n:
+            return text
+        self._ssml_replies = getattr(self, "_ssml_replies", 0) + 1
+        logger.warning("SSML markup spoken in a reply: %d tag(s); %d tagged reply(s) so far",
+                       n, self._ssml_replies)  # fmt: skip
+        session = id(self.connection)
+        if getattr(self, "_ssml_noted", None) != session:
+            self._ssml_noted = session
+            self.add_note(self.SSML_NOTE)
+        return cleaned
 
     def _gate_leak(self, verdict: Verdict) -> None:
         """Log one leaked call, report it (source "leaked"), and run it if leak_safe."""
@@ -1973,6 +1995,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             AdditionalOutputs({"role": "assistant", "content": event.transcript})
                         )
                         said = event.transcript or ""
+                        said = self._ssml_spoken(said)  # 11-03: "<speak>" read aloud
                         kept = said if self._gate_cut_kind else without_calls(said, self._gate_tools)  # 2026-10-20
                         if kept or not said:
                             self._emit_transcript("assistant", kept, True, artifact=self._gate_cut_kind)

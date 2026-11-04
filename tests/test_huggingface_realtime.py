@@ -3915,3 +3915,21 @@ async def test_a_reply_after_a_note_is_asked_only_while_nothing_else_speaks() ->
     handler._pending_responses.get_nowait()
     handler._user_speaking = True
     assert await handler.request_reply() is False
+
+
+def test_a_tagged_reply_is_counted_and_the_model_told_once_a_session() -> None:
+    """11-03 19:31: four "<speak>" replies in a row, each copying the last."""
+    from reachy_mini_conversation_app import huggingface_realtime as hr
+
+    cls = next(c for c in vars(hr).values() if isinstance(c, type) and hasattr(c, "_ssml_spoken"))
+    h = cls.__new__(cls)
+    notes: list[str] = []
+    h.add_note = lambda text, now=False: notes.append(text)
+    h.connection = object()
+    assert h._ssml_spoken("<speak>I'd love to!</speak>") == "I'd love to!"
+    assert h._ssml_spoken("<speak>Oh, you're right!</speak>") == "Oh, you're right!"
+    assert h._ssml_spoken("Plain words.") == "Plain words."
+    assert notes == [cls.SSML_NOTE] and h._ssml_replies == 2
+    h.connection = object()  # a new session: told again if it happens again
+    h._ssml_spoken("<speak>Hi</speak>")
+    assert len(notes) == 2

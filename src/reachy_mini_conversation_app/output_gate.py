@@ -367,6 +367,24 @@ def spoken_artifact(text: str, final: bool = False) -> str | None:
     return shapes[0][0] if isinstance(shapes, list) else shapes
 
 
+# SSML-like markup the model writes around words (11-03 19:31: "<speak>I'd love to!</speak>",
+# copied reply to reply). The backend's voice reads it aloud, so it cannot be cut from audio
+# already spoken: it is counted, kept out of the stored transcript, and the model told once.
+_SSML = re.compile(
+    r"</?\s*(?:speak|prosody|break|emphasis|say-as|voice|phoneme|sub|audio|lang|mark|p|s)"
+    r"\b[^<>]{0,200}/?>",
+    re.IGNORECASE,
+)
+
+
+def without_ssml(text: str) -> tuple[str, int]:
+    """`text` with SSML-like tags removed (their words kept), and how many there were."""
+    found = _SSML.findall(text)
+    if not found:
+        return text, 0
+    return re.sub(r"[ \t]{2,}", " ", _SSML.sub("", text)).strip(), len(found)
+
+
 def without_calls(text: str, tools: ToolNames | None = None) -> str:
     """A played reply's text with its call markup taken out: what the supervisor keeps.
 
