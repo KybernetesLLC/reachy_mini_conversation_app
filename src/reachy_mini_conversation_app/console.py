@@ -2035,7 +2035,7 @@ class LocalStream:
             "rms_5s": float(np.mean(recent)) if recent else 0.0,
         }
 
-    def clear_audio_queue(self) -> None:
+    def clear_audio_queue(self) -> float | None:
         """Flush queued playback audio immediately on user barge-in.
 
         On the local GStreamer backend, flushes the playback appsrc alone, since
@@ -2045,7 +2045,9 @@ class LocalStream:
         already queued for the speaker), and older SDKs ``clear_output_buffer()``.
         """
         logger.info("User intervention: flushing player queue")
-        self._replies.flushed(self._now())  # dropped audio is not unheard
+        cut = self._replies.flushed(self._now())  # dropped audio is not unheard
+        if cut is not None and cut[1] > 0.0:  # a day of these says whether the ends are cut (11-03)
+            logger.info("barge-in: %.1f s of a %.1f s reply unplayed", cut[1], cut[0])
         self._phantom.flushed(self._now())
         audio = getattr(self._robot.media, "audio", None)
         if audio is not None:
@@ -2067,6 +2069,7 @@ class LocalStream:
         # Drain the handler's pending output in place — do NOT replace the
         # queue object, since emit() may be awaiting it (wait_for_item).
         self._drain_output_queue()
+        return None if cut is None else cut[1]
 
     def _drain_output_queue(self) -> None:
         """Empty the handler's output queue in place without replacing it."""

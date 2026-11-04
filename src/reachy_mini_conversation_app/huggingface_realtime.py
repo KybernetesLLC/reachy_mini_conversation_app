@@ -81,6 +81,7 @@ logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
+MID_REPLY_LEFT_S = 0.5  # a barge-in this far from his reply's end cut it mid-way
 _OWED_OUTPUT_TIMEOUT: float = _RESPONSE_DONE_TIMEOUT  # longest hold of an in-band create
 # Carries a say() announcement's text (a timer, a greeting) on its queued create: spoken as
 # its own reply, never merged with another create. The sender adds the text as a user item
@@ -421,6 +422,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._followup_pending = False
         self._followup_live = False
         self._turn_began_owing = False
+        self._cut_mid_reply = False
         # Reliable search: this response's transcript and whether it called a tool; this
         # user turn's guard and filler, each used at most once; the last filler line.
         self._resp_text = ""
@@ -1327,7 +1329,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return
         if connection is self.connection:
             self._ctx_base = self._ctx_peak = None  # the next reply measures afresh
-        logger.info("Instructions sent again (%s): %d chars", why, len(instructions))
+        # with tokens at 3.5 chars each: drops have come at 14.4k-22k input tokens (11-03)
+        logger.info("Instructions sent again (%s): %d chars, about %d tokens",
+                    why, len(instructions), round(len(instructions) / 3.5))  # fmt: skip
 
     async def _send_instructions(self, connection: Any, instructions: str) -> None:
         """The instructions alone, as a live session.update."""
@@ -1861,8 +1865,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
                         self._gate_drop_held()
-                        if self._clear_queue:
-                            self._clear_queue()
+                        left = self._clear_queue() if self._clear_queue else None
+                        # his reply cut mid-way: if the turn proves empty, he goes on (11-03)
+                        self._cut_mid_reply = isinstance(left, float) and left > MID_REPLY_LEFT_S
                         if self._greeting_live:
                             await self._cancel_greeting()
                         self.deps.movement_manager.set_listening(True)
@@ -1977,7 +1982,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
+                            if getattr(self, "_cut_mid_reply", False):
+                                # 11-03 19:39-19:42: VAD fired on no speech 1-3 s into his reply,
+                                # the reply was dropped, and 11-36 s of silence followed
+                                self._cut_mid_reply = False
+                                logger.info("an empty turn cut his reply mid-way: replying again")
+                                await self._safe_response_create()
                             continue
+                        self._cut_mid_reply = False
 
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None

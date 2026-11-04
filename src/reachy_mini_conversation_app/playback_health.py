@@ -592,9 +592,17 @@ class ReplyTracker:
                 ends = current["heard_at"] + current["seconds"]
                 self._heard_until = max(self._heard_until or ends, ends)
 
-    def flushed(self, now: float) -> None:
-        """Note a barge-in: the reply being pushed is dropped audio, never unheard; earlier ones are judged."""
+    def flushed(self, now: float) -> tuple[float, float] | None:
+        """Note a barge-in: the reply being pushed is dropped audio, never unheard; earlier ones are judged.
+        (The reply's seconds, its seconds not yet played), or None with nothing pushed (11-03: whether
+        a barge-in cut a reply's end needs both)."""
         with self._lock:
+            cut = None
+            if self._replies:
+                last = self._replies[-1]
+                heard = last.get("heard_at") if last["lag"] == "measured" else None
+                left = last["seconds"] if heard is None else max(0.0, heard + last["seconds"] - now)
+                cut = (last["seconds"], left)
             if self._replies and not self._replies[-1]["judged"]:
                 self._replies[-1]["flushed"] = True
             for reply in self._replies:  # everything queued was dropped: no lag, and nothing to wait for
@@ -603,6 +611,7 @@ class ReplyTracker:
             self._before = None
             if self._heard_until is not None:  # the heard reply's queued rest was dropped too
                 self._heard_until = min(self._heard_until, now)
+            return cut
 
     def monitored(self, now: float, seconds: float, speech_s: float) -> None:
         """Note a buffer from the speaker's monitor, arriving at ``now``."""

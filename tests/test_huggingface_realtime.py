@@ -3980,3 +3980,31 @@ async def test_a_refusal_after_the_owed_output_landed_still_gets_one_reply_and_n
         shown.append(str(getattr(item, "args", item)))
     assert not any("[error]" in x for x in shown)
     assert "Realtime error" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_an_empty_turn_that_cut_his_reply_mid_way_gets_the_reply_again(monkeypatch: Any) -> None:
+    """11-03 19:39-19:42: VAD fired on no speech 1-3 s into his reply; the reply was dropped
+    and silence followed. Now an empty transcript after a mid-reply cut asks for a reply."""
+    for left, transcript, want in ((3.0, "", 1), (0.1, "", 0), (3.0, "yes", None)):
+        sent: list[tuple[str, Any]] = []
+        handler = _session_handler(monkeypatch, ())
+        handler._clear_queue = lambda left=left: left
+
+        async def _settle() -> None:
+            await asyncio.sleep(0.1)
+
+        handler.client = _ordering_client(
+            (
+                _FakeEvent("input_audio_buffer.speech_started", item_id="u1"),
+                _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="u1",
+                           transcript=transcript),  # fmt: skip
+                _settle,
+            ),
+            sent,
+            handler,
+        )
+        await handler._run_realtime_session()
+        creates = [k for k, _ in sent if k == "response.create"]
+        if want is not None:
+            assert len(creates) == want, (left, transcript)

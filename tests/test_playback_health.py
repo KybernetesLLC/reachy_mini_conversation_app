@@ -2207,3 +2207,14 @@ def test_a_sound_being_replaced_is_left_to_the_wrap(
             ph.close_sound(old, ph.SoundEnd.REPLACED)
     replaced = "Sound stream closed (replaced by a newer sound): song.wav"
     assert _closes(caplog) == [(logging.INFO, replaced)]
+
+
+def test_a_flush_says_how_much_of_the_reply_was_left() -> None:
+    """11-03: whether a barge-in cut a reply's end needs its length and what was unplayed."""
+    from reachy_mini_conversation_app.playback_health import ReplyTracker
+
+    r = ReplyTracker()
+    assert r.flushed(0.0) is None
+    r.pushed(1.0, 6.0, 5.0)
+    total, left = r.flushed(2.0)
+    assert total == 6.0 and left == 6.0  # never heard yet: all of it unplayed
