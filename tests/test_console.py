@@ -4297,6 +4297,15 @@ def test_the_companions_item_ids_and_session_starts_are_broadcast() -> None:
     assert ("conversation.realtime", {"state": "started"}) in sent
 
 
+def test_a_new_session_forgets_the_last_turn_state() -> None:
+    """A stay_quiet tool result left "thinking"; the next session's first "thinking" must
+    still be sent, and its idle state is not the old one."""
+    stream = LocalStream(_FakeSessionHandler(), SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))
+    stream._last_turn_state = "thinking"
+    stream._dispatch_session("started")
+    assert stream._last_turn_state is None
+
+
 @pytest.mark.asyncio
 async def test_an_open_on_a_live_connection_sends_the_instructions_again(
     monkeypatch: pytest.MonkeyPatch,

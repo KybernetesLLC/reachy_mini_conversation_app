@@ -522,6 +522,8 @@ class LocalStream:
 
     def _dispatch_session(self, state: str) -> None:
         """Push a conversation.realtime notification: a new realtime session ("started")."""
+        if state == "started":
+            self._last_turn_state = None  # the last session's state must not outlive it
         if self._rpc is not None:
             self._rpc.broadcast_threadsafe("conversation.realtime", {"state": state})
 

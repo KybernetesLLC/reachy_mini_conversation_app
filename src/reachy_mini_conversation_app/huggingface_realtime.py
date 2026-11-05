@@ -2179,6 +2179,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         )
                         usage = getattr(getattr(event, "response", None), "usage", None)
                         self._log_usage(usage)
+                        if not self._gate_had_audio:
+                            # A reply with no audio (tool-only): the companion's say waits on
+                            # a transcript, so it learns at once that none is coming.
+                            self._mark_activity("response_done_silent")
                         if _companion_tag(event) is None:
                             self._after_reply(usage)
                         if not self._gate_transcript_done and (
