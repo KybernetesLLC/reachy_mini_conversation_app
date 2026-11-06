@@ -405,17 +405,23 @@ class HoldPoseMove(Move):  # type: ignore
         if t < self.interpolation_duration:
             interpolation_t = t / self.interpolation_duration
 
-            head_pose = linear_pose_interpolation(
-                self.interpolation_start_pose,
-                self.target_head_pose,
-                interpolation_t,
-            )
             antennas = (
                 1 - interpolation_t
             ) * self.interpolation_start_antennas + interpolation_t * self.target_antennas
             body_yaw = (
                 1 - interpolation_t
             ) * self.interpolation_start_body_yaw + interpolation_t * self.target_body_yaw
+            # Blend relative to the body, as BreathingMove does, and put the present turn back:
+            # the world-frame blend takes the short way round, so a hold changing the world head
+            # by over 180 degrees left the body behind and IK reach for 6-9 s (2026-11-06).
+            head_pose = _turned(
+                linear_pose_interpolation(
+                    _turned(self.interpolation_start_pose, -self.interpolation_start_body_yaw),
+                    _turned(self.target_head_pose, -self.target_body_yaw),
+                    interpolation_t,
+                ),
+                body_yaw,
+            )
         else:
             # Past the interpolation window: hold exactly, no drift, no sway.
             head_pose = self.target_head_pose

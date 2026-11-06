@@ -209,7 +209,8 @@ def test_hold_pose_move_interpolates_then_holds_exactly() -> None:
     assert move.duration == float("inf")
 
     head_start, antennas_start, body_yaw_start = move.evaluate(0.0)
-    np.testing.assert_array_equal(head_start, start_pose)
+    # The start passes through the body frame and back, so it is exact only to rounding.
+    np.testing.assert_allclose(head_start, start_pose, atol=1e-12)
     np.testing.assert_array_equal(antennas_start, [0.0, 0.0])
     assert body_yaw_start == 0.3
 
@@ -228,6 +229,68 @@ def test_hold_pose_move_interpolates_then_holds_exactly() -> None:
     np.testing.assert_array_equal(head_later, target_pose)
     np.testing.assert_array_equal(antennas_later, [0.2, -0.2])
     assert body_yaw_later == 0.0
+
+
+# The logged holds of 2026-11-06 (body from, body to, head from, head to, pitch from, pitch to,
+# seconds; degrees). The logged pitch is an offset on ATTENTIVE's -0.10 rad. The first four are the
+# long swings and the fifth a requested turn; all left IK reach for 6-9 s in the world frame.
+_ATTENTIVE_PITCH_DEG = math.degrees(-0.10)
+_LOGGED_HOLDS = [
+    pytest.param(-129.6, 160, -55, 16, -20, -14, 14.48, id="16:29:00"),
+    pytest.param(-129.6, 160, 55, 16, -14, -14, 14.48, id="16:29:00-head-at-plus-55"),
+    pytest.param(151, -160, 42, 0, -20, -20, 15.55, id="16:29:44"),
+    pytest.param(-132.8, 160, -51, 0, -24, -17, 14.64, id="16:37:50"),
+    pytest.param(-126, 0, -55, 0, 0, 0, 6.3, id="16:31:12"),
+]
+
+
+@pytest.mark.parametrize("body0,body1,head0,head1,pitch0,pitch1,seconds", _LOGGED_HOLDS)
+def test_a_logged_hold_solves_at_every_step(
+    body0: float, body1: float, head0: float, head1: float, pitch0: float, pitch1: float, seconds: float
+) -> None:
+    """Each 10 ms step of a hold changing the world head by over 180 degrees stays within IK reach."""
+    from reachy_mini.kinematics import AnalyticalKinematics
+
+    def pose(yaw: float, pitch: float) -> np.ndarray:
+        return create_head_pose(0, 0, 0, 0, _ATTENTIVE_PITCH_DEG + pitch, yaw, degrees=True)
+
+    move = HoldPoseMove(
+        target_head_pose=pose(body1 + head1, pitch1),
+        target_antennas=(0.0, 0.0),
+        interpolation_start_pose=pose(body0 + head0, pitch0),
+        interpolation_start_antennas=(0.0, 0.0),
+        interpolation_duration=seconds,
+        target_body_yaw=math.radians(body1),
+        interpolation_start_body_yaw=math.radians(body0),
+    )
+    kinematics = AnalyticalKinematics(automatic_body_yaw=False)
+    unsolved = []
+    for step in range(int(seconds * 100) + 1):
+        head, _, body_yaw = move.evaluate(step / 100)
+        if np.any(np.isnan(kinematics.ik(head, body_yaw=body_yaw))):
+            unsolved.append(step / 100)
+    assert not unsolved, f"{len(unsolved)} steps unsolved, from {unsolved[0]} s to {unsolved[-1]} s"
+
+
+def test_a_hold_turning_the_body_keeps_the_head_still_on_the_body() -> None:
+    """With the head fixed relative to the body, the world head turns exactly with the body."""
+    head = create_head_pose(0, 0, 0, 0, -6, 0, degrees=True)
+
+    def turned(yaw: float) -> np.ndarray:
+        return create_head_pose(0, 0, 0, 0, 0, yaw, degrees=True) @ head
+
+    move = HoldPoseMove(
+        target_head_pose=turned(160),
+        target_antennas=(0.0, 0.0),
+        interpolation_start_pose=turned(-130),
+        interpolation_start_antennas=(0.0, 0.0),
+        interpolation_duration=10.0,
+        target_body_yaw=math.radians(160),
+        interpolation_start_body_yaw=math.radians(-130),
+    )
+    mid, _, body_yaw = move.evaluate(5.0)
+    assert body_yaw == pytest.approx(math.radians(15))
+    np.testing.assert_allclose(mid, turned(15), atol=1e-9)
 
 
 def test_hold_blocks_breathing_and_release_lets_it_resume() -> None:
