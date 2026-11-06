@@ -421,6 +421,11 @@ def check_playback(
 
 CAPTURE_GAP_S = 5.0
 CAPTURE_STALL_S = 3.0
+# A frame's send to the backend that has not returned in this long holds the record loop
+# behind it (2026-11-05: an outage kept one waiting 140.9 s, to the websocket's keepalive
+# timeout). The frames stop behind the send, not in the microphone, so that gap is no
+# capture gap: the watch forgets it, and the companion is told while it lasts.
+SEND_STALL_S = 2.0
 
 
 def capture_gap_decision(gap_s: float, limit_s: float = CAPTURE_GAP_S) -> Verdict:

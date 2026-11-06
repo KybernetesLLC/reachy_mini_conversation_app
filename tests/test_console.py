@@ -4319,3 +4319,84 @@ async def test_an_open_on_a_live_connection_sends_the_instructions_again(
     stream.handler.want_instructions = MagicMock()
     await stream.open_session()  # only the wish is marked: no websocket write from this thread
     stream.handler.want_instructions.assert_called_once_with("a session opened on a live connection")
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_backend_send_is_no_capture_gap() -> None:
+    """Frames held behind a send that waited 140 s (an outage, 2026-11-05) rebuild nothing."""
+    frame = np.zeros(4, dtype=np.int16)
+    clock = [100.0]
+    robot = _audio_robot(
+        get_input_audio_samplerate=MagicMock(return_value=16000),
+        get_audio_sample=MagicMock(),
+    )
+    handler = MagicMock()
+
+    async def stalled_send(_frame: Any) -> None:
+        clock[0] += 140.9
+
+    handler.receive = AsyncMock(side_effect=stalled_send)
+    stream = LocalStream(handler, robot)
+    stream._now = lambda: clock[0]  # type: ignore[method-assign]
+    stream._run_off_loop = MagicMock()  # type: ignore[method-assign]
+    calls = [0]
+
+    def sample() -> Any:
+        calls[0] += 1
+        if calls[0] == 2:
+            stream._stop_event.set()
+        return frame
+
+    robot.media.get_audio_sample.side_effect = sample
+
+    await stream.record_loop()
+
+    assert calls[0] == 2
+    stream._run_off_loop.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_send_watch_tells_the_companion_while_a_send_is_stalled() -> None:
+    """Past SEND_STALL_S each tick says stalled (one WARNING); the send's return says it is over."""
+    clock = [10.0]
+    robot = _audio_robot()
+    stream = LocalStream(MagicMock(), robot)
+    stream._now = lambda: clock[0]  # type: ignore[method-assign]
+    rpc = MagicMock()
+    stream._rpc = rpc
+    stream._send_since = 10.0
+    clock[0] = 13.0
+    task = asyncio.ensure_future(stream.send_watch_loop(interval_s=0.01))
+    await asyncio.sleep(0.05)
+    stream._stop_event.set()
+    await task
+
+    sent = [c.args for c in rpc.broadcast_threadsafe.call_args_list]
+    assert len(sent) >= 2
+    assert all(
+        m == "conversation.backend_send" and p["stalled"] is True for m, p in sent
+    )
+    assert stream._send_stall_told
+
+    stream._sent()
+
+    assert rpc.broadcast_threadsafe.call_args.args == (
+        "conversation.backend_send",
+        {"stalled": False},
+    )
+    assert stream._send_since is None and not stream._send_stall_told
+
+
+@pytest.mark.asyncio
+async def test_the_send_watch_is_quiet_for_a_prompt_send() -> None:
+    clock = [10.0]
+    stream = LocalStream(MagicMock(), _audio_robot())
+    stream._now = lambda: clock[0]  # type: ignore[method-assign]
+    stream._rpc = MagicMock()
+    stream._send_since = 9.5
+    task = asyncio.ensure_future(stream.send_watch_loop(interval_s=0.01))
+    await asyncio.sleep(0.03)
+    stream._stop_event.set()
+    await task
+
+    stream._rpc.broadcast_threadsafe.assert_not_called()

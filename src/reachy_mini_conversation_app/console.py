@@ -349,6 +349,10 @@ class LocalStream:
         self._recent_frames: deque[tuple[float, float]] = deque()
         # The capture-gap trigger: every frame the pipeline delivers, muted or not.
         self._capture_watch = playback_health.CaptureWatch()
+        # When the frame now being sent to the backend was handed over (None: no send in
+        # flight), and whether its stall was reported (playback_health.SEND_STALL_S).
+        self._send_since: float | None = None
+        self._send_stall_told = False
         self._now: Callable[[], float] = time.monotonic
         self._background: set[asyncio.Future[Any]] = set()
         # The unheard-reply trigger: replies pushed, judged against the speaker's monitor.
@@ -2142,6 +2146,7 @@ class LocalStream:
                     self.playback_watchdog_loop(), name="playback-watchdog"
                 ),
                 asyncio.create_task(self.playback_guard_loop(), name="playback-guard"),
+                asyncio.create_task(self.send_watch_loop(), name="send-watch"),
             ]
             try:
                 await asyncio.gather(*self._tasks)
@@ -2397,11 +2402,61 @@ class LocalStream:
                     # other path into the buffer.
                     self._append_preroll(frame)
                 else:
+                    self._send_since = self._now()
                     await self.handler.receive(frame)
+                    self._sent()
                     if not connected:
                         self._append_preroll(frame)
                 self._emit_level("user", audio_frame)
             await asyncio.sleep(0)  # avoid busy loop
+
+    def _sent(self) -> None:
+        """A frame's send returned: one that stalled held every frame behind it, which is no capture gap."""
+        since, self._send_since = self._send_since, None
+        waited = 0.0 if since is None else self._now() - since
+        if waited > playback_health.SEND_STALL_S or self._send_stall_told:
+            self._capture_watch.reset()
+        if self._send_stall_told:
+            self._send_stall_told = False
+            logger.info(
+                "The backend send returned after %.1f s; microphone frames flow again",
+                waited,
+            )
+            if self._rpc is not None:
+                self._rpc.broadcast_threadsafe(
+                    "conversation.backend_send", {"stalled": False}
+                )
+
+    async def send_watch_loop(self, interval_s: float = 1.0) -> None:
+        """Each second, tell the companion while a frame's backend send has not returned.
+
+        The record loop waits behind it, so no frames are read: without this the companion
+        takes the silence for a deaf microphone (2026-11-05).
+        """
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval_s)
+                return
+            except asyncio.TimeoutError:
+                pass
+            since = self._send_since
+            if since is None:
+                continue
+            waited = self._now() - since
+            if waited <= playback_health.SEND_STALL_S:
+                continue
+            if not self._send_stall_told:
+                self._send_stall_told = True
+                logger.warning(
+                    "A microphone frame has waited %.1f s on the backend send; the record loop "
+                    "waits behind it (the connection is stalled, not the microphone)",
+                    waited,
+                )
+            if self._rpc is not None:
+                self._rpc.broadcast_threadsafe(
+                    "conversation.backend_send",
+                    {"stalled": True, "for_s": round(waited, 1)},
+                )
 
     def _watch_capture(self, got_frame: bool) -> None:
         """Feed the capture-gap trigger one poll; a stall or a gap is acted on off the event loop."""
