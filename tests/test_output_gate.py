@@ -265,7 +265,8 @@ def test_an_open_tag_call_waits_while_streaming_and_ends_at_its_arguments_once_w
     head = f"<call:express{{feeling:{Q}shy{Q}}}"
     assert gate.spoken_artifact(head) == gate.UNDECIDED
     assert gate.spoken_artifact(head + " /") == gate.UNDECIDED
-    assert gate.spoken_artifact(head + " />") == "leaked tool call"
+    assert gate.spoken_artifact(head + " />") == gate.UNDECIDED  # words may follow it
+    assert gate.spoken_artifact(head + " />", final=True) == "leaked tool call"
     assert gate.spoken_artifact(head + " Hello") is None  # words: a reply
 
 
@@ -553,7 +554,7 @@ def test_a_name_in_words_that_could_be_cut_waits_on_the_name(text: str) -> None:
     assert (verdict.action, verdict.waits_on_name) == (gate.UNDECIDED, True)
 
 
-@pytest.mark.parametrize("text", ["Dance", "Expr", "<", "<xyz", "(stops"])
+@pytest.mark.parametrize("text", ["Dance", "Expr", "<xyz", "(stops"])
 def test_a_wait_that_cannot_end_in_a_spoken_name_cut_is_the_short_hold(
     text: str,
 ) -> None:
@@ -567,3 +568,72 @@ def test_a_wait_that_cannot_end_in_a_spoken_name_cut_is_the_short_hold(
 )
 def test_ordinary_short_replies_do_not_wait(text: str) -> None:
     assert gate.judge(text, TOOLS) == gate.Verdict(gate.PLAY)
+
+
+# The three leaks the review of a67a150 found (the owner, 11-07).
+MULTI_WORD = [n for n in REGISTRY if "_" in n.rsplit("__", 1)[-1]]
+
+
+@pytest.mark.parametrize("name", MULTI_WORD)
+@pytest.mark.parametrize(
+    "shape", ("<{w}/>", "< {w} />", "<{W}>", '<{w} reason="side talk"/>', "</{w}>")
+)
+def test_a_tool_name_with_spaces_in_a_tag_is_cut(name: str, shape: str) -> None:
+    words = _spoken(name)
+    text = shape.format(w=words, W=words.upper())
+    verdict = gate.judge(text, TOOLS)
+    assert (verdict.action, verdict.waits_on_name) == (gate.UNDECIDED, True)
+    verdict = gate.judge(text, TOOLS, final=True)
+    assert (verdict.action, verdict.tool, verdict.shape) == (
+        _expected_cut(name),
+        name,
+        "markup",
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<speak><stay_quiet/></speak>",
+        "<speak> <stay_quiet/> </speak>",
+        '<prosody rate="slow"><stay_quiet/></prosody>',
+        "<speak><call:stay_quiet/></speak>",
+        "<speak><stay quiet/></speak>",
+    ],
+)
+def test_a_tool_tag_inside_ssml_is_cut(text: str) -> None:
+    verdict = gate.judge(text, TOOLS)
+    assert (verdict.action, verdict.waits_on_name) == (gate.UNDECIDED, True)
+    verdict = gate.judge(text, TOOLS, final=True)
+    assert (verdict.action, verdict.tool) == (gate.CUT_AND_EXECUTE, "stay_quiet")
+
+
+@pytest.mark.parametrize(
+    "text", ["<call:stay_quiet/>", "<call:stay_quiet>", "<call:express{}/>"]
+)
+def test_a_finished_tag_call_waits_for_what_follows(text: str) -> None:
+    verdict = gate.judge(text, TOOLS)
+    assert (verdict.action, verdict.waits_on_name) == (gate.UNDECIDED, True)
+    assert gate.judge(text, TOOLS, final=True).action in (
+        gate.CUT,
+        gate.CUT_AND_EXECUTE,
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<stay calm/>",
+        "<speak>Sure.</speak>",
+        "<speak><stay_quiet/> Sure, it leaves at three.</speak>",
+        "<call:stay_quiet/> Sure, it leaves at three.",
+    ],
+)
+def test_tags_around_real_words_play(text: str) -> None:
+    assert gate.judge(text, TOOLS) == gate.Verdict(gate.PLAY)
+    assert gate.judge(text, TOOLS, final=True) == gate.Verdict(gate.PLAY)
+
+
+def test_a_played_reply_is_kept_without_its_spaced_tag() -> None:
+    assert gate.without_calls("<stay quiet/> Sure.", TOOLS) == "Sure."
+    assert gate.without_calls("<stay calm/> Sure.", TOOLS) == "<stay calm/> Sure."

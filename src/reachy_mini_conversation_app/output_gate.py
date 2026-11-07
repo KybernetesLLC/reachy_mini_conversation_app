@@ -66,6 +66,34 @@ _TAG_CALL_CLOSER = re.compile(r"</call(?::[\w.-]*)?\s*>", re.IGNORECASE)
 # morning, voiced as a chuckle): <name/>, <name>, </name>, with whitespace and attributes.
 _NAME_TAG = re.compile(r"<\s*/?\s*([A-Za-z_][\w.-]*)(?:\s[^<>]{0,200}?)?\s*/?\s*>")
 _NAME_TAG_OPEN = re.compile(r"<\s*/?\s*([A-Za-z_][\w.-]*)[^<>]{0,200}")
+# A tag's leading words, before any attribute's "=": "<stay quiet/>" names stay_quiet.
+_TAG_WORDS = re.compile(r"<\s*/?\s*([A-Za-z_][\w.-]*(?:\s+[A-Za-z_][\w.-]*){0,5})")
+
+
+def _tag_tool(tag: str, tools: ToolNames | None) -> LeakTool | None:
+    """The tool a bare tag names: its longest run of leading words that is a tool's name."""
+    words = _TAG_WORDS.match(tag)
+    if tools is None or not words:
+        return None
+    parts = words.group(1).split()
+    for n in range(len(parts), 0, -1):
+        tool = tools.find(_normal(" ".join(parts[:n])))
+        if tool is not None:
+            return tool
+    return None
+
+
+def _skip_ssml(text: str, i: int, tools: ToolNames | None) -> int:
+    """Return the index past whitespace, stray ". ! , ;" and SSML-like tags that name no
+    tool: "<speak><stay_quiet/></speak>" is the tag alone (11-07, the review)."""
+    while True:
+        i = _skip(text, i)
+        ssml = _SSML.match(text, i)
+        if not ssml or _tag_tool(ssml.group(), tools) is not None:
+            return i
+        i = ssml.end()
+
+
 _BARE_CALL = re.compile(r"call:\s*[\w.-]+\s*", re.IGNORECASE)
 _BARE_CALL_OPEN = re.compile(r"call:\s*[\w.-]*\s*", re.IGNORECASE)
 # A name with its arguments and no "call:" at all: "idle_do_nothing{reason:...}" (2026-10-17).
@@ -304,13 +332,21 @@ def _shape_at(
     c = text[i]
     if c == "<":
         angle = _angle_at(text, i, final)
+        tagged = angle is not None and bool(_TAG_CALL.match(text, i))
         if angle is None and tools is not None:
             tag = _NAME_TAG.match(text, i)
-            if tag and tools.find(_normal(tag.group(1))) is not None:
-                if not final and _skip(text, tag.end()) >= len(text):
-                    return _UNDECIDED, -1, None  # words may follow: judged with them
-                return _CALL, tag.end(), None
-        return None if angle is None else (*angle, None)
+            if tag and _tag_tool(tag.group(), tools) is not None:
+                angle, tagged = (_CALL, tag.end()), True
+        if angle is None:
+            return None
+        if (
+            tagged
+            and angle[0] == _CALL
+            and not final
+            and _skip_ssml(text, angle[1], tools) >= len(text)
+        ):
+            return _UNDECIDED, -1, None  # a finished tag: words may follow it
+        return (*angle, None)
     if rest[:5].lower() == "call:":
         call = _BARE_CALL.match(text, i)
         if call and call.end() < len(text) and text[call.end()] == "{":
@@ -374,7 +410,7 @@ def _shapes(
     """
     head = text.strip()
     found: list[tuple[str, str, list[str] | None]] = []
-    i = _skip(head, 0)
+    i = _skip_ssml(head, 0, tools)
     while i < len(head):
         shape = _shape_at(head, i, final, tools)
         if shape is None:
@@ -384,7 +420,7 @@ def _shapes(
             limit = _JSON_UNDECIDED_MAX if _json_opening(head[i:]) else _UNDECIDED_MAX
             return _UNDECIDED if len(head) <= limit else None
         found.append((kind, head[i:end], names))
-        i = _skip(head, end)
+        i = _skip_ssml(head, end, tools)
     return found if found else _UNDECIDED
 
 
@@ -567,12 +603,17 @@ def _ends_in_tool_tag(text: str, tools: ToolNames) -> bool:
     its audio waits the spoken-name hold."""
     tail = text.rstrip(" \t\r\n.!,;")
     i = tail.rfind("<")
+    while i != -1 and _SSML.fullmatch(tail, i) and _tag_tool(tail[i:], tools) is None:
+        tail = tail[:i].rstrip(" \t\r\n.!,;")  # a closing </speak> after the tag
+        i = tail.rfind("<")
     if i == -1:
         return False
-    tag = _NAME_TAG.fullmatch(tail, i)
-    if tag:
-        return tools.find(_normal(tag.group(1))) is not None
-    opened = _NAME_TAG_OPEN.fullmatch(tail, i)
+    last = tail[i:]
+    if last.lower().startswith("<call:") or "<call:".startswith(last.lower()):
+        return True  # a tag call, finished or open: cut when nothing follows
+    if _NAME_TAG.fullmatch(last):
+        return _tag_tool(last, tools) is not None
+    opened = _NAME_TAG_OPEN.fullmatch(last)
     return bool(opened) and tools.could_be_tag(opened.group(1).lower())
 
 
@@ -590,6 +631,8 @@ def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None
             names = json_names if json_names is not None else [_called_name(body)]
             shape = "json" if json_names is not None else "markup"
             found = [tools.find(_normal(name)) for name in names if name]
+            if json_names is None and _NAME_TAG.fullmatch(body):
+                found = [_tag_tool(body, tools)]  # "<stay quiet/>": its words
             leaks = [_leak(tool, shape) for tool in found if tool is not None]
             if leaks:
                 return _leaked(*leaks)
