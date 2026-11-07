@@ -65,7 +65,10 @@ from reachy_mini_conversation_app.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
 )
-from reachy_mini_conversation_app.conversation_handler import ConversationHandler
+from reachy_mini_conversation_app.conversation_handler import (
+    ConversationHandler,
+    drop_pending_responses,
+)
 from reachy_mini_conversation_app.tools.tool_constants import ToolState
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolCallRoutine,
@@ -446,6 +449,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._followup_live = False
         self._turn_began_owing = False
         self._cut_mid_reply = False
+        # Set by shutdown(), cleared when start_up begins: a close during the client's build
+        # opens no session.
+        self._closing_on_request = False
         # Reliable search: this response's transcript and whether it called a tool; this
         # user turn's guard and filler, each used at most once; the last filler line.
         self._resp_text = ""
@@ -728,40 +734,28 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         input_transcript.deltas = [delta]
 
     async def start_up(self) -> None:
-        """Start the handler with minimal retries on unexpected websocket closure."""
-        self.client = await self._build_realtime_client()
+        """Run one realtime session; after a drop the console's loop reconnects, gate first.
 
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
+        No retry here: one ran after our own close when the close frame never came, and
+        opened a session with the gate closed (11-05, twice).
+        """
+        self._closing_on_request = False
+        self.client = await self._build_realtime_client()
+        if self._closing_on_request:
+            logger.info("Realtime session closed on request while connecting; not connecting")
+            return
+        try:
+            await self._run_realtime_session()
+        except ConnectionClosedError as e:
+            logger.warning("Realtime websocket closed unexpectedly: %s", e)
+            raise
+        finally:
+            # never keep a stale reference
+            self.connection = None
             try:
-                await self._run_realtime_session()
-                # Normal exit from the session, stop retrying
-                return
-            except ConnectionClosedError as e:
-                # Abrupt close (e.g., "no close frame received or sent") → retry
-                logger.warning(
-                    "Realtime websocket closed unexpectedly (attempt %d/%d): %s",
-                    attempt,
-                    max_attempts,
-                    e,
-                )
-                if attempt < max_attempts:
-                    self.client = await self._build_realtime_client()
-                    # exponential backoff with jitter
-                    base_delay = 2 ** (attempt - 1)  # 1s, 2s, 4s, 8s, etc.
-                    jitter = random.uniform(0, 0.5)
-                    delay = base_delay + jitter
-                    logger.info("Retrying in %.1f seconds...", delay)
-                    await asyncio.sleep(delay)
-                    continue
-                raise
-            finally:
-                # never keep a stale reference
-                self.connection = None
-                try:
-                    self._connected_event.clear()
-                except Exception:
-                    pass
+                self._connected_event.clear()
+            except Exception:
+                pass
 
     async def _restart_session(self) -> None:
         """Force-close the current session and start a fresh one in background.
@@ -2031,6 +2025,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self.connection = conn
             self._prune.reset()  # the companion's context budget: this session's items
             self._reset_owed_outputs()
+            # A drop mid-response never brought its response.done, and what was queued or cut
+            # belongs to the session that ended. The companion's speaker says an announcement
+            # again when it sees the gap, so a kept one would be voiced twice.
+            self._response_done_event.set()
+            self._cut_mid_reply = False
+            dropped = drop_pending_responses(self._pending_responses)
+            if dropped:
+                logger.info("Dropped %d queued response(s) from the last session.", dropped)
             self._followup_pending = self._followup_live = False
             # Session-state hygiene: the last session's batch is over. Its cancelled tools'
             # results are dropped by the tool manager, never handled here.
@@ -2540,6 +2542,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
+        # First, before any await: on the handler's loop the gate's clear and this are one step,
+        # so a start_up that has not connected yet sees it (AppSession.tla, the companion).
+        self._closing_on_request = True
         # A session that closes between speech_started and speech_stopped never hears the
         # stop: release the listening pose here, or breathing (and every idle body turn,
         # which waits for it) stays off with no session open (the companion, 2026-10-19).

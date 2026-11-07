@@ -3,9 +3,11 @@ import time
 import base64
 import asyncio
 import logging
+import contextlib
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -4824,3 +4826,294 @@ async def test_an_empty_turn_that_cut_his_reply_mid_way_gets_the_reply_again(
         creates = [k for k, _ in sent if k == "response.create"]
         if want is not None:
             assert len(creates) == want, (left, transcript)
+
+
+# --- the session across closes and reconnects (the companion's AppSession.tla, 11-07) --------
+
+
+class _SessionConn(_ScriptedConn):
+    """A live connection the test drives: events, probes (callables run in the receiver), a drop.
+
+    `no_frame`: our close gets no close frame back, and the receiver's loop raises
+    ConnectionClosedError, as the server did 2 of 73 times (11-05 11:01:03 and 16:11:13).
+    """
+
+    def __init__(self, no_frame: bool = False) -> None:
+        """Build a live connection; `no_frame` makes our close end it with an error."""
+        super().__init__()
+        self.no_frame = no_frame
+
+    def drop(self) -> None:
+        """The server drops the session: no close frame received or sent."""
+        self._events.put_nowait(ConnectionClosedError(None, None))
+
+    async def close(self) -> None:
+        """End the session, cleanly or, with `no_frame`, as a dropped connection."""
+        self._closed.set()
+        self._events.put_nowait(ConnectionClosedError(None, None) if self.no_frame else None)
+
+    async def __anext__(self) -> Any:
+        """Return the next pushed event, run a pushed probe, or end at close or a drop."""
+        while True:
+            event = await self._events.get()
+            if event is None:
+                raise StopAsyncIteration
+            if isinstance(event, BaseException):
+                raise event
+            if not callable(event):
+                return event
+            result = event()
+            if asyncio.iscoroutine(result):
+                await result
+
+    async def processed(self) -> None:
+        """Return once the receiver has handled every event pushed before this call."""
+        reached = asyncio.Event()
+        self.push(reached.set)
+        await asyncio.wait_for(reached.wait(), timeout=1.0)
+
+
+def _reconnect_handler(
+    monkeypatch: Any, *, no_frame: bool = False
+) -> tuple[HuggingFaceRealtimeHandler, list[_SessionConn]]:
+    """Build a handler whose every connect opens a new _SessionConn, recorded in order."""
+    handler = _session_handler(monkeypatch, ())
+    conns: list[_SessionConn] = []
+
+    def _connect(**_kw: Any) -> _SessionConn:
+        conn = _SessionConn(no_frame=no_frame and not conns)
+        conns.append(conn)
+        if len(conns) > 1 and no_frame:
+            conn._events.put_nowait(None)  # a later session ends at once
+        return conn
+
+    client = SimpleNamespace(realtime=SimpleNamespace(connect=_connect))
+    handler.client = client
+
+    async def _build(self: Any) -> Any:
+        return client
+
+    monkeypatch.setattr(type(handler), "_build_realtime_client", _build)
+    return handler, conns
+
+
+async def _session(handler: HuggingFaceRealtimeHandler) -> asyncio.Task[None]:
+    """Run one _run_realtime_session, as start_up does once per connect, until it is connected."""
+    handler._connected_event.clear()
+    task = asyncio.create_task(handler._run_realtime_session())
+    await asyncio.wait_for(handler._connected_event.wait(), timeout=1.0)
+    return task
+
+
+async def _dropped(handler: HuggingFaceRealtimeHandler, conn: _SessionConn, task: Any) -> None:
+    """Drop the session and let it unwind as start_up's finally does."""
+    conn.drop()
+    with pytest.raises(ConnectionClosedError):
+        await asyncio.wait_for(task, timeout=1.0)
+    handler.connection = None
+
+
+def _creates(conn: _SessionConn) -> list[dict[str, Any]]:
+    return [c.kwargs for c in conn.response.create.await_args_list]
+
+
+def _announced(conn: _SessionConn) -> list[str]:
+    return [c.kwargs["item"]["content"][0]["text"] for c in conn.conversation.item.create.await_args_list]
+
+
+async def _only_the_marker_is_sent(handler: HuggingFaceRealtimeHandler, conn: _SessionConn) -> None:
+    """Say a marker and wait for its create: every create before it in this session is stale."""
+    await handler.say("marker")
+    for _ in range(200):
+        if conn.response.create.await_count and "marker" in _announced(conn):
+            break
+        await asyncio.sleep(0)
+    assert _announced(conn) == ["marker"]
+    assert len(_creates(conn)) == 1
+
+
+_RESPONSE_CREATED = _FakeEvent("response.created", response=SimpleNamespace(metadata=None))
+
+
+@pytest.mark.asyncio
+async def test_close_with_no_close_frame_opens_no_new_session(monkeypatch: Any) -> None:
+    """M1: a close that gets no close frame opens no new session.
+
+    start_up's retry opened one with the gate closed (11-05 11:01:03 and 16:11:13). The
+    console's loop reconnects, after the gate.
+    """
+    handler, conns = _reconnect_handler(monkeypatch, no_frame=True)
+    started: list[str] = []
+    handler.set_session_observer(started.append)
+
+    task = asyncio.create_task(handler.start_up())
+    await asyncio.wait_for(handler._connected_event.wait(), timeout=1.0)
+    await handler.shutdown()
+    with contextlib.suppress(ConnectionClosedError):
+        await asyncio.wait_for(task, timeout=5.0)
+
+    assert len(conns) == 1
+    assert started.count("started") == 1
+
+
+@pytest.mark.asyncio
+async def test_close_while_the_client_is_built_opens_no_session(monkeypatch: Any) -> None:
+    """A close that lands during the POST /session that builds the client opens nothing."""
+    handler, conns = _reconnect_handler(monkeypatch)
+    building, built = asyncio.Event(), asyncio.Event()
+    client = handler.client
+
+    async def _slow_build(self: Any) -> Any:
+        building.set()
+        await built.wait()
+        return client
+
+    monkeypatch.setattr(type(handler), "_build_realtime_client", _slow_build)
+    task = asyncio.create_task(handler.start_up())
+    await asyncio.wait_for(building.wait(), timeout=1.0)
+    await handler.shutdown()
+    built.set()
+    for _ in range(50):
+        await asyncio.sleep(0)
+    if not task.done():  # the session it opened: end it, to fail on the count below
+        for conn in conns:
+            await conn.close()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert conns == []
+
+
+@pytest.mark.asyncio
+async def test_a_drop_mid_response_leaves_the_done_event_set_after_reconnect(
+    monkeypatch: Any,
+) -> None:
+    """A drop between response.created and response.done leaves no clear done event behind.
+
+    In the next session every create waited 30 s, notes dropped as "response active", and
+    request_reply refused.
+    """
+    handler, conns = _reconnect_handler(monkeypatch)
+    first = await _session(handler)
+    conns[0].push(_RESPONSE_CREATED)
+    await conns[0].processed()
+    assert not handler._response_done_event.is_set()
+    await _dropped(handler, conns[0], first)
+
+    second = await _session(handler)
+
+    assert handler._response_done_event.is_set()
+    assert await handler._note_text_now("a note", conns[1]) is True
+    assert await handler.request_reply() is True
+    for _ in range(200):
+        if conns[1].response.create.await_count:
+            break
+        await asyncio.sleep(0)
+    assert len(_creates(conns[1])) == 1
+    await conns[1].close()
+    await asyncio.wait_for(second, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_plain_create_queued_before_a_drop_is_not_sent_after_reconnect(
+    monkeypatch: Any,
+) -> None:
+    """A follow-up queued behind a live response, then a drop: the next session does not send it.
+
+    It would be a reply with none of its context.
+    """
+    handler, conns = _reconnect_handler(monkeypatch)
+    first = await _session(handler)
+    conns[0].push(_RESPONSE_CREATED)
+    await conns[0].processed()
+    await handler._safe_response_create()  # the sender takes it and waits behind the response
+    await asyncio.sleep(0)
+    await handler._safe_response_create()  # this one stays queued
+    await _dropped(handler, conns[0], first)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0)  # no 30 s hold hides a stale send
+
+    second = await _session(handler)
+    await _only_the_marker_is_sent(handler, conns[1])
+    await conns[1].close()
+    await asyncio.wait_for(second, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_request_reply_between_sessions_is_not_sent_in_the_next(monkeypatch: Any) -> None:
+    """request_reply has no connection check: one asked between sessions waited for the next."""
+    handler, conns = _reconnect_handler(monkeypatch)
+    first = await _session(handler)
+    await handler.shutdown()
+    await asyncio.wait_for(first, timeout=1.0)
+
+    assert await handler.request_reply() is True  # queued with no session
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0)
+    second = await _session(handler)
+    await _only_the_marker_is_sent(handler, conns[1])
+    await conns[1].close()
+    await asyncio.wait_for(second, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_the_reconnect_drains_the_queue_like_a_close(monkeypatch: Any) -> None:
+    """An announcement queued at a drop is not sent in the next session.
+
+    The companion's speaker sees the gap and says it again (speaker.py), so sending it too would
+    voice it twice.
+    """
+    handler, conns = _reconnect_handler(monkeypatch)
+    first = await _session(handler)
+    conns[0].push(_RESPONSE_CREATED)
+    await conns[0].processed()
+    await handler.say("first")  # the sender takes it and waits behind the response
+    await asyncio.sleep(0)
+    await handler.say("The timer is done.")  # this one stays queued
+    await _dropped(handler, conns[0], first)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0)
+
+    second = await _session(handler)
+    await _only_the_marker_is_sent(handler, conns[1])
+    await conns[1].close()
+    await asyncio.wait_for(second, timeout=1.0)
+
+
+async def _cut_then_empty_turn(
+    monkeypatch: Any, end: Callable[[HuggingFaceRealtimeHandler, _SessionConn, Any], Any]
+) -> AsyncMock:
+    """Barge-in cuts his reply, the session ends by `end`, and the next opens on an empty turn."""
+    handler, conns = _reconnect_handler(monkeypatch)
+    handler._clear_queue = lambda: (6.0, 3.0)  # 3 s of the reply unplayed
+    asked = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", asked)
+    first = await _session(handler)
+    conns[0].push(_FakeEvent("input_audio_buffer.speech_started", item_id="u1"))
+    await conns[0].processed()
+    assert handler._cut_mid_reply
+    await end(handler, conns[0], first)
+
+    second = await _session(handler)
+    conns[1].push(_FakeEvent("conversation.item.input_audio_transcription.completed", item_id="u2", transcript=""))
+    await conns[1].processed()
+    await conns[1].close()
+    await asyncio.wait_for(second, timeout=1.0)
+    return asked
+
+
+@pytest.mark.asyncio
+async def test_a_cut_reply_does_not_cross_a_reconnect(monkeypatch: Any) -> None:
+    """An empty turn asks again only for a reply cut in its own session, not one before a drop."""
+    asked = await _cut_then_empty_turn(monkeypatch, _dropped)
+
+    asked.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_cut_reply_does_not_cross_a_close_and_reopen(monkeypatch: Any) -> None:
+    """shutdown() left the cut set: the next session's first empty turn asked for a reply."""
+
+    async def _closed(handler: HuggingFaceRealtimeHandler, _conn: Any, task: Any) -> None:
+        await handler.shutdown()
+        await asyncio.wait_for(task, timeout=1.0)
+
+    asked = await _cut_then_empty_turn(monkeypatch, _closed)
+
+    asked.assert_not_awaited()

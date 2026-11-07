@@ -2910,6 +2910,68 @@ def test_say_over_the_rpc_server_runs_on_the_streams_loop() -> None:
     assert seen == [loop]
 
 
+def _loop_of_this_call() -> asyncio.AbstractEventLoop | None:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None  # a synchronous route, run on the RPC server's worker thread
+
+
+def test_a_session_close_over_the_rpc_runs_on_the_handlers_loop() -> None:
+    """L10: a close over the RPC runs close_session, and so handler.shutdown(), on the handler's loop.
+
+    It ran on the RPC server's loop: the websocket close from there (11-02 11:19:15, an SSL
+    IndexError), and the gate's clear and shutdown's flag not one step on the loop that starts
+    the next session.
+    """
+    stream, _manager, app = _pose_stream()
+    seen: list[asyncio.AbstractEventLoop | None] = []
+
+    async def shutdown() -> None:
+        seen.append(_loop_of_this_call())
+
+    stream.handler.shutdown = shutdown
+    stream._session_parked.set()  # the startup loop is parked: one close settles it
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    try:
+        response = _rpc_call(app, "conversation.session", {"open": False})
+    finally:
+        _stop_loop(loop, thread)
+    assert response["result"] == {"wanted": False, "connected": False}
+    assert seen == [loop]
+
+
+def test_the_mute_and_capture_clears_run_on_the_handlers_loop() -> None:
+    """L11: the pre-roll clears of a mute and a capture-off run on the handler's loop.
+
+    They ran on the RPC thread while record_loop appended to the deques on the handler's loop.
+    """
+    stream, _manager, app = _pose_stream()
+    stream._robot.media.stop_recording = MagicMock()
+    stream._robot.media.stop_playing = MagicMock()
+    stream._capture_on = True
+    seen: list[asyncio.AbstractEventLoop | None] = []
+    cleared = threading.Event()
+
+    def clear() -> None:
+        seen.append(_loop_of_this_call())
+        cleared.set()
+
+    stream._clear_preroll = clear
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    try:
+        _rpc_call(app, "conversation.mic", {"muted": True})
+        assert cleared.wait(2.0)
+        cleared.clear()
+        _rpc_call(app, "conversation.capture", {"on": False})
+        assert cleared.wait(2.0)
+    finally:
+        _stop_loop(loop, thread)
+    assert seen == [loop, loop]
+
+
 def test_typed_text_over_the_rpc_is_heard_as_the_persons_words() -> None:
     """Send typed text in as a user turn, on the stream's loop, as say does.
 

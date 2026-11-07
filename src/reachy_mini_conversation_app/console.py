@@ -66,7 +66,10 @@ from reachy_mini_conversation_app.profile_tool_routes import (
     register_profile_tool_methods,
 )
 from reachy_mini_conversation_app.audio.startup_config import apply_audio_startup_config
-from reachy_mini_conversation_app.conversation_handler import ConversationHandler
+from reachy_mini_conversation_app.conversation_handler import (
+    ConversationHandler,
+    drop_pending_responses,
+)
 
 
 gi.require_version("Gst", "1.0")
@@ -851,6 +854,14 @@ class LocalStream:
             return await coro
         return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, loop))
 
+    async def _call_on_handler_loop(self, call: Callable[[], Any]) -> Any:
+        """Run a synchronous `call` on the handler's loop, from any loop."""
+
+        async def run() -> Any:
+            return call()
+
+        return await self._on_handler_loop(run())
+
     async def glance(self, *, at_open: bool = False) -> dict[str, object]:
         """Add one fresh camera frame to the live session, with no response.
 
@@ -957,13 +968,7 @@ class LocalStream:
             logger.debug("Handler shutdown ignored while closing the session: %s", e)
         pending = getattr(self.handler, "_pending_responses", None)
         if pending is not None:
-            dropped = 0
-            while not pending.empty():
-                try:
-                    pending.get_nowait()
-                    dropped += 1
-                except asyncio.QueueEmpty:
-                    break
+            dropped = drop_pending_responses(pending)
             if dropped:
                 logger.info("Dropped %d queued response(s) on session close.", dropped)
 
@@ -1409,8 +1414,11 @@ class LocalStream:
                 )
             if not self.handler._is_connected():
                 raise JsonRpcError("no active session", reason="not_running")
-            self.clear_audio_queue()  # barge in if mid-utterance
-            await self._on_handler_loop(self.handler.say(text))
+            async def _say() -> None:
+                self.clear_audio_queue()  # barge in if mid-utterance
+                await self.handler.say(text)
+
+            await self._on_handler_loop(_say())
             return {"ok": True}
 
         @rpc.method("conversation.breathing")  # type: ignore[untyped-decorator]
@@ -1456,15 +1464,18 @@ class LocalStream:
                 )
             if not self.handler._is_connected():
                 raise JsonRpcError("no active session", reason="not_running")
-            self.clear_audio_queue()  # as speaking over him would
-            await self._on_handler_loop(self.handler.type_text(text))
+            async def _type() -> None:
+                self.clear_audio_queue()  # as speaking over him would
+                await self.handler.type_text(text)
+
+            await self._on_handler_loop(_type())
             return {"ok": True}
 
         @rpc.method("conversation.interrupt")  # type: ignore[untyped-decorator]
-        def _rpc_interrupt(_params: dict[str, object]) -> dict[str, object]:
+        async def _rpc_interrupt(_params: dict[str, object]) -> dict[str, object]:
             if not self.handler._is_connected():
                 raise JsonRpcError("no active session", reason="not_running")
-            self.clear_audio_queue()
+            await self._call_on_handler_loop(self.clear_audio_queue)
             self._last_turn_state = "listening"
             rpc.broadcast_threadsafe(
                 "conversation.turn", {"state": "listening", "reason": "interrupted"}
@@ -1481,7 +1492,7 @@ class LocalStream:
                     # later be flushed as if it were fresh -- record_loop
                     # stops buffering while muted, but does not itself
                     # discard whatever was already there.
-                    self._clear_preroll()
+                    await self._call_on_handler_loop(self._clear_preroll)
                 logger.info(
                     "Microphone %s via /rpc", "muted" if self._mic_muted else "unmuted"
                 )
@@ -1546,14 +1557,19 @@ class LocalStream:
         async def _rpc_session(params: dict[str, object]) -> dict[str, object]:
             if "open" in params:
                 if bool(params["open"]):
-                    await self.open_session(
-                        preroll=bool(params.get("preroll", False)),
-                        anchor_ago=_anchor_ago(params.get("preroll_anchor_ago")),
-                        glance=params.get("glance") is True,
-                        greet=params.get("greet") is True,
+                    # On the handler's loop (L10): close's shutdown() writes the websocket, and
+                    # the gate's clear and shutdown's flag are then one step on the loop that
+                    # starts the next session.
+                    await self._on_handler_loop(
+                        self.open_session(
+                            preroll=bool(params.get("preroll", False)),
+                            anchor_ago=_anchor_ago(params.get("preroll_anchor_ago")),
+                            glance=params.get("glance") is True,
+                            greet=params.get("greet") is True,
+                        )
                     )
                 else:
-                    await self.close_session()
+                    await self._on_handler_loop(self.close_session())
             return {
                 "wanted": self._session_wanted.is_set(),
                 "connected": self._backend_connected(),
@@ -1586,8 +1602,13 @@ class LocalStream:
                         media.stop_playing()
                         self._end_user_turn_soon()
                         # No audio from before a capture-off may survive into
-                        # a later session.
-                        self._clear_preroll()
+                        # a later session. On the handler's loop, where record_loop
+                        # appends: this route is synchronous and holds the media lock.
+                        loop = self._asyncio_loop
+                        if loop is not None and loop.is_running():
+                            loop.call_soon_threadsafe(self._clear_preroll)
+                        else:
+                            self._clear_preroll()
                     self._capture_on = wanted
                     logger.info(
                         "Audio capture %s via /rpc", "started" if wanted else "stopped"

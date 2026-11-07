@@ -24,6 +24,18 @@ HandlerOutput: TypeAlias = AudioFrame | AdditionalOutputs | None
 QueueItem: TypeAlias = AudioFrame | AdditionalOutputs
 
 
+def drop_pending_responses(pending: asyncio.Queue[Any]) -> int:
+    """Empty a handler's queued response.create requests in place; return how many were dropped."""
+    dropped = 0
+    while not pending.empty():
+        try:
+            pending.get_nowait()
+            dropped += 1
+        except asyncio.QueueEmpty:
+            break
+    return dropped
+
+
 class ConversationHandler(AsyncStreamHandler, ABC):
     """Shared app handler contract and idle behavior for realtime conversation backends."""
 
