@@ -2288,7 +2288,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
-                        self._in_flight_tool_calls.clear()
+                        # L13: tools still running stay in flight, so their batch gets one
+                        # follow-up; every call brings a result (cancelled ones too), and a
+                        # new session clears the set.
                         self._tool_batch_needs_response = False
                         self._tool_batch_only_gestured = True
                         self._start_user_turn()

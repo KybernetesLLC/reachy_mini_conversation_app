@@ -4309,6 +4309,54 @@ async def test_a_closed_session_leaves_no_stale_batch_for_the_next(
 
 
 @pytest.mark.asyncio
+async def test_a_batch_spanning_a_user_turn_gets_one_follow_up(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """L13: two lookups still run when the user speaks; the batch still gets one follow-up.
+
+    A new transcript cleared the in-flight set, so the first result found it empty and asked
+    for a follow-up, and the second asked for another. The owed-output hold merged the two
+    creates here, but only while the second tool finished within the hold's 30 s.
+    """
+    caplog.set_level(logging.INFO, logger=hf_mod.logger.name)
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="t-1")),
+    )
+
+    def _finisher(tool: ToolNotification) -> Any:
+        async def _finish() -> None:
+            await handler._handle_tool_result(tool)
+            await asyncio.sleep(0.05)
+
+        return _finish
+
+    handler.client = _ordering_client(
+        (
+            *_response(
+                "r1", "", (("c1", "test__get_weather"), ("c2", "test__get_weather"))
+            ),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="u1",
+                transcript="and tomorrow",
+            ),
+            _finisher(_done_tool("c1", "test__get_weather", "r1")),
+            _finisher(_done_tool("c2", "test__get_weather", "r1")),
+        ),
+        sent,
+        handler,
+    )
+    await handler._run_realtime_session()
+
+    assert _kinds(sent) == ["output", "output", "create"]
+    assert caplog.text.count("follow-up reply queued") == 1
+
+
+@pytest.mark.asyncio
 async def test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next(
     monkeypatch: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
