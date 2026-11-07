@@ -5171,6 +5171,9 @@ async def test_a_bare_tag_split_across_deltas_is_held_then_cut(
             _audio(1, 2),
             _said("y_quiet/>"),
             _audio(3, 4),
+            _FakeEvent(
+                "response.output_audio_transcript.done", transcript="<stay_quiet/>"
+            ),
         ),
     )
     cleared: list[bool] = []
@@ -5180,6 +5183,62 @@ async def test_a_bare_tag_split_across_deltas_is_held_then_cut(
 
     assert _frames(handler) == []
     assert cleared == []
+    assert _tools["stay_quiet"].runs == 1
+
+
+@pytest.mark.asyncio
+async def test_a_bare_tag_then_words_in_the_next_delta_is_spoken_whole(
+    monkeypatch: Any,
+) -> None:
+    """The review: a finished tag is judged with the words that follow it."""
+    text = "<stay_quiet/> Sure, it leaves at three."
+    handler, tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("<stay_quiet/>"),
+            _audio(1, 2),
+            _said(" Sure, it leaves at three."),
+            _audio(3, 4),
+            _FakeEvent("response.output_audio_transcript.done", transcript=text),
+        ),
+    )
+    seen: list[tuple[Any, ...]] = []
+    handler.set_transcript_observer(lambda *args: seen.append(args))
+
+    await _run_with_leaks(handler)
+
+    assert len(_frames(handler)) == 2
+    assert tools["stay_quiet"].runs == 0
+    assert seen == [("assistant", "Sure, it leaves at three.", True, None)]
+
+
+@pytest.mark.asyncio
+async def test_a_lone_bare_tag_whose_verdict_comes_after_the_short_hold_is_never_voiced(
+    monkeypatch: Any,
+) -> None:
+    """08:55:14: a bare tag's transcript.done came 0.95 s after its first audio."""
+    monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
+    handler, tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("<stay_quiet/>"),
+            _audio(1, 2),
+            lambda: asyncio.sleep(0.15),
+            _FakeEvent(
+                "response.output_audio_transcript.done", transcript="<stay_quiet/>"
+            ),
+        ),
+    )
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+
+    await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert cleared == []
+    assert tools["stay_quiet"].runs == 1
 
 
 @pytest.mark.asyncio

@@ -65,6 +65,7 @@ _TAG_CALL_CLOSER = re.compile(r"</call(?::[\w.-]*)?\s*>", re.IGNORECASE)
 # A registered tool's name written as a bare tag (11-07: "<stay_quiet/>" 17 times in one
 # morning, voiced as a chuckle): <name/>, <name>, </name>, with whitespace and attributes.
 _NAME_TAG = re.compile(r"<\s*/?\s*([A-Za-z_][\w.-]*)(?:\s[^<>]{0,200}?)?\s*/?\s*>")
+_NAME_TAG_OPEN = re.compile(r"<\s*/?\s*([A-Za-z_][\w.-]*)[^<>]{0,200}")
 _BARE_CALL = re.compile(r"call:\s*[\w.-]+\s*", re.IGNORECASE)
 _BARE_CALL_OPEN = re.compile(r"call:\s*[\w.-]*\s*", re.IGNORECASE)
 # A name with its arguments and no "call:" at all: "idle_do_nothing{reason:...}" (2026-10-17).
@@ -306,6 +307,8 @@ def _shape_at(
         if angle is None and tools is not None:
             tag = _NAME_TAG.match(text, i)
             if tag and tools.find(_normal(tag.group(1))) is not None:
+                if not final and _skip(text, tag.end()) >= len(text):
+                    return _UNDECIDED, -1, None  # words may follow: judged with them
                 return _CALL, tag.end(), None
         return None if angle is None else (*angle, None)
     if rest[:5].lower() == "call:":
@@ -522,6 +525,10 @@ class ToolNames:
             return False
         return any(form != normal and form.startswith(normal) for form in self._forms)
 
+    def could_be_tag(self, name: str) -> bool:
+        """Whether an open tag's name, lowercased, starts a tool's name."""
+        return any(form.startswith(name) for form in self._forms)
+
     def could_be_cut(self, normal: str) -> bool:
         """Whether this is, or could become, a name that is cut when said alone: one with
         an underscore ("stay quiet", "stay"). A one-word name plays, so it never qualifies.
@@ -553,11 +560,29 @@ def _leaked(*calls: Verdict) -> Verdict:
     return replace(calls[0], calls=calls)
 
 
+def _ends_in_tool_tag(text: str, tools: ToolNames) -> bool:
+    """Whether the text ends in a tool's bare tag, finished or still open ("<stay_qu").
+
+    A finished one is judged on the whole reply, as words may follow it (the review), so
+    its audio waits the spoken-name hold."""
+    tail = text.rstrip(" \t\r\n.!,;")
+    i = tail.rfind("<")
+    if i == -1:
+        return False
+    tag = _NAME_TAG.fullmatch(tail, i)
+    if tag:
+        return tools.find(_normal(tag.group(1))) is not None
+    opened = _NAME_TAG_OPEN.fullmatch(tail, i)
+    return bool(opened) and tools.could_be_tag(opened.group(1).lower())
+
+
 def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None:
     """Rule 1: a reply that is only a registered tool's name."""
     shapes = _shapes(text, final, tools)
     if shapes == _UNDECIDED and not final:
-        return Verdict(UNDECIDED)  # a registered name's open arguments: "express{feel"
+        return Verdict(
+            UNDECIDED, waits_on_name=_ends_in_tool_tag(text, tools)
+        )  # a registered name's open arguments: "express{feel"
     if isinstance(shapes, list):
         for kind, body, json_names in shapes:
             if kind != _CALL:

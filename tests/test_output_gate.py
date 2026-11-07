@@ -502,23 +502,28 @@ BARE_TAG_SHAPES = (
 
 @pytest.mark.parametrize("name", REGISTRY)
 @pytest.mark.parametrize("shape", BARE_TAG_SHAPES)
-def test_every_tool_as_a_bare_tag_is_cut_before_the_reply_ends(
-    name: str, shape: str
-) -> None:
+def test_every_tool_as_a_bare_tag_is_cut(name: str, shape: str) -> None:
+    """Mid-reply it waits on the long hold, as words may follow; the whole reply is cut."""
     text = shape.format(n=name, N=name.upper())
-    for final in (False, True):
-        verdict = gate.judge(text, TOOLS, final=final)
-        assert (verdict.action, verdict.tool, verdict.shape, verdict.kind) == (
-            _expected_cut(name),
-            name,
-            "markup",
-            "leaked tool call",
-        )
+    verdict = gate.judge(text, TOOLS)
+    assert (verdict.action, verdict.waits_on_name) == (gate.UNDECIDED, True)
+    verdict = gate.judge(text, TOOLS, final=True)
+    assert (verdict.action, verdict.tool, verdict.shape, verdict.kind) == (
+        _expected_cut(name),
+        name,
+        "markup",
+        "leaked tool call",
+    )
 
 
-@pytest.mark.parametrize("text", ["<", "<sta", "<stay_quiet", "<stay_quiet/", "</sta"])
-def test_the_start_of_a_bare_tag_waits(text: str) -> None:
-    assert gate.judge(text, TOOLS).action == gate.UNDECIDED
+@pytest.mark.parametrize("text", ["<sta", "<stay_quiet", "<stay_quiet/", "</sta"])
+def test_the_start_of_a_bare_tag_waits_on_the_name(text: str) -> None:
+    verdict = gate.judge(text, TOOLS)
+    assert (verdict.action, verdict.waits_on_name) == (gate.UNDECIDED, True)
+
+
+def test_a_bare_tag_with_words_after_it_in_the_same_text_plays() -> None:
+    assert gate.judge("<stay_quiet/> Sure", TOOLS) == gate.Verdict(gate.PLAY)
 
 
 @pytest.mark.parametrize(
@@ -548,7 +553,7 @@ def test_a_name_in_words_that_could_be_cut_waits_on_the_name(text: str) -> None:
     assert (verdict.action, verdict.waits_on_name) == (gate.UNDECIDED, True)
 
 
-@pytest.mark.parametrize("text", ["Dance", "Expr", "<sta", "(stops"])
+@pytest.mark.parametrize("text", ["Dance", "Expr", "<", "<xyz", "(stops"])
 def test_a_wait_that_cannot_end_in_a_spoken_name_cut_is_the_short_hold(
     text: str,
 ) -> None:

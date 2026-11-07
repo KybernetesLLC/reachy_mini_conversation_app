@@ -308,11 +308,13 @@ def _companion_tag(event: Any) -> str | None:
 # transcript as it streams; audio that arrives first is held for at most
 # SPOKEN_ARTIFACT_HOLD_S, then released.
 SPOKEN_ARTIFACT_HOLD_S = 0.3
-# A reply whose words so far are a tool's name, or its start, that is cut when said alone
-# ("Stay quiet.", "Stay") is judged only on its whole transcript, whose done event follows
-# the audio: it is held to this bound instead (11-07). On 11-07 a name-length reply's
-# transcript.done came 0.11-0.27 s after its first audio.
-SPOKEN_NAME_HOLD_S = 1.0
+# A reply that is so far a tool's bare tag ("<stay_quiet/>", "<sta") or its name in words
+# that is cut when said alone ("Stay quiet.", "Stay") is judged only on its whole
+# transcript, as words may follow; transcript.done comes after the audio, so it is held
+# to this bound instead (11-07). On 11-07 a bare tag's transcript.done came 0.11-0.95 s
+# after its first audio; three spoken-name leaks on 11-04 and 11-05 were cut 0.37-0.48 s
+# after theirs, past the short hold.
+SPOKEN_NAME_HOLD_S = 1.5
 
 
 # The tool-call-log brief (2026-10-11): one /rpc notification per finished (or
@@ -1114,8 +1116,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             await asyncio.sleep(max(0.0, SPOKEN_NAME_HOLD_S - SPOKEN_ARTIFACT_HOLD_S))
         if self._gate == "hold":
             logger.info(
-                "reply audio released after %.0f ms with no verdict",
+                "reply audio released after %.0f ms with no verdict (%d chars)",
                 (time.monotonic() - self._gate_held_at) * 1000,
+                len(self._gate_text),
             )
             self._gate_timer = None  # this task: not cancelled by the release
             self._gate_release("open")
