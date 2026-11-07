@@ -210,12 +210,22 @@ class BackgroundToolManager(BaseModel):
         return background_tool
 
     def _cancelled_unstarted(self, background_tool: BackgroundTool, task: asyncio.Task[None]) -> None:
-        """L14: a task cancelled before its first step never ran `_run_tool`; settle it here."""
-        if not task.cancelled() or background_tool.status != ToolState.RUNNING:
+        """Settle a tool task that ended without notifying (L14), so every call brings a result.
+
+        A task cancelled before its first step never ran `_run_tool`; one that raised in it
+        never reached the notification.
+        """
+        if background_tool.status != ToolState.RUNNING:
+            return
+        if task.cancelled():
+            background_tool.status, background_tool.error = ToolState.CANCELLED, "Tool cancelled"
+        elif task.exception() is not None:
+            exc = task.exception()
+            logger.error("Background tool %s (id=%s) raised: %r", background_tool.tool_name, background_tool.id, exc)
+            background_tool.status, background_tool.error = ToolState.FAILED, f"{type(exc).__name__}: {exc}"
+        else:
             return
         background_tool.completed_at = time.monotonic()
-        background_tool.status = ToolState.CANCELLED
-        background_tool.error = "Tool cancelled"
         self._notification_queue.put_nowait(background_tool.get_notification())
 
     async def _run_tool(

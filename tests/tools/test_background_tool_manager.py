@@ -423,6 +423,28 @@ class TestCancelTool:
         note = manager._notification_queue.get_nowait()
         assert (note.id, note.status, note.error) == ("c1", ToolState.CANCELLED, "Tool cancelled")
 
+    @pytest.mark.asyncio
+    async def test_a_run_that_raises_is_failed_and_notified(self, manager: BackgroundToolManager) -> None:
+        """L14 (review): a run that raises is failed and notified.
+
+        An exception in _run_tool itself (a tool returning no dict) left the call RUNNING with
+        no result, so its batch never got its follow-up.
+        """
+        routine = MagicMock(spec=ToolCallRoutine)
+        routine.tool_name, routine.args_json_str = "odd", "{}"
+
+        async def _call(manager: BackgroundToolManager) -> Any:
+            return "not a dict"
+
+        routine.side_effect = _call
+        bg = await manager.start_tool("c2", routine, is_idle_tool_call=False)
+        await asyncio.sleep(0.05)
+
+        assert bg.status == ToolState.FAILED
+        note = manager._notification_queue.get_nowait()
+        assert (note.id, note.status) == ("c2", ToolState.FAILED)
+        assert note.error and "AttributeError" in note.error
+
 
 class TestTimeoutTools:
     """Verify automatic timeout of long-running tools."""
