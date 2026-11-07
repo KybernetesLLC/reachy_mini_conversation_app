@@ -18,7 +18,14 @@ from fastapi.testclient import TestClient
 
 from reachy_mini.utils import create_head_pose
 import reachy_mini_conversation_app.console as console_mod
-from reachy_mini_conversation_app.moves import HoldPoseMove, BreathingMove, MovementManager, PoseSequenceMove
+from reachy_mini_conversation_app.moves import (
+    BODY_YAW_LOW,
+    BODY_YAW_HIGH,
+    HoldPoseMove,
+    BreathingMove,
+    MovementManager,
+    PoseSequenceMove,
+)
 from reachy_mini_conversation_app.config import HF_AVAILABLE_VOICES, config
 from reachy_mini_conversation_app.console import LocalStream
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
@@ -468,7 +475,10 @@ def test_pose_read_only_reports_without_changing_anything() -> None:
         {"antennas": [0.1, -0.1], "duration": float("inf")},  # infinite duration
         {"antennas": [0.1, -0.1], "head_pose": {"pitch": float("nan")}},  # NaN head_pose field
         {"release": True, "body_yaw": "left"},  # non-numeric body yaw
-        {"release": True, "body_yaw": 3.0},  # past the SDK's 160 degrees
+        {"release": True, "body_yaw": 3.0},  # a turn past the commanded limits
+        {"release": True, "body_yaw": BODY_YAW_HIGH + 0.01},  # a turn just past the left limit
+        {"release": True, "body_yaw": BODY_YAW_LOW - 0.01},  # a turn just past the right limit
+        {"antennas": [0.1, -0.1], "body_yaw": 3.0},  # a hold past the SDK's 160 degrees
         {"release": True, "body_yaw": 0.2, "duration": 0},  # turn duration must be > 0
         {"antennas": [0.1, -0.1], "body_yaw": "left"},  # non-numeric body yaw on a hold
     ],
@@ -496,6 +506,34 @@ def test_pose_hold_with_a_body_yaw_holds_it_and_says_so() -> None:
     _drive_manager(manager)
     assert isinstance(manager.state.current_move, HoldPoseMove)
     assert manager.state.current_move.target_body_yaw == pytest.approx(0.3)
+
+
+@pytest.mark.parametrize("limit", [BODY_YAW_HIGH, BODY_YAW_LOW])
+def test_a_turn_to_a_commanded_limit_is_accepted(limit: float) -> None:
+    """The limits are inclusive: the supervisor commands exactly these numbers at its reach."""
+    _stream, _manager, app = _pose_stream()
+
+    params = {"release": True, "body_yaw": limit, "duration": 2.0}
+    resp = _rpc_call(app, "conversation.pose", params)
+
+    assert resp["result"] == {"holding": False, "body_yaw": limit}
+
+
+def test_a_hold_past_a_commanded_limit_is_accepted_for_the_mover_to_bring_back() -> None:
+    """The supervisor holds at the body yaw it reads, and a read can lie past a limit. Refusing it
+    would fail the hold; the mover clips it and steps a body already there inward (moves.py)."""
+    _stream, manager, app = _pose_stream()
+    past = BODY_YAW_HIGH + 0.05
+
+    resp = _rpc_call(
+        app,
+        "conversation.pose",
+        {"head_pose": {"yaw": past}, "antennas": [0.2, -0.2], "duration": 0.5, "body_yaw": past},
+    )
+
+    assert resp["result"] == {"holding": True, "body_yaw": past}
+    _drive_manager(manager)
+    assert manager.state.current_move.target_body_yaw == pytest.approx(past)
 
 
 def test_pose_release_with_a_body_yaw_turns_the_idle_body() -> None:

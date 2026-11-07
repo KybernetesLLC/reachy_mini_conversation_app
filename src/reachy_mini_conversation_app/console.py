@@ -27,6 +27,7 @@ from reachy_mini.io.jsonrpc import JsonRpcError
 from reachy_mini.apps.jsonrpc_server import JsonRpcServer
 from reachy_mini.media.media_manager import MediaBackend
 from reachy_mini_conversation_app import startup, phantom_speech, playback_health
+from reachy_mini_conversation_app.moves import BODY_YAW_LOW, BODY_YAW_HIGH
 from reachy_mini_conversation_app.config import (
     HF_BACKEND,
     LOCKED_PROFILE,
@@ -124,18 +125,32 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 
 # reachy_mini 1.10.0: yaw_body is capped at 160 degrees (URDF, max_body_yaw).
-_BODY_YAW_LIMIT = math.radians(160.0)
+_BODY_YAW_SDK_LIMIT = math.radians(160.0)
 
 
-def _body_yaw(value: object) -> float:
-    """Parse a body yaw in radians within the SDK's limit, or raise invalid_params."""
+def _bad_body_yaw() -> JsonRpcError:
+    return JsonRpcError(
+        "pose body_yaw is past the body's limit", reason="invalid_params", code=-32602
+    )
+
+
+def _turn_body_yaw(value: object) -> float:
+    """Parse a turn's target in radians within the commanded limits, or raise invalid_params."""
     yaw = _finite_float(value, "pose body_yaw must be numeric")
-    if abs(yaw) > _BODY_YAW_LIMIT:
-        raise JsonRpcError(
-            "pose body_yaw is past the body's limit",
-            reason="invalid_params",
-            code=-32602,
-        )
+    if not BODY_YAW_LOW <= yaw <= BODY_YAW_HIGH:
+        raise _bad_body_yaw()
+    return yaw
+
+
+def _held_body_yaw(value: object) -> float:
+    """Parse a held body yaw in radians within the SDK's limit, or raise invalid_params.
+
+    Wider than a turn's on purpose. The supervisor holds at the body yaw it reads, and a read can
+    lie past a commanded limit. The mover clips what it sends and steps such a body inward
+    (moves._within_body_range); refusing here would fail the hold instead."""
+    yaw = _finite_float(value, "pose body_yaw must be numeric")
+    if abs(yaw) > _BODY_YAW_SDK_LIMIT:
+        raise _bad_body_yaw()
     return yaw
 
 
@@ -1598,7 +1613,7 @@ class LocalStream:
                     return {"holding": False}
                 # The companion (decision 026): released to idle breathing,
                 # turned to face this way, min-jerk over `duration`.
-                turn_yaw = _body_yaw(params["body_yaw"])
+                turn_yaw = _turn_body_yaw(params["body_yaw"])
                 turn_seconds = _finite_float(
                     params.get("duration", 1.0), "pose duration must be numeric"
                 )
@@ -1657,7 +1672,7 @@ class LocalStream:
                     "pose duration must be > 0", reason="invalid_params", code=-32602
                 )
 
-            body_yaw = _body_yaw(params["body_yaw"]) if "body_yaw" in params else None
+            body_yaw = _held_body_yaw(params["body_yaw"]) if "body_yaw" in params else None
             target_head_pose = create_head_pose(
                 x, y, z, roll, pitch, yaw, degrees=False
             )
@@ -1767,7 +1782,7 @@ class LocalStream:
                             _finite_float(antennas_raw[0], error),
                             _finite_float(antennas_raw[1], error),
                         ),
-                        _body_yaw(item["body_yaw"]) if "body_yaw" in item else None,
+                        _held_body_yaw(item["body_yaw"]) if "body_yaw" in item else None,
                         move,
                         pause,
                     )
