@@ -2809,10 +2809,22 @@ SPOKEN_ARTIFACT_CASES = [
 ]
 
 
+FINISHED_TAG_CALLS = {
+    "<call:stay_quiet/>", "<call:stay_quiet>", "<call:stay_quiet></call>",
+    "<call:stay_quiet>{}</call>", '<call:express {"mood": "happy"}/>',
+}
+
+
 @pytest.mark.parametrize(("text", "verdict"), SPOKEN_ARTIFACT_CASES)
 def test_spoken_artifact_rule(text: str, verdict: str | None) -> None:
-    """Only text made wholly of artifact shapes is an artifact; an unfinished one waits."""
-    assert hf_mod.spoken_artifact(text) == verdict
+    """Only text made wholly of artifact shapes is an artifact; an unfinished one waits.
+
+    A decided row is judged on the whole reply: a finished tag call at the end of the
+    text so far waits for what follows it (11-07)."""
+    if verdict != _U:
+        assert hf_mod.spoken_artifact(text, final=True) == verdict
+    streaming = _U if text in FINISHED_TAG_CALLS else verdict  # words may follow
+    assert hf_mod.spoken_artifact(text) == streaming
 
 
 @pytest.mark.asyncio
@@ -5135,3 +5147,288 @@ async def test_a_cut_reply_does_not_cross_a_close_and_reopen(monkeypatch: Any) -
     asked = await _cut_then_empty_turn(monkeypatch, _closed)
 
     asked.assert_not_awaited()
+
+
+# The bare tag (11-07): "<stay_quiet/>" was sent to the voice 17 times in one morning and
+# heard as a chuckle. Its audio is never released, and a spoken name waits for its verdict.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio_first", [False, True])
+async def test_a_bare_tag_is_cut_with_no_audio_released(
+    monkeypatch: Any, caplog: Any, audio_first: bool
+) -> None:
+    handler, tools = _leak_session(
+        monkeypatch, _reply_events("<stay_quiet/>", audio_first=audio_first)
+    )
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert cleared == []
+    assert "leaked tool call: stay_quiet (markup) cut; executed=True" in caplog.messages
+    assert tools["stay_quiet"].runs == 1
+
+
+@pytest.mark.asyncio
+async def test_a_bare_tag_split_across_deltas_is_held_then_cut(
+    monkeypatch: Any,
+) -> None:
+    handler, _tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("<sta"),
+            _audio(1, 2),
+            _said("y_quiet/>"),
+            _audio(3, 4),
+            _FakeEvent(
+                "response.output_audio_transcript.done", transcript="<stay_quiet/>"
+            ),
+        ),
+    )
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+
+    await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert cleared == []
+    assert _tools["stay_quiet"].runs == 1
+
+
+@pytest.mark.asyncio
+async def test_a_bare_tag_then_words_in_the_next_delta_is_spoken_whole(
+    monkeypatch: Any,
+) -> None:
+    """The review: a finished tag is judged with the words that follow it."""
+    text = "<stay_quiet/> Sure, it leaves at three."
+    handler, tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("<stay_quiet/>"),
+            _audio(1, 2),
+            _said(" Sure, it leaves at three."),
+            _audio(3, 4),
+            _FakeEvent("response.output_audio_transcript.done", transcript=text),
+        ),
+    )
+    seen: list[tuple[Any, ...]] = []
+    handler.set_transcript_observer(lambda *args: seen.append(args))
+
+    await _run_with_leaks(handler)
+
+    assert len(_frames(handler)) == 2
+    assert tools["stay_quiet"].runs == 0
+    assert seen == [("assistant", "Sure, it leaves at three.", True, None)]
+
+
+@pytest.mark.asyncio
+async def test_a_lone_bare_tag_whose_verdict_comes_after_the_short_hold_is_never_voiced(
+    monkeypatch: Any,
+) -> None:
+    """08:55:14: a bare tag's transcript.done came 0.95 s after its first audio."""
+    monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
+    handler, tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("<stay_quiet/>"),
+            _audio(1, 2),
+            lambda: asyncio.sleep(0.15),
+            _FakeEvent(
+                "response.output_audio_transcript.done", transcript="<stay_quiet/>"
+            ),
+        ),
+    )
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+
+    await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert cleared == []
+    assert tools["stay_quiet"].runs == 1
+
+
+@pytest.mark.asyncio
+async def test_a_spoken_name_is_never_voiced_when_its_verdict_comes_after_the_short_hold(
+    monkeypatch: Any,
+) -> None:
+    """08:33:49: "Stay quiet." is decided only by transcript.done, which follows its audio."""
+    monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
+    handler, _tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("Stay quiet."),
+            _audio(1, 2),
+            lambda: asyncio.sleep(0.15),
+            _audio(3, 4),
+            _FakeEvent("response.output_audio.done"),
+            _FakeEvent(
+                "response.output_audio_transcript.done", transcript="Stay quiet."
+            ),
+        ),
+    )
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+
+    await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert cleared == []
+
+
+@pytest.mark.asyncio
+async def test_the_spoken_name_hold_is_bounded(monkeypatch: Any) -> None:
+    """A reply that stays "Stay" with no verdict plays after SPOKEN_NAME_HOLD_S."""
+    monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
+    monkeypatch.setattr(hf_mod, "SPOKEN_NAME_HOLD_S", 0.2)
+    sizes: list[int] = []
+    handler: HuggingFaceRealtimeHandler
+    events = (
+        _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+        _said("Stay"),
+        _audio(1, 2),
+        lambda: asyncio.sleep(0.1),
+        lambda: sizes.append(handler.output_queue.qsize()),  # past the short hold: held
+        lambda: asyncio.sleep(0.2),
+        lambda: sizes.append(handler.output_queue.qsize()),  # past the bound: released
+    )
+    handler, _tools = _leak_session(monkeypatch, events)
+
+    await _run_with_leaks(handler)
+
+    assert sizes == [0, 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text", ["Sure.", "Stay calm, it's fine", "I'll stay quiet while you two talk."]
+)
+async def test_ordinary_replies_are_released_at_once(
+    monkeypatch: Any, text: str
+) -> None:
+    sizes: list[int] = []
+    handler: HuggingFaceRealtimeHandler
+    events = (
+        _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+        _said(text),
+        _audio(1, 2),
+        lambda: sizes.append(handler.output_queue.qsize()),
+        _FakeEvent("response.output_audio_transcript.done", transcript=text),
+    )
+    handler, _tools = _leak_session(monkeypatch, events)
+
+    await _run_with_leaks(handler)
+
+    assert sizes == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transcript", ["<stay quiet/>", "<speak><stay_quiet/></speak>"]
+)
+async def test_a_spaced_or_ssml_wrapped_tool_tag_is_cut_with_no_audio(
+    monkeypatch: Any, transcript: str
+) -> None:
+    handler, tools = _leak_session(
+        monkeypatch, _reply_events(transcript, audio_first=False)
+    )
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+
+    await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert cleared == []
+    assert tools["stay_quiet"].runs == 1
+
+
+@pytest.mark.asyncio
+async def test_a_tag_call_then_words_in_the_next_delta_is_spoken_whole(
+    monkeypatch: Any,
+) -> None:
+    text = "<call:stay_quiet/> Sure, it leaves at three."
+    handler, tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("<call:stay_quiet/>"),
+            _audio(1, 2),
+            _said(" Sure, it leaves at three."),
+            _audio(3, 4),
+            _FakeEvent("response.output_audio_transcript.done", transcript=text),
+        ),
+    )
+    seen: list[tuple[Any, ...]] = []
+    handler.set_transcript_observer(lambda *args: seen.append(args))
+
+    await _run_with_leaks(handler)
+
+    assert len(_frames(handler)) == 2
+    assert tools["stay_quiet"].runs == 0
+    assert seen == [("assistant", "Sure, it leaves at three.", True, None)]
+
+
+@pytest.mark.asyncio
+async def test_a_lone_tag_call_whose_verdict_comes_after_the_short_hold_is_never_voiced(
+    monkeypatch: Any,
+) -> None:
+    """08:42:55: "<call:stay_quiet/>"'s transcript.done came 0.42 s after its first audio."""
+    monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
+    handler, tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("<call:stay_quiet/>"),
+            _audio(1, 2),
+            lambda: asyncio.sleep(0.15),
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                transcript="<call:stay_quiet/>",
+            ),
+        ),
+    )
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+
+    await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert cleared == []
+    assert tools["stay_quiet"].runs == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "<call:stay_quiet></call>",
+        '<call:stay_quiet{reason:<|"|>side talk<|"|>}/>',
+        '<call:stay_quiet{reason:<|"|>' + "side talk " * 22 + '<|"|>}/>',
+    ],
+)
+async def test_a_finished_tag_call_of_any_form_is_never_voiced(
+    monkeypatch: Any, transcript: str
+) -> None:
+    monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
+    handler, tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said(transcript),
+            _audio(1, 2),
+            lambda: asyncio.sleep(0.15),
+            _FakeEvent("response.output_audio_transcript.done", transcript=transcript),
+        ),
+    )
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+    await _run_with_leaks(handler)
+    assert _frames(handler) == []
+    assert cleared == []
+    assert tools["stay_quiet"].runs == 1

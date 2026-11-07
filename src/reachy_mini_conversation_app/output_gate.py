@@ -39,6 +39,9 @@ _UNDECIDED: Final[str] = "undecided"
 _STAGE: Final[str] = "stage direction"
 _CALL: Final[str] = "leaked tool call"
 _THINKING: Final[str] = "thinking"
+_TAG_WAIT: Final[str] = (
+    "finished tag"  # a finished tag ends the text so far: words may follow
+)
 _DIRECTION_MAX = 80  # characters inside a stage direction's brackets
 _UNDECIDED_MAX = 200  # past this much text, an unfinished shape is a reply
 _JSON_UNDECIDED_MAX = (
@@ -62,6 +65,38 @@ _WRAPPERS = (
 _TAG_CALL = re.compile(r"<call:\s*[\w.-]+\s*", re.IGNORECASE)
 _TAG_CALL_END = re.compile(r"[^<>]*?(/?)>")
 _TAG_CALL_CLOSER = re.compile(r"</call(?::[\w.-]*)?\s*>", re.IGNORECASE)
+# A registered tool's name written as a bare tag (11-07: "<stay_quiet/>" 17 times in one
+# morning, voiced as a chuckle): <name/>, <name>, </name>, with whitespace and attributes.
+_NAME_TAG = re.compile(r"<\s*/?\s*([A-Za-z_][\w.-]*)(?:\s[^<>]{0,200}?)?\s*/?\s*>")
+_NAME_TAG_OPEN = re.compile(r"<\s*/?\s*([A-Za-z_][\w.-]*)[^<>]{0,200}")
+# A tag's leading words, before any attribute's "=": "<stay quiet/>" names stay_quiet.
+_TAG_WORDS = re.compile(r"<\s*/?\s*([A-Za-z_][\w.-]*(?:\s+[A-Za-z_][\w.-]*){0,5})")
+
+
+def _tag_tool(tag: str, tools: ToolNames | None) -> LeakTool | None:
+    """The tool a bare tag names: its longest run of leading words that is a tool's name."""
+    words = _TAG_WORDS.match(tag)
+    if tools is None or not words:
+        return None
+    parts = words.group(1).split()
+    for n in range(len(parts), 0, -1):
+        tool = tools.find(_normal(" ".join(parts[:n])))
+        if tool is not None:
+            return tool
+    return None
+
+
+def _skip_ssml(text: str, i: int, tools: ToolNames | None) -> int:
+    """Return the index past whitespace, stray ". ! , ;" and SSML-like tags that name no
+    tool: "<speak><stay_quiet/></speak>" is the tag alone (11-07, the review)."""
+    while True:
+        i = _skip(text, i)
+        ssml = _SSML.match(text, i)
+        if not ssml or _tag_tool(ssml.group(), tools) is not None:
+            return i
+        i = ssml.end()
+
+
 _BARE_CALL = re.compile(r"call:\s*[\w.-]+\s*", re.IGNORECASE)
 _BARE_CALL_OPEN = re.compile(r"call:\s*[\w.-]*\s*", re.IGNORECASE)
 # A name with its arguments and no "call:" at all: "idle_do_nothing{reason:...}" (2026-10-17).
@@ -300,7 +335,21 @@ def _shape_at(
     c = text[i]
     if c == "<":
         angle = _angle_at(text, i, final)
-        return None if angle is None else (*angle, None)
+        tagged = angle is not None and bool(_TAG_CALL.match(text, i))
+        if angle is None and tools is not None:
+            tag = _NAME_TAG.match(text, i)
+            if tag and _tag_tool(tag.group(), tools) is not None:
+                angle, tagged = (_CALL, tag.end()), True
+        if angle is None:
+            return None
+        if (
+            tagged
+            and angle[0] == _CALL
+            and not final
+            and _skip_ssml(text, angle[1], tools) >= len(text)
+        ):
+            return _TAG_WAIT, -1, None  # a finished tag: words may follow it
+        return (*angle, None)
     if rest[:5].lower() == "call:":
         call = _BARE_CALL.match(text, i)
         if call and call.end() < len(text) and text[call.end()] == "{":
@@ -364,17 +413,19 @@ def _shapes(
     """
     head = text.strip()
     found: list[tuple[str, str, list[str] | None]] = []
-    i = _skip(head, 0)
+    i = _skip_ssml(head, 0, tools)
     while i < len(head):
         shape = _shape_at(head, i, final, tools)
         if shape is None:
             return None
         kind, end, names = shape
+        if kind == _TAG_WAIT:
+            return _TAG_WAIT  # bounded by the spoken-name hold, not _UNDECIDED_MAX
         if kind == _UNDECIDED:
             limit = _JSON_UNDECIDED_MAX if _json_opening(head[i:]) else _UNDECIDED_MAX
             return _UNDECIDED if len(head) <= limit else None
         found.append((kind, head[i:end], names))
-        i = _skip(head, end)
+        i = _skip_ssml(head, end, tools)
     return found if found else _UNDECIDED
 
 
@@ -385,6 +436,8 @@ def spoken_artifact(text: str, final: bool = False) -> str | None:
     named by its first shape. Pure.
     """
     shapes = _shapes(text, final)
+    if shapes == _TAG_WAIT:
+        return _UNDECIDED
     return shapes[0][0] if isinstance(shapes, list) else shapes
 
 
@@ -450,6 +503,7 @@ class Verdict:
     tool: str | None = None
     shape: str | None = None
     calls: tuple[Verdict, ...] = ()
+    waits_on_name: bool = False  # undecided on a name in words that would be cut
 
 
 # The tool-name leak guard (the planning session, 2026-10-17): the hosted model said
@@ -474,6 +528,7 @@ _CALLED_NAME = (
     re.compile(r'"name"\s*:\s*"([^"]+)"'),
     re.compile(r"^\[\s*([A-Za-z_][\w.]*)\("),
     re.compile(r"tool_code\s*([A-Za-z_][\w.]*)\(", re.IGNORECASE),
+    _NAME_TAG,
 )
 
 
@@ -513,6 +568,18 @@ class ToolNames:
             return False
         return any(form != normal and form.startswith(normal) for form in self._forms)
 
+    def could_be_tag(self, name: str) -> bool:
+        """Whether an open tag's name, lowercased, starts a tool's name."""
+        return any(form.startswith(name) for form in self._forms)
+
+    def could_be_cut(self, normal: str) -> bool:
+        """Whether this is, or could become, a name that is cut when said alone: one with
+        an underscore ("stay quiet", "stay"). A one-word name plays, so it never qualifies.
+        """
+        if len(normal) < _MIN_WAIT:
+            return False
+        return any("_" in form and form.startswith(normal) for form in self._forms)
+
 
 def _called_name(markup: str) -> str | None:
     for pattern in _CALLED_NAME:
@@ -536,11 +603,36 @@ def _leaked(*calls: Verdict) -> Verdict:
     return replace(calls[0], calls=calls)
 
 
+def _ends_in_tool_tag(text: str, tools: ToolNames) -> bool:
+    """Whether the text ends in a tool's bare tag, finished or still open ("<stay_qu").
+
+    A finished one is judged on the whole reply, as words may follow it (the review), so
+    its audio waits the spoken-name hold."""
+    tail = text.rstrip(" \t\r\n.!,;")
+    i = tail.rfind("<")
+    while i != -1 and _SSML.fullmatch(tail, i) and _tag_tool(tail[i:], tools) is None:
+        tail = tail[:i].rstrip(" \t\r\n.!,;")  # a closing </speak> after the tag
+        i = tail.rfind("<")
+    if i == -1:
+        return False
+    last = tail[i:]
+    if last.lower().startswith("<call:") or "<call:".startswith(last.lower()):
+        return True  # a tag call, finished or open: cut when nothing follows
+    if _NAME_TAG.fullmatch(last):
+        return _tag_tool(last, tools) is not None
+    opened = _NAME_TAG_OPEN.fullmatch(last)
+    return bool(opened) and tools.could_be_tag(opened.group(1).lower())
+
+
 def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None:
     """Rule 1: a reply that is only a registered tool's name."""
     shapes = _shapes(text, final, tools)
+    if shapes == _TAG_WAIT:
+        return Verdict(UNDECIDED, waits_on_name=True)
     if shapes == _UNDECIDED and not final:
-        return Verdict(UNDECIDED)  # a registered name's open arguments: "express{feel"
+        return Verdict(
+            UNDECIDED, waits_on_name=_ends_in_tool_tag(text, tools)
+        )  # a registered name's open arguments: "express{feel"
     if isinstance(shapes, list):
         for kind, body, json_names in shapes:
             if kind != _CALL:
@@ -548,11 +640,13 @@ def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None
             names = json_names if json_names is not None else [_called_name(body)]
             shape = "json" if json_names is not None else "markup"
             found = [tools.find(_normal(name)) for name in names if name]
+            if json_names is None and _NAME_TAG.fullmatch(body):
+                found = [_tag_tool(body, tools)]  # "<stay quiet/>": its words
             leaks = [_leak(tool, shape) for tool in found if tool is not None]
             if leaks:
                 return _leaked(*leaks)
         return None
-    word = text.strip().strip(_WORD_EDGES).strip()
+    word = without_ssml(text)[0].strip().strip(_WORD_EDGES).strip()
     if not _PLAIN.fullmatch(word):
         return None
     normal = _normal(word)
@@ -561,7 +655,9 @@ def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None
         # A tool's name, or the start of one, waits for what follows: "{" makes it a
         # call, a space and a word make it a sentence (the owner, 2026-10-20).
         named = tool is not None and len(normal) >= _MIN_WAIT
-        return Verdict(UNDECIDED) if named or tools.could_become(normal) else None
+        if not (named or tools.could_become(normal)):
+            return None
+        return Verdict(UNDECIDED, waits_on_name=tools.could_be_cut(normal))
     if tool is None:
         return None
     if "_" in word:
@@ -587,13 +683,13 @@ RULES: Final[tuple[Rule, ...]] = (leaked_tool_name, artifact_shape)
 
 def judge(text: str, tools: ToolNames, *, final: bool = False) -> Verdict:
     """The first decisive rule's verdict; UNDECIDED while any rule waits; else PLAY. Pure."""
-    waiting = False
+    waiting: Verdict | None = None
     for rule in RULES:
         verdict = rule(text, tools, final)
         if verdict is None:
             continue
         if verdict.action == UNDECIDED:
-            waiting = True
+            waiting = waiting or verdict
             continue
         return verdict
-    return Verdict(UNDECIDED) if waiting and not final else Verdict(PLAY)
+    return waiting if waiting and not final else Verdict(PLAY)
