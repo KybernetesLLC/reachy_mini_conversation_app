@@ -388,6 +388,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     """Realtime stream handler for the Hugging Face OpenAI-compatible endpoint."""
 
     SAMPLE_RATE = 16000
+    # When (time.monotonic, the host's) the instructions were last read for a new session: the
+    # companion keeps any silent note that session's starting block already held (11-07).
+    memory_read_at: Optional[float] = None
 
     def __init__(
         self,
@@ -586,6 +589,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self, tool_specs: list[ToolSpec]
     ) -> RealtimeSessionCreateRequestParam:
         """Return the Hugging Face OpenAI-compatible session config."""
+        self.memory_read_at = time.monotonic()  # taken before the read: never after it
         return RealtimeSessionCreateRequestParam(
             type="realtime",
             instructions=get_session_instructions(self.instance_path),

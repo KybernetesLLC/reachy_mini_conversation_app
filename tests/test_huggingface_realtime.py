@@ -5432,3 +5432,15 @@ async def test_a_finished_tag_call_of_any_form_is_never_voiced(
     assert _frames(handler) == []
     assert cleared == []
     assert tools["stay_quiet"].runs == 1
+
+
+def test_the_session_config_keeps_when_the_companions_block_was_read(monkeypatch: Any) -> None:
+    """11-07: the steady time taken just before the instructions (the companion's block) are
+    read for a new session, so the session's start can say it; None before any."""
+    monkeypatch.setattr(hf_mod.time, "monotonic", lambda: 777.0)
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
+    assert handler.memory_read_at is None
+    handler._get_session_config([])
+    assert handler.memory_read_at == 777.0
