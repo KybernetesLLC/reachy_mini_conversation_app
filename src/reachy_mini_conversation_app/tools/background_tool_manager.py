@@ -351,7 +351,12 @@ class BackgroundToolManager(BaseModel):
                         dropped(background_tool)
                     continue
                 for callback in tool_callbacks:
-                    await callback(background_tool)
+                    try:
+                        await callback(background_tool)
+                    except Exception:  # one result's failure never ends the session's results
+                        logger.exception(
+                            "handling the result of %s (%s) failed", background_tool.tool_name, background_tool.id
+                        )
 
         async def _cleanup(interval_seconds: float = 5 * 60) -> None:
             while True:

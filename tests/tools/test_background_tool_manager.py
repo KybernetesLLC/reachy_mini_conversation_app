@@ -627,6 +627,24 @@ class TestStartUp:
         assert cb1.call_count == 1
         assert cb2.call_count == 1
 
+    @pytest.mark.asyncio
+    async def test_a_callback_that_raises_does_not_end_the_listener(self, manager: BackgroundToolManager) -> None:
+        """A callback that raises does not end the listener (review, 11-07).
+
+        An exception in one result's handling ended the listener, so no later tool result in
+        the session was handled.
+        """
+        callback = AsyncMock(side_effect=[ValueError("not serialisable"), None])
+        manager.start_up(tool_callbacks=[callback])
+
+        await manager.start_tool("c1", _make_routine("first"), is_idle_tool_call=False)
+        await asyncio.sleep(0.05)
+        await manager.start_tool("c2", _make_routine("second"), is_idle_tool_call=False)
+        await asyncio.sleep(0.05)
+
+        assert [c.args[0].id for c in callback.call_args_list] == ["c1", "c2"]
+        await manager.shutdown()
+
 
 class TestNotificationQueue:
     """Verify notifications are enqueued on tool completion or failure."""
