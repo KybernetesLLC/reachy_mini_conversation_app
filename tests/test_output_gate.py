@@ -485,3 +485,80 @@ def test_ssml_tags_are_counted_and_kept_out_of_the_stored_reply() -> None:
         "I'd say 3 < 5 and <think> is not ours",
         0,
     )
+
+
+# The bare tag (11-07): the model wrote its stay_quiet call as "<stay_quiet/>" 17 times in
+# one morning; the gate let it through and the voice rendered it as a chuckle.
+BARE_TAG_SHAPES = (
+    "<{n}/>",
+    "<{n}>",
+    "</{n}>",
+    "< {n} />",
+    "<{N}/>",
+    '<{n} reason="side talk"/>',
+    "<{n}/>.",
+)
+
+
+@pytest.mark.parametrize("name", REGISTRY)
+@pytest.mark.parametrize("shape", BARE_TAG_SHAPES)
+def test_every_tool_as_a_bare_tag_is_cut_before_the_reply_ends(
+    name: str, shape: str
+) -> None:
+    text = shape.format(n=name, N=name.upper())
+    for final in (False, True):
+        verdict = gate.judge(text, TOOLS, final=final)
+        assert (verdict.action, verdict.tool, verdict.shape, verdict.kind) == (
+            _expected_cut(name),
+            name,
+            "markup",
+            "leaked tool call",
+        )
+
+
+@pytest.mark.parametrize("text", ["<", "<sta", "<stay_quiet", "<stay_quiet/", "</sta"])
+def test_the_start_of_a_bare_tag_waits(text: str) -> None:
+    assert gate.judge(text, TOOLS).action == gate.UNDECIDED
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<stay_quiet/> Sure, the train leaves at three.",
+        "<b>Hello</b>",
+        "<not_a_tool/>",
+        "5 < 6 and stay > 2",
+    ],
+)
+def test_a_bare_tag_with_real_words_or_no_tool_plays(text: str) -> None:
+    assert gate.judge(text, TOOLS, final=True) == gate.Verdict(gate.PLAY)
+
+
+def test_a_played_reply_is_kept_without_its_bare_tag() -> None:
+    assert gate.without_calls("<stay_quiet/> Sure.", TOOLS) == "Sure."
+    assert gate.without_calls("<b>Hello</b>", TOOLS) == "<b>Hello</b>"
+
+
+@pytest.mark.parametrize(
+    "text", ["Stay quiet.", "stay quiet", "Stay", "stay qu", "Idle do"]
+)
+def test_a_name_in_words_that_could_be_cut_waits_on_the_name(text: str) -> None:
+    """Its audio is held until the verdict (SPOKEN_NAME_HOLD_S), not the short hold."""
+    verdict = gate.judge(text, TOOLS)
+    assert (verdict.action, verdict.waits_on_name) == (gate.UNDECIDED, True)
+
+
+@pytest.mark.parametrize("text", ["Dance", "Expr", "<sta", "(stops"])
+def test_a_wait_that_cannot_end_in_a_spoken_name_cut_is_the_short_hold(
+    text: str,
+) -> None:
+    """A one-word name ends as "play and log"; markup decides on its own deltas."""
+    verdict = gate.judge(text, TOOLS)
+    assert (verdict.action, verdict.waits_on_name) == (gate.UNDECIDED, False)
+
+
+@pytest.mark.parametrize(
+    "text", ["Sure.", "Stay calm, it's fine", "Yes.", "I'll stay quiet while you talk."]
+)
+def test_ordinary_short_replies_do_not_wait(text: str) -> None:
+    assert gate.judge(text, TOOLS) == gate.Verdict(gate.PLAY)

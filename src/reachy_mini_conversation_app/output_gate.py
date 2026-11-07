@@ -62,6 +62,9 @@ _WRAPPERS = (
 _TAG_CALL = re.compile(r"<call:\s*[\w.-]+\s*", re.IGNORECASE)
 _TAG_CALL_END = re.compile(r"[^<>]*?(/?)>")
 _TAG_CALL_CLOSER = re.compile(r"</call(?::[\w.-]*)?\s*>", re.IGNORECASE)
+# A registered tool's name written as a bare tag (11-07: "<stay_quiet/>" 17 times in one
+# morning, voiced as a chuckle): <name/>, <name>, </name>, with whitespace and attributes.
+_NAME_TAG = re.compile(r"<\s*/?\s*([A-Za-z_][\w.-]*)(?:\s[^<>]{0,200}?)?\s*/?\s*>")
 _BARE_CALL = re.compile(r"call:\s*[\w.-]+\s*", re.IGNORECASE)
 _BARE_CALL_OPEN = re.compile(r"call:\s*[\w.-]*\s*", re.IGNORECASE)
 # A name with its arguments and no "call:" at all: "idle_do_nothing{reason:...}" (2026-10-17).
@@ -300,6 +303,10 @@ def _shape_at(
     c = text[i]
     if c == "<":
         angle = _angle_at(text, i, final)
+        if angle is None and tools is not None:
+            tag = _NAME_TAG.match(text, i)
+            if tag and tools.find(_normal(tag.group(1))) is not None:
+                return _CALL, tag.end(), None
         return None if angle is None else (*angle, None)
     if rest[:5].lower() == "call:":
         call = _BARE_CALL.match(text, i)
@@ -450,6 +457,7 @@ class Verdict:
     tool: str | None = None
     shape: str | None = None
     calls: tuple[Verdict, ...] = ()
+    waits_on_name: bool = False  # undecided on a name in words that would be cut
 
 
 # The tool-name leak guard (the planning session, 2026-10-17): the hosted model said
@@ -474,6 +482,7 @@ _CALLED_NAME = (
     re.compile(r'"name"\s*:\s*"([^"]+)"'),
     re.compile(r"^\[\s*([A-Za-z_][\w.]*)\("),
     re.compile(r"tool_code\s*([A-Za-z_][\w.]*)\(", re.IGNORECASE),
+    _NAME_TAG,
 )
 
 
@@ -512,6 +521,14 @@ class ToolNames:
         if len(normal) < _MIN_WAIT:
             return False
         return any(form != normal and form.startswith(normal) for form in self._forms)
+
+    def could_be_cut(self, normal: str) -> bool:
+        """Whether this is, or could become, a name that is cut when said alone: one with
+        an underscore ("stay quiet", "stay"). A one-word name plays, so it never qualifies.
+        """
+        if len(normal) < _MIN_WAIT:
+            return False
+        return any("_" in form and form.startswith(normal) for form in self._forms)
 
 
 def _called_name(markup: str) -> str | None:
@@ -561,7 +578,9 @@ def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None
         # A tool's name, or the start of one, waits for what follows: "{" makes it a
         # call, a space and a word make it a sentence (the owner, 2026-10-20).
         named = tool is not None and len(normal) >= _MIN_WAIT
-        return Verdict(UNDECIDED) if named or tools.could_become(normal) else None
+        if not (named or tools.could_become(normal)):
+            return None
+        return Verdict(UNDECIDED, waits_on_name=tools.could_be_cut(normal))
     if tool is None:
         return None
     if "_" in word:
@@ -587,13 +606,13 @@ RULES: Final[tuple[Rule, ...]] = (leaked_tool_name, artifact_shape)
 
 def judge(text: str, tools: ToolNames, *, final: bool = False) -> Verdict:
     """The first decisive rule's verdict; UNDECIDED while any rule waits; else PLAY. Pure."""
-    waiting = False
+    waiting: Verdict | None = None
     for rule in RULES:
         verdict = rule(text, tools, final)
         if verdict is None:
             continue
         if verdict.action == UNDECIDED:
-            waiting = True
+            waiting = waiting or verdict
             continue
         return verdict
-    return Verdict(UNDECIDED) if waiting and not final else Verdict(PLAY)
+    return waiting if waiting and not final else Verdict(PLAY)

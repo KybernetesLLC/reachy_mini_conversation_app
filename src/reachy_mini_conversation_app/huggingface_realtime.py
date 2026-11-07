@@ -308,6 +308,11 @@ def _companion_tag(event: Any) -> str | None:
 # transcript as it streams; audio that arrives first is held for at most
 # SPOKEN_ARTIFACT_HOLD_S, then released.
 SPOKEN_ARTIFACT_HOLD_S = 0.3
+# A reply whose words so far are a tool's name, or its start, that is cut when said alone
+# ("Stay quiet.", "Stay") is judged only on its whole transcript, whose done event follows
+# the audio: it is held to this bound instead (11-07). On 11-07 a name-length reply's
+# transcript.done came 0.11-0.27 s after its first audio.
+SPOKEN_NAME_HOLD_S = 1.0
 
 
 # The tool-call-log brief (2026-10-11): one /rpc notification per finished (or
@@ -502,6 +507,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._gate_text = ""
         self._gate_held: list[Tuple[int, NDArray[np.int16]]] = []
         self._gate_released = False
+        self._gate_name_wait = False  # undecided on a spoken name: the longer hold
         self._gate_held_at = 0.0
         self._gate_timer: asyncio.Task[None] | None = None
         # The output gate's tool names (the live registry, at each session open), the
@@ -942,6 +948,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._gate_had_audio = False
         self._gate_held = []
         self._gate_released = False
+        self._gate_name_wait = False
 
     def _gate_release(self, state: str) -> None:
         """Queue the held audio in order, in one synchronous burst, and move to ``state``."""
@@ -985,6 +992,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return
         self._gate_text = text
         verdict = judge(text, self._gate_tools, final=final)
+        self._gate_name_wait = verdict.waits_on_name
         if verdict.action == PLAY_AND_LOG:
             for call in verdict.calls:
                 self._gate_leak(call)
@@ -1102,10 +1110,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _gate_timeout(self) -> None:
         await asyncio.sleep(SPOKEN_ARTIFACT_HOLD_S)
+        if self._gate == "hold" and self._gate_name_wait:
+            await asyncio.sleep(max(0.0, SPOKEN_NAME_HOLD_S - SPOKEN_ARTIFACT_HOLD_S))
         if self._gate == "hold":
             logger.info(
-                "reply audio released after %.0f ms with no transcript",
-                SPOKEN_ARTIFACT_HOLD_S * 1000,
+                "reply audio released after %.0f ms with no verdict",
+                (time.monotonic() - self._gate_held_at) * 1000,
             )
             self._gate_timer = None  # this task: not cancelled by the release
             self._gate_release("open")
