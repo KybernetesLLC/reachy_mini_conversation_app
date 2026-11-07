@@ -637,3 +637,10 @@ def test_tags_around_real_words_play(text: str) -> None:
 def test_a_played_reply_is_kept_without_its_spaced_tag() -> None:
     assert gate.without_calls("<stay quiet/> Sure.", TOOLS) == "Sure."
     assert gate.without_calls("<stay calm/> Sure.", TOOLS) == "<stay calm/> Sure."
+
+
+@pytest.mark.parametrize(
+    "text", ["<speak>stay_quiet</speak>", "<speak>Stay quiet.</speak>"]
+)
+def test_a_tool_name_inside_ssml_is_cut(text: str) -> None:
+    assert gate.judge(text, TOOLS, final=True).action == gate.CUT_AND_EXECUTE

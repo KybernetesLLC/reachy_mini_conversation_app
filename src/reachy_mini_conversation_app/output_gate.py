@@ -39,6 +39,9 @@ _UNDECIDED: Final[str] = "undecided"
 _STAGE: Final[str] = "stage direction"
 _CALL: Final[str] = "leaked tool call"
 _THINKING: Final[str] = "thinking"
+_TAG_WAIT: Final[str] = (
+    "finished tag"  # a finished tag ends the text so far: words may follow
+)
 _DIRECTION_MAX = 80  # characters inside a stage direction's brackets
 _UNDECIDED_MAX = 200  # past this much text, an unfinished shape is a reply
 _JSON_UNDECIDED_MAX = (
@@ -345,7 +348,7 @@ def _shape_at(
             and not final
             and _skip_ssml(text, angle[1], tools) >= len(text)
         ):
-            return _UNDECIDED, -1, None  # a finished tag: words may follow it
+            return _TAG_WAIT, -1, None  # a finished tag: words may follow it
         return (*angle, None)
     if rest[:5].lower() == "call:":
         call = _BARE_CALL.match(text, i)
@@ -416,6 +419,8 @@ def _shapes(
         if shape is None:
             return None
         kind, end, names = shape
+        if kind == _TAG_WAIT:
+            return _TAG_WAIT  # bounded by the spoken-name hold, not _UNDECIDED_MAX
         if kind == _UNDECIDED:
             limit = _JSON_UNDECIDED_MAX if _json_opening(head[i:]) else _UNDECIDED_MAX
             return _UNDECIDED if len(head) <= limit else None
@@ -431,6 +436,8 @@ def spoken_artifact(text: str, final: bool = False) -> str | None:
     named by its first shape. Pure.
     """
     shapes = _shapes(text, final)
+    if shapes == _TAG_WAIT:
+        return _UNDECIDED
     return shapes[0][0] if isinstance(shapes, list) else shapes
 
 
@@ -620,6 +627,8 @@ def _ends_in_tool_tag(text: str, tools: ToolNames) -> bool:
 def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None:
     """Rule 1: a reply that is only a registered tool's name."""
     shapes = _shapes(text, final, tools)
+    if shapes == _TAG_WAIT:
+        return Verdict(UNDECIDED, waits_on_name=True)
     if shapes == _UNDECIDED and not final:
         return Verdict(
             UNDECIDED, waits_on_name=_ends_in_tool_tag(text, tools)
@@ -637,7 +646,7 @@ def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None
             if leaks:
                 return _leaked(*leaks)
         return None
-    word = text.strip().strip(_WORD_EDGES).strip()
+    word = without_ssml(text)[0].strip().strip(_WORD_EDGES).strip()
     if not _PLAIN.fullmatch(word):
         return None
     normal = _normal(word)

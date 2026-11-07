@@ -2809,13 +2809,22 @@ SPOKEN_ARTIFACT_CASES = [
 ]
 
 
+FINISHED_TAG_CALLS = {
+    "<call:stay_quiet/>", "<call:stay_quiet>", "<call:stay_quiet></call>",
+    "<call:stay_quiet>{}</call>", '<call:express {"mood": "happy"}/>',
+}
+
+
 @pytest.mark.parametrize(("text", "verdict"), SPOKEN_ARTIFACT_CASES)
 def test_spoken_artifact_rule(text: str, verdict: str | None) -> None:
     """Only text made wholly of artifact shapes is an artifact; an unfinished one waits.
 
     A decided row is judged on the whole reply: a finished tag call at the end of the
     text so far waits for what follows it (11-07)."""
-    assert hf_mod.spoken_artifact(text, final=verdict != _U) == verdict
+    if verdict != _U:
+        assert hf_mod.spoken_artifact(text, final=True) == verdict
+    streaming = _U if text in FINISHED_TAG_CALLS else verdict  # words may follow
+    assert hf_mod.spoken_artifact(text) == streaming
 
 
 @pytest.mark.asyncio
@@ -5389,6 +5398,37 @@ async def test_a_lone_tag_call_whose_verdict_comes_after_the_short_hold_is_never
 
     await _run_with_leaks(handler)
 
+    assert _frames(handler) == []
+    assert cleared == []
+    assert tools["stay_quiet"].runs == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "<call:stay_quiet></call>",
+        '<call:stay_quiet{reason:<|"|>side talk<|"|>}/>',
+        '<call:stay_quiet{reason:<|"|>' + "side talk " * 22 + '<|"|>}/>',
+    ],
+)
+async def test_a_finished_tag_call_of_any_form_is_never_voiced(
+    monkeypatch: Any, transcript: str
+) -> None:
+    monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
+    handler, tools = _leak_session(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said(transcript),
+            _audio(1, 2),
+            lambda: asyncio.sleep(0.15),
+            _FakeEvent("response.output_audio_transcript.done", transcript=transcript),
+        ),
+    )
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+    await _run_with_leaks(handler)
     assert _frames(handler) == []
     assert cleared == []
     assert tools["stay_quiet"].runs == 1
