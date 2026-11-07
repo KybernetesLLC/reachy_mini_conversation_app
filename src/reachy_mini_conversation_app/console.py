@@ -543,11 +543,16 @@ class LocalStream:
     }
 
     def _dispatch_session(self, state: str) -> None:
-        """Push a conversation.realtime notification: a new realtime session ("started")."""
+        """Push a conversation.realtime notification: a new realtime session ("started"), with
+        when the handler read the companion's block for it, when it says (11-07)."""
+        params: dict[str, Any] = {"state": state}
         if state == "started":
             self._last_turn_state = None  # the last session's state must not outlive it
+            read = getattr(self.handler, "memory_read_at", None)
+            if isinstance(read, (int, float)):
+                params["memory_read_at"] = float(read)
         if self._rpc is not None:
-            self._rpc.broadcast_threadsafe("conversation.realtime", {"state": state})
+            self._rpc.broadcast_threadsafe("conversation.realtime", params)
 
     def _dispatch_activity(self, reason: str, item_id: str | None = None) -> None:
         """Fan one activity reason out to JSON-RPC clients, with its realtime item_id if any."""

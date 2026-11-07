@@ -4485,6 +4485,19 @@ def test_the_companions_item_ids_and_session_starts_are_broadcast() -> None:
     assert ("conversation.realtime", {"state": "started"}) in sent
 
 
+def test_a_session_start_says_when_the_companions_block_was_read() -> None:
+    """11-07: the companion sends no silent note that the new session's starting block held, so
+    the start says when (the host's steady clock) the handler read that block."""
+    sent: list[tuple[str, dict]] = []
+    rpc = SimpleNamespace(_clients=set(), broadcast_threadsafe=lambda m, p: sent.append((m, p)))
+    handler = _FakeSessionHandler()
+    stream = LocalStream(handler, SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))
+    stream._rpc = rpc
+    handler.memory_read_at = 1234.5
+    stream._dispatch_session("started")
+    assert ("conversation.realtime", {"state": "started", "memory_read_at": 1234.5}) in sent
+
+
 def test_a_new_session_forgets_the_last_turn_state() -> None:
     """A stay_quiet tool result left "thinking"; the next session's first "thinking" must
     still be sent, and its idle state is not the old one."""
