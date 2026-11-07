@@ -406,6 +406,23 @@ class TestCancelTool:
         result = await manager.cancel_tool(bg.tool_id)
         assert result is True
 
+    @pytest.mark.asyncio
+    async def test_cancel_before_first_step_is_cancelled_and_notified(self, manager: BackgroundToolManager) -> None:
+        """L14: a tool cancelled before its task first runs is not left RUNNING.
+
+        Its routine never starts, so its own "Tool cancelled" result never comes; the call
+        still needs a notification so its owed output and in-flight entry are settled.
+        """
+        routine = _make_routine("slow", delay=10.0)
+        bg = await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        assert await manager.cancel_tool(bg.tool_id) is True
+        await asyncio.sleep(0.05)
+
+        assert bg.status == ToolState.CANCELLED
+        assert bg.completed_at is not None
+        note = manager._notification_queue.get_nowait()
+        assert (note.id, note.status, note.error) == ("c1", ToolState.CANCELLED, "Tool cancelled")
+
 
 class TestTimeoutTools:
     """Verify automatic timeout of long-running tools."""

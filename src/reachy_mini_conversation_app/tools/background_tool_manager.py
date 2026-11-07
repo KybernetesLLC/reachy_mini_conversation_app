@@ -203,10 +203,20 @@ class BackgroundToolManager(BaseModel):
             name=f"bg-{tool_name}-{id}",
         )
         background_tool._task = async_task
+        async_task.add_done_callback(lambda task: self._cancelled_unstarted(background_tool, task))
 
         logger.info(f"Started background tool: {background_tool.tool_name} (id={id})")
 
         return background_tool
+
+    def _cancelled_unstarted(self, background_tool: BackgroundTool, task: asyncio.Task[None]) -> None:
+        """L14: a task cancelled before its first step never ran `_run_tool`; settle it here."""
+        if not task.cancelled() or background_tool.status != ToolState.RUNNING:
+            return
+        background_tool.completed_at = time.monotonic()
+        background_tool.status = ToolState.CANCELLED
+        background_tool.error = "Tool cancelled"
+        self._notification_queue.put_nowait(background_tool.get_notification())
 
     async def _run_tool(
         self,
