@@ -747,6 +747,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         try:
             await self._run_realtime_session()
         except ConnectionClosedError as e:
+            if self._closing_on_request:
+                # Our own close, its close frame missing (11-05): not a backend failure.
+                logger.info("Realtime session closed on request with no close frame: %s", e)
+                return
             logger.warning("Realtime websocket closed unexpectedly: %s", e)
             raise
         finally:

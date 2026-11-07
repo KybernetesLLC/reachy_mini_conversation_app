@@ -5,6 +5,7 @@ import base64
 import asyncio
 import logging
 import threading
+import contextlib
 from types import SimpleNamespace
 from typing import Any
 from pathlib import Path
@@ -642,6 +643,51 @@ async def test_close_session_keeps_closing_until_the_loop_actually_parks(
     stream._stop_event.set()
     stream._session_wanted.set()
     loop_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_close_during_a_handler_rebuild_is_honoured_before_start_up(
+    monkeypatch: Any,
+) -> None:
+    """The restart path checks the gate again after the rebuild.
+
+    A close that landed while the old handler shut down opens no session on the new one.
+    """
+    stream = _gate_stream()
+    started = asyncio.Event()
+    rebuilt = MagicMock()
+    rebuilt.last_activity_time = time.monotonic()
+
+    async def _start_up() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    rebuilt.start_up = _start_up
+
+    async def _shutdown_old() -> None:
+        stream._session_wanted.clear()  # the close lands during the shutdown
+
+    monkeypatch.setattr(stream, "_shutdown_active_handler", _shutdown_old)
+    monkeypatch.setattr(stream, "_can_rebuild_handler", lambda: True)
+    monkeypatch.setattr(stream, "_build_handler_for_current_backend", lambda: setattr(stream, "handler", rebuilt))
+    monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
+    stream._session_wanted.set()
+    stream._restart_requested.set()
+
+    loop_task = asyncio.create_task(stream._run_handler_startup_loop())
+    parked = asyncio.ensure_future(stream._session_parked.wait())
+    began = asyncio.ensure_future(started.wait())
+    await asyncio.wait({parked, began}, timeout=2.0, return_when=asyncio.FIRST_COMPLETED)
+    stopped_at_gate = parked.done() and not began.done()
+    for waiter in (parked, began):
+        waiter.cancel()
+    stream._stop_event.set()
+    stream._session_wanted.set()
+    loop_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await loop_task
+
+    assert stopped_at_gate
 
 
 @pytest.mark.asyncio
@@ -2940,6 +2986,48 @@ def test_a_session_close_over_the_rpc_runs_on_the_handlers_loop() -> None:
         _stop_loop(loop, thread)
     assert response["result"] == {"wanted": False, "connected": False}
     assert seen == [loop]
+
+
+def test_a_session_open_over_the_rpc_runs_on_the_handlers_loop() -> None:
+    """The open's gate set and greeting flag are handler state: set on the handler's loop."""
+    stream, _manager, app = _pose_stream()
+    seen: list[asyncio.AbstractEventLoop | None] = []
+    stream._refresh_speaker_if_idle = lambda: seen.append(_loop_of_this_call())
+    stream._session_wanted.clear()  # closed: this open opens it
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    try:
+        response = _rpc_call(app, "conversation.session", {"open": True})
+    finally:
+        _stop_loop(loop, thread)
+    assert response["result"]["wanted"] is True
+    assert seen == [loop]
+
+
+def test_a_close_before_the_handlers_loop_is_known_does_not_break_later_closes() -> None:
+    """A close before launch() records the handler's loop runs on the RPC server's loop.
+
+    Its wait on _session_parked bound that Event to the RPC server's loop, and every later
+    close, hopped onto the handler's loop, failed with "bound to a different event loop".
+    """
+    stream, _manager, app = _pose_stream()
+
+    async def shutdown() -> None:
+        # The startup loop parks just after the close's first check.
+        asyncio.get_running_loop().call_soon(stream._session_parked.set)
+
+    stream.handler.shutdown = shutdown
+    stream._asyncio_loop = None
+    early = _rpc_call(app, "conversation.session", {"open": False})
+    stream._session_parked.clear()
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    try:
+        later = _rpc_call(app, "conversation.session", {"open": False})
+    finally:
+        _stop_loop(loop, thread)
+    assert early["result"] == {"wanted": False, "connected": False}
+    assert later.get("result") == {"wanted": False, "connected": False}, later
 
 
 def test_the_mute_and_capture_clears_run_on_the_handlers_loop() -> None:

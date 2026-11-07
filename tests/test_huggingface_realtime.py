@@ -4844,7 +4844,7 @@ class _SessionConn(_ScriptedConn):
         self.no_frame = no_frame
 
     def drop(self) -> None:
-        """The server drops the session: no close frame received or sent."""
+        """Drop the session as the server does: no close frame received or sent."""
         self._events.put_nowait(ConnectionClosedError(None, None))
 
     async def close(self) -> None:
@@ -4954,6 +4954,24 @@ async def test_close_with_no_close_frame_opens_no_new_session(monkeypatch: Any) 
 
     assert len(conns) == 1
     assert started.count("started") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_close_with_no_close_frame_is_not_a_backend_failure(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Our own close missing its close frame ends start_up quietly.
+
+    The companion's log scans count a warning or a raised error here as the backend failing.
+    """
+    handler, _conns = _reconnect_handler(monkeypatch, no_frame=True)
+    task = asyncio.create_task(handler.start_up())
+    await asyncio.wait_for(handler._connected_event.wait(), timeout=1.0)
+    with caplog.at_level(logging.INFO, logger=hf_mod.__name__):
+        await handler.shutdown()
+        await asyncio.wait_for(task, timeout=5.0)  # returns, does not raise
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 @pytest.mark.asyncio

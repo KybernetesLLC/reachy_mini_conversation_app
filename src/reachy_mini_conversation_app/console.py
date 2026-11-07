@@ -943,10 +943,9 @@ class LocalStream:
                     self._session_parked.is_set(),
                 )
                 return False
-            try:
-                await asyncio.wait_for(self._session_parked.wait(), 0.2)
-            except asyncio.TimeoutError:
-                pass
+            # Polled, not awaited: a close before launch() records the handler's loop runs on
+            # the RPC server's, and waiting there would bind the Event to that loop for good.
+            await asyncio.sleep(0.2)
             if self._backend_connected():
                 await self._close_live_session()
 
@@ -2055,6 +2054,7 @@ class LocalStream:
                     )
                     await self._sleep_or_restart_requested(self._backend_retry_delay)
                     continue
+                continue  # the gate again: a close may have landed during the rebuild
 
             if not has_hf_realtime_target():
                 self._set_backend_connection_state(
