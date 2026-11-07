@@ -203,10 +203,30 @@ class BackgroundToolManager(BaseModel):
             name=f"bg-{tool_name}-{id}",
         )
         background_tool._task = async_task
+        async_task.add_done_callback(lambda task: self._cancelled_unstarted(background_tool, task))
 
         logger.info(f"Started background tool: {background_tool.tool_name} (id={id})")
 
         return background_tool
+
+    def _cancelled_unstarted(self, background_tool: BackgroundTool, task: asyncio.Task[None]) -> None:
+        """Settle a tool task that ended without notifying (L14), so every call brings a result.
+
+        A task cancelled before its first step never ran `_run_tool`; one that raised in it
+        never reached the notification.
+        """
+        if background_tool.status != ToolState.RUNNING:
+            return
+        if task.cancelled():
+            background_tool.status, background_tool.error = ToolState.CANCELLED, "Tool cancelled"
+        elif task.exception() is not None:
+            exc = task.exception()
+            logger.error("Background tool %s (id=%s) raised: %r", background_tool.tool_name, background_tool.id, exc)
+            background_tool.status, background_tool.error = ToolState.FAILED, f"{type(exc).__name__}: {exc}"
+        else:
+            return
+        background_tool.completed_at = time.monotonic()
+        self._notification_queue.put_nowait(background_tool.get_notification())
 
     async def _run_tool(
         self,
@@ -331,7 +351,12 @@ class BackgroundToolManager(BaseModel):
                         dropped(background_tool)
                     continue
                 for callback in tool_callbacks:
-                    await callback(background_tool)
+                    try:
+                        await callback(background_tool)
+                    except Exception:  # one result's failure never ends the session's results
+                        logger.exception(
+                            "handling the result of %s (%s) failed", background_tool.tool_name, background_tool.id
+                        )
 
         async def _cleanup(interval_seconds: float = 5 * 60) -> None:
             while True:

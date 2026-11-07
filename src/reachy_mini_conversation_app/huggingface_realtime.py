@@ -1999,6 +1999,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 # After the follow-up create is queued, so a held create merges with it.
                 # A dropped or failed output is settled too: nothing more will be sent.
                 self._output_settled(completed_tool.id)
+                # Out of its batch however it ended (L13 keeps the set across a user turn)
+                self._in_flight_tool_calls.discard(completed_tool.id)
             # Sent after the result reaches the model (or the attempt fails):
             # the report itself is in-memory only and never blocks a tool call.
             self._report_tool_call(report_payload)
@@ -2305,7 +2307,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
-                        self._in_flight_tool_calls.clear()
+                        # L13: tools still running stay in flight, so their batch gets one
+                        # follow-up; every call brings a result (cancelled ones too), and a
+                        # new session clears the set.
                         self._tool_batch_needs_response = False
                         self._tool_batch_only_gestured = True
                         self._start_user_turn()
