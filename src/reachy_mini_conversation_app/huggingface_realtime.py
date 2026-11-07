@@ -1982,6 +1982,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 # After the follow-up create is queued, so a held create merges with it.
                 # A dropped or failed output is settled too: nothing more will be sent.
                 self._output_settled(completed_tool.id)
+                # Out of its batch however it ended (L13 keeps the set across a user turn)
+                self._in_flight_tool_calls.discard(completed_tool.id)
             # Sent after the result reaches the model (or the attempt fails):
             # the report itself is in-memory only and never blocks a tool call.
             self._report_tool_call(report_payload)

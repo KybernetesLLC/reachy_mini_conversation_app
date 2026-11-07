@@ -313,6 +313,36 @@ async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> 
     assert create.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_a_result_whose_handling_raises_leaves_the_batch(monkeypatch: Any) -> None:
+    """L13 with M3: a result that raises mid-way is still out of the in-flight set, or the
+    session's later batches would wait on it for good."""
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    )
+    handler.connection = AsyncMock()
+    handler.connection.conversation.item.create.side_effect = ValueError("bad output")
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(
+        handler,
+        "_wait_for_response_done_before_tool_result",
+        AsyncMock(return_value=True),
+    )
+    handler._in_flight_tool_calls = {"call_a"}
+    with pytest.raises(ValueError):
+        await handler._handle_tool_result(
+            ToolNotification(
+                id="call_a",
+                tool_name="test__probe",
+                is_idle_tool_call=False,
+                status=ToolState.COMPLETED,
+                result={"ok": True},
+            )
+        )
+    assert handler._in_flight_tool_calls == set()
+
+
 def test_handler_uses_hf_startup_voice_at_startup(monkeypatch: Any) -> None:
     """Hugging Face startup should restore persisted HF voices."""
     handler = HuggingFaceRealtimeHandler(
@@ -4354,6 +4384,50 @@ async def test_a_batch_spanning_a_user_turn_gets_one_follow_up(
 
     assert _kinds(sent) == ["output", "output", "create"]
     assert caplog.text.count("follow-up reply queued") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_batch_spanning_a_user_turn_sends_one_create_past_the_hold(
+    monkeypatch: Any,
+) -> None:
+    """L13 on the wire: the second lookup finishes after the owed-output hold gives up, which
+    sent the first follow-up alone and then a second create."""
+    monkeypatch.setattr(hf_mod, "_OWED_OUTPUT_TIMEOUT", 0.05)
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="t-1")),
+    )
+
+    def _finisher(tool: ToolNotification, after: float = 0.0) -> Any:
+        async def _finish() -> None:
+            await asyncio.sleep(after)
+            await handler._handle_tool_result(tool)
+            await asyncio.sleep(0.05)
+
+        return _finish
+
+    handler.client = _ordering_client(
+        (
+            *_response(
+                "r1", "", (("c1", "test__get_weather"), ("c2", "test__get_weather"))
+            ),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed",
+                item_id="u1",
+                transcript="and tomorrow",
+            ),
+            _finisher(_done_tool("c1", "test__get_weather", "r1")),
+            _finisher(_done_tool("c2", "test__get_weather", "r1"), after=0.2),
+        ),
+        sent,
+        handler,
+    )
+    await handler._run_realtime_session()
+
+    assert _kinds(sent).count("create") == 1
 
 
 @pytest.mark.asyncio
