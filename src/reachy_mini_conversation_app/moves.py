@@ -76,15 +76,43 @@ def _idle_setting(name: str, default: float) -> float:
     return value
 
 
-# The companion (11-02): with automatic body yaw off, the daemon passes a body yaw straight
-# to the motor, unclamped. 160 degrees is the SDK's own bound (max_body_yaw).
-BODY_YAW_MAX = math.radians(160.0)
+def _body_limit(name: str, default: float) -> float:
+    """A commanded body limit in degrees, from the setting the supervisor reads (facing.py), with
+    the same range; outside it, the default (with one warning)."""
+    value = _idle_setting(name, default)
+    if not 10.0 <= value <= 160.0:
+        logger.warning("%s=%s is not 10 to 160 degrees; using %s", name, value, default)
+        return default
+    return value
 
 
-def _within_body_range(head: NDArray[np.float64], body_yaw: float) -> Tuple[NDArray[np.float64], float]:
-    """Hold the body within BODY_YAW_MAX each way; the head turns back by the same amount,
-    so a recorded move keeps its head-to-body shape (an emotion's +62 on a body at 140)."""
-    clipped = min(max(float(body_yaw), -BODY_YAW_MAX), BODY_YAW_MAX)
+def _body_limits() -> Tuple[float, float]:
+    """The commanded body limits (lowest, highest, radians); positive yaw is his left."""
+    left = _body_limit("REACHY_COMPANION_BODY_TURN_LEFT_DEG", 106.0)
+    right = _body_limit("REACHY_COMPANION_BODY_TURN_RIGHT_DEG", 115.0)
+    return math.radians(-right), math.radians(left)
+
+
+# The companion (11-02): with automatic body yaw off, the daemon passes a body yaw straight to the
+# motor, unclamped. 11-06, the owner: the pose system operates the body safely and consumers obey
+# its limits, so every mover in the app stops at the supervisor's commanded limits.
+BODY_YAW_LOW, BODY_YAW_HIGH = _body_limits()
+# A body already past a limit comes back at most this far per send: the supervisor's turn speed
+# (facing.TURN_SPEED, 20 degrees a second) at the control loop's rate.
+BODY_INWARD_STEP = math.radians(20.0) / CONTROL_LOOP_FREQUENCY_HZ
+
+
+def _within_body_range(
+    head: NDArray[np.float64], body_yaw: float, last_sent: float | None = None
+) -> Tuple[NDArray[np.float64], float]:
+    """Hold the body within its limits; the head turns back by the same amount, so a recorded move
+    keeps its head-to-body shape (an emotion's +62 on a body at +105). When `last_sent` is past a
+    limit the body steps inward from there, whatever the target, so it never jumps."""
+    clipped = min(max(float(body_yaw), BODY_YAW_LOW), BODY_YAW_HIGH)
+    if last_sent is not None and last_sent > BODY_YAW_HIGH:
+        clipped = max(clipped, last_sent - BODY_INWARD_STEP)
+    elif last_sent is not None and last_sent < BODY_YAW_LOW:
+        clipped = min(clipped, last_sent + BODY_INWARD_STEP)
     if clipped == body_yaw:
         return head, body_yaw
     return _turned(np.asarray(head, dtype=np.float64), clipped - float(body_yaw)), clipped
@@ -1126,7 +1154,7 @@ class MovementManager:
         self, head: NDArray[np.float32], antennas: Tuple[float, float], body_yaw: float
     ) -> None:
         """Send the pose to the robot with throttled error logging."""
-        head, body_yaw = _within_body_range(head, body_yaw)
+        head, body_yaw = _within_body_range(head, body_yaw, self._last_commanded_pose[2])
         try:
             self.current_robot.set_target(head=head, antennas=antennas, body_yaw=body_yaw)
         except Exception as e:

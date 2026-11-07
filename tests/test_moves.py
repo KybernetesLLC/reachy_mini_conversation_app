@@ -1216,21 +1216,91 @@ def test_a_set_that_lands_after_a_breathing_move_is_queued_still_reaches_it() ->
     assert (move.rate_scale, move.depth_scale, move.pitch_offset) == (0.8, 1.2, 0.04)
 
 
-def test_a_body_yaw_past_160_is_held_at_160_and_the_head_turns_back_with_it() -> None:
-    """11-02: with automatic body yaw off the daemon passes the body yaw to the motor
-    unclamped; an emotion's +62 on a body at 140 must stop at 160, head and body together."""
+def test_a_body_yaw_past_the_limits_is_held_there_and_the_head_turns_back_with_it() -> None:
+    """11-06, the owner: the pose system operates the body safely and consumers obey its limits.
+    An emotion's +62 on a body at +105 stops at the commanded +106 (-115 on the right), head and
+    body together, so the recorded head-to-body shape stays."""
     import math
 
     from reachy_mini.utils import create_head_pose
-    from reachy_mini_conversation_app.moves import BODY_YAW_MAX, _within_body_range
+    from reachy_mini_conversation_app.moves import _within_body_range
 
-    head = create_head_pose(0, 0, 0, 0, 0, math.radians(200), degrees=False)
-    out, body = _within_body_range(head, math.radians(202))
-    assert body == BODY_YAW_MAX
-    head_yaw = math.atan2(out[1, 0], out[0, 0])
-    assert math.degrees(head_yaw) == pytest.approx(158.0)  # 2 degrees off the body, as recorded
+    head = create_head_pose(0, 0, 0, 0, 0, math.radians(167), degrees=False)
+    out, body = _within_body_range(head, math.radians(167))
+    assert math.degrees(body) == pytest.approx(106.0)
+    assert math.degrees(math.atan2(out[1, 0], out[0, 0])) == pytest.approx(106.0)
+
+    head = create_head_pose(0, 0, 0, 0, 0, math.radians(-158), degrees=False)
+    out, body = _within_body_range(head, math.radians(-160))
+    assert math.degrees(body) == pytest.approx(-115.0)
+    assert math.degrees(math.atan2(out[1, 0], out[0, 0])) == pytest.approx(-113.0)  # 2 off the body
+
     same, inside = _within_body_range(head, 1.0)
     assert inside == 1.0 and same is head
+
+
+def test_the_body_limits_read_the_supervisors_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One number on the robot: the names and the range are the supervisor's (facing.py). A value
+    outside the range, or not a number, gives the default."""
+    import math
+
+    from reachy_mini_conversation_app.moves import _body_limits
+
+    monkeypatch.delenv("REACHY_COMPANION_BODY_TURN_LEFT_DEG", raising=False)
+    monkeypatch.delenv("REACHY_COMPANION_BODY_TURN_RIGHT_DEG", raising=False)
+    assert _body_limits() == pytest.approx((math.radians(-115), math.radians(106)))
+    monkeypatch.setenv("REACHY_COMPANION_BODY_TURN_LEFT_DEG", "90")
+    monkeypatch.setenv("REACHY_COMPANION_BODY_TURN_RIGHT_DEG", "80")
+    assert _body_limits() == pytest.approx((math.radians(-80), math.radians(90)))
+    for bad in ("170", "5", "nan", "much", ""):
+        monkeypatch.setenv("REACHY_COMPANION_BODY_TURN_LEFT_DEG", bad)
+        monkeypatch.setenv("REACHY_COMPANION_BODY_TURN_RIGHT_DEG", bad)
+        assert _body_limits() == pytest.approx((math.radians(-115), math.radians(106)))
+
+
+@pytest.mark.parametrize("start, limit", [(140.0, 106.0), (-150.0, -115.0)])
+def test_a_body_already_past_the_limit_steps_inward_without_a_jump(start: float, limit: float) -> None:
+    """A body read past the limit at start (or left there): each send moves it at most the turn
+    speed, head and body together, and it stays at the limit once there."""
+    import math
+
+    from reachy_mini.utils import create_head_pose
+    from reachy_mini_conversation_app.moves import BODY_INWARD_STEP
+
+    robot = MagicMock()
+    head = create_head_pose(0, 0, 0, 0, 0, math.radians(start), degrees=False)
+    robot.get_current_head_pose.return_value = head
+    robot.get_current_joint_positions.return_value = ([math.radians(start)] + [0.0] * 6, (0.0, 0.0))
+    manager = MovementManager(robot)
+    manager._seed_from_robot()
+
+    def world_yaw(pose: np.ndarray) -> float:
+        return math.atan2(pose[1, 0], pose[0, 0])
+
+    sent_body, sent_head = [math.radians(start)], [math.radians(start)]
+    for _ in range(int(abs(start - limit) / math.degrees(BODY_INWARD_STEP)) + 5):
+        manager._issue_control_command(head, (0.0, 0.0), math.radians(start))  # the pose it holds
+        kwargs = robot.set_target.call_args.kwargs
+        sent_body.append(kwargs["body_yaw"])
+        sent_head.append(world_yaw(kwargs["head"]))
+
+    steps = np.abs(np.diff(sent_body))
+    assert steps.max() <= BODY_INWARD_STEP + 1e-9
+    assert np.abs(np.diff(sent_head)).max() <= BODY_INWARD_STEP + 1e-9
+    assert steps[0] == pytest.approx(BODY_INWARD_STEP)  # it does move at once
+    assert math.degrees(sent_body[-1]) == pytest.approx(limit)
+    assert math.degrees(sent_head[-1]) == pytest.approx(limit)
+
+
+def test_a_body_inside_the_limits_follows_its_command_at_once() -> None:
+    """Only a body past the limit is rate limited: a move inside the range plays as recorded."""
+    import math
+
+    robot = MagicMock()
+    manager = MovementManager(robot)
+    manager._last_commanded_pose = (np.eye(4), (0.0, 0.0), math.radians(50))
+    manager._issue_control_command(np.eye(4), (0.0, 0.0), math.radians(90))
+    assert robot.set_target.call_args.kwargs["body_yaw"] == pytest.approx(math.radians(90))
 
 
 def test_a_gaze_hold_never_cuts_a_playing_move() -> None:
