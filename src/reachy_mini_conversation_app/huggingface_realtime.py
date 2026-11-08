@@ -434,10 +434,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_done_event.set()
         self._response_started_or_rejected_event: asyncio.Event = asyncio.Event()
         self._last_response_rejected: bool = False
-        # The response being generated, and the one the companion's interrupt cancelled:
-        # audio deltas the server still sends for that one are dropped (cancel_response).
+        # The latest response created, and the one the companion's interrupt stopped: its
+        # tools get no follow-up and it gets no missed-call nudge (cancel_response).
         self._live_response_id: str | None = None
-        self._cancelled_response_id: str | None = None
+        self._interrupted_id: str | None = None
+        # From an interrupt that cancelled a live response to the next response.created,
+        # every audio delta is the cancelled reply's rest (the websocket keeps order).
+        self._dropping_cancelled = False
+        self._dropped_deltas = 0
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
         self._turn_first_audio_at: float | None = None
@@ -1172,6 +1176,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """
         if _companion_tag(event) == FILLER_TAG["companion"]:
             return False  # the app's own line
+        response_id = getattr(getattr(event, "response", None), "id", None)
+        if response_id is not None and response_id == self._interrupted_id:
+            return False  # the companion stopped it: nothing more is to be said
         text = self._resp_text.strip()
         if self._resp_called or self._turn_guarded or not LOOKUP_PROMISE.search(text):
             return False
@@ -1354,13 +1361,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         conversation.interrupt (a reminder's stop) flushes the player; without this the
         rest of a reply still generating would stream in after the flush and play. Drops
         the audio the output gate holds, cancels the live response on the server, and
-        drops any audio delta that still arrives for it. With no response live there is
-        nothing to cancel: a cancel then could only land on the next reply.
+        drops every audio delta until the next response is created. The latest response's
+        tools get no follow-up reply, done or not. With no response live there is nothing
+        to cancel: a cancel then could only land on the next reply.
         """
         self._gate_drop_held()
+        self._interrupted_id = self._live_response_id
         if self._response_done_event.is_set() or not self.connection:
             return
-        self._cancelled_response_id = self._live_response_id
+        self._dropping_cancelled = True
         logger.info("interrupt: cancelling response %s", self._live_response_id)
         try:
             await self.connection.response.cancel()
@@ -1995,7 +2004,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Parallel tool calls in one turn: respond once every result is in, not per tool.
             if self._tool_batch_needs_response and not self._in_flight_tool_calls:
                 self._tool_batch_needs_response = False
-                if self._tool_batch_only_gestured:
+                interrupted = (
+                    completed_tool.turn_id is not None
+                    and completed_tool.turn_id == self._interrupted_id
+                )
+                if interrupted:
+                    logger.info(
+                        "tool follow-up skipped: the companion interrupted its response (%s)",
+                        completed_tool.tool_name,
+                    )
+                    # Nothing more comes for this turn: not left "thinking" after the result.
+                    self._mark_activity("tool_followup_skipped")
+                elif self._tool_batch_only_gestured:
                     # 2026-10-23: the greeting spoke and called express; its follow-up, with
                     # nothing left to say, read the context aloud. A skipped follow-up no longer
                     # adds a stored assistant reply, which the express trial counts.
@@ -2179,6 +2199,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     if event.type == "response.created":
                         self._response_done_event.clear()
+                        self._dropping_cancelled = False
                         self._live_response_id = getattr(
                             getattr(event, "response", None), "id", None
                         )
@@ -2214,6 +2235,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.info("Response created (active)")
 
                     if event.type == "response.done":
+                        if self._dropping_cancelled:
+                            logger.info(
+                                "interrupt: dropped %d audio deltas of the cancelled response",
+                                self._dropped_deltas,
+                            )
+                            self._dropped_deltas = 0
                         # Doesn't mean the audio is done playing
                         # Resume tracking for responses that emit no audio (text-only / tool-only).
                         self.deps.movement_manager.set_speaking(False)
@@ -2388,10 +2415,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     # Handle audio delta
                     if (
                         event.type == "response.output_audio.delta"
-                        and self._cancelled_response_id is not None
-                        and getattr(event, "response_id", None)
-                        == self._cancelled_response_id
+                        and self._dropping_cancelled
                     ):
+                        self._dropped_deltas += 1
                         continue  # the interrupted reply's rest: never played
                     if event.type == "response.output_audio.delta":
                         decoded_pcm_bytes = base64.b64decode(event.delta)

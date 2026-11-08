@@ -5660,3 +5660,185 @@ async def test_an_interrupt_drops_reply_audio_still_held() -> None:
     handler._gate_release("pass")
     assert _frames(handler) == []
     handler.connection.response.cancel.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_an_interrupt_drops_deltas_that_carry_no_response_id(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The interrupted reply's rest is dropped whether or not its deltas name a response.
+
+    The count dropped is logged once, with no text.
+    """
+    holder: dict[str, HuggingFaceRealtimeHandler] = {}
+
+    async def interrupt() -> None:
+        await holder["handler"].cancel_response()
+
+    def bare(*samples: int) -> _FakeEvent:
+        return _FakeEvent("response.output_audio.delta", delta=_pcm_delta(*samples))
+
+    events = (
+        _cancel_case_event("response.created", "r1"),
+        _said("Time for a short break."),
+        bare(1, 2),
+        interrupt,
+        bare(3, 4),
+        bare(7, 8),
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            transcript="Time for a short break.",
+        ),
+        _cancel_case_event("response.done", "r1"),
+        _cancel_case_event("response.created", "r2"),
+        _said("Hello."),
+        bare(5, 6),
+        _FakeEvent("response.output_audio_transcript.done", transcript="Hello."),
+        _cancel_case_event("response.done", "r2"),
+    )
+    handler = _session_handler(monkeypatch, events)
+    holder["handler"] = handler
+    handler._clear_queue = lambda: None
+
+    with caplog.at_level(logging.INFO, logger=hf_mod.__name__):
+        await handler._run_realtime_session()
+
+    played = _cancel_case_samples(handler)
+    assert [3, 4] not in played and [7, 8] not in played
+    assert [5, 6] in played
+    counts = [
+        r.getMessage() for r in caplog.records if "audio deltas" in r.getMessage()
+    ]
+    assert counts == ["interrupt: dropped 2 audio deltas of the cancelled response"]
+
+
+async def _run_interrupted(
+    monkeypatch: Any,
+    events: tuple[Any, ...],
+    done: tuple[ToolNotification, ...],
+    reasons: list[str],
+) -> list[str]:
+    """`events`, then the companion's interrupt, then each finished tool; the kinds sent."""
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="t-1")),
+    )
+    handler.set_activity_observer(lambda reason, **_kw: reasons.append(reason))
+
+    async def _interrupt() -> None:
+        await handler.cancel_response()
+        await asyncio.sleep(0.05)
+
+    def _finisher(tool: ToolNotification) -> Any:
+        async def _finish() -> None:
+            await handler._handle_tool_result(tool)
+            await asyncio.sleep(0.05)
+
+        return _finish
+
+    handler.client = _ordering_client(
+        (*events, _interrupt, *(_finisher(t) for t in done)), sent, handler
+    )
+    await handler._run_realtime_session()
+    return _kinds(sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("spoken", "tool"),
+    [("", "express"), ("Let me check.", "test__web_search")],
+    ids=["a gesture", "a lookup"],
+)
+async def test_a_tool_of_the_interrupted_reply_gets_no_follow_up(
+    monkeypatch: Any, spoken: str, tool: str
+) -> None:
+    """A tool of a response stopped after its done gets no follow-up reply.
+
+    The reminder's response called a tool, finished, then was stopped: the tool's result
+    is still given to the model, no follow-up speaks after the stop, and the turn is left
+    not busy so the companion's next say does not wait on it.
+    """
+    reasons: list[str] = []
+    events = _response("r1", spoken, (("c1", tool),))
+
+    kinds = await _run_interrupted(
+        monkeypatch, events, (_done_tool("c1", tool, "r1"),), reasons
+    )
+
+    from reachy_mini_conversation_app.console import LocalStream
+
+    assert [k for k in kinds if k != "filler"] == ["output"]
+    turns = [LocalStream._REASON_TO_TURN.get(r) for r in reasons]
+    assert [t for t in turns if t][-1] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_a_tool_of_a_later_reply_still_gets_its_follow_up(
+    monkeypatch: Any,
+) -> None:
+    """Only the interrupted reply's tools lose their follow-up."""
+    reasons: list[str] = []
+    events = (
+        *_response("r1", "", ()),
+        *_response("r2", "", (("c1", "express"),)),
+    )
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+    monkeypatch.setattr(
+        type(handler.tool_manager),
+        "start_tool",
+        AsyncMock(return_value=SimpleNamespace(tool_id="t-1")),
+    )
+    handler.set_activity_observer(lambda reason, **_kw: reasons.append(reason))
+
+    async def _interrupt() -> None:
+        await handler.cancel_response()
+
+    async def _finish() -> None:
+        await handler._handle_tool_result(_done_tool("c1", "express", "r2"))
+        await asyncio.sleep(0.05)
+
+    handler.client = _ordering_client(
+        (*events[:2], _interrupt, *events[2:], _finish), sent, handler
+    )
+    await handler._run_realtime_session()
+    assert _kinds(sent) == ["output", "create"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_reply_that_promised_a_lookup_gets_no_nudge(
+    monkeypatch: Any,
+) -> None:
+    """A stopped reply said "let me check" and called nothing: no missed-call note follows."""
+    holder: dict[str, HuggingFaceRealtimeHandler] = {}
+    sent: list[tuple[str, Any]] = []
+
+    async def interrupt() -> None:
+        await holder["handler"].cancel_response()
+
+    events = (
+        _FakeEvent("response.created", response=SimpleNamespace(id="r1")),
+        _FakeEvent(
+            "response.output_audio_transcript.delta",
+            delta="Let me check.",
+            response_id="r1",
+        ),
+        interrupt,
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            transcript="Let me check.",
+            response_id="r1",
+        ),
+        _FakeEvent(
+            "response.done", response=SimpleNamespace(id="r1", status="cancelled")
+        ),
+        lambda: asyncio.sleep(0.05),
+    )
+    handler = _session_handler(monkeypatch, ())
+    holder["handler"] = handler
+    handler.client = _ordering_client(events, sent, handler)
+    await handler._run_realtime_session()
+    assert _kinds(sent) == []

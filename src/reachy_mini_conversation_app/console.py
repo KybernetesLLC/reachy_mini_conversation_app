@@ -538,6 +538,7 @@ class LocalStream:
         "response_created": "thinking",
         "tool_call_received": "thinking",
         "tool_result_ready": "thinking",
+        "tool_followup_skipped": "ready",  # the companion's interrupt: no reply comes
         "assistant_audio_delta": "speaking",
         "assistant_transcript_done": "ready",
     }
