@@ -667,20 +667,16 @@ REASONING_1108 = (
     [
         REASONING_1108,
         REASONING_1108.removeprefix("<thought\n"),
-        "Thinking Process:\n1. Current state: someone asked about soup.",
+        "<thoughtThinking Process: they asked about soup.",
+        "<|channel>thought\nThey asked about soup.",
+        "  <THOUGHT>They asked about soup.",
         "**Thinking Process:**\n1. Current state: someone asked about soup.",
         "**Thought Process**\nThey asked about soup.",
-        "## Reasoning\nThey asked about soup.",
-        "  thinking:\nThey asked about soup.",
-        "Analysis: they asked about soup.",
-        "Internal monologue: they asked about soup.",
-        "PLAN:\n1. Answer about soup.",
-        "1. **Current state**: someone asked about soup.",
-        "1. Current state: someone asked about soup.",
-        "1. Request Analysis: someone asked about soup.",
+        "## Thinking process\nThey asked about soup.",
+        "thought process: they asked about soup.",
     ],
 )
-def test_a_reply_that_opens_with_a_reasoning_header_is_thinking(text: str) -> None:
+def test_a_reply_that_opens_as_reasoning_is_thinking(text: str) -> None:
     for final in (False, True):
         assert gate.judge(text, TOOLS, final=final) == gate.Verdict(
             gate.CUT, kind="thinking"
@@ -690,36 +686,39 @@ def test_a_reply_that_opens_with_a_reasoning_header_is_thinking(text: str) -> No
 @pytest.mark.parametrize(
     "text",
     [
+        "Plan: let's go",
+        "Analysis: it's rain",
+        "Reasoning: it's late.",
+        "Thinking:\nmaybe soup.",
+        "1. Leave at 7:30",
+        "1. Make coffee",
+        "1. **Current state**: someone asked about soup.",
+        "Thinking of pancakes",
         "I'm thinking of pancakes.",
-        "Thinking of you, too!",
-        "Thinking about it, yes.",
-        "Planning ahead is smart.",
-        "Plans change.",
-        "Analysis paralysis, maybe!",
-        "Here are three: 1. **Soup**: warm. 2. **Bread**: fresh.",
-        "Sure! 1. Preheat the oven: it takes ten minutes.",
-        "10 degrees and clear.",
-        "1.5 miles, more or less.",
-        "I think so.",
+        "In the morning",
+        "An apple",
         "Thoughtful of you.",
+        "Here it is: Thinking Process: soup.",
     ],
 )
-def test_a_reply_that_only_mentions_thinking_plays(text: str) -> None:
+def test_a_reply_that_is_not_one_of_the_two_shapes_plays(text: str) -> None:
     assert gate.judge(text, TOOLS) == gate.Verdict(gate.PLAY)
     assert gate.judge(text, TOOLS, final=True) == gate.Verdict(gate.PLAY)
 
 
 @pytest.mark.parametrize(
     "text",
-    ["Th", "Thinking", "Thinking Pro", "Thinking Process", "**", "## Rea", "1.",
-     "1. ", "1. **Curr", "1. Current state", "<thou", "<thought", "Pla", "Plan"],
+    ["Thin", "Thou", "**Th", "# Th", "<tho", "<|ch", "Thinking", "Thinking ",
+     "Thinking Pro", "Thought Process", "**Thinking Process**"],
 )  # fmt: skip
-def test_the_start_of_a_reasoning_header_waits(text: str) -> None:
+def test_the_start_of_a_reasoning_opening_waits(text: str) -> None:
     assert gate.judge(text, TOOLS).action == gate.UNDECIDED
     assert gate.judge(text, TOOLS, final=True).action == gate.PLAY
 
 
-def test_an_open_header_shape_is_a_reply_past_the_undecided_limit() -> None:
-    text = "1. Current " + "word " * 50  # no colon in sight
-    assert len(text) > 200
+@pytest.mark.parametrize(
+    "text",
+    ["In", "An", "Th", "1.", "#", "Thinking o", "Thinking about", "1. Make coffee"],
+)
+def test_a_short_or_diverging_opening_plays_at_once(text: str) -> None:
     assert gate.judge(text, TOOLS) == gate.Verdict(gate.PLAY)

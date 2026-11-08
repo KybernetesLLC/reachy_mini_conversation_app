@@ -680,64 +680,36 @@ def artifact_shape(text: str, tools: ToolNames, final: bool) -> Verdict | None:
 
 # Thinking written as plain text (11-08 08:37:56): a follow-up after express opened
 # "<thought\nThinking Process:\n1. Current state: ..." with no <think> tags, and all 6,000
-# characters of it were spoken. A reply that opens with Gemma 4's "thought" channel name,
-# a reasoning header, or "1. **...**" / "1. Word Word:" is thinking, cut whole. While the
-# opening could still become one it waits, under _UNDECIDED_MAX; once real words come
-# first ("I'm thinking of pancakes", "Sure! 1. ...") it plays.
-_REASONING_HEADERS: Final[tuple[str, ...]] = (
-    "thinking process",
-    "thought process",
-    "thinking",
-    "reasoning",
-    "analysis",
-    "internal monologue",
-    "plan",
-)
-_THOUGHT_MARK = re.compile(r"(?:<\|channel>|<)thought(?:\|?>|(?=\s))", re.IGNORECASE)
+# characters of it were spoken. Two shapes have evidence, and only they are cut whole: Gemma
+# 4's thought marker at the start, followed by anything, and a "Thinking Process" or
+# "Thought Process" header (bold or a heading), then ":" or a newline. Losing a real answer
+# is worse, so nothing else is: "Plan:", "Analysis:" and "1. Leave at 7:30" play. The
+# opening is held only while it is a prefix of one of the shapes, from 4 characters on.
 _THOUGHT_MARKS: Final[tuple[str, ...]] = ("<|channel>thought", "<thought")
+_REASONING_HEADERS: Final[tuple[str, ...]] = ("thinking process", "thought process")
 _DECORATION = re.compile(r"(?:#{1,6}[ \t]*)?(?:\*\*|__)?[ \t]*")
-_DECORATION_OPEN = re.compile(r"(?:#{1,6}[ \t]*)?(?:\*\*?|__?)?[ \t]*")
 _HEADER_END = re.compile(r"[ \t]*(?:\*\*|__)?[ \t]*(?::|\n)")
 _HEADER_END_OPEN = re.compile(r"[ \t]*(?:\*\*?|__?)?[ \t]*")
-_NUMBERED = re.compile(
-    r"1\.[ \t]+(?:\*\*[^*\n]{1,60}\*\*|[A-Za-z][\w'-]*(?:[ \t]+[\w'-]+){0,4}[ \t]*:)"
-)
-_NUMBERED_OPEN = re.compile(
-    r"1(?:\.(?:[ \t]+(?:\*\*?[^*\n]{0,60}|\*\*[^*\n]{1,60}\*"
-    r"|[A-Za-z][\w'-]*(?:[ \t]+[\w'-]*){0,4}[ \t]*)?)?)?"
-)
-
-
-def _reasoning_opening(head: str) -> str | None:
-    """Return "thinking" when `head` opens as reasoning, "undecided" while it could, else None."""
-    if _THOUGHT_MARK.match(head) or _NUMBERED.match(head):
-        return _THINKING
-    waits = _DECORATION_OPEN.fullmatch(head) is not None or any(
-        mark.startswith(head.lower()) for mark in _THOUGHT_MARKS
-    )
-    waits = waits or _NUMBERED_OPEN.fullmatch(head) is not None
-    rest = _DECORATION.sub("", head, count=1)  # it always matches at 0, if only empty
-    words = rest.lower()
-    for header in _REASONING_HEADERS:
-        if words.startswith(header):
-            after = rest[len(header) :]
-            if _HEADER_END.match(after):
-                return _THINKING
-            waits = waits or _HEADER_END_OPEN.fullmatch(after) is not None
-        elif len(words) >= 2 and header.startswith(words):
-            waits = True  # never on "I" or "A" alone: "I" starts a fifth of his replies
-    return _UNDECIDED if waits else None
+_REASONING_MIN_WAIT = 4  # "In", "An", "1." and "#" never wait
 
 
 def reasoning_header(text: str, tools: ToolNames, final: bool) -> Verdict | None:
     """Rule 3: a reply that opens as reasoning, its thinking written as plain text."""
     head = text.lstrip()
-    if not head:
-        return None
-    opening = _reasoning_opening(head)
-    if opening == _THINKING:
+    lower = head.lower()
+    if lower.startswith(_THOUGHT_MARKS):
         return Verdict(CUT, kind=_THINKING)
-    if opening == _UNDECIDED and not final and len(head) <= _UNDECIDED_MAX:
+    rest = _DECORATION.sub("", head, count=1)  # it always matches at 0, if only empty
+    words = rest.lower()
+    waits = any(mark.startswith(lower) for mark in _THOUGHT_MARKS)
+    for header in _REASONING_HEADERS:
+        if words.startswith(header):
+            after = rest[len(header) :]
+            if _HEADER_END.match(after):
+                return Verdict(CUT, kind=_THINKING)
+            waits = waits or _HEADER_END_OPEN.fullmatch(after) is not None
+        waits = waits or header.startswith(words)
+    if waits and not final and len(head) >= _REASONING_MIN_WAIT:
         return Verdict(UNDECIDED)
     return None
 

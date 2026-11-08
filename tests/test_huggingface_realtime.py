@@ -5850,8 +5850,8 @@ async def test_a_cancelled_reply_that_promised_a_lookup_gets_no_nudge(
     "deltas",
     [
         ("<thou", "ght\nThink", "ing Pro", "cess:\n1. Current state: ", "asked about soup."),
-        ("Th", "inking", " Process", ":", "\n1. Current state: asked about soup."),
-        ("1", ". ", "Current", " state", ": asked about soup."),
+        ("Thin", "king", " Process", ":", "\n1. Current state: asked about soup."),
+        ("**Th", "ought Pro", "cess**", "\nThey asked about soup."),
     ],
 )  # fmt: skip
 async def test_plain_reasoning_split_across_deltas_is_cut_and_marked(
@@ -5875,3 +5875,34 @@ async def test_a_reply_that_starts_like_a_header_plays_whole(monkeypatch: Any) -
     await _run_with_leaks(handler)
 
     assert len(_frames(handler)) == len(deltas)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_found_after_the_hold_released_its_audio_flushes_the_player(
+    monkeypatch: Any,
+) -> None:
+    """"<" holds, the timeout releases its audio, then the thought marker cuts and flushes.
+
+    "<" could start "<call:", so it waits the spoken-name hold too."""
+    monkeypatch.setattr(hf_mod, "SPOKEN_ARTIFACT_HOLD_S", 0.05)
+    monkeypatch.setattr(hf_mod, "SPOKEN_NAME_HOLD_S", 0.05)
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+            _said("<"),
+            _audio(1, 2),
+            lambda: asyncio.sleep(0.15),
+            _said("thought\nThinking Process:"),
+            _audio(3, 4),
+        ),
+    )
+    cleared: list[bool] = []
+    handler._clear_queue = lambda: cleared.append(True)
+
+    await handler._run_realtime_session()
+
+    assert cleared == [True]
+    assert [list(a.reshape(-1)) for _r, a in _frames(handler)] == [
+        [1, 2]
+    ]  # released before the cut; the fake flush drained nothing, later audio dropped
