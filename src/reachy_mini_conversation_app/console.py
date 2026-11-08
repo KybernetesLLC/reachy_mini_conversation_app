@@ -1479,7 +1479,14 @@ class LocalStream:
         async def _rpc_interrupt(_params: dict[str, object]) -> dict[str, object]:
             if not self.handler._is_connected():
                 raise JsonRpcError("no active session", reason="not_running")
-            await self._call_on_handler_loop(self.clear_audio_queue)
+
+            async def _interrupt() -> None:
+                # No await between the flush and the cancel's mark: no delta of the
+                # live reply can reach the player in between.
+                self.clear_audio_queue()
+                await self.handler.cancel_response()
+
+            await self._on_handler_loop(_interrupt())
             self._last_turn_state = "listening"
             rpc.broadcast_threadsafe(
                 "conversation.turn", {"state": "listening", "reason": "interrupted"}

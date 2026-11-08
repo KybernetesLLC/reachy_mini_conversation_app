@@ -2376,6 +2376,7 @@ def test_rpc_interrupt_broadcasts_turn_listening() -> None:
     handler = MagicMock()
     handler.output_queue = asyncio.Queue()
     handler._is_connected.return_value = True
+    handler.cancel_response = AsyncMock()
     app = FastAPI()
     stream = LocalStream(handler, _rpc_robot(), settings_app=app)
     stream._init_settings_ui_if_needed()
@@ -2386,6 +2387,7 @@ def test_rpc_interrupt_broadcasts_turn_listening() -> None:
     notes = [m for m in msgs if m.get("method") == "conversation.turn"]
     assert results and results[0]["result"] == {"ok": True}
     assert notes and notes[0]["params"] == {"state": "listening", "reason": "interrupted"}
+    handler.cancel_response.assert_awaited_once()  # a reply still generating stops too
 
 
 def test_rpc_say_requires_active_session() -> None:

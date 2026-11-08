@@ -5566,3 +5566,97 @@ def test_the_session_config_keeps_when_the_companions_block_was_read(monkeypatch
     assert handler.memory_read_at is None
     handler._get_session_config([])
     assert handler.memory_read_at == 777.0
+
+
+# --- the companion's interrupt cancels the reply still generating (11-08) ----------------------
+
+
+def _cancel_case_delta(response_id: str, *samples: int) -> _FakeEvent:
+    return _FakeEvent(
+        "response.output_audio.delta",
+        delta=_pcm_delta(*samples),
+        response_id=response_id,
+    )
+
+
+def _cancel_case_event(event_type: str, response_id: str) -> _FakeEvent:
+    return _FakeEvent(
+        event_type,
+        response=SimpleNamespace(
+            id=response_id, metadata=None, status="completed", output=[]
+        ),
+    )
+
+
+def _cancel_case_samples(handler: HuggingFaceRealtimeHandler) -> list[list[int]]:
+    return [frame[1].reshape(-1).tolist() for frame in _frames(handler)]
+
+
+@pytest.mark.asyncio
+async def test_an_interrupt_cancels_the_reply_still_generating(
+    monkeypatch: Any,
+) -> None:
+    """The companion's reminder stop: none of the reply's audio after it plays.
+
+    The server is told to cancel the reply, and the next reply plays as usual.
+    """
+    cancels: list[AsyncMock] = []
+    holder: dict[str, HuggingFaceRealtimeHandler] = {}
+
+    async def interrupt() -> None:
+        handler = holder["handler"]
+        cancel = AsyncMock()
+        handler.connection.response.cancel = cancel  # type: ignore[union-attr]
+        cancels.append(cancel)
+        await handler.cancel_response()
+
+    events = (
+        _cancel_case_event("response.created", "r1"),
+        _said("Time for a short break."),
+        _cancel_case_delta("r1", 1, 2),
+        interrupt,
+        _cancel_case_delta("r1", 3, 4),
+        _FakeEvent(
+            "response.output_audio_transcript.done",
+            transcript="Time for a short break.",
+        ),
+        _cancel_case_event("response.done", "r1"),
+        _cancel_case_event("response.created", "r2"),
+        _said("Hello."),
+        _cancel_case_delta("r2", 5, 6),
+        _FakeEvent("response.output_audio_transcript.done", transcript="Hello."),
+        _cancel_case_event("response.done", "r2"),
+    )
+    handler = _session_handler(monkeypatch, events)
+    holder["handler"] = handler
+    handler._clear_queue = lambda: None
+
+    await handler._run_realtime_session()
+
+    played = _cancel_case_samples(handler)
+    assert [3, 4] not in played
+    assert [5, 6] in played
+    assert cancels and cancels[0].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_an_interrupt_with_no_reply_generating_cancels_nothing() -> None:
+    """A response.cancel with nothing live could only land on the next reply."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    await handler.cancel_response()
+    handler.connection.response.cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_interrupt_drops_reply_audio_still_held() -> None:
+    """Audio the output gate still holds is the interrupted reply's: it never plays."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    handler._response_done_event.clear()
+    handler._gate_start()
+    handler._gate_audio((handler.SAMPLE_RATE, np.array([[1, 2]], dtype=np.int16)))
+    await handler.cancel_response()
+    handler._gate_release("pass")
+    assert _frames(handler) == []
+    handler.connection.response.cancel.assert_awaited_once()

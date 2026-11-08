@@ -211,3 +211,11 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         open.
         """
         ...
+
+    @abstractmethod
+    async def cancel_response(self) -> None:
+        """Stop the reply still being generated, so none of its rest plays.
+
+        The companion's ``conversation.interrupt`` calls it after flushing the player.
+        """
+        ...

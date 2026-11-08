@@ -434,6 +434,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._response_done_event.set()
         self._response_started_or_rejected_event: asyncio.Event = asyncio.Event()
         self._last_response_rejected: bool = False
+        # The response being generated, and the one the companion's interrupt cancelled:
+        # audio deltas the server still sends for that one are dropped (cancel_response).
+        self._live_response_id: str | None = None
+        self._cancelled_response_id: str | None = None
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
         self._turn_first_audio_at: float | None = None
@@ -1344,6 +1348,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # No input_audio_buffer.clear: the hosted backend answers it "Unknown or invalid
         # event" (2026-10-09, 11:22), and the muted microphone sends nothing more anyway.
 
+    async def cancel_response(self) -> None:
+        """Stop the reply still being generated: the companion interrupted it.
+
+        conversation.interrupt (a reminder's stop) flushes the player; without this the
+        rest of a reply still generating would stream in after the flush and play. Drops
+        the audio the output gate holds, cancels the live response on the server, and
+        drops any audio delta that still arrives for it. With no response live there is
+        nothing to cancel: a cancel then could only land on the next reply.
+        """
+        self._gate_drop_held()
+        if self._response_done_event.is_set() or not self.connection:
+            return
+        self._cancelled_response_id = self._live_response_id
+        logger.info("interrupt: cancelling response %s", self._live_response_id)
+        try:
+            await self.connection.response.cancel()
+        except Exception as e:
+            logger.debug("interrupt: could not cancel the live response (%s)", e)
+
     async def type_text(self, text: str) -> None:
         """Add ``text`` as the person's own words and answer it as speech would be.
 
@@ -2156,6 +2179,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     if event.type == "response.created":
                         self._response_done_event.clear()
+                        self._live_response_id = getattr(
+                            getattr(event, "response", None), "id", None
+                        )
                         self._response_started_or_rejected_event.set()
                         self._cut_mid_reply = (
                             False  # answered: an empty turn asks for no other reply
@@ -2360,6 +2386,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._response_transcript(event.transcript or "")
 
                     # Handle audio delta
+                    if (
+                        event.type == "response.output_audio.delta"
+                        and self._cancelled_response_id is not None
+                        and getattr(event, "response_id", None)
+                        == self._cancelled_response_id
+                    ):
+                        continue  # the interrupted reply's rest: never played
                     if event.type == "response.output_audio.delta":
                         decoded_pcm_bytes = base64.b64decode(event.delta)
                         decoded_pcm = np.frombuffer(
