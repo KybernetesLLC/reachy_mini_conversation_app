@@ -6,6 +6,7 @@ wins:
 
 1. leaked_tool_name: the reply is only a registered tool's name, bare or in call markup.
 2. artifact_shape: the reply is only stage directions, call markup or thinking.
+3. reasoning_header: the reply opens as reasoning written as plain text (11-08).
 
 The handler holds audio while the verdict is undecided, cuts on CUT, and at the end of
 the transcript (final=True) asks once more, so a bare name is judged on the whole reply.
@@ -677,8 +678,72 @@ def artifact_shape(text: str, tools: ToolNames, final: bool) -> Verdict | None:
     return Verdict(CUT, kind=kind)
 
 
+# Thinking written as plain text (11-08 08:37:56): a follow-up after express opened
+# "<thought\nThinking Process:\n1. Current state: ..." with no <think> tags, and all 6,000
+# characters of it were spoken. A reply that opens with Gemma 4's "thought" channel name,
+# a reasoning header, or "1. **...**" / "1. Word Word:" is thinking, cut whole. While the
+# opening could still become one it waits, under _UNDECIDED_MAX; once real words come
+# first ("I'm thinking of pancakes", "Sure! 1. ...") it plays.
+_REASONING_HEADERS: Final[tuple[str, ...]] = (
+    "thinking process",
+    "thought process",
+    "thinking",
+    "reasoning",
+    "analysis",
+    "internal monologue",
+    "plan",
+)
+_THOUGHT_MARK = re.compile(r"(?:<\|channel>|<)thought(?:\|?>|(?=\s))", re.IGNORECASE)
+_THOUGHT_MARKS: Final[tuple[str, ...]] = ("<|channel>thought", "<thought")
+_DECORATION = re.compile(r"(?:#{1,6}[ \t]*)?(?:\*\*|__)?[ \t]*")
+_DECORATION_OPEN = re.compile(r"(?:#{1,6}[ \t]*)?(?:\*\*?|__?)?[ \t]*")
+_HEADER_END = re.compile(r"[ \t]*(?:\*\*|__)?[ \t]*(?::|\n)")
+_HEADER_END_OPEN = re.compile(r"[ \t]*(?:\*\*?|__?)?[ \t]*")
+_NUMBERED = re.compile(
+    r"1\.[ \t]+(?:\*\*[^*\n]{1,60}\*\*|[A-Za-z][\w'-]*(?:[ \t]+[\w'-]+){0,4}[ \t]*:)"
+)
+_NUMBERED_OPEN = re.compile(
+    r"1(?:\.(?:[ \t]+(?:\*\*?[^*\n]{0,60}|\*\*[^*\n]{1,60}\*"
+    r"|[A-Za-z][\w'-]*(?:[ \t]+[\w'-]*){0,4}[ \t]*)?)?)?"
+)
+
+
+def _reasoning_opening(head: str) -> str | None:
+    """Return "thinking" when `head` opens as reasoning, "undecided" while it could, else None."""
+    if _THOUGHT_MARK.match(head) or _NUMBERED.match(head):
+        return _THINKING
+    waits = _DECORATION_OPEN.fullmatch(head) is not None or any(
+        mark.startswith(head.lower()) for mark in _THOUGHT_MARKS
+    )
+    waits = waits or _NUMBERED_OPEN.fullmatch(head) is not None
+    rest = _DECORATION.sub("", head, count=1)  # it always matches at 0, if only empty
+    words = rest.lower()
+    for header in _REASONING_HEADERS:
+        if words.startswith(header):
+            after = rest[len(header) :]
+            if _HEADER_END.match(after):
+                return _THINKING
+            waits = waits or _HEADER_END_OPEN.fullmatch(after) is not None
+        elif len(words) >= 2 and header.startswith(words):
+            waits = True  # never on "I" or "A" alone: "I" starts a fifth of his replies
+    return _UNDECIDED if waits else None
+
+
+def reasoning_header(text: str, tools: ToolNames, final: bool) -> Verdict | None:
+    """Rule 3: a reply that opens as reasoning, its thinking written as plain text."""
+    head = text.lstrip()
+    if not head:
+        return None
+    opening = _reasoning_opening(head)
+    if opening == _THINKING:
+        return Verdict(CUT, kind=_THINKING)
+    if opening == _UNDECIDED and not final and len(head) <= _UNDECIDED_MAX:
+        return Verdict(UNDECIDED)
+    return None
+
+
 Rule = Callable[[str, ToolNames, bool], Verdict | None]
-RULES: Final[tuple[Rule, ...]] = (leaked_tool_name, artifact_shape)
+RULES: Final[tuple[Rule, ...]] = (leaked_tool_name, artifact_shape, reasoning_header)
 
 
 def judge(text: str, tools: ToolNames, *, final: bool = False) -> Verdict:

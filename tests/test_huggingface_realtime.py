@@ -5842,3 +5842,36 @@ async def test_a_cancelled_reply_that_promised_a_lookup_gets_no_nudge(
     handler.client = _ordering_client(events, sent, handler)
     await handler._run_realtime_session()
     assert _kinds(sent) == []
+
+
+# 11-08 08:37:56: plain-text reasoning, its header split across deltas. Invented text.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        ("<thou", "ght\nThink", "ing Pro", "cess:\n1. Current state: ", "asked about soup."),
+        ("Th", "inking", " Process", ":", "\n1. Current state: asked about soup."),
+        ("1", ". ", "Current", " state", ": asked about soup."),
+    ],
+)  # fmt: skip
+async def test_plain_reasoning_split_across_deltas_is_cut_and_marked(
+    monkeypatch: Any, deltas: tuple[str, ...]
+) -> None:
+    handler, _ = _leak_session(monkeypatch, _streamed(*deltas))
+    seen: list[tuple[Any, ...]] = []
+    handler.set_transcript_observer(lambda *args: seen.append(args))
+
+    await _run_with_leaks(handler)
+
+    assert _frames(handler) == []
+    assert seen == [("assistant", "".join(deltas), True, "thinking")]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_that_starts_like_a_header_plays_whole(monkeypatch: Any) -> None:
+    deltas = ("Thinking", " of pancakes", ", honestly.")
+    handler, _ = _leak_session(monkeypatch, _streamed(*deltas))
+
+    await _run_with_leaks(handler)
+
+    assert len(_frames(handler)) == len(deltas)

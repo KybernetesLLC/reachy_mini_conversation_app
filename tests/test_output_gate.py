@@ -165,7 +165,11 @@ def test_an_unregistered_call_is_still_an_artifact_with_no_tool() -> None:
 
 
 def test_rules_run_in_order_from_one_declaration() -> None:
-    assert gate.RULES == (gate.leaked_tool_name, gate.artifact_shape)
+    assert gate.RULES == (
+        gate.leaked_tool_name,
+        gate.artifact_shape,
+        gate.reasoning_header,
+    )
 
 
 def test_with_no_registry_the_artifact_rule_alone_decides() -> None:
@@ -644,3 +648,78 @@ def test_a_played_reply_is_kept_without_its_spaced_tag() -> None:
 )
 def test_a_tool_name_inside_ssml_is_cut(text: str) -> None:
     assert gate.judge(text, TOOLS, final=True).action == gate.CUT_AND_EXECUTE
+
+
+# 11-08 08:37:56: a follow-up after express wrote its reasoning as plain text and all of it
+# was spoken. Invented text in the same shape.
+REASONING_1108 = (
+    "<thought\n"
+    "Thinking Process:\n"
+    "1. Current state: The person is in the kitchen, asking about soup. "
+    "2. Mood: Cheerful, a little sleepy. "
+    "3. Goal: Answer briefly and warmly.\n"
+    "4. Draft: Say something about soup."
+)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        REASONING_1108,
+        REASONING_1108.removeprefix("<thought\n"),
+        "Thinking Process:\n1. Current state: someone asked about soup.",
+        "**Thinking Process:**\n1. Current state: someone asked about soup.",
+        "**Thought Process**\nThey asked about soup.",
+        "## Reasoning\nThey asked about soup.",
+        "  thinking:\nThey asked about soup.",
+        "Analysis: they asked about soup.",
+        "Internal monologue: they asked about soup.",
+        "PLAN:\n1. Answer about soup.",
+        "1. **Current state**: someone asked about soup.",
+        "1. Current state: someone asked about soup.",
+        "1. Request Analysis: someone asked about soup.",
+    ],
+)
+def test_a_reply_that_opens_with_a_reasoning_header_is_thinking(text: str) -> None:
+    for final in (False, True):
+        assert gate.judge(text, TOOLS, final=final) == gate.Verdict(
+            gate.CUT, kind="thinking"
+        )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I'm thinking of pancakes.",
+        "Thinking of you, too!",
+        "Thinking about it, yes.",
+        "Planning ahead is smart.",
+        "Plans change.",
+        "Analysis paralysis, maybe!",
+        "Here are three: 1. **Soup**: warm. 2. **Bread**: fresh.",
+        "Sure! 1. Preheat the oven: it takes ten minutes.",
+        "10 degrees and clear.",
+        "1.5 miles, more or less.",
+        "I think so.",
+        "Thoughtful of you.",
+    ],
+)
+def test_a_reply_that_only_mentions_thinking_plays(text: str) -> None:
+    assert gate.judge(text, TOOLS) == gate.Verdict(gate.PLAY)
+    assert gate.judge(text, TOOLS, final=True) == gate.Verdict(gate.PLAY)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Th", "Thinking", "Thinking Pro", "Thinking Process", "**", "## Rea", "1.",
+     "1. ", "1. **Curr", "1. Current state", "<thou", "<thought", "Pla", "Plan"],
+)  # fmt: skip
+def test_the_start_of_a_reasoning_header_waits(text: str) -> None:
+    assert gate.judge(text, TOOLS).action == gate.UNDECIDED
+    assert gate.judge(text, TOOLS, final=True).action == gate.PLAY
+
+
+def test_an_open_header_shape_is_a_reply_past_the_undecided_limit() -> None:
+    text = "1. Current " + "word " * 50  # no colon in sight
+    assert len(text) > 200
+    assert gate.judge(text, TOOLS) == gate.Verdict(gate.PLAY)
