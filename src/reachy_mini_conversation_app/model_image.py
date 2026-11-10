@@ -12,7 +12,7 @@ environment on the robot.
 """
 
 import logging
-from typing import Any, Tuple, Optional
+from typing import Any, Tuple, Callable, Optional
 from dataclasses import dataclass
 
 import numpy as np
@@ -126,8 +126,13 @@ def jpeg_from_frame(frame: np.ndarray, spec: ModelImageSpec = MODEL_IMAGE) -> Op
     return jpeg
 
 
-def jpeg_from_jpeg(jpeg: bytes, spec: ModelImageSpec = MODEL_IMAGE) -> Optional[bytes]:
-    """Return JPEG bytes as a JPEG for the model, fitted to `spec`; None if they do not decode."""
+def jpeg_from_jpeg(
+    jpeg: bytes, spec: ModelImageSpec = MODEL_IMAGE, cut: Optional[Callable[[np.ndarray], np.ndarray]] = None
+) -> Optional[bytes]:
+    """Return JPEG bytes as a JPEG for the model, fitted to `spec`; None if they do not decode.
+
+    `cut`, when given, takes the decoded frame to the part of it to send.
+    """
     launch = (
         "appsrc name=src caps=image/jpeg ! jpegdec ! videoconvert ! video/x-raw,format=BGR "
         "! appsink name=sink sync=false"
@@ -143,4 +148,5 @@ def jpeg_from_jpeg(jpeg: bytes, spec: ModelImageSpec = MODEL_IMAGE) -> Optional[
     structure = caps.get_structure(0)
     width, height = structure.get_value("width"), structure.get_value("height")
     rows = np.frombuffer(raw, dtype=np.uint8).reshape(height, len(raw) // height)
-    return jpeg_from_frame(rows[:, : width * 3].reshape(height, width, 3), spec)
+    frame = rows[:, : width * 3].reshape(height, width, 3)
+    return jpeg_from_frame(frame if cut is None else cut(frame), spec)

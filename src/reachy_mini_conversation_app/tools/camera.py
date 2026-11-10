@@ -5,7 +5,7 @@ import asyncio
 import logging
 import datetime
 import threading
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple, Callable, Optional
 from pathlib import Path
 
 import numpy as np
@@ -57,6 +57,54 @@ def _room_luma() -> Optional[float]:
         return None
 
 
+# Look closer (companion ticket visual-perception/11-look-closer.md, the owner, 11-09): a
+# CLOSE_W x CLOSE_H cut of the frame at native pixels instead of the whole frame scaled down.
+# The hosted model rescales every image to about 1056 wide, so the whole 1920x1080 view
+# reaches it at about half its pixels; the cut reaches it at all of them, 1.8x the detail
+# across about 45 of the view's 82 degrees, at the same size and cost. The nine regions
+# overlap. `held` is the middle below where a face would be: head tracking keeps a face near
+# the centre, and a thing held up to show him sits below it. It is fixed for now; the
+# detector aims it later only if the log shows it missing. The cut is fixed in pixels for
+# the default 1080p stream: a frame no larger than it is sent whole, and at 4K the nine
+# regions would leave gaps (the review, 11-09; neither is configured on the robot).
+CLOSE_W, CLOSE_H = 1056, 594
+REGIONS: Dict[str, Tuple[float, float]] = {  # name: (x, y), 0 the left or top edge, 1 the other
+    "top left": (0.0, 0.0),
+    "top": (0.5, 0.0),
+    "top right": (1.0, 0.0),
+    "left": (0.0, 0.5),
+    "center": (0.5, 0.5),
+    "right": (1.0, 0.5),
+    "bottom left": (0.0, 1.0),
+    "bottom": (0.5, 1.0),
+    "bottom right": (1.0, 1.0),
+    "held": (0.5, 1.0),
+}
+CLOSE_UP_NOTE = "This picture is a close-up of {where} at full detail, not your whole view."
+
+
+def close_box(width: int, height: int, closer: str) -> Tuple[int, int, int, int]:
+    """Return the (x0, y0, x1, y1) cut of a width x height frame for the region `closer`."""
+    fx, fy = REGIONS[closer]
+    w, h = min(CLOSE_W, width), min(CLOSE_H, height)
+    x0, y0 = round((width - w) * fx), round((height - h) * fy)
+    return x0, y0, x0 + w, y0 + h
+
+
+def _cut(closer: Optional[str]) -> Optional[Callable[[np.ndarray], np.ndarray]]:
+    """Return a function cutting a frame to the region `closer` and logging the box, or None."""
+    if closer is None:
+        return None
+
+    def cut(frame: np.ndarray) -> np.ndarray:
+        height, width = frame.shape[:2]
+        x0, y0, x1, y1 = close_box(width, height, closer)
+        logger.info("camera: closer=%s box=%d,%d,%d,%d of %dx%d", closer, x0, y0, x1, y1, width, height)
+        return frame[y0:y1, x0:x1]
+
+    return cut
+
+
 # One reopen at a time: the camera tool and a glance may both want a frame, and
 # each closes and replaces the shared camera (the review, 2026-10-07).
 _CAMERA_LOCK = threading.Lock()
@@ -72,22 +120,26 @@ def _encode(camera: Any, frame: Any) -> Optional[bytes]:
     return model_image.jpeg_from_frame(frame)
 
 
-def _fresh_frame(media: Any) -> Tuple[Optional[bytes], Optional[float]]:
+def _fresh_frame(media: Any, closer: Optional[str] = None) -> Tuple[Optional[bytes], Optional[float]]:
     """Reopen the IPC camera; return (JPEG, mean luma) of one frame, under the lock."""
     with _CAMERA_LOCK:
-        return _fresh_frame_held(media)
+        return _fresh_frame_held(media, closer)
 
 
-def _fresh_frame_held(media: Any) -> Tuple[Optional[bytes], Optional[float]]:
-    """Reopen the IPC camera and return (JPEG for the model, the frame's mean luma).
+def _fresh_frame_held(media: Any, closer: Optional[str] = None) -> Tuple[Optional[bytes], Optional[float]]:
+    """Reopen the IPC camera and return (JPEG for the model, the whole frame's mean luma).
 
     Runs in a worker thread: opening waits for the pipeline. A camera that is
-    not the IPC reader is read as before, with no luma.
+    not the IPC reader is read as before, with no luma. `closer` cuts the JPEG to
+    one region of the frame.
     """
+    cut = _cut(closer)
     old = getattr(media, "camera", None)
     if not _REOPENABLE or not isinstance(old, _REOPENABLE):
         jpeg = media.get_frame_jpeg()
-        return (None if jpeg is None else model_image.jpeg_from_jpeg(jpeg)), None
+        if jpeg is None:
+            return None, None
+        return (model_image.jpeg_from_jpeg(jpeg) if cut is None else model_image.jpeg_from_jpeg(jpeg, cut=cut)), None
     specs = getattr(old, "camera_specs", None)
     try:
         old.close()
@@ -103,20 +155,21 @@ def _fresh_frame_held(media: Any) -> Tuple[Optional[bytes], Optional[float]]:
         frame = camera.read()
     if frame is None:
         return None, None
-    return _encode(camera, frame), float(np.mean(frame))
+    return _encode(camera, frame if cut is None else cut(frame)), float(np.mean(frame))
 
 
-def fresh_jpeg(media: Any) -> Tuple[Optional[bytes], Optional[float], Optional[str]]:
+def fresh_jpeg(media: Any, closer: Optional[str] = None) -> Tuple[Optional[bytes], Optional[float], Optional[str]]:
     """Return (JPEG, luma, why not) from a fresh frame; for the tool and the glance.
 
     A dark frame in a lit room is tried once more, then refused. Runs in a worker
-    thread: reopening the camera waits for its first frame.
+    thread: reopening the camera waits for its first frame. `closer` names a region
+    of the view (REGIONS) to send at full detail instead of the whole view.
     """
     room = _room_luma()
-    jpeg, luma = _fresh_frame(media)
+    jpeg, luma = _fresh_frame(media, closer)
     if luma is not None and room is not None and luma < DARK_FRAME <= ROOM_LIT <= room:
         logger.warning("camera frame dark (luma %.1f) in a lit room (%.1f); trying once more", luma, room)
-        jpeg, luma = _fresh_frame(media)
+        jpeg, luma = _fresh_frame(media, closer)
         if luma is not None and luma < DARK_FRAME:
             return None, luma, "dark frame in a lit room"
     if jpeg is None:
@@ -150,7 +203,9 @@ class Camera(Tool):
     description = (
         "Take a picture to see what is in front of you now: what someone is holding, how "
         "they look, the scene, or your visual opinion. If asked to look without saying at "
-        "what, don't ask; call it and describe what you see."
+        "what, don't ask; call it and describe what you see. To read small text or see a small or "
+        "far thing, set closer to the part of your view it is in, or to held for something a "
+        "person holds up to you."
     )
     parameters_schema = {
         "type": "object",
@@ -158,6 +213,11 @@ class Camera(Tool):
             "question": {
                 "type": "string",
                 "description": "What to look for in the picture.",
+            },
+            "closer": {
+                "type": "string",
+                "enum": list(REGIONS),
+                "description": "Optional: a sharper picture of only this part of your view.",
             },
         },
         "required": ["question"],
@@ -170,12 +230,27 @@ class Camera(Tool):
             logger.warning("camera: empty question")
             return {"error": "question must be a non-empty string"}
 
-        logger.info("Tool call: camera question=%s", question[:120])
+        raw = kwargs.get("closer")
+        closer = " ".join(raw.lower().replace("centre", "center").split()) if isinstance(raw, str) else raw
+        closer = closer or None
+        if closer is not None and (not isinstance(closer, str) or closer not in REGIONS):
+            logger.warning("camera: unknown closer %r", closer)
+            return {"error": f"closer must be one of: {', '.join(REGIONS)}"}
+
+        logger.info("Tool call: camera question=%s closer=%s", question[:120], closer or "-")
 
         if not deps.camera_enabled:
             return no_picture("camera", "camera disabled")
 
-        jpeg_bytes, _luma, why_not = await asyncio.to_thread(fresh_jpeg, deps.reachy_mini.media)
+        jpeg_bytes, _luma, why_not = await asyncio.to_thread(fresh_jpeg, deps.reachy_mini.media, closer)
         if jpeg_bytes is None:
             return no_picture("camera", why_not or "no frame")
-        return {"b64_im": base64.b64encode(jpeg_bytes).decode("utf-8")}
+        result: Dict[str, Any] = {"b64_im": base64.b64encode(jpeg_bytes).decode("utf-8")}
+        if closer is not None:
+            where = (
+                "the middle of your view, below where a face would be"
+                if closer == "held"
+                else f"the {closer} of your view"
+            )
+            result["view"] = CLOSE_UP_NOTE.format(where=where)
+        return result

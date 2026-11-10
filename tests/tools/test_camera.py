@@ -241,3 +241,149 @@ def test_a_fresh_frame_is_encoded_for_the_model(monkeypatch) -> None:
 
     assert camera_mod._encode(object(), np.zeros((1080, 1920, 3), dtype=np.uint8)) == b"for the model"
     assert seen == [(1080, 1920, 3)]
+
+
+# --- 2026-11-09: look closer, a region of the view at native pixels ---
+
+
+def test_close_boxes_cut_the_1080p_frame_at_native_size() -> None:
+    """Each region is 1056x594 of the 1920x1080 frame; held is the middle below a face."""
+    assert camera_mod.close_box(1920, 1080, "top left") == (0, 0, 1056, 594)
+    assert camera_mod.close_box(1920, 1080, "center") == (432, 243, 1488, 837)
+    assert camera_mod.close_box(1920, 1080, "bottom right") == (864, 486, 1920, 1080)
+    assert camera_mod.close_box(1920, 1080, "held") == (432, 486, 1488, 1080)
+    assert camera_mod.close_box(640, 480, "right") == (0, 0, 640, 480)  # a smaller frame is sent whole
+
+
+class BigCamera(FakeCamera):
+    """An IPC camera serving one 1920x1080 frame whose pixels say where they are."""
+
+    def read(self):
+        """Return the frame once."""
+        if not self.frames:
+            return None
+        self.frames.pop(0)
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        frame[:, :, 0] = (np.arange(1920) // 8)[None, :]  # column / 8
+        frame[:, :, 1] = (np.arange(1080) // 8)[:, None]  # row / 8
+        return frame
+
+
+def _big_deps(monkeypatch, tmp_path, encoded: list):
+    stale = BigCamera.__new__(BigCamera)
+    stale.camera_specs, stale.frames, stale.closed = None, [], False
+    FakeCamera.made = [stale]
+    FakeCamera.scripts = [[1.0]]
+    monkeypatch.setattr(camera_mod, "_REOPENABLE", (BigCamera,))
+    monkeypatch.setattr(camera_mod, "FRAME_WAIT_SECONDS", 0.05)
+
+    def encode(camera, frame):
+        encoded.append(frame)
+        return b"\xff\xd8close\xff\xd9"
+
+    monkeypatch.setattr(camera_mod, "_encode", encode)
+    monkeypatch.setenv("REACHY_COMPANION_LIGHT_LOG", str(tmp_path / "none.csv"))
+    reachy_mini = MagicMock()
+    reachy_mini.media.camera = stale
+    return ToolDependencies(reachy_mini=reachy_mini, movement_manager=MagicMock(), camera_enabled=True)
+
+
+@pytest.mark.asyncio
+async def test_closer_sends_that_region_and_says_it_is_a_close_up(monkeypatch, tmp_path, caplog) -> None:
+    """The cut is the named region at native pixels, the result says so and the log gives the box."""
+    encoded: list = []
+    deps = _big_deps(monkeypatch, tmp_path, encoded)
+
+    with caplog.at_level("INFO"):
+        result = await Camera()(deps, question="what is the title", closer="bottom right")
+
+    (frame,) = encoded
+    assert frame.shape == (594, 1056, 3)
+    assert frame[0, 0, 0] == 864 // 8 and frame[0, 0, 1] == 486 // 8  # cut at the bottom right
+    assert "close-up of the bottom right of your view" in result["view"]
+    assert "closer=bottom right box=864,486,1920,1080 of 1920x1080" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_without_closer_the_whole_view_is_sent_as_before(monkeypatch, tmp_path) -> None:
+    """No closer: the whole frame, and no close-up note."""
+    encoded: list = []
+    deps = _big_deps(monkeypatch, tmp_path, encoded)
+
+    result = await Camera()(deps, question="what do you see")
+
+    assert encoded[0].shape == (1080, 1920, 3)
+    assert "view" not in result and "b64_im" in result
+
+
+@pytest.mark.asyncio
+async def test_held_says_where_it_looked(monkeypatch, tmp_path) -> None:
+    """Held is the middle below a face, and the note says so."""
+    encoded: list = []
+    deps = _big_deps(monkeypatch, tmp_path, encoded)
+
+    result = await Camera()(deps, question="what book is this", closer="held")
+
+    assert encoded[0][0, 0, 1] == 486 // 8
+    assert "the middle of your view, below where a face would be" in result["view"]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_closer_is_an_error_and_takes_no_picture(monkeypatch, tmp_path) -> None:
+    """A region not in the list takes no picture."""
+    encoded: list = []
+    deps = _big_deps(monkeypatch, tmp_path, encoded)
+
+    result = await Camera()(deps, question="what is that", closer="far left")
+
+    assert "closer must be one of" in result["error"] and encoded == []
+
+
+@pytest.mark.asyncio
+async def test_closer_cuts_the_sdk_jpeg_path_too(monkeypatch) -> None:
+    """A camera that is not the IPC reader is cut as well."""
+    from reachy_mini_conversation_app import model_image
+
+    cuts: list = []
+
+    def fitted(jpeg, cut=None):
+        cuts.append(cut(np.zeros((1080, 1920, 3), dtype=np.uint8)).shape)
+        return b"fitted"
+
+    monkeypatch.setattr(model_image, "jpeg_from_jpeg", fitted)
+    reachy_mini = MagicMock()
+    reachy_mini.media.get_frame_jpeg.return_value = b"\xff\xd8jpeg\xff\xd9"
+    deps = ToolDependencies(reachy_mini=reachy_mini, movement_manager=MagicMock(), camera_enabled=True)
+
+    result = await Camera()(deps, question="read it", closer="top")
+
+    assert cuts == [(594, 1056, 3)] and "b64_im" in result
+
+
+def test_the_schema_offers_the_regions() -> None:
+    """The model sees the nine regions and held; question stays the only required field."""
+    closer = Camera.parameters_schema["properties"]["closer"]
+    assert closer["enum"] == list(camera_mod.REGIONS) and "held" in closer["enum"]
+    assert Camera.parameters_schema["required"] == ["question"]
+
+
+@pytest.mark.asyncio
+async def test_closer_takes_any_case_spacing_and_the_british_spelling(monkeypatch, tmp_path) -> None:
+    """Case, spacing and "centre" give the region meant, not a failed round trip."""
+    encoded: list = []
+    deps = _big_deps(monkeypatch, tmp_path, encoded)
+
+    result = await Camera()(deps, question="what is that", closer=" Centre ")
+
+    assert encoded[0][0, 0, 0] == 432 // 8 and "the center of your view" in result["view"]
+
+
+@pytest.mark.asyncio
+async def test_a_closer_that_is_not_a_string_is_an_error(monkeypatch, tmp_path) -> None:
+    """A list from the model returns the error, not a TypeError."""
+    encoded: list = []
+    deps = _big_deps(monkeypatch, tmp_path, encoded)
+
+    result = await Camera()(deps, question="what is that", closer=["top"])
+
+    assert "closer must be one of" in result["error"] and encoded == []
