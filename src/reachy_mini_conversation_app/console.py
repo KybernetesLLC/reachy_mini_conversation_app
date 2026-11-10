@@ -127,6 +127,7 @@ def _finite_float(value: object, message: str) -> float:
 # how long past the dance's own length the wobbler's return waits for its last move.
 DANCE_BPM_LOW, DANCE_BPM_HIGH = 40.0, 240.0
 DANCE_WOBBLE_SLACK_S = 30.0
+DANCE_MAX_S = 60.0  # the companion's dances are at most 20 s; wobbling is off throughout
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -672,6 +673,8 @@ class LocalStream:
             move = DanceQueueMove(name, bpm=bpm, beats=beats, amplitude=amplitude, antennas=False)
             move.ends_on_release = True
             moves.append(move)
+        if sum(m.duration for m in moves) > DANCE_MAX_S:
+            raise JsonRpcError(f"a dance is at most {DANCE_MAX_S:.0f}s", reason="invalid_params", code=-32602)
         self._dance_number += 1
         number = self._dance_number
         await asyncio.to_thread(self._wobbling, False)

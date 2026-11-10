@@ -2615,6 +2615,7 @@ def test_a_dance_over_rpc_queues_its_moves_at_its_tempo() -> None:
         ({**_DANCE, "moves": []}, "invalid_params"),
         ({**_DANCE, "bpm": None}, "invalid_params"),
         ({**_DANCE, "bpm": 400}, "invalid_params"),
+        ({**_DANCE, "bpm": 60, "moves": [{"name": "simple_nod", "beats": 64}]}, "invalid_params"),
     ],
 )
 def test_a_bad_dance_is_refused_and_moves_nothing(params: dict[str, Any], reason: str) -> None:
