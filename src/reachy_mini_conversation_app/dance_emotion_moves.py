@@ -50,6 +50,7 @@ class DanceQueueMove(Move):  # type: ignore
         self.dance_move = DanceMove(move_name)
         self.move_name = move_name
         self.beats = beats
+        self.antennas = antennas
         if bpm is not None:
             self.dance_move.default_bpm = float(bpm)
         if amplitude != 1.0 or not antennas:
@@ -79,6 +80,10 @@ class DanceQueueMove(Move):  # type: ignore
             # Convert to numpy array if antennas is tuple and return in official Move format
             if isinstance(antennas, tuple):
                 antennas = np.array([antennas[0], antennas[1]])
+            if not getattr(self, "antennas", True):
+                # still antennas are left at the manager's rest value, not commanded to 0:
+                # 0 is 10 degrees off the held pose and reads as a press (companion review)
+                antennas = None
 
             return (head_pose, antennas, body_yaw)
 
