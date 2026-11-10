@@ -2553,6 +2553,174 @@ def test_an_unknown_cue_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(manager.move_queue) == 0
 
 
+def _dance_stream() -> tuple[LocalStream, MovementManager, FastAPI]:
+    """_pose_stream with a robot whose wobbling calls are recorded."""
+    stream, manager, app = _pose_stream()
+    stream._robot.enable_wobbling = MagicMock()
+    stream._robot.disable_wobbling = MagicMock()
+    return stream, manager, app
+
+
+_DANCE = {
+    "moves": [
+        {"name": "groovy_sway_and_roll", "beats": 4, "amplitude": 0.7},
+        {"name": "interwoven_spirals", "beats": 8, "amplitude": 0.7},
+        {"name": "uh_huh_tilt", "beats": 4, "amplitude": 0.7},
+    ],
+    "bpm": 120.0,
+}
+
+
+def _wait_waiter(stream: LocalStream) -> None:
+    waiter = stream._dance_waiter
+    assert waiter is not None
+    waiter.join(timeout=2.0)
+    assert not waiter.is_alive()
+
+
+def test_a_dance_over_rpc_queues_its_moves_at_its_tempo() -> None:
+    """conversation.dance queues one move each at the bpm; seconds is the beats at the bpm.
+
+    Each move plays its beats, its amplitudes scaled, the antennas still.
+    """
+    from reachy_mini_dances_library.collection.dance import AVAILABLE_MOVES
+    from reachy_mini_conversation_app.dance_emotion_moves import DanceQueueMove
+
+    stream, manager, app = _dance_stream()
+    library = {n: dict(AVAILABLE_MOVES[n][1]) for n in ("groovy_sway_and_roll", "interwoven_spirals")}
+
+    resp = _rpc_call(app, "conversation.dance", _DANCE)
+
+    assert resp["result"] == {"queued": 3, "seconds": 8.0}  # 16 beats at 120 bpm
+    stream._robot.disable_wobbling.assert_called_once()
+    _drive_manager(manager)
+    moves = [manager.state.current_move, *manager.move_queue]
+    assert [m.move_name for m in moves] == ["groovy_sway_and_roll", "interwoven_spirals", "uh_huh_tilt"]
+    assert all(isinstance(m, DanceQueueMove) and m.ends_on_release for m in moves)
+    assert [m.duration for m in moves] == [2.0, 4.0, 2.0]
+    first = moves[0].dance_move.move_params
+    assert first["y_amplitude_m"] == library["groovy_sway_and_roll"]["y_amplitude_m"] * 0.7
+    assert first["antenna_amplitude_rad"] == 0.0
+    assert {n: dict(AVAILABLE_MOVES[n][1]) for n in library} == library  # the library unchanged
+
+
+@pytest.mark.parametrize(
+    "params, reason",
+    [
+        ({**_DANCE, "moves": [{"name": "ellipse_walk", "beats": 4}]}, "unknown_move"),  # forbidden.py
+        ({**_DANCE, "moves": [{"name": "moonwalk", "beats": 4}]}, "unknown_move"),
+        ({**_DANCE, "moves": [{"name": "simple_nod", "beats": 0}]}, "invalid_params"),
+        ({**_DANCE, "moves": [{"name": "simple_nod", "beats": 2.5}]}, "invalid_params"),
+        ({**_DANCE, "moves": [{"name": "simple_nod", "beats": 4, "amplitude": 1.5}]}, "invalid_params"),
+        ({**_DANCE, "moves": []}, "invalid_params"),
+        ({**_DANCE, "bpm": None}, "invalid_params"),
+        ({**_DANCE, "bpm": 400}, "invalid_params"),
+    ],
+)
+def test_a_bad_dance_is_refused_and_moves_nothing(params: dict[str, Any], reason: str) -> None:
+    """A bad name, beats, amplitude or bpm queues nothing and leaves wobbling on."""
+    stream, manager, app = _dance_stream()
+
+    resp = _rpc_call(app, "conversation.dance", params)
+
+    assert resp["error"]["data"]["reason"] == reason
+    _drive_manager(manager)
+    assert manager.state.current_move is None and len(manager.move_queue) == 0
+    stream._robot.disable_wobbling.assert_not_called()
+
+
+def test_wobbling_comes_back_once_the_dance_has_played() -> None:
+    """The last move's end turns wobbling back on."""
+    stream, manager, app = _dance_stream()
+    _rpc_call(app, "conversation.dance", _DANCE)
+    t = manager._now()
+    _drive_manager(manager, t)
+    for step in (2.0, 6.0, 8.0):  # each move's end
+        _drive_manager(manager, t + step + 0.01)
+    assert not getattr(manager.state.current_move, "ends_on_release", False)
+    assert len(manager.move_queue) == 0
+    _wait_waiter(stream)
+    stream._robot.enable_wobbling.assert_called_once()
+
+
+def test_a_hold_ends_the_dance_and_wobbling_comes_back() -> None:
+    """A hold replaces the dance's moves, and the dropped last move brings wobbling back."""
+    stream, manager, app = _dance_stream()
+    _rpc_call(app, "conversation.dance", _DANCE)
+    _drive_manager(manager)
+
+    _rpc_call(app, "conversation.pose", {"antennas": [0.0, 0.0], "duration": 0.5})
+    _drive_manager(manager)
+
+    assert isinstance(manager.state.current_move, HoldPoseMove) and len(manager.move_queue) == 0
+    _wait_waiter(stream)
+    stream._robot.enable_wobbling.assert_called_once()
+
+
+def test_a_release_ends_a_dance_with_no_hold() -> None:
+    """A release drops the dance's moves when nothing is held.
+
+    moves.py's release_hold: the posture driver cuts a dance with one {release: true}.
+    """
+    stream, manager, app = _dance_stream()
+    _rpc_call(app, "conversation.dance", _DANCE)
+    _drive_manager(manager)
+    assert manager.is_holding() is False
+
+    assert _rpc_call(app, "conversation.pose", {"release": True})["result"] == {"holding": False}
+    _drive_manager(manager)
+
+    assert not getattr(manager.state.current_move, "ends_on_release", False)
+    assert not any(getattr(m, "ends_on_release", False) for m in manager.move_queue)
+    _wait_waiter(stream)
+    stream._robot.enable_wobbling.assert_called_once()
+
+
+def test_a_release_ends_a_dance_that_set_a_hold_aside() -> None:
+    """A dance over a hold sets it aside; a release ends both."""
+    stream, manager, app = _dance_stream()
+    _rpc_call(app, "conversation.pose", {"antennas": [0.1, -0.1], "duration": 0.5})
+    _drive_manager(manager)
+    _rpc_call(app, "conversation.dance", _DANCE)
+    _drive_manager(manager)
+    assert manager.state.current_move.ends_on_release and manager.is_holding()  # set aside
+
+    _rpc_call(app, "conversation.pose", {"release": True})
+    _drive_manager(manager)
+
+    assert manager.state.current_move is None and len(manager.move_queue) == 0
+    assert manager.is_holding() is False
+
+
+def test_a_release_leaves_the_models_own_dance_alone() -> None:
+    """The dance tool's moves are not marked: a release with no hold stays a no-op for them."""
+    from reachy_mini_conversation_app.dance_emotion_moves import DanceQueueMove
+
+    _stream, manager, app = _pose_stream()
+    manager.queue_move(DanceQueueMove("simple_nod"))
+    _drive_manager(manager)
+
+    _rpc_call(app, "conversation.pose", {"release": True})
+    _drive_manager(manager)
+
+    assert manager.state.current_move.move_name == "simple_nod"
+
+
+def test_an_earlier_dance_never_brings_wobbling_back_during_a_later_one() -> None:
+    """Only the latest dance's end turns wobbling back on."""
+    stream, manager, app = _dance_stream()
+    _rpc_call(app, "conversation.dance", _DANCE)
+    first = stream._dance_waiter
+    _drive_manager(manager)
+    _rpc_call(app, "conversation.pose", {"antennas": [0.0, 0.0], "duration": 0.5})  # ends it
+    _rpc_call(app, "conversation.dance", _DANCE)
+    _drive_manager(manager)
+    assert first is not None
+    first.join(timeout=2.0)
+
+    stream._robot.enable_wobbling.assert_not_called()
+
+
 def test_the_preroll_keeps_four_seconds() -> None:
     """The companion's audit, D27: 2 s counted back from connect left about 0.7 s of
     margin, and decision 030's camera check after a quiet name spends most of it."""

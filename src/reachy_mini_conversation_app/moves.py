@@ -669,10 +669,24 @@ class MovementManager:
     def release_hold(self) -> None:
         """Release a held pose, if any, and let normal idle behaviour resume.
 
-        A no-op when nothing is held: any other current or queued move is left
+        With nothing held, it drops only the companion's dance moves (those marked
+        `ends_on_release`, conversation.dance); any other current or queued move is left
         untouched. Thread-safe via the command queue.
         """
         self._command_queue.put(("release_hold", None))
+
+    def _drop_released_moves(self) -> bool:
+        """Drop the current and queued moves marked `ends_on_release`; True if any was."""
+        kept = [m for m in self.move_queue if not getattr(m, "ends_on_release", False)]
+        dropped = len(kept) != len(self.move_queue)
+        if dropped:
+            self.move_queue.clear()
+            self.move_queue.extend(kept)
+        if getattr(self.state.current_move, "ends_on_release", False):
+            self.state.current_move = None
+            self.state.move_start_time = None
+            dropped = True
+        return dropped
 
     def _only_a_hold_plays(self) -> bool:
         """A hold is the current move, nothing waits behind it and nothing is set aside."""
@@ -862,6 +876,12 @@ class MovementManager:
                 self._breathing_active = False
                 self.state.update_activity()
                 logger.info("Released held pose")
+            elif self._drop_released_moves():
+                # The companion's dance (conversation.dance) over no hold: a release ends it
+                # as it would a hold, so its posture driver can cut a dance with one call.
+                self._breathing_active = False
+                self.state.update_activity()
+                logger.info("Released: the dance's moves were dropped")
         elif command == "turn_idle_body":
             try:
                 yaw, duration = float(payload[0]), float(payload[1])

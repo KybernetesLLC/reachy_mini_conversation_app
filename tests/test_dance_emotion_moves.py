@@ -78,3 +78,33 @@ def test_dance_queue_move_converts_tuple_antennas() -> None:
     assert isinstance(antennas, np.ndarray)
     np.testing.assert_allclose(antennas, [0.1, 0.2])
     assert body_yaw == 0.5
+
+
+def test_a_dance_move_takes_its_tempo_beats_and_amplitude_and_leaves_the_library_alone() -> None:
+    """Tempo and beats set a conversation.dance move's length; the library is never changed.
+
+    DanceMove.__init__ updates the library's shared parameter dict in place.
+    """
+    from reachy_mini_dances_library.collection.dance import AVAILABLE_MOVES
+
+    before = dict(AVAILABLE_MOVES["head_tilt_roll"][1])
+    move = DanceQueueMove("head_tilt_roll", bpm=90.0, beats=8, amplitude=0.5, antennas=False)
+    again = DanceQueueMove("head_tilt_roll", bpm=90.0, beats=8, amplitude=0.5, antennas=False)
+
+    assert move.duration == 8 * 60 / 90.0
+    assert move.dance_move.default_bpm == 90.0
+    assert move.dance_move.move_params["amplitude_rad"] == before["amplitude_rad"] * 0.5
+    assert again.dance_move.move_params["amplitude_rad"] == before["amplitude_rad"] * 0.5
+    assert move.dance_move.move_params["antenna_amplitude_rad"] == 0.0
+    assert AVAILABLE_MOVES["head_tilt_roll"][1] == before
+    plain = DanceQueueMove("head_tilt_roll")
+    assert plain.dance_move.default_bpm == 114 and plain.ends_on_release is False
+
+
+def test_a_still_antenna_dance_move_keeps_the_antennas_at_zero() -> None:
+    """antennas=False holds both antennas at 0 and never turns the body."""
+    move = DanceQueueMove("groovy_sway_and_roll", bpm=120.0, beats=4, antennas=False)
+    for t in np.linspace(0.0, move.duration, 9):
+        _, antennas, body_yaw = move.evaluate(float(t))
+        np.testing.assert_allclose(antennas, [0.0, 0.0], atol=1e-12)
+        assert body_yaw == 0

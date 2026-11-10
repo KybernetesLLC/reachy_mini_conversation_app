@@ -123,6 +123,12 @@ def _finite_float(value: object, message: str) -> float:
     return parsed
 
 
+# conversation.dance (the companion's dance intention, 2026-11-10): the tempos it takes, and
+# how long past the dance's own length the wobbler's return waits for its last move.
+DANCE_BPM_LOW, DANCE_BPM_HIGH = 40.0, 240.0
+DANCE_WOBBLE_SLACK_S = 30.0
+
+
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -373,6 +379,10 @@ class LocalStream:
         self._send_stall_told = False
         self._now: Callable[[], float] = time.monotonic
         self._background: set[asyncio.Future[Any]] = set()
+        # conversation.dance: each dance's number, so only the latest brings wobbling back,
+        # and the thread waiting for its last move (tests join it).
+        self._dance_number = 0
+        self._dance_waiter: threading.Thread | None = None
         # The unheard-reply trigger: replies pushed, judged against the speaker's monitor.
         self._replies = playback_health.ReplyTracker()
         # The phantom-speech detector (2026-10-26): speaker sound the app did not push.
@@ -623,6 +633,88 @@ class LocalStream:
         except TypeError:
             handler_state = {}
         return handler_state.get("connection") is not None
+
+    async def _queue_dance(self, params: dict[str, object]) -> dict[str, object]:
+        """conversation.dance's body (the RPC above)."""
+        manager = self._movement_manager()
+        if manager is None:
+            raise JsonRpcError("movement manager unavailable", reason="not_running")
+        try:
+            from reachy_mini_dances_library.collection.dance import AVAILABLE_MOVES
+            from reachy_mini_conversation_app.dance_emotion_moves import DanceQueueMove
+        except ImportError:
+            raise JsonRpcError("dance library unavailable", reason="not_running")
+        bpm = _finite_float(params.get("bpm"), "dance needs a numeric bpm")
+        if not DANCE_BPM_LOW <= bpm <= DANCE_BPM_HIGH:
+            raise JsonRpcError(
+                f"dance bpm must be {DANCE_BPM_LOW:.0f} to {DANCE_BPM_HIGH:.0f}",
+                reason="invalid_params",
+                code=-32602,
+            )
+        raw = params.get("moves")
+        if not isinstance(raw, list) or not raw:
+            raise JsonRpcError(
+                "dance requires 'moves', a non-empty list", reason="invalid_params", code=-32602
+            )
+        moves = []
+        for item in raw:
+            if not isinstance(item, dict):
+                raise JsonRpcError("dance moves must be objects", reason="invalid_params", code=-32602)
+            name, beats = item.get("name"), item.get("beats")
+            # FORBIDDEN_MOVES are never in AVAILABLE_MOVES
+            if not isinstance(name, str) or name not in AVAILABLE_MOVES:
+                raise JsonRpcError(f"unknown dance move {name!r}", reason="unknown_move", code=-32602)
+            if isinstance(beats, bool) or not isinstance(beats, int) or beats <= 0:
+                raise JsonRpcError("dance beats must be a whole number > 0", reason="invalid_params", code=-32602)
+            amplitude = _finite_float(item.get("amplitude", 1.0), "dance amplitude must be numeric")
+            if not 0 < amplitude <= 1:
+                raise JsonRpcError("dance amplitude must be in (0, 1]", reason="invalid_params", code=-32602)
+            move = DanceQueueMove(name, bpm=bpm, beats=beats, amplitude=amplitude, antennas=False)
+            move.ends_on_release = True
+            moves.append(move)
+        self._dance_number += 1
+        number = self._dance_number
+        await asyncio.to_thread(self._wobbling, False)
+        for move in moves[:-1]:
+            manager.queue_move(move)
+        done = manager.queue_watched_move(moves[-1])
+        seconds = sum(m.duration for m in moves)
+        waiter = threading.Thread(
+            target=self._wobble_after_dance,
+            args=(manager, done, number, seconds + DANCE_WOBBLE_SLACK_S),
+            name="dance-wobble",
+            daemon=True,
+        )
+        self._dance_waiter = waiter
+        waiter.start()
+        logger.info("Dance: %d moves at %.1f bpm over %.1fs", len(moves), bpm, seconds)
+        return {"queued": len(moves), "seconds": seconds}
+
+    def _wobble_after_dance(self, manager: Any, done: threading.Event, number: int, wait_s: float) -> None:
+        """Turn wobbling back on once the dance's last move has played or was dropped.
+
+        Not after a later dance began (it owns the wobbler), nor once the movement manager
+        has stopped (going to sleep turned wobbling off on purpose).
+        """
+        ended = done.wait(wait_s)
+        if number != self._dance_number:
+            return
+        if not ended:
+            logger.warning("Dance: its last move had not ended %.0fs on; wobbling back on", wait_s)
+        stopped = getattr(manager, "_stop_event", None)
+        if stopped is not None and stopped.is_set():
+            return
+        self._wobbling(True)
+
+    def _wobbling(self, on: bool) -> None:
+        """Turn the SDK's audio-reactive head wobble on or off; a robot without it is left alone."""
+        call = getattr(self._robot, "enable_wobbling" if on else "disable_wobbling", None)
+        if not callable(call):
+            return
+        try:
+            call()
+        except Exception as e:
+            logger.warning("Dance: wobbling %s failed: %s", "on" if on else "off", e)
 
     def _movement_manager(self) -> Any:
         """Return the active handler's movement manager, if any."""
@@ -1850,6 +1942,18 @@ class LocalStream:
             manager.queue_move(move)
             # its length, so the companion counts it as his own motion, not a touch
             return {"queued": name, "seconds": move.duration}
+
+        @rpc.method("conversation.dance")  # type: ignore[untyped-decorator]
+        async def _rpc_dance(params: dict[str, object]) -> dict[str, object]:
+            """Queue a dance: {moves: [{name, beats, amplitude}], bpm} -> {seconds}.
+
+            Each move is a library dance move played for `beats` at `bpm`, its amplitudes
+            scaled by `amplitude`, the antennas still, and wobbling off until the last move
+            has played or was dropped. Queued moves set a hold aside, as a cue does; a later
+            hold, or {release: true}, ends the dance (moves.py's release_hold).
+            """
+            return await self._queue_dance(params)
+
 
         @rpc.method("backend.config")  # type: ignore[untyped-decorator]
         def _rpc_backend_config(params: dict[str, object]) -> dict[str, object]:

@@ -26,14 +26,48 @@ class DanceQueueMove(Move):  # type: ignore
     # the body's yaw as it starts.
     relative_to_body = True
 
-    def __init__(self, move_name: str):
-        """Initialize a DanceQueueMove."""
+    # A move the companion's conversation.dance queued: a release ends it as it ends a hold
+    # (moves.py's release_hold). The model's own dance tool leaves it False.
+    ends_on_release = False
+
+    def __init__(
+        self,
+        move_name: str,
+        *,
+        bpm: float | None = None,
+        beats: int | None = None,
+        amplitude: float = 1.0,
+        antennas: bool = True,
+    ):
+        """Initialize a DanceQueueMove.
+
+        `bpm` sets this move's tempo (DanceMove.default_bpm, read per instance), `beats` how
+        many it plays (its library length otherwise), `amplitude` scales the library's
+        amplitude parameters, and `antennas=False` keeps the antennas still. The library's
+        parameter dict is shared by every move of that name (DanceMove.__init__ updates it in
+        place), so a changed move gets its own copy.
+        """
         self.dance_move = DanceMove(move_name)
         self.move_name = move_name
+        self.beats = beats
+        if bpm is not None:
+            self.dance_move.default_bpm = float(bpm)
+        if amplitude != 1.0 or not antennas:
+            params = dict(self.dance_move.move_params)
+            for key, value in params.items():
+                if key.startswith("antenna_"):
+                    continue
+                if "amp" in key and isinstance(value, (int, float, np.floating)):
+                    params[key] = float(value) * amplitude
+            if not antennas and "antenna_amplitude_rad" in params:
+                params["antenna_amplitude_rad"] = 0.0
+            self.dance_move.move_params = params
 
     @property
     def duration(self) -> float:
         """Duration property required by official Move interface."""
+        if self.beats is not None:
+            return float(self.beats) * 60.0 / float(self.dance_move.default_bpm)
         return float(self.dance_move.duration)
 
     def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
