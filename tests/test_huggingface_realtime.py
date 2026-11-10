@@ -2086,6 +2086,40 @@ async def test_a_camera_picture_is_handed_over_and_asks_only_for_the_reply(
 
 
 @pytest.mark.asyncio
+async def test_a_camera_picture_hands_over_its_facts_and_question(
+    monkeypatch: Any,
+) -> None:
+    """The kept copy's facts (the frame store's camera kind, 11-09): the result's, not the image."""
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(
+        handler,
+        "_wait_for_response_done_before_tool_result",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(handler, "_safe_response_create", AsyncMock())
+    got: list[tuple] = []
+    handler.on_sight = lambda *a: got.append(a)
+    handler._in_flight_tool_calls = {"cam"}
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="cam",
+            tool_name="camera",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            args={"question": "what is the title", "closer": "held"},
+            result={"b64_im": "abc", "closer": "held", "zoom": 1.82, "view": "a close-up"},
+        )
+    )
+
+    assert got == [
+        ("abc", "camera", {"closer": "held", "zoom": 1.82, "question": "what is the title"})
+    ]
+
+
+@pytest.mark.asyncio
 async def test_a_text_response_is_never_an_inner_note(monkeypatch: Any) -> None:
     """With notes off the voice service, the app writes no inner transcript at all."""
     from types import SimpleNamespace

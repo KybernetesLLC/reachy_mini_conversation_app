@@ -472,7 +472,9 @@ class LocalStream:
                 params["item_id"] = item_id
             self._rpc.broadcast_threadsafe("conversation.transcript", params)
 
-    def _dispatch_sight(self, b64_jpeg: str, source: str) -> None:
+    def _dispatch_sight(
+        self, b64_jpeg: str, source: str, facts: dict[str, object] | None = None
+    ) -> None:
         """Push a conversation.sight notification for the companion's sight note.
 
         The frame was just added to the conversation; the companion writes the note
@@ -484,10 +486,10 @@ class LocalStream:
                 "Sight frame (%s) not handed over: no companion attached", source
             )
             return
-        self._rpc.broadcast_threadsafe(
-            "conversation.sight",
-            {"jpeg": b64_jpeg, "source": source, "at": time.time()},
-        )
+        params: dict[str, object] = {"jpeg": b64_jpeg, "source": source, "at": time.time()}
+        if facts:
+            params["facts"] = facts  # a camera picture's, for the companion's kept copy
+        self._rpc.broadcast_threadsafe("conversation.sight", params)
 
     def _dispatch_tool_call(self, payload: dict[str, object]) -> bool:
         """Push a conversation.tool notification (the tool-call-log brief, 2026-10-11).

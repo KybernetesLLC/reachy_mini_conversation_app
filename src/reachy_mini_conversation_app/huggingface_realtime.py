@@ -29,6 +29,7 @@ from openai.types.realtime import (
 from websockets.exceptions import ConnectionClosedError
 from openai.types.realtime.realtime_audio_input_turn_detection_param import ServerVad
 
+from reachy_mini_conversation_app.tools import camera as camera_tool
 from reachy_mini_conversation_app.tools import core_tools
 from reachy_mini_conversation_app import talk_prune
 from reachy_mini_conversation_app.config import (
@@ -487,7 +488,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._spoken_responses: "deque[str]" = deque(maxlen=64)
         # Each frame added to the conversation, handed to the companion for its sight
         # note (Claude Haiku, 2026-10-17): (base64 JPEG, source). Set by the console.
-        self.on_sight: Callable[[str, str], None] | None = None
+        self.on_sight: Callable[..., None] | None = None
         # The cold-open brief (2026-10-17), per session: what went to the voice service,
         # and the glance at open against the first reply to a person's turn (monotonic).
         self._session_images = 0
@@ -1421,17 +1422,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             },
         )
 
-    def note_image(self, b64_jpeg: str, source: str) -> None:
+    def note_image(
+        self, b64_jpeg: str, source: str, facts: dict[str, Any] | None = None
+    ) -> None:
         """Hand a frame just added to the conversation to the companion, for its sight note.
 
         `source`: "glance" or "camera". The supervisor writes the note with Claude Haiku,
         off the voice service (the cold-open brief, 2026-10-17); nothing here waits on it.
+        `facts`: a camera picture's facts and question, for the companion's kept copy.
         """
         sink = self.on_sight
         if sink is None:
             return
         try:
-            sink(b64_jpeg, source)
+            if facts:
+                sink(b64_jpeg, source, facts)
+            else:
+                sink(b64_jpeg, source)
         except Exception:
             logger.warning(
                 "A frame was not handed over for its sight note", exc_info=True
@@ -1944,6 +1951,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
 
             sight_note: str | None = None
+            sight_facts: dict[str, Any] | None = None
             if (
                 model_result_submitted
                 and completed_tool.tool_name == "camera"
@@ -1955,6 +1963,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.warning("Unexpected type for b64_im: %s", type(b64_im))
                     b64_im = str(b64_im)
                 sight_note = b64_im
+                sight_facts = {
+                    k: tool_result[k] for k in camera_tool.FACT_KEYS if k in tool_result
+                }
+                question = (completed_tool.args or {}).get("question")
+                if isinstance(question, str):
+                    sight_facts["question"] = question[:300]
                 image_width = tool_result.get("image_width")
                 image_height = tool_result.get("image_height")
                 jpeg_bytes_value = tool_result.get("jpeg_bytes")
@@ -2031,7 +2045,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     await self._safe_response_create()
                 self._tool_batch_only_gestured = True
             if sight_note is not None:
-                self.note_image(sight_note, "camera")
+                self.note_image(sight_note, "camera", sight_facts)
 
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")

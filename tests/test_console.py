@@ -2846,6 +2846,9 @@ def test_a_sight_frame_is_a_notification_and_needs_a_companion_attached() -> Non
     [(method, params)] = sent
     assert method == "conversation.sight"
     assert (params["jpeg"], params["source"]) == ("abc", "camera") and isinstance(params["at"], float)
+    assert "facts" not in params
+    stream._dispatch_sight("abc", "camera", {"zoom": 1.82})
+    assert sent[-1][1]["facts"] == {"zoom": 1.82}
 
 
 # --- the crash of 2026-10-07: sends from an RPC handler go on the handler's loop ----

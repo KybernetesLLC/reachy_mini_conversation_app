@@ -214,6 +214,11 @@ def no_picture(source: str, reason: str) -> Dict[str, Any]:
     return {"no_picture": True, "instruction": NO_PICTURE.format(reason=reason)}
 
 
+# The facts handed to the companion with the frame, for its kept copy (the frame store's
+# `camera` kind, 24 h; the owner, 11-09): what the result says, and the question asked.
+FACT_KEYS = ("closer", "frame", "box", "image_width", "image_height", "jpeg_bytes", "zoom", "taken_at")
+
+
 def picture_facts(closer: Optional[str], meta: Dict[str, Any], jpeg: bytes) -> Dict[str, Any]:
     """Return what the result says about the picture, for the model and the analyses.
 
