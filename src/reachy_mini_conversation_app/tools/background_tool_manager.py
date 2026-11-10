@@ -124,7 +124,7 @@ class BackgroundTool(ToolNotification):
 # returned, so a picture asked after a turn or a head move shows the view after it. The move
 # tools return once their move has ended, each with its own deadline; ORDER_WAIT_S bounds the
 # wait behind one that never returns.
-ORDERED_TOOLS = frozenset({"turn_body", "look_at_me", "move_head", "camera"})
+ORDERED_TOOLS = frozenset({"turn_body", "look_at_me", "move_head", "camera", "look"})
 ORDER_WAIT_S = 20.0
 
 
