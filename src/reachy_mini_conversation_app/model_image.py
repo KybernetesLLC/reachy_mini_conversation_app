@@ -126,6 +126,17 @@ def jpeg_from_frame(frame: np.ndarray, spec: ModelImageSpec = MODEL_IMAGE) -> Op
     return jpeg
 
 
+def jpeg_size(jpeg: bytes) -> Optional[Tuple[int, int]]:
+    """Return a JPEG's (width, height) from its frame header, or None if there is none."""
+    i = 2
+    while i + 9 <= len(jpeg) and jpeg[i] == 0xFF:
+        marker, length = jpeg[i + 1], int.from_bytes(jpeg[i + 2 : i + 4], "big")
+        if marker in (0xC0, 0xC1, 0xC2):
+            return int.from_bytes(jpeg[i + 7 : i + 9], "big"), int.from_bytes(jpeg[i + 5 : i + 7], "big")
+        i += 2 + length
+    return None
+
+
 def jpeg_from_jpeg(
     jpeg: bytes, spec: ModelImageSpec = MODEL_IMAGE, cut: Optional[Callable[[np.ndarray], np.ndarray]] = None
 ) -> Optional[bytes]:

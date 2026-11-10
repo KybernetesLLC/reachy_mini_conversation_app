@@ -91,15 +91,26 @@ def close_box(width: int, height: int, closer: str) -> Tuple[int, int, int, int]
     return x0, y0, x0 + w, y0 + h
 
 
-def _cut(closer: Optional[str]) -> Optional[Callable[[np.ndarray], np.ndarray]]:
-    """Return a function cutting a frame to the region `closer` and logging the box, or None."""
-    if closer is None:
+def _cut(closer: Optional[str], meta: Optional[Dict[str, Any]] = None) -> Optional[Callable[[np.ndarray], np.ndarray]]:
+    """Return a function cutting a frame to the region `closer`, or None for the whole frame.
+
+    `meta`, when given, is filled with the frame's size, the box sent and when the frame
+    was taken; the whole frame then goes through the function too.
+    """
+    if closer is None and meta is None:
         return None
 
     def cut(frame: np.ndarray) -> np.ndarray:
         height, width = frame.shape[:2]
-        x0, y0, x1, y1 = close_box(width, height, closer)
-        logger.info("camera: closer=%s box=%d,%d,%d,%d of %dx%d", closer, x0, y0, x1, y1, width, height)
+        x0, y0, x1, y1 = (0, 0, width, height) if closer is None else close_box(width, height, closer)
+        if closer is not None:
+            logger.info("camera: closer=%s box=%d,%d,%d,%d of %dx%d", closer, x0, y0, x1, y1, width, height)
+        if meta is not None:
+            meta.update(
+                frame=[width, height],
+                box=[x0, y0, x1, y1],
+                taken_at=datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            )
         return frame[y0:y1, x0:x1]
 
     return cut
@@ -120,20 +131,24 @@ def _encode(camera: Any, frame: Any) -> Optional[bytes]:
     return model_image.jpeg_from_frame(frame)
 
 
-def _fresh_frame(media: Any, closer: Optional[str] = None) -> Tuple[Optional[bytes], Optional[float]]:
+def _fresh_frame(
+    media: Any, closer: Optional[str] = None, meta: Optional[Dict[str, Any]] = None
+) -> Tuple[Optional[bytes], Optional[float]]:
     """Reopen the IPC camera; return (JPEG, mean luma) of one frame, under the lock."""
     with _CAMERA_LOCK:
-        return _fresh_frame_held(media, closer)
+        return _fresh_frame_held(media, closer, meta)
 
 
-def _fresh_frame_held(media: Any, closer: Optional[str] = None) -> Tuple[Optional[bytes], Optional[float]]:
+def _fresh_frame_held(
+    media: Any, closer: Optional[str] = None, meta: Optional[Dict[str, Any]] = None
+) -> Tuple[Optional[bytes], Optional[float]]:
     """Reopen the IPC camera and return (JPEG for the model, the whole frame's mean luma).
 
     Runs in a worker thread: opening waits for the pipeline. A camera that is
     not the IPC reader is read as before, with no luma. `closer` cuts the JPEG to
-    one region of the frame.
+    one region of the frame; `meta` is filled as `_cut` says.
     """
-    cut = _cut(closer)
+    cut = _cut(closer, meta)
     old = getattr(media, "camera", None)
     if not _REOPENABLE or not isinstance(old, _REOPENABLE):
         jpeg = media.get_frame_jpeg()
@@ -158,18 +173,21 @@ def _fresh_frame_held(media: Any, closer: Optional[str] = None) -> Tuple[Optiona
     return _encode(camera, frame if cut is None else cut(frame)), float(np.mean(frame))
 
 
-def fresh_jpeg(media: Any, closer: Optional[str] = None) -> Tuple[Optional[bytes], Optional[float], Optional[str]]:
+def fresh_jpeg(
+    media: Any, closer: Optional[str] = None, meta: Optional[Dict[str, Any]] = None
+) -> Tuple[Optional[bytes], Optional[float], Optional[str]]:
     """Return (JPEG, luma, why not) from a fresh frame; for the tool and the glance.
 
     A dark frame in a lit room is tried once more, then refused. Runs in a worker
     thread: reopening the camera waits for its first frame. `closer` names a region
-    of the view (REGIONS) to send at full detail instead of the whole view.
+    of the view (REGIONS) to send at full detail instead of the whole view; `meta`
+    is filled with the frame, the box and the time it was taken.
     """
     room = _room_luma()
-    jpeg, luma = _fresh_frame(media, closer)
+    jpeg, luma = _fresh_frame(media, closer, meta)
     if luma is not None and room is not None and luma < DARK_FRAME <= ROOM_LIT <= room:
         logger.warning("camera frame dark (luma %.1f) in a lit room (%.1f); trying once more", luma, room)
-        jpeg, luma = _fresh_frame(media, closer)
+        jpeg, luma = _fresh_frame(media, closer, meta)
         if luma is not None and luma < DARK_FRAME:
             return None, luma, "dark frame in a lit room"
     if jpeg is None:
@@ -194,6 +212,26 @@ def no_picture(source: str, reason: str) -> Dict[str, Any]:
     """Log the miss and return the tool result that tells the model it has no picture."""
     logger.warning("camera: no frame for %s/%s", source, reason)
     return {"no_picture": True, "instruction": NO_PICTURE.format(reason=reason)}
+
+
+def picture_facts(closer: Optional[str], meta: Dict[str, Any], jpeg: bytes) -> Dict[str, Any]:
+    """Return what the result says about the picture, for the model and the analyses.
+
+    zoom is the detail against today's whole-view picture: 1.0 for the whole view sent at
+    the model's long side, 1.82 for a 1080p close-up, less when the encoder stepped down.
+    """
+    facts: Dict[str, Any] = {"closer": closer, "jpeg_bytes": len(jpeg)}
+    size = model_image.jpeg_size(jpeg)
+    if size is not None:
+        facts["image_width"], facts["image_height"] = size
+    if "box" in meta:
+        frame_w = meta["frame"][0]
+        cut_w = meta["box"][2] - meta["box"][0]
+        facts.update(frame=meta["frame"], box=meta["box"], taken_at=meta["taken_at"])
+        if size is not None and cut_w > 0:
+            whole_w = min(model_image.MODEL_IMAGE.long_side, frame_w)
+            facts["zoom"] = round(size[0] / cut_w * frame_w / whole_w, 2)
+    return facts
 
 
 class Camera(Tool):
@@ -242,11 +280,14 @@ class Camera(Tool):
         if not deps.camera_enabled:
             return no_picture("camera", "camera disabled")
 
-        jpeg_bytes, _luma, why_not = await asyncio.to_thread(fresh_jpeg, deps.reachy_mini.media, closer)
+        meta: Dict[str, Any] = {}
+        jpeg_bytes, _luma, why_not = await asyncio.to_thread(fresh_jpeg, deps.reachy_mini.media, closer, meta)
         if jpeg_bytes is None:
             return no_picture("camera", why_not or "no frame")
         result: Dict[str, Any] = {"b64_im": base64.b64encode(jpeg_bytes).decode("utf-8")}
-        if closer is not None:
+        result.update(picture_facts(closer, meta, jpeg_bytes))
+        whole = "box" in meta and meta["box"] == [0, 0, *meta["frame"]]  # a frame no larger than the cut
+        if closer is not None and not whole:
             where = (
                 "the middle of your view, below where a face would be"
                 if closer == "held"

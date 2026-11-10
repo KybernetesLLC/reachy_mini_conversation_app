@@ -14,7 +14,7 @@ async def test_camera_tool_returns_base64_of_sdk_jpeg(monkeypatch) -> None:
     """The tool base64-encodes the JPEG bytes returned by the SDK, as fitted for the model."""
     from reachy_mini_conversation_app import model_image
 
-    monkeypatch.setattr(model_image, "jpeg_from_jpeg", lambda jpeg: b"fitted:" + jpeg)
+    monkeypatch.setattr(model_image, "jpeg_from_jpeg", lambda jpeg, cut=None: b"fitted:" + jpeg)
     jpeg_bytes = b"\xff\xd8jpeg\xff\xd9"
     reachy_mini = MagicMock()
     reachy_mini.media.get_frame_jpeg.return_value = jpeg_bytes
@@ -387,3 +387,62 @@ async def test_a_closer_that_is_not_a_string_is_an_error(monkeypatch, tmp_path) 
     result = await Camera()(deps, question="what is that", closer=["top"])
 
     assert "closer must be one of" in result["error"] and encoded == []
+
+
+# --- 2026-11-09: what the result says about the picture ---
+
+
+def _jpeg(width: int, height: int) -> bytes:
+    """Return a JPEG header with a baseline frame of width x height, enough for jpeg_size."""
+    app0 = b"\xff\xe0" + (16).to_bytes(2, "big") + b"JFIF\x00" + bytes(9)
+    sof = b"\xff\xc0" + (17).to_bytes(2, "big") + b"\x08" + height.to_bytes(2, "big") + width.to_bytes(2, "big")
+    return b"\xff\xd8" + app0 + sof + bytes(12) + b"\xff\xd9"
+
+
+@pytest.mark.parametrize(
+    "closer,sent,zoom",
+    [(None, (1056, 594), 1.0), ("top left", (1056, 594), 1.82), ("top left", (960, 540), 1.65)],
+)
+@pytest.mark.asyncio
+async def test_the_result_carries_the_picture_facts(monkeypatch, tmp_path, closer, sent, zoom) -> None:
+    """Region, box, frame, size sent, bytes, zoom and when it was taken, close-up or not."""
+    encoded: list = []
+    deps = _big_deps(monkeypatch, tmp_path, encoded)
+    jpeg = _jpeg(*sent)
+    monkeypatch.setattr(camera_mod, "_encode", lambda camera, frame: encoded.append(frame) or jpeg)
+
+    result = await Camera()(deps, question="what is it", closer=closer)
+
+    assert result["closer"] == closer and result["frame"] == [1920, 1080]
+    assert result["box"] == ([0, 0, 1920, 1080] if closer is None else [0, 0, 1056, 594])
+    assert (result["image_width"], result["image_height"]) == sent and result["jpeg_bytes"] == len(jpeg)
+    assert result["zoom"] == zoom
+    assert result["taken_at"][:2] == "20" and "T" in result["taken_at"]
+
+
+def test_a_frame_no_larger_than_the_cut_is_not_called_a_close_up() -> None:
+    """The review, 11-09: a 640x480 frame is sent whole, so the note would be false."""
+    meta = {"frame": [640, 480], "box": [0, 0, 640, 480], "taken_at": "t"}
+    facts = camera_mod.picture_facts("right", meta, _jpeg(640, 480))
+    assert facts["zoom"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_a_small_frame_with_closer_has_no_close_up_note(monkeypatch, tmp_path) -> None:
+    """A closer on a frame the size of the cut sends it whole and says nothing about a close-up."""
+    stale = FakeCamera.__new__(FakeCamera)
+    stale.camera_specs, stale.frames, stale.closed = None, [], False
+    FakeCamera.scripts = [[91.0]]
+    _, deps = _deps(monkeypatch, tmp_path, stale=stale, room_luma=None)
+
+    result = await Camera()(deps, question="what is it", closer="right")
+
+    assert "view" not in result and result["box"] == [0, 0, 4, 4]
+
+
+def test_jpeg_size_reads_the_frame_header() -> None:
+    """The size sent comes from the JPEG itself; no header, no size."""
+    from reachy_mini_conversation_app import model_image
+
+    assert model_image.jpeg_size(_jpeg(1056, 594)) == (1056, 594)
+    assert model_image.jpeg_size(b"\xff\xd8fresh\xff\xd9") is None
