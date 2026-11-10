@@ -540,6 +540,9 @@ class MovementManager:
 
         # Move queue (primary moves)
         self.move_queue: deque[Move] = deque()
+        # Moves a tool waits on (look closer, 11-09): each event is set once its move has
+        # played or was dropped (a hold clears the queue). The control loop alone touches it.
+        self._watched: list[tuple[Move, threading.Event]] = []
 
         # Configuration
         self.idle_inactivity_delay = 0.3  # seconds
@@ -600,6 +603,17 @@ class MovementManager:
         control loop remains the sole mutator of movement state.
         """
         self._command_queue.put(("queue_move", move))
+
+    def queue_watched_move(self, move: Move) -> threading.Event:
+        """Queue a primary move as queue_move does, with an event set once it is over.
+
+        The event is set once the move has played or was dropped (the companion's
+        LookAfterMove.tla `Play`, `Settle`, a hold's `Send`). Thread-safe: the move and its
+        event go through the worker command queue.
+        """
+        done = threading.Event()
+        self._command_queue.put(("queue_watched", (move, done)))
+        return done
 
     def clear_move_queue(self) -> None:
         """Stop the active move and discard any queued primary moves.
@@ -662,11 +676,7 @@ class MovementManager:
 
     def _only_a_hold_plays(self) -> bool:
         """A hold is the current move, nothing waits behind it and nothing is set aside."""
-        return (
-            isinstance(self.state.current_move, HoldPoseMove)
-            and not self.move_queue
-            and self._held_aside is None
-        )
+        return isinstance(self.state.current_move, HoldPoseMove) and not self.move_queue and self._held_aside is None
 
     def is_holding(self) -> bool:
         """Return True while a HoldPoseMove is the current or a queued move, or set aside."""
@@ -762,7 +772,11 @@ class MovementManager:
         """Handle a single cross-thread command."""
         if command == "play_sequence":
             head, antennas, body_yaw = self._last_commanded_pose
-            start = (np.asarray(head, dtype=np.float64).copy(), (float(antennas[0]), float(antennas[1])), float(body_yaw))
+            start = (
+                np.asarray(head, dtype=np.float64).copy(),
+                (float(antennas[0]), float(antennas[1])),
+                float(body_yaw),
+            )
             # A frame without a body yaw keeps the yaw the sequence starts from.
             frames = [(h, a, start[2] if y is None else y, m, p) for h, a, y, m, p in payload]
             move = PoseSequenceMove(frames, start)
@@ -770,6 +784,10 @@ class MovementManager:
             self.state.update_activity()
             logger.info("Playing a pose sequence of %d frames over %.2fs", len(move.frames), move.duration)
             return
+        if command == "queue_watched":
+            move, done = payload
+            self._watched.append((move, done))
+            command, payload = "queue_move", move
         if command == "queue_move":
             if isinstance(payload, Move):
                 self.move_queue.append(payload)
@@ -1102,7 +1120,20 @@ class MovementManager:
     def _update_primary_motion(self, current_time: float) -> None:
         """Advance queue state and idle behaviours for this tick."""
         self._manage_move_queue(current_time)
+        self._release_watched()
         self._manage_breathing(current_time)
+
+    def _release_watched(self) -> None:
+        """Set the event of every watched move neither playing nor queued: played or dropped."""
+        if not self._watched:
+            return
+        kept = []
+        for move, done in self._watched:
+            if self.state.current_move is move or any(m is move for m in self.move_queue):
+                kept.append((move, done))
+            else:
+                done.set()
+        self._watched = kept
 
     def _calculate_blended_antennas(self, target_antennas: Tuple[float, float]) -> Tuple[float, float]:
         """Blend target antennas with listening freeze state and update blending.

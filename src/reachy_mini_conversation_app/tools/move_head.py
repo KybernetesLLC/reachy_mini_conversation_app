@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Any, Dict, Tuple, Literal
 
@@ -8,6 +9,9 @@ from reachy_mini_conversation_app.dance_emotion_moves import GotoQueueMove
 
 
 logger = logging.getLogger(__name__)
+
+# Past its duration, how long move_head waits for its move to play (a queue behind an emotion).
+MOVE_WAIT_GRACE_SECONDS = 4.0
 
 Direction = Literal["left", "right", "up", "down", "front"]
 
@@ -74,9 +78,13 @@ class MoveHead(Tool):
                 duration=deps.motion_duration_s,
             )
 
-            movement_manager.queue_move(goto_move)
+            done = movement_manager.queue_watched_move(goto_move)
             movement_manager.set_moving_state(deps.motion_duration_s)
-
+            # Look closer (11-09): return once the move has played or was dropped, so a picture
+            # asked after it shows the new view; the deadline covers a queue that never plays.
+            played = await asyncio.to_thread(done.wait, deps.motion_duration_s + MOVE_WAIT_GRACE_SECONDS)
+            if not played:
+                logger.warning("move_head %s: the move did not play in time", direction)
             return {"status": f"looking {direction}"}
 
         except Exception as e:

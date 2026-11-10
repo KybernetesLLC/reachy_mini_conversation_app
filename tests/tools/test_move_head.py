@@ -26,7 +26,7 @@ async def test_move_head_queues_goto_move() -> None:
     deps = _deps()
     result = await MoveHead()(deps, direction="left")
     assert result == {"status": "looking left"}
-    queued_move = deps.movement_manager.queue_move.call_args.args[0]
+    queued_move = deps.movement_manager.queue_watched_move.call_args.args[0]
     assert isinstance(queued_move, GotoQueueMove)
     deps.movement_manager.set_moving_state.assert_called_once_with(deps.motion_duration_s)
 
@@ -49,8 +49,42 @@ async def test_looking_right_is_from_where_the_body_faces() -> None:
 
     deps = _deps()  # body yaw 0.5
     await MoveHead()(deps, direction="right")
-    move = deps.movement_manager.queue_move.call_args.args[0]
+    move = deps.movement_manager.queue_watched_move.call_args.args[0]
     assert move.start_body_yaw == pytest.approx(0.5)
     assert move.target_body_yaw == pytest.approx(0.5)
     head_yaw = float(np.arctan2(move.target_head_pose[1, 0], move.target_head_pose[0, 0]))
     assert head_yaw == pytest.approx(0.5 - np.radians(40), abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_move_head_returns_once_its_move_has_played() -> None:
+    """The tool returns once the move has played, not when it was queued.
+
+    Look closer (the companion's LookAfterMove.tla `headsleep`): a picture asked after it
+    shows the new view.
+    """
+    import asyncio
+    import threading
+
+    deps = _deps()
+    done = threading.Event()
+    deps.movement_manager.queue_watched_move.return_value = done
+    tool = asyncio.create_task(MoveHead()(deps, direction="up"))
+    await asyncio.sleep(0.05)
+    assert not tool.done()
+    done.set()
+    assert await asyncio.wait_for(tool, 1.0) == {"status": "looking up"}
+
+
+@pytest.mark.asyncio
+async def test_move_head_stops_waiting_at_its_deadline(monkeypatch) -> None:
+    """A move that never plays ends the wait at its deadline."""
+    import threading
+
+    from reachy_mini_conversation_app.tools import move_head
+
+    monkeypatch.setattr(move_head, "MOVE_WAIT_GRACE_SECONDS", 0.01)
+    deps = _deps()
+    deps.motion_duration_s = 0.01
+    deps.movement_manager.queue_watched_move.return_value = threading.Event()
+    assert await MoveHead()(deps, direction="up") == {"status": "looking up"}

@@ -119,6 +119,15 @@ class BackgroundTool(ToolNotification):
         )
 
 
+# Look closer (11-09; the companion's docs/formal/posture/LookAfterMove.tla, "serial"): calls
+# that move him or take a picture run one after another, each once the one before it has
+# returned, so a picture asked after a turn or a head move shows the view after it. The move
+# tools return once their move has ended, each with its own deadline; ORDER_WAIT_S bounds the
+# wait behind one that never returns.
+ORDERED_TOOLS = frozenset({"turn_body", "look_at_me", "move_head", "camera"})
+ORDER_WAIT_S = 20.0
+
+
 class BackgroundToolManager(BaseModel):
     """Manages background tools for non-blocking tool execution.
 
@@ -136,6 +145,7 @@ class BackgroundToolManager(BaseModel):
     _max_tool_duration_seconds: float = PrivateAttr(default=86400)  # 1 day
     _max_tool_memory_seconds: float = PrivateAttr(default=3600)  # 1 hour
     _session_index: int = PrivateAttr(default=0)
+    _ordered_last: Optional[asyncio.Task[None]] = PrivateAttr(default=None)
 
     def set_loop(
         self,
@@ -198,10 +208,13 @@ class BackgroundToolManager(BaseModel):
         )
         self._tools[background_tool.tool_id] = background_tool
 
+        after = self._ordered_last if tool_name in ORDERED_TOOLS else None
         async_task = asyncio.create_task(
-            self._run_tool(background_tool, tool_call_routine),
+            self._run_tool(background_tool, tool_call_routine, after),
             name=f"bg-{tool_name}-{id}",
         )
+        if tool_name in ORDERED_TOOLS:
+            self._ordered_last = async_task
         background_tool._task = async_task
         async_task.add_done_callback(lambda task: self._cancelled_unstarted(background_tool, task))
 
@@ -232,8 +245,19 @@ class BackgroundToolManager(BaseModel):
         self,
         background_tool: BackgroundTool,
         tool_call_routine: ToolCallRoutine,
+        after: Optional[asyncio.Task[None]] = None,
     ) -> None:
-        """Execute the tool and handle completion."""
+        """Execute the tool and handle completion; first, wait for `after` (ORDERED_TOOLS)."""
+        if after is not None and not after.done():
+            # asyncio.wait: neither the other call's error nor its cancel ends this one
+            _, waiting = await asyncio.wait({after}, timeout=ORDER_WAIT_S)
+            if waiting:
+                logger.warning(
+                    "%s (id=%s) started after %.0f s behind an earlier call that had not returned",
+                    background_tool.tool_name,
+                    background_tool.id,
+                    ORDER_WAIT_S,
+                )
         result: dict[str, Any] = await tool_call_routine(self)
         background_tool.completed_at = time.monotonic()
         error = result.get("error")

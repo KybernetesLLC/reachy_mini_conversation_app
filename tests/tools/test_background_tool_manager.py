@@ -671,3 +671,67 @@ class TestNotificationQueue:
         n = manager._notification_queue.get_nowait()
         assert n.status == ToolState.FAILED
         assert "RuntimeError: oops" in (n.error or "")
+
+
+class TestOrderedTools:
+    """Look closer: a picture asked after a move starts once the move tool has returned.
+
+    The companion's LookAfterMove.tla, "serial".
+    """
+
+    @staticmethod
+    def _timed(tool_name: str, log: list[tuple[str, str]], delay: float) -> ToolCallRoutine:
+        routine = MagicMock(spec=ToolCallRoutine)
+        routine.tool_name = tool_name
+        routine.args_json_str = "{}"
+
+        async def _call(manager: BackgroundToolManager) -> dict[str, Any]:
+            log.append(("start", tool_name))
+            await asyncio.sleep(delay)
+            log.append(("end", tool_name))
+            return {"ok": True}
+
+        routine.side_effect = _call
+        return routine
+
+    @pytest.mark.asyncio
+    async def test_a_camera_call_waits_for_the_turn_before_it(self, manager) -> None:
+        """The camera starts after the turn ends."""
+        log: list[tuple[str, str]] = []
+        turn = await manager.start_tool("t", self._timed("turn_body", log, 0.05), False)
+        cam = await manager.start_tool("c", self._timed("camera", log, 0.0), False)
+        await asyncio.gather(turn._task, cam._task)
+        assert log == [("start", "turn_body"), ("end", "turn_body"), ("start", "camera"), ("end", "camera")]
+
+    @pytest.mark.asyncio
+    async def test_other_tools_do_not_wait(self, manager) -> None:
+        """A tool outside the ordered set runs alongside."""
+        log: list[tuple[str, str]] = []
+        turn = await manager.start_tool("t", self._timed("turn_body", log, 0.05), False)
+        other = await manager.start_tool("o", self._timed("remember", log, 0.0), False)
+        await asyncio.gather(turn._task, other._task)
+        assert log.index(("end", "remember")) < log.index(("end", "turn_body"))
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_move_does_not_cancel_the_picture(self, manager) -> None:
+        """A cancel of the move ends the wait, not the picture."""
+        log: list[tuple[str, str]] = []
+        turn = await manager.start_tool("t", self._timed("move_head", log, 5.0), False)
+        cam = await manager.start_tool("c", self._timed("camera", log, 0.0), False)
+        await asyncio.sleep(0.01)
+        turn._task.cancel()
+        await asyncio.wait_for(cam._task, 1.0)
+        assert ("end", "camera") in log
+
+    @pytest.mark.asyncio
+    async def test_the_wait_behind_a_call_that_never_returns_is_bounded(self, manager, monkeypatch) -> None:
+        """ORDER_WAIT_S ends the wait behind a call that never returns."""
+        from reachy_mini_conversation_app.tools import background_tool_manager as btm
+
+        monkeypatch.setattr(btm, "ORDER_WAIT_S", 0.02)
+        log: list[tuple[str, str]] = []
+        stuck = await manager.start_tool("t", self._timed("turn_body", log, 5.0), False)
+        cam = await manager.start_tool("c", self._timed("camera", log, 0.0), False)
+        await asyncio.wait_for(cam._task, 1.0)
+        assert ("end", "camera") in log
+        stuck._task.cancel()

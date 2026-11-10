@@ -1323,3 +1323,44 @@ def test_a_gaze_hold_never_cuts_a_playing_move() -> None:
     manager.state.current_move = emotion  # an emotion is playing
     manager._handle_command("hold_pose", (gazed, (0.2, -0.2), 0.3, None, True), t0)
     assert manager.state.current_move is emotion and not manager.move_queue
+
+
+def _watching_manager() -> MovementManager:
+    robot = MagicMock()
+    robot.get_current_joint_positions.return_value = ([0.0] * 6, [0.0, 0.0])
+    robot.get_current_head_pose.return_value = np.eye(4)
+    return MovementManager(robot)
+
+
+def test_a_watched_move_is_released_once_it_has_played() -> None:
+    """The event is set when the move ends, not when it is queued.
+
+    Look closer: the companion's LookAfterMove.tla `Play`, `Settle`.
+    """
+    import threading
+
+    manager = _watching_manager()
+    look = GotoQueueMove(target_head_pose=create_head_pose(0, 0, 0, 0, -30, 0, degrees=True), duration=1.0)
+    done = threading.Event()
+    t0 = manager._now()
+    manager._handle_command("queue_watched", (look, done), t0)
+    manager._update_primary_motion(t0)
+    assert manager.state.current_move is look and not done.is_set()
+    manager._update_primary_motion(t0 + 0.5)
+    assert not done.is_set()
+    manager._update_primary_motion(t0 + 1.1)
+    assert done.is_set()
+
+
+def test_a_watched_move_a_hold_drops_is_released() -> None:
+    """A turn's hold clears the queue (LookAfterMove `Send`): the waiting tool is let go."""
+    import threading
+
+    manager = _watching_manager()
+    look = GotoQueueMove(target_head_pose=create_head_pose(0, 0, 0, 0, -30, 0, degrees=True), duration=1.0)
+    done = threading.Event()
+    t0 = manager._now()
+    manager._handle_command("queue_watched", (look, done), t0)
+    manager._handle_command("hold_pose", (create_head_pose(0, 0, 0, 0, 0, 0, degrees=True), (0.0, 0.0), 1.0), t0)
+    manager._update_primary_motion(t0)
+    assert done.is_set()
