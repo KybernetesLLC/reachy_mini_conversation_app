@@ -6093,3 +6093,16 @@ async def test_a_reply_with_markup_the_gate_passed_raises_the_alarm(caplog: Any)
     clean_reports = _capture_tool_reports(clean)
     clean._scrub_leak("it8", "Hello there.", "Hello there.")
     assert clean_reports == []
+
+
+
+@pytest.mark.asyncio
+async def test_markup_after_the_release_is_still_scrubbed() -> None:
+    """LeakScrub.tla: with no transcript.done, markup that came after the gate released the
+    reply went unseen, so the reply stayed in the talk."""
+    handler = _plain_handler()
+    handler.connection = conn = _ScrubConnection()
+    handler._gate = "pass"
+    handler._gate_transcript("Sure, here it is. <tool_code> express() </tool_code>")
+    await handler._scrub_at_done(_scrub_done("it9"))
+    assert conn.sent == [("delete", "it9")]

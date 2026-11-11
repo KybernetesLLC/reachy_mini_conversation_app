@@ -1009,9 +1009,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Judge the response's transcript so far: release on a reply, cut an artifact, else
         wait. `final` is the whole transcript: a bare tool name is judged only on it.
         """
-        if self._gate == "cut" or (self._gate == "pass" and not final):
+        if self._gate == "cut":
             return
-        self._gate_text = text
+        self._gate_text = text  # after the release too: the scrub reads it at response.done (11-11)
+        if self._gate == "pass" and not final:
+            return
         verdict = judge(text, self._gate_tools, final=final)
         self._gate_name_wait = verdict.waits_on_name
         if verdict.action == PLAY_AND_LOG:
