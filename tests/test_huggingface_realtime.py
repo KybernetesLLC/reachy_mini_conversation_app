@@ -6150,3 +6150,28 @@ async def test_markup_in_deltas_after_the_release_is_scrubbed_in_a_session(
     monkeypatch.setattr(handler, "_scrub_at_done", scrub)
     await handler._run_realtime_session()
     assert conn.sent == [("delete", "it12")]
+
+
+@pytest.mark.asyncio
+async def test_a_session_reply_ending_in_an_open_tag_is_scrubbed(monkeypatch: Any) -> None:
+    """The review of 99feb02: the open fragment through the session's own delta path."""
+    events = (
+        _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+        _said("Sure, here it is, the song you asked about. "),
+        _audio(1, 2),
+        _said("<tool_code> express("),
+        _FakeEvent("response.output_audio.done"),
+        _scrub_done("it13"),
+    )
+    handler = _session_handler(monkeypatch, events)
+    handler._clear_queue = lambda: None
+    conn = _ScrubConnection()
+    real = handler._scrub_at_done
+
+    async def scrub(event: Any) -> None:
+        handler.connection = conn
+        await real(event)
+
+    monkeypatch.setattr(handler, "_scrub_at_done", scrub)
+    await handler._run_realtime_session()
+    assert conn.sent == [("delete", "it13")]

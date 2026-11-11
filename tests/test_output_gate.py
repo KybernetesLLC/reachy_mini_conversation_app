@@ -772,6 +772,11 @@ def test_a_tool_name_before_brackets_in_words_plays(said: str) -> None:
         ("I like to dance(s", False),
         ("I want to cal", False),
         ("Look at this `", False),
+        ("I <3 you", False),
+        ("a < b, and", False),
+        ("I love you <", False),
+        ("Sure. <stay", True),
+        ("Sure. <|tool_call>call:ex", True),
         ('Done. <tool_code> express(feeling="x") </tool_code> and more', False),
     ],
 )

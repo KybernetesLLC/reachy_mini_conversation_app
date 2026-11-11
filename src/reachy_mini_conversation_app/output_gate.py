@@ -493,16 +493,22 @@ def without_calls(text: str, tools: ToolNames | None = None) -> str:
 
 
 
+_TAG_START = re.compile(r"<[A-Za-z_|/]")  # "a < b" is a comparison
+
+
 def _words_in_brackets(inner: str) -> bool:
     return bool(inner.strip()) and "=" not in inner and '"' not in inner
 
 
 def ends_in_open_call(text: str, tools: ToolNames | None = None) -> bool:
-    """Whether `text` stops inside an unfinished call: "Sure. <tool_code> express(" when a
-    barge-in cancels the reply mid-tag (the 11-11 review, F3). `without_calls` keeps such a
-    fragment, since a closed shape is all it removes. An open bracket, star or underscore is
-    a stage direction or words ("I like music (jazz"), and so is a word cut short that
-    "call:" or a code fence starts with. Pure."""
+    """Whether `text` holds an unfinished call, which runs on to its end.
+
+    "Sure. <tool_code> express(" when a barge-in cancels the reply mid-tag (the 11-11 review,
+    F3): `without_calls` keeps such a fragment, since a closed shape is all it removes. A "<"
+    starts one only right before a letter, "_", "|" or "/". An open bracket, star or
+    underscore is a stage direction or words ("I like music (jazz"), and so is a word cut
+    short that "call:" or a code fence starts with. Pure.
+    """
     i = 0
     while i < len(text):
         if text[i] == "<" or i == 0 or not text[i - 1].isalnum():
@@ -511,6 +517,8 @@ def ends_in_open_call(text: str, tools: ToolNames | None = None) -> bool:
                 rest = text[i:].lower()
                 if text[i] in _DIRECTION_CLOSERS:
                     pass
+                elif text[i] == "<" and not _TAG_START.match(text, i):
+                    pass  # "I <3 you", "a < b": no tag starts there (the review of 99feb02)
                 elif rest[:1] == "`" and not rest.startswith("```"):
                     pass
                 elif rest[:1] == "c" and "call:".startswith(rest):
