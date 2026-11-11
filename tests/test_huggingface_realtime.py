@@ -5940,3 +5940,119 @@ async def test_reasoning_found_after_the_hold_released_its_audio_flushes_the_pla
     assert [list(a.reshape(-1)) for _r, a in _frames(handler)] == [
         [1, 2]
     ]  # released before the cut; the fake flush drained nothing, later audio dropped
+
+
+# --- the leaked reply's scrub (11-11: a leak kept in the backend's history brings the next) ---
+
+
+class _ScrubConnection:
+    """A connection that records the item deletes and creates sent on it."""
+
+    def __init__(self) -> None:
+        """Start with nothing sent."""
+        self.sent: list[tuple[str, Any]] = []
+        self.conversation = SimpleNamespace(
+            item=SimpleNamespace(create=self._create, delete=self._delete)
+        )
+
+    async def _create(self, **kw: Any) -> None:
+        """Record the create."""
+        self.sent.append(("create", kw["item"]))
+
+    async def _delete(self, **kw: Any) -> None:
+        """Record the delete."""
+        self.sent.append(("delete", kw["item_id"]))
+
+
+async def _scrubbed(handler: HuggingFaceRealtimeHandler) -> None:
+    """Wait for the scrubs the handler started."""
+    await asyncio.gather(*list(handler._leak_tasks))
+
+
+@pytest.mark.asyncio
+async def test_a_played_reply_with_markup_is_swapped_for_its_words_in_the_talk() -> None:
+    """Delete the leaked item, then put back the words he said."""
+    handler = _plain_handler()
+    handler.connection = conn = _ScrubConnection()
+    handler._prune.items["it1"] = 1.0
+    handler._scrub_leak("it1", "<call:express{}/>I'm glad.", "I'm glad.")
+    await _scrubbed(handler)
+    assert conn.sent == [
+        ("delete", "it1"),
+        (
+            "create",
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "I'm glad."}]},
+        ),
+    ]  # fmt: skip
+    assert "it1" not in handler._prune.items  # the pruner never deletes it again
+
+
+@pytest.mark.asyncio
+async def test_a_cut_reply_leaves_the_talk_with_no_words_put_back() -> None:
+    """A cut reply was never heard: deleted, nothing put back."""
+    handler = _plain_handler()
+    handler.connection = conn = _ScrubConnection()
+    handler._gate_cut_kind = "leaked tool call"
+    handler._scrub_leak("it2", "<call:recall{}/>", "<call:recall{}/>")
+    await _scrubbed(handler)
+    assert conn.sent == [("delete", "it2")]
+
+
+@pytest.mark.asyncio
+async def test_a_clean_reply_stays_in_the_talk() -> None:
+    """A reply with no markup is left alone."""
+    handler = _plain_handler()
+    handler.connection = conn = _ScrubConnection()
+    handler._scrub_leak("it3", "Hello there.", "Hello there.")
+    await _scrubbed(handler)
+    assert conn.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_scrub_after_its_session_ended_sends_nothing() -> None:
+    """A new session has none of the old one's items: nothing is sent to either."""
+    handler = _plain_handler()
+    handler.connection = conn = _ScrubConnection()
+    handler._scrub_leak("it4", "<call:x{}/>Hi.", "Hi.")
+    handler.connection = _ScrubConnection()  # a new session, before the task ran
+    await _scrubbed(handler)
+    assert conn.sent == [] and handler.connection.sent == []
+
+
+@pytest.mark.asyncio
+async def test_the_transcript_done_hands_its_item_to_the_scrub(monkeypatch: Any) -> None:
+    """The reply's item id, what it said and what was kept reach the scrub."""
+    text = "<call:express{}/>I'm glad."
+    events = list(_reply_events(text, audio_first=False))
+    events[-2] = _FakeEvent(
+        "response.output_audio_transcript.done", transcript=text, item_id="it5"
+    )
+    handler = _session_handler(monkeypatch, tuple(events))
+    handler._clear_queue = lambda: None
+    monkeypatch.setattr(hf_mod, "without_calls", lambda t, tools=None: "I'm glad.")
+    asked: list = []
+    monkeypatch.setattr(handler, "_scrub_leak", lambda *a: asked.append(a))
+    await handler._run_realtime_session()
+    assert asked == [("it5", text, "I'm glad.")]
+
+
+@pytest.mark.asyncio
+async def test_a_delete_of_a_gone_item_wakes_no_waiting_response(monkeypatch: Any) -> None:
+    """A not-found error is never the answer to a waiting response.create.
+
+    A scrub's delete is applied after the reply ends, maybe while the next one waits.
+    """
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent(
+                "error",
+                error=SimpleNamespace(message="gone", code="conversation_item_not_found"),
+            ),
+        ),
+    )
+    handler._response_started_or_rejected_event.clear()
+    await handler._run_realtime_session()
+    assert not handler._response_started_or_rejected_event.is_set()
+    assert _messages(_drain(handler)) == []

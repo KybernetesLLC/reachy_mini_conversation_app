@@ -1071,6 +1071,42 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._leak_tasks.add(task)
         task.add_done_callback(self._leak_tasks.discard)
 
+    def _scrub_leak(self, item_id: str | None, said: str, kept: str) -> None:
+        """Take a reply with markup in it out of the backend's history (11-11).
+
+        Gemma copies its own recent replies, so one kept leak brings the next. The item is
+        deleted; a played reply's clean words go back as an assistant message, so he still
+        said them. The backend holds both until the response ends and applies them in order.
+        Ids only are logged.
+        """
+        if not item_id or self.connection is None:
+            return
+        if not self._gate_cut_kind and kept == said:
+            return
+        clean = "" if self._gate_cut_kind else kept.strip()
+        task = asyncio.create_task(self._scrub(self.connection, item_id, clean))
+        self._leak_tasks.add(task)
+        task.add_done_callback(self._leak_tasks.discard)
+
+    async def _scrub(self, conn: Any, item_id: str, clean: str) -> None:
+        """Delete the leaked item, then put back its clean words, on the session it came from."""
+        try:
+            if self.connection is not conn:
+                return  # the session ended: its history went with it
+            await conn.conversation.item.delete(item_id=item_id)
+            self._prune.forget(item_id)
+            if clean and self.connection is conn:
+                await conn.conversation.item.create(
+                    item={
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": clean}],
+                    },
+                )
+            logger.info("leaked reply %s scrubbed from the talk (words kept: %s)", item_id, bool(clean))
+        except Exception:
+            logger.exception("leaked reply %s: not scrubbed", item_id)
+
     def _leak_report(
         self, name: str, status: str, ms: float = 0.0, error: str | None = None
     ) -> dict[str, Any]:
@@ -2424,6 +2460,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._emit_transcript(
                                 "assistant", said, True, artifact="leaked tool call"
                             )
+                        self._scrub_leak(getattr(event, "item_id", None), said, kept)
                         self._response_transcript(event.transcript or "")
 
                     # Handle audio delta
@@ -2533,6 +2570,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         )
                         code = getattr(err, "code", "") or getattr(err, "type", "")
 
+                        if code == "conversation_item_not_found":
+                            # A delete of an item already gone (a scrub, a prune): never an
+                            # answer to a response.create, so it wakes no waiting sender.
+                            logger.info("Realtime: %s", msg)
+                            continue
                         if code == "conversation_already_has_active_response":
                             # response.create was rejected.  The sender worker
                             # is waiting on _response_done_event; when the active

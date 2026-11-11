@@ -85,6 +85,10 @@ class TalkPrune:
             while len(self.items) > LEDGER_MAX:
                 self.items.popitem(last=False)
 
+    def forget(self, item_id: str) -> None:
+        """Drop an item deleted elsewhere (a leaked reply's scrub): never deleted again here."""
+        self.items.pop(item_id, None)
+
     def reset(self) -> None:
         """A new session: nothing of the last one is in its conversation."""
         self.__init__()
