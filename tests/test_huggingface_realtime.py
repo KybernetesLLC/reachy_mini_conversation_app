@@ -6106,3 +6106,47 @@ async def test_markup_after_the_release_is_still_scrubbed() -> None:
     handler._gate_transcript("Sure, here it is. <tool_code> express() </tool_code>")
     await handler._scrub_at_done(_scrub_done("it9"))
     assert conn.sent == [("delete", "it9")]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_cancelled_inside_a_tag_is_scrubbed() -> None:
+    """The 11-11 review, F3: a barge-in mid-tag leaves an unclosed fragment, which
+    `without_calls` keeps, so the heard part stayed in the talk tag and all."""
+    handler = _plain_handler()
+    handler.connection = conn = _ScrubConnection()
+    handler._gate = "pass"
+    handler._gate_transcript("Sure. <tool_code> express(")
+    await handler._scrub_at_done(_scrub_done("it10"))
+    assert conn.sent == [("delete", "it10")]
+    handler._gate_transcript("I like music (jazz")  # an open bracket in words stays
+    await handler._scrub_at_done(_scrub_done("it11"))
+    assert conn.sent == [("delete", "it10")]
+
+
+@pytest.mark.asyncio
+async def test_markup_in_deltas_after_the_release_is_scrubbed_in_a_session(
+    monkeypatch: Any,
+) -> None:
+    """The review's ask: the same as above through the session's own delta path, with no
+    transcript.done, rather than a gate state set by hand."""
+    events = (
+        _FakeEvent("response.created", response=SimpleNamespace(metadata=None)),
+        _said("Sure, here it is, the song you asked about. "),
+        _audio(1, 2),
+        _said("<tool_code> express() </tool_code>"),
+        _audio(3, 4),
+        _FakeEvent("response.output_audio.done"),
+        _scrub_done("it12"),
+    )
+    handler = _session_handler(monkeypatch, events)
+    handler._clear_queue = lambda: None
+    conn = _ScrubConnection()
+    real = handler._scrub_at_done
+
+    async def scrub(event: Any) -> None:
+        handler.connection = conn
+        await real(event)
+
+    monkeypatch.setattr(handler, "_scrub_at_done", scrub)
+    await handler._run_realtime_session()
+    assert conn.sent == [("delete", "it12")]

@@ -492,6 +492,39 @@ def without_calls(text: str, tools: ToolNames | None = None) -> str:
     return re.sub(r"\s{2,}", " ", "".join(out)).strip()
 
 
+
+def _words_in_brackets(inner: str) -> bool:
+    return bool(inner.strip()) and "=" not in inner and '"' not in inner
+
+
+def ends_in_open_call(text: str, tools: ToolNames | None = None) -> bool:
+    """Whether `text` stops inside an unfinished call: "Sure. <tool_code> express(" when a
+    barge-in cancels the reply mid-tag (the 11-11 review, F3). `without_calls` keeps such a
+    fragment, since a closed shape is all it removes. An open bracket, star or underscore is
+    a stage direction or words ("I like music (jazz"), and so is a word cut short that
+    "call:" or a code fence starts with. Pure."""
+    i = 0
+    while i < len(text):
+        if text[i] == "<" or i == 0 or not text[i - 1].isalnum():
+            shape = _shape_at(text, i, final=True, tools=tools)
+            if shape is not None and shape[0] == _UNDECIDED:
+                rest = text[i:].lower()
+                if text[i] in _DIRECTION_CLOSERS:
+                    pass
+                elif rest[:1] == "`" and not rest.startswith("```"):
+                    pass
+                elif rest[:1] == "c" and "call:".startswith(rest):
+                    pass
+                elif (py := _PY_CALL.match(text, i)) and _words_in_brackets(text[py.end() + 1 :]):
+                    pass  # "dance(s" is a word, as `_shape_at` judges a closed one
+                else:
+                    return True
+            elif shape is not None and shape[1] > i:
+                i = shape[1]
+                continue
+        i += 1
+    return False
+
 # --- the gate ------------------------------------------------------------------------
 
 PLAY: Final[str] = "play"

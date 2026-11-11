@@ -60,6 +60,7 @@ from reachy_mini_conversation_app.output_gate import (  # noqa: F401  (spoken_ar
     spoken_artifact,
     leaked_express,
     without_calls,
+    ends_in_open_call,
     without_ssml,
 )
 from reachy_mini_conversation_app.tools.core_tools import (
@@ -1100,7 +1101,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if conn is None or _companion_tag(event) is not None:
             return
         text = self._gate_text or ""
-        if not (self._gate_cut_kind or (text and without_calls(text, self._gate_tools) != text)):
+        marked = text and (
+            without_calls(text, self._gate_tools) != text
+            or ends_in_open_call(text, self._gate_tools)
+        )
+        if not (self._gate_cut_kind or marked):
             return
         response = getattr(event, "response", None)
         ids = [

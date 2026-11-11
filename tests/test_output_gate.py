@@ -757,3 +757,24 @@ def test_a_leaked_express_call_gives_back_its_arguments(text: str, args: Any) ->
 def test_a_tool_name_before_brackets_in_words_plays(said: str) -> None:
     """11-11: a Python call needs no space, and empty, keyword or quoted arguments."""
     assert gate.judge(said, TOOLS, final=True).action == gate.PLAY
+
+
+@pytest.mark.parametrize(
+    ("text", "open_call"),
+    [
+        ("Sure. <tool_code> express(", True),
+        ("Sure. <tool_code>", True),
+        ('Sure. express{"feeling":', True),
+        ("Sure. <call:express{feeling:", True),
+        ('Sure. express(feeling="jo', True),
+        ("Sure, sounds good.", False),
+        ("I like music (jazz", False),
+        ("I like to dance(s", False),
+        ("I want to cal", False),
+        ("Look at this `", False),
+        ('Done. <tool_code> express(feeling="x") </tool_code> and more', False),
+    ],
+)
+def test_a_reply_cut_off_inside_a_call_is_found(text: str, open_call: bool) -> None:
+    """The 11-11 review, F3: a barge-in mid-tag; words cut short stay words."""
+    assert gate.ends_in_open_call(text, TOOLS) is open_call
