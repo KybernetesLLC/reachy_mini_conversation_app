@@ -5969,72 +5969,74 @@ async def _scrubbed(handler: HuggingFaceRealtimeHandler) -> None:
     await asyncio.gather(*list(handler._leak_tasks))
 
 
+def _scrub_done(*ids: str, tag: Any = None) -> Any:
+    """A response.done listing assistant message items `ids` (and a function call)."""
+    output = [SimpleNamespace(type="message", id=i) for i in ids]
+    output.append(SimpleNamespace(type="function_call", id="fc1"))
+    return _FakeEvent(
+        "response.done", response=SimpleNamespace(metadata=tag, output=output, status="completed")
+    )
+
+
 @pytest.mark.asyncio
-async def test_a_played_reply_with_markup_is_swapped_for_its_words_in_the_talk() -> None:
-    """Delete the leaked item, then put back the words he said."""
+async def test_a_reply_with_markup_is_deleted_at_its_end_and_nothing_put_back() -> None:
+    """LeakScrub.tla, design atdonedel: a put-back created unheard words after a barge-in."""
     handler = _plain_handler()
     handler.connection = conn = _ScrubConnection()
     handler._prune.items["it1"] = 1.0
-    handler._scrub_leak("it1", "<call:express{}/>I'm glad.", "I'm glad.")
-    await _scrubbed(handler)
-    assert conn.sent == [
-        ("delete", "it1"),
-        (
-            "create",
-            {"type": "message", "role": "assistant",
-             "content": [{"type": "output_text", "text": "I'm glad."}]},
-        ),
-    ]  # fmt: skip
+    handler._gate_text = '<tool_code> express(feeling="happy") </tool_code> Fun!'
+    await handler._scrub_at_done(_scrub_done("it1"))
+    assert conn.sent == [("delete", "it1")]
     assert "it1" not in handler._prune.items  # the pruner never deletes it again
 
 
 @pytest.mark.asyncio
-async def test_a_cut_reply_leaves_the_talk_with_no_words_put_back() -> None:
-    """A cut reply was never heard: deleted, nothing put back."""
+async def test_a_cut_reply_is_deleted_too() -> None:
     handler = _plain_handler()
     handler.connection = conn = _ScrubConnection()
-    handler._gate_cut_kind = "leaked tool call"
-    handler._scrub_leak("it2", "<call:recall{}/>", "<call:recall{}/>")
-    await _scrubbed(handler)
+    handler._gate_cut_kind, handler._gate_text = "leaked tool call", "<call:recall{}/>"
+    await handler._scrub_at_done(_scrub_done("it2"))
     assert conn.sent == [("delete", "it2")]
 
 
 @pytest.mark.asyncio
-async def test_a_clean_reply_stays_in_the_talk() -> None:
-    """A reply with no markup is left alone."""
+async def test_a_clean_reply_and_an_out_of_band_one_stay() -> None:
     handler = _plain_handler()
     handler.connection = conn = _ScrubConnection()
-    handler._scrub_leak("it3", "Hello there.", "Hello there.")
-    await _scrubbed(handler)
+    handler._gate_text = "Hello there."
+    await handler._scrub_at_done(_scrub_done("it3"))
+    handler._gate_text = "<tool_code> x() </tool_code> Hi."
+    handler._gate_cut_kind = "leaked tool call"
+    await handler._scrub_at_done(_scrub_done("it4", tag={"companion": "greeting"}))
     assert conn.sent == []
 
 
 @pytest.mark.asyncio
-async def test_a_scrub_after_its_session_ended_sends_nothing() -> None:
-    """A new session has none of the old one's items: nothing is sent to either."""
+async def test_the_session_end_scrubs_nothing() -> None:
     handler = _plain_handler()
-    handler.connection = conn = _ScrubConnection()
-    handler._scrub_leak("it4", "<call:x{}/>Hi.", "Hi.")
-    handler.connection = _ScrubConnection()  # a new session, before the task ran
-    await _scrubbed(handler)
-    assert conn.sent == [] and handler.connection.sent == []
+    handler.connection = None
+    handler._gate_cut_kind = "leaked tool call"
+    await handler._scrub_at_done(_scrub_done("it5"))  # no connection, nothing to send to
 
 
 @pytest.mark.asyncio
-async def test_the_transcript_done_hands_its_item_to_the_scrub(monkeypatch: Any) -> None:
-    """The reply's item id, what it said and what was kept reach the scrub."""
-    text = "<call:express{}/>I'm glad."
+async def test_a_session_deletes_a_leaked_reply_before_the_response_is_done(
+    monkeypatch: Any,
+) -> None:
+    """Sent before a waiting response.create can wake, so it is not deferred into the next."""
+    text = "<tool_code> express() </tool_code> I'm glad."
     events = list(_reply_events(text, audio_first=False))
-    events[-2] = _FakeEvent(
-        "response.output_audio_transcript.done", transcript=text, item_id="it5"
-    )
+    events[-1] = _scrub_done("it6")
     handler = _session_handler(monkeypatch, tuple(events))
     handler._clear_queue = lambda: None
-    monkeypatch.setattr(hf_mod, "without_calls", lambda t, tools=None: "I'm glad.")
-    asked: list = []
-    monkeypatch.setattr(handler, "_scrub_leak", lambda *a: asked.append(a))
+    order: list = []
+
+    async def scrub(event: Any) -> None:
+        order.append(("scrub", handler._response_done_event.is_set()))
+
+    monkeypatch.setattr(handler, "_scrub_at_done", scrub)
     await handler._run_realtime_session()
-    assert asked == [("it5", text, "I'm glad.")]
+    assert order == [("scrub", False)]
 
 
 @pytest.mark.asyncio

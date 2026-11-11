@@ -1078,23 +1078,40 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         task.add_done_callback(self._leak_tasks.discard)
 
     def _scrub_leak(self, item_id: str | None, said: str, kept: str) -> None:
-        """Take a reply with markup in it out of the backend's history (11-11).
-
-        Gemma copies its own recent replies, so one kept leak brings the next. The item is
-        deleted; a played reply's clean words go back as an assistant message, so he still
-        said them. The backend holds both until the response ends and applies them in order.
-        Ids only are logged.
-        """
+        """At a reply's transcript: run a leaked express, or raise the alarm on markup the gate
+        passed. The scrub itself waits for the response's end (`_scrub_at_done`)."""
         if not self._gate_cut_kind and kept == said:
             self._unknown_markup(said)
             return
-        if not item_id or self.connection is None:
-            return
         self._run_leaked_express(said)
-        clean = "" if self._gate_cut_kind else kept.strip()
-        task = asyncio.create_task(self._scrub(self.connection, item_id, clean))
-        self._leak_tasks.add(task)
-        task.add_done_callback(self._leak_tasks.discard)
+
+    async def _scrub_at_done(self, event: Any) -> None:
+        """Take a reply with markup out of the backend's history at its response.done (11-11,
+        docs/formal/conversation LeakScrub.tla, design `atdonedel`): Gemma copies its own recent
+        replies, so one kept leak brings the next. Only deletes, by the ids response.done lists:
+        putting the clean words back created words nobody heard after a barge-in, and doubled a
+        reply on a deferred route. Sent before the next response.create can be, so the delete is
+        not deferred into it. An out-of-band response (the greeting, a filler) is in no history.
+        Judged from the response's own text, so a reply with no transcript.done is scrubbed too.
+        Ids only are logged."""
+        conn = self.connection
+        if conn is None or _companion_tag(event) is not None:
+            return
+        text = self._gate_text or ""
+        if not (self._gate_cut_kind or (text and without_calls(text, self._gate_tools) != text)):
+            return
+        response = getattr(event, "response", None)
+        ids = [
+            i for item in (getattr(response, "output", None) or [])
+            if getattr(item, "type", None) == "message" and (i := getattr(item, "id", None))
+        ]  # fmt: skip
+        for item_id in ids:
+            try:
+                await conn.conversation.item.delete(item_id=item_id)
+                self._prune.forget(item_id)
+                logger.info("leaked reply %s scrubbed from the talk", item_id)
+            except Exception:
+                logger.exception("leaked reply %s: not scrubbed", item_id)
 
     def _unknown_markup(self, said: str) -> None:
         """Raise the alarm on a reply that carries markup the gate passed (11-11: a new shape
@@ -1128,25 +1145,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         task = asyncio.create_task(run())
         self._leak_tasks.add(task)
         task.add_done_callback(self._leak_tasks.discard)
-
-    async def _scrub(self, conn: Any, item_id: str, clean: str) -> None:
-        """Delete the leaked item, then put back its clean words, on the session it came from."""
-        try:
-            if self.connection is not conn:
-                return  # the session ended: its history went with it
-            await conn.conversation.item.delete(item_id=item_id)
-            self._prune.forget(item_id)
-            if clean and self.connection is conn:
-                await conn.conversation.item.create(
-                    item={
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": clean}],
-                    },
-                )
-            logger.info("leaked reply %s scrubbed from the talk (words kept: %s)", item_id, bool(clean))
-        except Exception:
-            logger.exception("leaked reply %s: not scrubbed", item_id)
 
     def _leak_report(
         self, name: str, status: str, ms: float = 0.0, error: str | None = None
@@ -2332,6 +2330,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 self._dropped_deltas,
                             )
                             self._dropped_deltas = 0
+                        await self._scrub_at_done(event)  # before a sender can wake (11-11)
                         # Doesn't mean the audio is done playing
                         # Resume tracking for responses that emit no audio (text-only / tool-only).
                         self.deps.movement_manager.set_speaking(False)
