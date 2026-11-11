@@ -6056,3 +6056,21 @@ async def test_a_delete_of_a_gone_item_wakes_no_waiting_response(monkeypatch: An
     await handler._run_realtime_session()
     assert not handler._response_started_or_rejected_event.is_set()
     assert _messages(_drain(handler)) == []
+
+
+@pytest.mark.asyncio
+async def test_a_leaked_express_runs_with_its_feeling(monkeypatch: Any) -> None:
+    """Its face shows the feeling the reply wrote (11-11)."""
+    handler = _plain_handler()
+    handler.connection = _ScrubConnection()
+    ran: list = []
+
+    async def express(deps: Any, **kw: Any) -> dict:
+        ran.append(kw)
+        return {"ok": True}
+
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"express": express})
+    said = '<tool_code> express(feeling="happy", intensity=0.6) </tool_code> Fun!'
+    handler._scrub_leak("it6", said, "Fun!")
+    await _scrubbed(handler)
+    assert ran == [{"feeling": "happy", "intensity": 0.6}]

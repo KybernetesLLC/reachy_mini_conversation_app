@@ -58,6 +58,7 @@ from reachy_mini_conversation_app.output_gate import (  # noqa: F401  (spoken_ar
     ToolNames,
     judge,
     spoken_artifact,
+    leaked_express,
     without_calls,
     without_ssml,
 )
@@ -1083,8 +1084,33 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return
         if not self._gate_cut_kind and kept == said:
             return
+        self._run_leaked_express(said)
         clean = "" if self._gate_cut_kind else kept.strip()
         task = asyncio.create_task(self._scrub(self.connection, item_id, clean))
+        self._leak_tasks.add(task)
+        task.add_done_callback(self._leak_tasks.discard)
+
+    def _run_leaked_express(self, said: str) -> None:
+        """Run an express call the model wrote as text, with its arguments (11-11): it has no
+        call_id, so nothing goes back to the server; express checks its own arguments."""
+        args = leaked_express(said)
+        tool = core_tools.get_tools().get("express") if args else None
+        if tool is None:
+            return
+
+        async def run() -> None:
+            started, status, error = time.monotonic(), "ok", None
+            try:
+                await tool(self.deps, **args)
+            except Exception as exc:  # a report, never a crash
+                status, error = "error", f"{type(exc).__name__}: {exc}"
+                logger.warning("leaked express: failed: %s", error)
+            logger.info("leaked express: run from the reply's text (%s)", status)
+            self._report_tool_call(
+                self._leak_report("express", status, (time.monotonic() - started) * 1000, error)
+            )
+
+        task = asyncio.create_task(run())
         self._leak_tasks.add(task)
         task.add_done_callback(self._leak_tasks.discard)
 

@@ -730,3 +730,46 @@ def judge(text: str, tools: ToolNames, *, final: bool = False) -> Verdict:
             continue
         return verdict
     return waiting if waiting and not final else Verdict(PLAY)
+
+
+# The leaked feeling (11-11): "express(feeling=..., intensity=...)" written as text never ran, so
+# his face stopped showing what he felt (18 of 22 leaks one morning). Its arguments are read back
+# so the call can run; express checks them itself.
+_PY_EXPRESS = re.compile(r"\bexpress\s*\(([^()]*)\)")
+_GEMMA_EXPRESS = re.compile(r"call:\s*express\s*\{([^{}]*)\}", re.IGNORECASE)
+_GEMMA_ARG = re.compile(r'(\w+)\s*:\s*(?:<\|"\|>(.*?)<\|"\|>|"([^"]*)"|([\w.+-]+))')
+
+
+def leaked_express(text: str) -> dict[str, Any] | None:
+    """The arguments of the first express call written in `text` as a Python call or Gemma's
+    call markup, as literals; None without one. Pure."""
+    import ast
+
+    m = _PY_EXPRESS.search(text)
+    if m:
+        try:
+            call = ast.parse(f"f({m.group(1)})", mode="eval").body
+        except SyntaxError:
+            return None
+        if not isinstance(call, ast.Call) or call.args:
+            return None
+        out: dict[str, Any] = {}
+        for kw in call.keywords:
+            try:
+                out[str(kw.arg)] = ast.literal_eval(kw.value)
+            except ValueError:
+                return None
+        return out or None
+    m = _GEMMA_EXPRESS.search(text)
+    if m:
+        out = {}
+        for key, q, d, bare in _GEMMA_ARG.findall(m.group(1)):
+            value: Any = q or d or bare
+            if bare:
+                try:
+                    value = float(bare)
+                except ValueError:
+                    pass
+            out[key] = value
+        return out or None
+    return None

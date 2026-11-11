@@ -7,6 +7,8 @@ test_huggingface_realtime.py.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from reachy_mini_conversation_app import output_gate as gate
@@ -731,3 +733,20 @@ def test_a_tool_code_tag_before_words_is_taken_out_of_the_kept_text() -> None:
     caught, so each was kept whole and copied by the next."""
     said = '<tool_code> express(feeling="happy", intensity=0.6) </tool_code> That was fun!'
     assert gate.without_calls(said, TOOLS).strip() == "That was fun!"
+
+
+@pytest.mark.parametrize(
+    ("text", "args"),
+    [
+        ('<tool_code> express(feeling="happy", intensity=0.6) </tool_code> Fun!',
+         {"feeling": "happy", "intensity": 0.6}),
+        ('<call:express{feeling:<|"|>shy<|"|>,intensity:0.4}/>Sorry.',
+         {"feeling": "shy", "intensity": 0.4}),
+        ("express(feeling=os.system('x'))", None),  # literals only
+        ("I express myself (sometimes).", None),
+        ("Hello there.", None),
+    ],
+)  # fmt: skip
+def test_a_leaked_express_call_gives_back_its_arguments(text: str, args: Any) -> None:
+    """11-11: 18 of a morning's 22 leaks were express, and none ran."""
+    assert gate.leaked_express(text) == args
