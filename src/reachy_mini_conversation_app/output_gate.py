@@ -54,13 +54,13 @@ _PAIRS: Final[dict[str, str]] = {"(": ")", "[": "]", "{": "}"}
 # Whole special tokens and stray closing tags: <|"|>, <|im_end|>, <|tool_call>, <tool_call|>.
 _TOKEN = re.compile(
     r"<\|[^<>|\s]{1,40}\|>|<\|\w{1,40}>|<\w{1,40}\|>"
-    r"|</(?:tool_call|function_call|function|think|thinking|call)\s*>",
+    r"|</(?:tool_call|tool_code|function_call|function|think|thinking|call)\s*>",
     re.IGNORECASE,
 )
 # Wrappers whose whole body is markup: (opener, closer, kind).
 _WRAPPERS = (
     (re.compile(r"<(think|thinking)>", re.IGNORECASE), "</{}>", _THINKING),
-    (re.compile(r"<(tool_call|function_call)>", re.IGNORECASE), "</{}>", _CALL),
+    (re.compile(r"<(tool_call|tool_code|function_call)>", re.IGNORECASE), "</{}>", _CALL),
     (re.compile(r"<function=[\w.-]+>", re.IGNORECASE), "</function>", _CALL),
 )
 _TAG_CALL = re.compile(r"<call:\s*[\w.-]+\s*", re.IGNORECASE)
@@ -528,7 +528,7 @@ _CALLED_NAME = (
     re.compile(r"<function=([\w.-]+)>", re.IGNORECASE),
     re.compile(r'"name"\s*:\s*"([^"]+)"'),
     re.compile(r"^\[\s*([A-Za-z_][\w.]*)\("),
-    re.compile(r"tool_code\s*([A-Za-z_][\w.]*)\(", re.IGNORECASE),
+    re.compile(r"tool_code>?\s*([A-Za-z_][\w.]*)\(", re.IGNORECASE),  # 11-11: <tool_code> tag
     _NAME_TAG,
 )
 

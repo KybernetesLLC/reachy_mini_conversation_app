@@ -53,6 +53,8 @@ MARKUP_SHAPES = (
     "<function={n}><parameter=x>1</parameter></function>",
     "[{n}()]",
     "```tool_code\n{n}()\n```",
+    "<tool_code> {n}() </tool_code>",  # 11-11: Gemma's tag, 22 replies in half an hour
+    '<tool_code>{n}(feeling="happy", intensity=0.6)</tool_code>',
     "{n}{{}}",  # bare, no "call:" (2026-10-17, 2026-10-18)
     '{n}{{reason:<|"|>Conversational acknowledgement.<|"|>}}',
 )
@@ -722,3 +724,10 @@ def test_the_start_of_a_reasoning_opening_waits(text: str) -> None:
 )
 def test_a_short_or_diverging_opening_plays_at_once(text: str) -> None:
     assert gate.judge(text, TOOLS) == gate.Verdict(gate.PLAY)
+
+
+def test_a_tool_code_tag_before_words_is_taken_out_of_the_kept_text() -> None:
+    """11-11, 08:27 to 08:56: '<tool_code> express(...) </tool_code>' led 22 replies, none
+    caught, so each was kept whole and copied by the next."""
+    said = '<tool_code> express(feeling="happy", intensity=0.6) </tool_code> That was fun!'
+    assert gate.without_calls(said, TOOLS).strip() == "That was fun!"
