@@ -85,6 +85,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Markup the gate does not know (11-11): an angle tag of a plain name, or a call wrapper's name.
+UNKNOWN_MARKUP = re.compile(
+    r"<\s*/?\s*([A-Za-z_]{3,20})\s*/?\s*>|\b(tool_code|tool_call|function_call)\b", re.I
+)
+
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 MID_REPLY_LEFT_S = 0.5  # a barge-in this far from his reply's end cut it mid-way
@@ -1080,15 +1085,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         said them. The backend holds both until the response ends and applies them in order.
         Ids only are logged.
         """
-        if not item_id or self.connection is None:
-            return
         if not self._gate_cut_kind and kept == said:
+            self._unknown_markup(said)
+            return
+        if not item_id or self.connection is None:
             return
         self._run_leaked_express(said)
         clean = "" if self._gate_cut_kind else kept.strip()
         task = asyncio.create_task(self._scrub(self.connection, item_id, clean))
         self._leak_tasks.add(task)
         task.add_done_callback(self._leak_tasks.discard)
+
+    def _unknown_markup(self, said: str) -> None:
+        """Raise the alarm on a reply that carries markup the gate passed (11-11: a new shape
+        led 22 replies with no gate line). Only the tags' own names are logged."""
+        tags = sorted({m.group(1) or m.group(2) for m in UNKNOWN_MARKUP.finditer(said)})
+        if not tags:
+            return
+        logger.warning("reply markup the gate does not know: %s", ", ".join(tags))
+        self._report_tool_call(self._leak_report(tags[0], "unrecognised shape"))
 
     def _run_leaked_express(self, said: str) -> None:
         """Run an express call the model wrote as text, with its arguments (11-11): it has no

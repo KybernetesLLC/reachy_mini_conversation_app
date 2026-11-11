@@ -102,6 +102,9 @@ _BARE_CALL = re.compile(r"call:\s*[\w.-]+\s*", re.IGNORECASE)
 _BARE_CALL_OPEN = re.compile(r"call:\s*[\w.-]*\s*", re.IGNORECASE)
 # A name with its arguments and no "call:" at all: "idle_do_nothing{reason:...}" (2026-10-17).
 _NAMED_ARGS = re.compile(r"[A-Za-z_][\w.-]*(?=\{)")
+# A registered tool written as a Python call anywhere in a reply (11-11: the next shape is caught
+# the day it appears, not after 22 replies): "express(feeling=...)". Only registered names.
+_PY_CALL = re.compile(r"[A-Za-z_][\w.]*(?=\()")
 _CALL_ITEM = r"[A-Za-z_][\w.]*\(.*\)"
 _CALL_LIST = re.compile(rf"\[\s*{_CALL_ITEM}(?:\s*,\s*{_CALL_ITEM})*\s*\]", re.DOTALL)
 # A fenced block, ```tool_code (Gemma 3) or ```json: its tag, its body, and its closing
@@ -390,6 +393,14 @@ def _shape_at(
     named = _NAMED_ARGS.match(text, i)
     if named and _named_call(named.group(), tools):
         return (*_closed(_CALL, _balanced_end(text, named.end())), None)
+    py = _PY_CALL.match(text, i)
+    if py and tools is not None and tools.find(_normal(py.group())) is not None:
+        end = _balanced_end(text, py.end())
+        if end == -1:
+            return _UNDECIDED, -1, None
+        inner = text[py.end() + 1 : end - 1]
+        if not inner.strip() or "=" in inner or '"' in inner:  # "dance(s)" is a word
+            return _CALL, end, None
     if c in _DIRECTION_CLOSERS:
         close_at = text.find(_DIRECTION_CLOSERS[c], i + 1)
         if close_at == -1:
@@ -528,6 +539,7 @@ _CALLED_NAME = (
     re.compile(r"<function=([\w.-]+)>", re.IGNORECASE),
     re.compile(r'"name"\s*:\s*"([^"]+)"'),
     re.compile(r"^\[\s*([A-Za-z_][\w.]*)\("),
+    re.compile(r"^([A-Za-z_][\w.]*)\("),  # a bare Python call (11-11)
     re.compile(r"tool_code>?\s*([A-Za-z_][\w.]*)\(", re.IGNORECASE),  # 11-11: <tool_code> tag
     _NAME_TAG,
 )

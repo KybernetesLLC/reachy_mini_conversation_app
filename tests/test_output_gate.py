@@ -55,6 +55,7 @@ MARKUP_SHAPES = (
     "<function={n}><parameter=x>1</parameter></function>",
     "[{n}()]",
     "```tool_code\n{n}()\n```",
+    '{n}(reason="ok")',  # 11-11: a bare Python call, any tag or none
     "<tool_code> {n}() </tool_code>",  # 11-11: Gemma's tag, 22 replies in half an hour
     '<tool_code>{n}(feeling="happy", intensity=0.6)</tool_code>',
     "{n}{{}}",  # bare, no "call:" (2026-10-17, 2026-10-18)
@@ -750,3 +751,9 @@ def test_a_tool_code_tag_before_words_is_taken_out_of_the_kept_text() -> None:
 def test_a_leaked_express_call_gives_back_its_arguments(text: str, args: Any) -> None:
     """11-11: 18 of a morning's 22 leaks were express, and none ran."""
     assert gate.leaked_express(text) == args
+
+
+@pytest.mark.parametrize("said", ["I love music (jazz most).", "Dance(s) are fun.", "Look (over there)."])
+def test_a_tool_name_before_brackets_in_words_plays(said: str) -> None:
+    """11-11: a Python call needs no space, and empty, keyword or quoted arguments."""
+    assert gate.judge(said, TOOLS, final=True).action == gate.PLAY

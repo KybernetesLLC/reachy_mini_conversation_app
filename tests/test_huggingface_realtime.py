@@ -6074,3 +6074,20 @@ async def test_a_leaked_express_runs_with_its_feeling(monkeypatch: Any) -> None:
     handler._scrub_leak("it6", said, "Fun!")
     await _scrubbed(handler)
     assert ran == [{"feeling": "happy", "intensity": 0.6}]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_with_markup_the_gate_passed_raises_the_alarm(caplog: Any) -> None:
+    """11-11: <tool_code> led 22 replies before anyone knew; now the first one says so."""
+    handler = _plain_handler()
+    handler.connection = _ScrubConnection()
+    reports = _capture_tool_reports(handler)
+    said = "<new_wrapper> something(1) </new_wrapper> Hello."
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        handler._scrub_leak("it7", said, said)
+    assert "reply markup the gate does not know: new_wrapper" in caplog.text
+    assert [r["status"] for r in reports] == ["unrecognised shape"]
+    clean = _plain_handler()
+    clean_reports = _capture_tool_reports(clean)
+    clean._scrub_leak("it8", "Hello there.", "Hello there.")
+    assert clean_reports == []
