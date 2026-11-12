@@ -660,8 +660,7 @@ def test_a_tool_tag_inside_ssml_is_cut(text: str) -> None:
         "<call:stay_quiet/>",
         "<call:stay_quiet>",
         "<call:express{}/>",
-        '<p> <interact> <call name="express" args="{feeling: \'curiosity\'}"/>',
-        '<call name="express" args="{}"/></interact></p>',
+        '<call name="express" feeling="curiosity"/>',  # no args attribute: words may follow
     ],
 )
 def test_a_finished_tag_call_waits_for_what_follows(text: str) -> None:
@@ -923,3 +922,45 @@ def test_no_prefix_of_a_new_shape_is_released(said: str) -> None:
 def test_markdown_and_brackets_around_words_are_not_calls(text: str) -> None:
     assert gate.judge(text, TOOLS, final=True).tool is None
     assert gate.without_calls(text, TOOLS) == text
+
+
+def test_a_tag_with_args_is_cut_as_soon_as_it_closes() -> None:
+    """The review of 1ccb9f8, 1: an args tag waited for what followed, so the words after it
+    released the held audio with the markup. It cuts like call:express{...}."""
+    said = "<call name=\"express\" args=\"{feeling: 'joy'}\"/> Hello there."
+    closed = said.index("/>") + 2
+    for k in range(4, closed):
+        assert gate.judge(said[:k], TOOLS).action == gate.UNDECIDED, said[:k]
+    assert gate.judge(said[:closed], TOOLS).action == gate.CUT
+
+
+def test_an_open_tool_tag_waits_the_name_hold() -> None:
+    """The review of 1ccb9f8, 2: the 21:13 shape held only the short hold while its args streamed."""
+    start = LIVE_2113.index("name=") + len("name=")
+    for k in range(start, len(LIVE_2113) - 1):
+        verdict = gate.judge(LIVE_2113[:k], TOOLS)
+        assert (verdict.action, verdict.waits_on_name) == (gate.UNDECIDED, True), LIVE_2113[:k]
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        '<say name="music">Here is some music for you, I hope you like it.',
+        '<action name="dance">I am dancing now!',
+    ],
+)
+def test_a_tool_named_tag_before_words_is_a_reply_and_stays_in_the_talk(said: str) -> None:
+    """The review of 1ccb9f8, 3: it waited on every prefix, played, and was then deleted from
+    the backend's history because the kept text lost the tag."""
+    assert gate.judge(said, TOOLS).action == gate.PLAY
+    assert gate.judge(said, TOOLS, final=True).action == gate.PLAY
+    assert gate.without_calls(said, TOOLS) == said
+    assert not gate.ends_in_open_call(said, TOOLS)
+
+
+@pytest.mark.parametrize("said", ["I said response: hi{there}", "Use [ARGS] here.", "look[ARGS] ok"])
+def test_response_and_args_forms_need_a_registered_tool(said: str) -> None:
+    """The review of 1ccb9f8, 4."""
+    assert gate.judge(said, TOOLS, final=True).action == gate.PLAY
+    assert gate.without_calls(said, TOOLS) == said
+    assert not gate.ends_in_open_call(said, TOOLS)

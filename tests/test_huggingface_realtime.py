@@ -6107,6 +6107,42 @@ async def test_the_2113_interact_reply_runs_express_and_is_deleted(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tail", ["", " That was fun!"])
+async def test_the_2113_shape_streamed_is_cut_before_any_audio_and_runs_express_once(
+    monkeypatch: Any, tail: str
+) -> None:
+    """The review of 1ccb9f8, 6: the live shape through _gate_transcript one character at a
+    time, alone and followed by words, with audio held from the start."""
+    handler = _plain_handler()
+    handler.connection = _ScrubConnection()
+    handler._clear_queue = lambda: None
+    handler._gate_tools = hf_mod.ToolNames([("express", False), ("music", False)])
+    ran: list = []
+
+    async def express(deps: Any, **kw: Any) -> dict:
+        ran.append(kw)
+        return {"ok": True}
+
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"express": express})
+    said = (
+        "<p> <interact> <call name=\"express\" args=\"{feeling: 'curiosity', intensity: 0.4}\"/>"
+        + tail
+    )
+    handler._gate_start()
+    handler._gate_audio((24000, np.array([1, 2], dtype=np.int16)))
+    for k in range(1, len(said) + 1):
+        handler._gate_transcript(said[:k])
+        assert _frames(handler) == [], said[:k]
+    handler._gate_transcript(said, final=True)
+    handler._gate_audio((24000, np.array([3, 4], dtype=np.int16)))
+    assert _frames(handler) == []
+    assert handler._gate_cut_kind == "leaked tool call"
+    handler._scrub_leak("it14", said, said)
+    await _scrubbed(handler)
+    assert ran == [{"feeling": "curiosity", "intensity": 0.4}]
+
+
+@pytest.mark.asyncio
 async def test_a_reply_with_markup_the_gate_passed_raises_the_alarm(caplog: Any) -> None:
     """11-11: <tool_code> led 22 replies before anyone knew; now the first one says so."""
     handler = _plain_handler()

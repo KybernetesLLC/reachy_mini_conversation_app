@@ -61,7 +61,7 @@ _TOKEN = re.compile(
     r"|<escape>",
     re.IGNORECASE,
 )
-_BRACKET_TOKEN = re.compile(r"\[/?(?:TOOL_CALLS|ARGS|CALL_ID|TOOL_RESULTS|AVAILABLE_TOOLS)\]")
+_BRACKET_TOKEN = re.compile(r"\[/?(?:TOOL_CALLS|CALL_ID|TOOL_RESULTS|AVAILABLE_TOOLS)\]")
 # Wrappers whose whole body is markup: (opener, closer, kind).
 _WRAPPERS = (
     (re.compile(r"<(think|thinking)>", re.IGNORECASE), "</{}>", _THINKING),
@@ -87,10 +87,14 @@ _ATTR = re.compile(r"""([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 _NAME_KEYS: Final[frozenset[str]] = frozenset(
     {"name", "function", "function_name", "tool", "tool_name", "fn"}
 )
-# A tag that names no tool, which wraps a call's markup (11-11: "<p> <interact> <call .../>"):
-# skipped between shapes, and dropped from a reply a call leaked from.
+# A tag that names no tool, which wraps a call's markup: _NAME_TAG would also take "<stay
+# calm/>", a tag of words, which plays.
 _PLAIN_TAG = re.compile(
     r"""</?\s*[A-Za-z][\w-]{0,30}(?:\s+[\w:.-]+\s*=\s*(?:"[^"<>]*"|'[^'<>]*'))*\s*/?>"""
+)
+# An open tag's name-type key, so its audio waits the spoken-name hold (the review of 1ccb9f8).
+_NAME_KEY_OPEN = re.compile(
+    r"\s(?:name|function|function_name|tool|tool_name|fn)\s*=", re.IGNORECASE
 )
 _TAG_CALL_END = re.compile(r"[^<>]*?(/?)>")
 _TAG_CALL_CLOSER = re.compile(r"</call(?::[\w.-]*)?\s*>", re.IGNORECASE)
@@ -127,8 +131,9 @@ def _skip_ssml(text: str, i: int, tools: ToolNames | None) -> int:
 
 
 def _plain_tag(text: str, i: int, tools: ToolNames | None) -> re.Match[str] | None:
-    """A plain tag at text[i] that is no shape of its own: "<p>", "</interact>", not "<think>"
-    or <call name="express"/>."""
+    """A tag at text[i] that names no tool and is no shape of its own, which wraps a call's
+    markup (11-11: "<p> <interact> <call .../>"): "<p>", "</interact>", not "<think>" or
+    <call name="express"/>."""
     tag = _PLAIN_TAG.match(text, i)
     if not tag or _angle_at(text, i) is not None or _attr_tool(tag.group(), tools):
         return None
@@ -169,7 +174,7 @@ def _wrapped_calls(
 
 
 # Gemma 4's tool answer, written by the model itself after <|tool_response>: response:name{...}.
-_TOOL_RESPONSE = re.compile(r"response:\s*[\w.-]+\s*\{", re.IGNORECASE)
+_TOOL_RESPONSE = re.compile(r"response:\s*([\w.-]+)\s*\{", re.IGNORECASE)
 _BARE_CALL = re.compile(r"call:\s*[\w.-]+\s*", re.IGNORECASE)
 _BARE_CALL_OPEN = re.compile(r"call:\s*[\w.-]*\s*", re.IGNORECASE)
 # A name with its arguments and no "call:" at all: "idle_do_nothing{reason:...}" (2026-10-17).
@@ -411,17 +416,29 @@ def _attr_call_at(
 ) -> tuple[str, int] | None:
     """Match a tag naming a tool in an attribute at text[i], to its "/>" or its closing tag.
 
-    An open one waits while the reply streams; at the reply's end it is the tag alone."""
+    An open one is a call only when markup or arguments follow it, and waits while nothing
+    has; at the reply's end it is the tag alone."""
     tag = _ATTR_TAG.match(text, i)
     if not tag or _SSML.match(text, i) or _attr_tool(tag.group(), tools) is None:
         return None  # <voice name="music"> is SSML
     if tag.group(3):
         return _CALL, tag.end()
+    k = tag.end() + len(text[tag.end() :]) - len(text[tag.end() :].lstrip())
+    if k >= len(text):
+        return (_CALL, tag.end()) if final else (_UNDECIDED, -1)
+    if text[k] not in "<{[(":
+        return None  # '<say name="music">Here is some music': words, not a call (the review)
     closer = re.compile(rf"</\s*{re.escape(tag.group(1))}\s*>", re.IGNORECASE)
     found = closer.search(text, tag.end())
     if found:
         return _CALL, found.end()
     return (_CALL, tag.end()) if final else (_UNDECIDED, -1)
+
+
+def _has_args(text: str, i: int) -> bool:
+    """Whether the tag at text[i] carries its arguments in an args-type attribute."""
+    tag = _ATTR_TAG.match(text, i)
+    return bool(tag) and any(k.lower() in _ARGS_KEYS for k, _, _ in _ATTR.findall(tag.group(2)))
 
 
 def _named_call(name: str, tools: ToolNames | None) -> bool:
@@ -444,7 +461,7 @@ def _shape_at(
         tagged = angle is not None and bool(_TAG_CALL.match(text, i))
         if angle is None:
             angle = _attr_call_at(text, i, final, tools)
-            tagged = angle is not None
+            tagged = angle is not None and not _has_args(text, i)  # cut like call:x{...}
         if angle is None and tools is not None:
             tag = _NAME_TAG.match(text, i)
             if tag and _tag_tool(tag.group(), tools) is not None:
@@ -467,7 +484,9 @@ def _shape_at(
     if "call:".startswith(rest.lower()):
         return _UNDECIDED, -1, None
     response = _TOOL_RESPONSE.match(text, i)
-    if response:  # no wait on its start: "Re..." starts too many replies
+    if response and (  # no wait on its start: "Re..." starts too many replies
+        tools is None or tools.find(_normal(response.group(1))) is not None
+    ):  # a registered tool's name; with no registry, the artifact rule's whole-reply check
         return (*_closed(_CALL, _balanced_end(text, response.end() - 1)), None)
     wrapped = _wrapped_calls(text, i, final, tools) if c in "`*(" else None
     if wrapped:
@@ -505,11 +524,17 @@ def _shape_at(
         ):  # a bare list of JSON calls: an inner "]" is not its end
             return (_UNDECIDED, -1, None) if _could_be_json_call(inner) else None
     named = _NAMED_ARGS.match(text, i)
-    if named and _named_call(named.group(), tools):
-        j = named.end() + (6 if text.startswith("[ARGS]", named.end()) else 0)
-        if j >= len(text) or text[j] != "{":
+    mistral = bool(named) and text.startswith("[ARGS]", named.end())
+    if named and (
+        tools is not None and tools.find(_normal(named.group())) is not None
+        if mistral  # name[ARGS]{...}: a registered tool's only (the review)
+        else _named_call(named.group(), tools)
+    ):
+        j = named.end() + (6 if mistral else 0)
+        if j >= len(text):
             return _UNDECIDED, -1, None
-        return (*_closed(_CALL, _balanced_end(text, j)), None)
+        if text[j] == "{":
+            return (*_closed(_CALL, _balanced_end(text, j)), None)
     py = _PY_CALL.match(text, i)
     if py and tools is not None and tools.find(_normal(py.group())) is not None:
         end = _balanced_end(text, py.end())
@@ -806,6 +831,10 @@ def _ends_in_tool_tag(text: str, tools: ToolNames) -> bool:
     last = tail[i:]
     if last.lower().startswith("<call:") or "<call:".startswith(last.lower()):
         return True  # a tag call, finished or open: cut when nothing follows
+    if _NAME_KEY_OPEN.search(last) or any(
+        _attr_tool(tag.group(), tools) for tag in _ATTR_TAG.finditer(text)
+    ):  # '<call name="express" args="{fe', '<invoke name="x"><parameter': a tool's tag (the review)
+        return True
     if _NAME_TAG.fullmatch(last):
         return _tag_tool(last, tools) is not None
     opened = _NAME_TAG_OPEN.fullmatch(last)
