@@ -60,6 +60,24 @@ MARKUP_SHAPES = (
     '<tool_code>{n}(feeling="happy", intensity=0.6)</tool_code>',
     "{n}{{}}",  # bare, no "call:" (2026-10-17, 2026-10-18)
     '{n}{{reason:<|"|>Conversational acknowledgement.<|"|>}}',
+    # 11-11 21:13: a tag naming the tool in an attribute, args a JS-style object, any wrapper
+    '<p> <interact> <call name="{n}" args="{{feeling: \'curiosity\', intensity: 0.4}}"/>',
+    '<p><interact><call name="{n}" args="{{feeling: \'curiosity\'}}"/></interact></p>',
+    '<call name="{n}" feeling="curiosity" intensity="0.4"/>',
+    '<function_call name="{n}">{{"a": 1}}</function_call>',
+    # Anthropic-style XML calls
+    '<invoke name="{n}"><parameter name="a">1</parameter></invoke>',
+    '<function_calls><invoke name="{n}"><parameter name="a">1</parameter></invoke></function_calls>',
+    # FunctionGemma: its own tokens, <escape> for quotes
+    "<start_function_call>call:{n}{{a:<escape>x<escape>}}<end_function_call>",
+    # Gemma 3 in a tool_code wrapper, and a generic <tool_use> one
+    "<tool_code>\nprint(default_api.{n}(a=1))\n</tool_code>",
+    "<tool_use>{n}(a=1)</tool_use>",
+    # Gemma 4 after vLLM drops special tokens: no <|"|>, no <|tool_call>
+    "call:{n}{{feeling:curiosity,intensity:0.4}}",
+    # vLLM's other parsers: hermes, mistral (v11+); their JSON forms are in JSON_SHAPES
+    '<tool_call>\n{{"name": "{n}", "arguments": {{"a": 1}}}}\n</tool_call>',
+    '[TOOL_CALLS]{n}[ARGS]{{"a": 1}}',
 )
 
 
@@ -136,6 +154,14 @@ def test_every_multi_word_tool_said_as_words_is_cut(name: str, shape: str) -> No
         "Sure!",
         "Richie here.",
         "call:stay_quiet{} and then hello",
+        "Call me later, I'm busy.",
+        "I want to express how I feel about it.",
+        "Can you express that in words?",
+        "My name is Reachy.",
+        "Press the <Enter> key.",
+        "Please respond: yes.",
+        "My response: {yes}.",
+        "<p>Hello there.</p>",
         '{"status": "ok", "server_alias": "pollen_robotics_reachy_mini_weather_tool"}',
     ],
 )
@@ -328,6 +354,11 @@ JSON_SHAPES = (
     '```json\n{{"tool_calls": [{{"name": "{n}", "arguments": {{}}}}]}}\n```',
     '[{{"function": "{n}", "parameters": {{"items": [1, 2]}}}}]',
     '[\n  {{"name": "{n}"}}\n]',
+    # 11-11, vLLM's other parsers: llama3_json, granite, xlam, mistral (pre-v11)
+    '<|python_tag|>{{"name": "{n}", "parameters": {{"a": 1}}}}<|eom_id|>',
+    '<|tool_call|>[{{"name": "{n}", "arguments": {{"a": 1}}}}]',
+    '[{{"name": "{n}", "arguments": {{"a": 1}}}}]',
+    '[TOOL_CALLS][{{"name": "{n}", "arguments": {{"a": 1}}}}]',
 )
 
 
@@ -618,7 +649,14 @@ def test_a_tool_tag_inside_ssml_is_cut(text: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "text", ["<call:stay_quiet/>", "<call:stay_quiet>", "<call:express{}/>"]
+    "text",
+    [
+        "<call:stay_quiet/>",
+        "<call:stay_quiet>",
+        "<call:express{}/>",
+        '<p> <interact> <call name="express" args="{feeling: \'curiosity\'}"/>',
+        '<call name="express" args="{}"/></interact></p>',
+    ],
 )
 def test_a_finished_tag_call_waits_for_what_follows(text: str) -> None:
     verdict = gate.judge(text, TOOLS)
@@ -743,6 +781,18 @@ def test_a_tool_code_tag_before_words_is_taken_out_of_the_kept_text() -> None:
          {"feeling": "happy", "intensity": 0.6}),
         ('<call:express{feeling:<|"|>shy<|"|>,intensity:0.4}/>Sorry.',
          {"feeling": "shy", "intensity": 0.4}),
+        # 11-11 21:13 and 21:14: a tag naming express, its args a JS-style object
+        ('<p> <interact> <call name="express" args="{feeling: \'curiosity\', intensity: 0.4}"/>',
+         {"feeling": "curiosity", "intensity": 0.4}),
+        ('<p> <interact> <call name="express" args="{feeling: \'curiosity\', intensity: 0.3}"/>'
+         "</interact></p>", {"feeling": "curiosity", "intensity": 0.3}),
+        ('<call name="express" feeling="curiosity" intensity="0.4"/>',
+         {"feeling": "curiosity", "intensity": 0.4}),
+        ('<call name="express" args=\'{"feeling": "shy"}\'/>', {"feeling": "shy"}),
+        ("<start_function_call>call:express{feeling:<escape>shy<escape>,intensity:0.4}"
+         "<end_function_call>", {"feeling": "shy", "intensity": 0.4}),
+        ('<call name="look" args="{feeling: \'shy\'}"/>', None),
+        ('The name="express" part.', None),
         ("express(feeling=os.system('x'))", None),  # literals only
         ("I express myself (sometimes).", None),
         ("Hello there.", None),
@@ -776,6 +826,10 @@ def test_a_tool_name_before_brackets_in_words_plays(said: str) -> None:
         ("a < b, and", False),
         ("I love you <", False),
         ("Sure. <stay", True),
+        ('<p> <interact> <call name="express" args="{feel', True),
+        ("Call me later", False),
+        ("I want to express", False),
+        ("Please respo", False),
         ("Sure. <|tool_call>call:ex", True),
         ('Done. <tool_code> express(feeling="x") </tool_code> and more', False),
     ],
@@ -783,3 +837,53 @@ def test_a_tool_name_before_brackets_in_words_plays(said: str) -> None:
 def test_a_reply_cut_off_inside_a_call_is_found(text: str, open_call: bool) -> None:
     """The 11-11 review, F3: a barge-in mid-tag; words cut short stay words."""
     assert gate.ends_in_open_call(text, TOOLS) is open_call
+
+
+LIVE_2113 = '<p> <interact> <call name="express" args="{feeling: \'curiosity\', intensity: 0.4}"/>'
+
+
+@pytest.mark.parametrize("tail", ["", "</interact></p>", " </interact> </p> "])
+def test_the_2113_interact_shape_is_cut_and_names_express(tail: str) -> None:
+    """11-11 21:13 and 21:14: the alarm named "interact", the gate passed it, and it was spoken."""
+    verdict = gate.judge(LIVE_2113 + tail, TOOLS, final=True)
+    assert (verdict.action, verdict.tool, verdict.kind) == (gate.CUT, "express", "leaked tool call")
+
+
+@pytest.mark.parametrize("tail", [" That was fun!", "</interact></p> That was fun!"])
+def test_the_2113_shape_before_words_plays_and_is_kept_without_its_tags(tail: str) -> None:
+    """A reply with real words plays whole (the owner, 10-16); the kept text and the backend's
+    copy keep neither the call nor the tags around it, so the next reply has none to copy."""
+    said = LIVE_2113 + tail
+    assert gate.judge(said, TOOLS, final=True).action == gate.PLAY
+    assert gate.without_calls(said, TOOLS) == "That was fun!"
+
+
+@pytest.mark.parametrize(
+    "text", ["<p>Hello there.</p>", "Press the <Enter> key.", "<speak>Sure.</speak>"]
+)
+def test_tags_without_a_call_stay_in_the_kept_text(text: str) -> None:
+    """Only a reply a call leaked from loses its plain tags: a changed text deletes the reply
+    from the backend's history at its response.done."""
+    assert gate.without_calls(text, TOOLS) == text
+
+
+def test_a_tool_answer_the_model_writes_itself_is_cut_and_runs_nothing() -> None:
+    """Gemma 4's tool response format, written by the model: cut, no tool named, none run."""
+    said = "<|tool_response>response:express{ok:true}<tool_response|>"
+    verdict = gate.judge(said, TOOLS, final=True)
+    assert (verdict.action, verdict.tool) == (gate.CUT, None)
+    assert gate.leaked_express(said) is None
+    assert gate.without_calls(said + " Done.", TOOLS) == "Done."
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '<span title="look">Over there.</span>',  # a single-word tool as an ordinary value
+        '<voice name="music">Hello.</voice>',
+        '<call name="Matt"/> Hello.',
+    ],
+)
+def test_a_tag_whose_name_is_no_tool_or_whose_tool_is_in_another_key_plays(text: str) -> None:
+    assert gate.judge(text, TOOLS, final=True) == gate.Verdict(gate.PLAY)
+    assert gate.without_calls(text, TOOLS) == text

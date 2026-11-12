@@ -52,18 +52,44 @@ _GEMMA_QUOTE: Final[str] = '<|"|>'
 _DIRECTION_CLOSERS: Final[dict[str, str]] = {"(": ")", "[": "]", "*": "*", "_": "_"}
 _PAIRS: Final[dict[str, str]] = {"(": ")", "[": "]", "{": "}"}
 # Whole special tokens and stray closing tags: <|"|>, <|im_end|>, <|tool_call>, <tool_call|>.
+# 11-11: FunctionGemma's and Gemma 3's plain-named tokens (<start_function_call>, <escape>,
+# <end_of_turn>), and Mistral's bracketed ones ([TOOL_CALLS], [ARGS]).
 _TOKEN = re.compile(
     r"<\|[^<>|\s]{1,40}\|>|<\|\w{1,40}>|<\w{1,40}\|>"
-    r"|</(?:tool_call|tool_code|function_call|function|think|thinking|call)\s*>",
+    r"|</(?:tool_call|tool_code|function_call|function|think|thinking|call)\s*>"
+    r"|<(?:start|end)_(?:function_call|function_response|function_declaration|of_turn)>"
+    r"|<escape>",
     re.IGNORECASE,
 )
+_BRACKET_TOKEN = re.compile(r"\[/?(?:TOOL_CALLS|ARGS|CALL_ID|TOOL_RESULTS|AVAILABLE_TOOLS)\]")
 # Wrappers whose whole body is markup: (opener, closer, kind).
 _WRAPPERS = (
     (re.compile(r"<(think|thinking)>", re.IGNORECASE), "</{}>", _THINKING),
-    (re.compile(r"<(tool_call|tool_code|function_call)>", re.IGNORECASE), "</{}>", _CALL),
+    (
+        re.compile(
+            r"<(tool_call|tool_code|function_call|tool_calls|function_calls|tool_use"
+            r"|tool_response|function_response)>",
+            re.IGNORECASE,
+        ),
+        "</{}>",
+        _CALL,
+    ),
     (re.compile(r"<function=[\w.-]+>", re.IGNORECASE), "</function>", _CALL),
 )
 _TAG_CALL = re.compile(r"<call:\s*[\w.-]+\s*", re.IGNORECASE)
+# A tag that names a tool in an attribute, whatever the tag (11-11 21:13: "<call name="express"
+# args="{feeling: 'curiosity', intensity: 0.4}"/>"; Anthropic-style <invoke name="...">). Only
+# name-type keys count: single-word tools ("look", "music") are ordinary attribute values.
+_ATTR_TAG = re.compile(
+    r"""<\s*([A-Za-z_][\w:.-]*)((?:\s+[\w:.-]+\s*=\s*(?:"[^"]*"|'[^']*'))+)\s*(/?)\s*>"""
+)
+_ATTR = re.compile(r"""([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+_NAME_KEYS: Final[frozenset[str]] = frozenset(
+    {"name", "function", "function_name", "tool", "tool_name", "fn"}
+)
+# A tag with no attributes, which wraps a call's markup when no tool is named (11-11: "<p>
+# <interact> <call .../>"): skipped between shapes, and dropped from a reply a call leaked from.
+_PLAIN_TAG = re.compile(r"</?\s*[A-Za-z][\w-]{0,30}\s*/?>")
 _TAG_CALL_END = re.compile(r"[^<>]*?(/?)>")
 _TAG_CALL_CLOSER = re.compile(r"</call(?::[\w.-]*)?\s*>", re.IGNORECASE)
 # A registered tool's name written as a bare tag (11-07: "<stay_quiet/>" 17 times in one
@@ -92,16 +118,24 @@ def _skip_ssml(text: str, i: int, tools: ToolNames | None) -> int:
     tool: "<speak><stay_quiet/></speak>" is the tag alone (11-07, the review)."""
     while True:
         i = _skip(text, i)
-        ssml = _SSML.match(text, i)
+        ssml = _SSML.match(text, i) or _plain_tag(text, i)
         if not ssml or _tag_tool(ssml.group(), tools) is not None:
             return i
         i = ssml.end()
 
 
+def _plain_tag(text: str, i: int) -> re.Match[str] | None:
+    """A plain tag at text[i] that is no shape of its own: "<p>", "</interact>", not "<think>"."""
+    tag = _PLAIN_TAG.match(text, i)
+    return tag if tag and _angle_at(text, i) is None else None
+
+
+# Gemma 4's tool answer, written by the model itself after <|tool_response>: response:name{...}.
+_TOOL_RESPONSE = re.compile(r"response:\s*[\w.-]+\s*\{", re.IGNORECASE)
 _BARE_CALL = re.compile(r"call:\s*[\w.-]+\s*", re.IGNORECASE)
 _BARE_CALL_OPEN = re.compile(r"call:\s*[\w.-]*\s*", re.IGNORECASE)
 # A name with its arguments and no "call:" at all: "idle_do_nothing{reason:...}" (2026-10-17).
-_NAMED_ARGS = re.compile(r"[A-Za-z_][\w.-]*(?=\{)")
+_NAMED_ARGS = re.compile(r"[A-Za-z_][\w.-]*(?=\{|\[ARGS\])")  # Mistral: name[ARGS]{...}
 # A registered tool written as a Python call anywhere in a reply (11-11: the next shape is caught
 # the day it appears, not after 22 replies): "express(feeling=...)". Only registered names.
 _PY_CALL = re.compile(r"[A-Za-z_][\w.]*(?=\()")
@@ -322,6 +356,36 @@ def _angle_at(text: str, i: int, final: bool = False) -> tuple[str, int] | None:
     return (_UNDECIDED, -1) if ">" not in text[i:] else None
 
 
+def _attr_tool(tag: str, tools: ToolNames | None) -> LeakTool | None:
+    """The tool a tag names in a name-type attribute: <call name="express" .../>."""
+    if tools is None:
+        return None
+    for key, double, single in _ATTR.findall(tag):
+        if key.lower() in _NAME_KEYS:
+            tool = tools.find(_normal(double or single))
+            if tool is not None:
+                return tool
+    return None
+
+
+def _attr_call_at(
+    text: str, i: int, final: bool, tools: ToolNames | None
+) -> tuple[str, int] | None:
+    """Match a tag naming a tool in an attribute at text[i], to its "/>" or its closing tag.
+
+    An open one waits while the reply streams; at the reply's end it is the tag alone."""
+    tag = _ATTR_TAG.match(text, i)
+    if not tag or _SSML.match(text, i) or _attr_tool(tag.group(), tools) is None:
+        return None  # <voice name="music"> is SSML
+    if tag.group(3):
+        return _CALL, tag.end()
+    closer = re.compile(rf"</\s*{re.escape(tag.group(1))}\s*>", re.IGNORECASE)
+    found = closer.search(text, tag.end())
+    if found:
+        return _CALL, found.end()
+    return (_CALL, tag.end()) if final else (_UNDECIDED, -1)
+
+
 def _named_call(name: str, tools: ToolNames | None) -> bool:
     """A bare name{...} is a call when the name has an underscore or is a registered tool:
     "x{1}" in a reply is not (the review)."""
@@ -340,6 +404,9 @@ def _shape_at(
     if c == "<":
         angle = _angle_at(text, i, final)
         tagged = angle is not None and bool(_TAG_CALL.match(text, i))
+        if angle is None:
+            angle = _attr_call_at(text, i, final, tools)
+            tagged = angle is not None
         if angle is None and tools is not None:
             tag = _NAME_TAG.match(text, i)
             if tag and _tag_tool(tag.group(), tools) is not None:
@@ -361,6 +428,9 @@ def _shape_at(
         return (_UNDECIDED, -1, None) if _BARE_CALL_OPEN.fullmatch(rest) else None
     if "call:".startswith(rest.lower()):
         return _UNDECIDED, -1, None
+    response = _TOOL_RESPONSE.match(text, i)
+    if response:  # no wait on its start: "Re..." starts too many replies
+        return (*_closed(_CALL, _balanced_end(text, response.end() - 1)), None)
     if c == "`":
         if not rest.startswith("```"):
             return (_UNDECIDED, -1, None) if "```".startswith(rest) else None
@@ -378,6 +448,9 @@ def _shape_at(
         names = _json_call_names(text[i:end], tools)
         return (_CALL, end, names) if names else None
     if c == "[":
+        token = _BRACKET_TOKEN.match(text, i)
+        if token:
+            return _CALL, token.end(), None
         end = _balanced_end(text, i)
         if end != -1:
             if _CALL_LIST.fullmatch(text, i, end):
@@ -392,7 +465,10 @@ def _shape_at(
             return (_UNDECIDED, -1, None) if _could_be_json_call(inner) else None
     named = _NAMED_ARGS.match(text, i)
     if named and _named_call(named.group(), tools):
-        return (*_closed(_CALL, _balanced_end(text, named.end())), None)
+        j = named.end() + (6 if text.startswith("[ARGS]", named.end()) else 0)
+        if j >= len(text) or text[j] != "{":
+            return _UNDECIDED, -1, None
+        return (*_closed(_CALL, _balanced_end(text, j)), None)
     py = _PY_CALL.match(text, i)
     if py and tools is not None and tools.find(_normal(py.group())) is not None:
         end = _balanced_end(text, py.end())
@@ -489,7 +565,10 @@ def without_calls(text: str, tools: ToolNames | None = None) -> str:
                 continue
         out.append(text[i])
         i += 1
-    return re.sub(r"\s{2,}", " ", "".join(out)).strip()
+    kept = "".join(out)
+    if kept != text:  # a reply a call leaked from keeps no wrapper of it: "<p> <interact>"
+        kept = _PLAIN_TAG.sub(lambda m: m.group() if _tag_tool(m.group(), tools) else "", kept)
+    return re.sub(r"\s{2,}", " ", kept).strip()
 
 
 
@@ -574,14 +653,23 @@ _WORD_EDGES: Final[str] = " \t\r\n.!,;?:'\"`*"
 _PLAIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\s-]{0,79}")
 _CALLED_NAME = (
     re.compile(
-        r"^([A-Za-z_][\w.-]*)\{"
+        r"^([A-Za-z_][\w.-]*)(?:\[ARGS\])?\{"
     ),  # first: a name inside the arguments is not it (the review)
     re.compile(r"call:\s*([\w.-]+)", re.IGNORECASE),
     re.compile(r"<function=([\w.-]+)>", re.IGNORECASE),
     re.compile(r'"name"\s*:\s*"([^"]+)"'),
     re.compile(r"^\[\s*([A-Za-z_][\w.]*)\("),
     re.compile(r"^([A-Za-z_][\w.]*)\("),  # a bare Python call (11-11)
-    re.compile(r"tool_code>?\s*([A-Za-z_][\w.]*)\(", re.IGNORECASE),  # 11-11: <tool_code> tag
+    re.compile(  # 11-11: a call wrapper's Python call; Gemma 3 writes print(default_api.name())
+        r"(?:tool_code|tool_use|tool_calls?|function_calls?)>?\s*"
+        r"(?:print\(\s*)?(?:default_api\.)?([A-Za-z_]\w*)\(",
+        re.IGNORECASE,
+    ),
+    re.compile(  # 11-11 21:13: <call name="express" .../>, <invoke name="...">
+        r"""<[\w:.-]+[^<>]*?\s(?:name|function|function_name|tool|tool_name|fn)\s*=\s*["']"""
+        r"""([\w.-]+)["']""",
+        re.IGNORECASE,
+    ),
     _NAME_TAG,
 )
 
@@ -695,7 +783,8 @@ def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None
             shape = "json" if json_names is not None else "markup"
             found = [tools.find(_normal(name)) for name in names if name]
             if json_names is None and _NAME_TAG.fullmatch(body):
-                found = [_tag_tool(body, tools)]  # "<stay quiet/>": its words
+                # "<stay quiet/>": its words; "<call name="express"/>": its name attribute
+                found = [_attr_tool(body, tools) or _tag_tool(body, tools)]
             leaks = [_leak(tool, shape) for tool in found if tool is not None]
             if leaks:
                 return _leaked(*leaks)
@@ -790,12 +879,47 @@ def judge(text: str, tools: ToolNames, *, final: bool = False) -> Verdict:
 # so the call can run; express checks them itself.
 _PY_EXPRESS = re.compile(r"\bexpress\s*\(([^()]*)\)")
 _GEMMA_EXPRESS = re.compile(r"call:\s*express\s*\{([^{}]*)\}", re.IGNORECASE)
-_GEMMA_ARG = re.compile(r'(\w+)\s*:\s*(?:<\|"\|>(.*?)<\|"\|>|"([^"]*)"|([\w.+-]+))')
+# A key's value: Gemma 4's <|"|> quote, FunctionGemma's <escape>, either quote, or a bare
+# literal. Keys may be quoted, so a JS-style object ({feeling: 'curiosity'}) reads too (11-11).
+_GEMMA_ARG = re.compile(
+    r"""["']?(\w+)["']?\s*:\s*(?:<\|"\|>(.*?)<\|"\|>|<escape>(.*?)<escape>|"([^"]*)"|'([^']*)'"""
+    r"""|([\w.+-]+))"""
+)
+_ARGS_KEYS: Final[frozenset[str]] = frozenset({"args", "arguments", "parameters", "params"})
+
+
+def _literal(value: str) -> Any:
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _object_args(body: str) -> dict[str, Any]:
+    """The keys and values of a call's argument object written as Gemma or JS writes it."""
+    out: dict[str, Any] = {}
+    for key, gemma, escaped, double, single, bare in _GEMMA_ARG.findall(body):
+        out[key] = _literal(bare) if bare else gemma or escaped or double or single
+    return out
+
+
+def _attr_express(text: str) -> dict[str, Any] | None:
+    """The arguments of a tag naming express in an attribute (11-11 21:13): an args object,
+    else its other attributes."""
+    for tag in _ATTR_TAG.finditer(text):
+        attrs = [(k.lower(), d or q) for k, d, q in _ATTR.findall(tag.group(2))]
+        if not any(k in _NAME_KEYS and v.strip().lower() == "express" for k, v in attrs):
+            continue
+        for key, value in attrs:
+            if key in _ARGS_KEYS:
+                return _object_args(value) or None
+        return {k: _literal(v) for k, v in attrs if k not in _NAME_KEYS} or None
+    return None
 
 
 def leaked_express(text: str) -> dict[str, Any] | None:
-    """The arguments of the first express call written in `text` as a Python call or Gemma's
-    call markup, as literals; None without one. Pure."""
+    """The arguments of the first express call written in `text` as a Python call, Gemma's
+    call markup or a tag naming it, as literals; None without one. Pure."""
     import ast
 
     m = _PY_EXPRESS.search(text)
@@ -815,14 +939,5 @@ def leaked_express(text: str) -> dict[str, Any] | None:
         return out or None
     m = _GEMMA_EXPRESS.search(text)
     if m:
-        out = {}
-        for key, q, d, bare in _GEMMA_ARG.findall(m.group(1)):
-            value: Any = q or d or bare
-            if bare:
-                try:
-                    value = float(bare)
-                except ValueError:
-                    pass
-            out[key] = value
-        return out or None
-    return None
+        return _object_args(m.group(1)) or None
+    return _attr_express(text)

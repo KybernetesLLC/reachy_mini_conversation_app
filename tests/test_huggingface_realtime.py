@@ -6079,6 +6079,34 @@ async def test_a_leaked_express_runs_with_its_feeling(monkeypatch: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_2113_interact_reply_runs_express_and_is_deleted(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """11-11 21:13: the alarm named "interact" and the reply was spoken; now it is cut, its
+    express runs with the feeling it wrote, and it leaves the backend's history."""
+    handler = _plain_handler()
+    handler.connection = conn = _ScrubConnection()
+    ran: list = []
+
+    async def express(deps: Any, **kw: Any) -> dict:
+        ran.append(kw)
+        return {"ok": True}
+
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"express": express})
+    said = "<p> <interact> <call name=\"express\" args=\"{feeling: 'curiosity', intensity: 0.4}\"/>"
+    verdict = hf_mod.judge(said, hf_mod.ToolNames([("express", False)]), final=True)
+    assert verdict.tool == "express"
+    handler._gate_cut_kind, handler._gate_text = verdict.kind, said
+    with caplog.at_level(logging.WARNING, logger=hf_mod.logger.name):
+        handler._scrub_leak("it10", said, "")
+    await _scrubbed(handler)
+    await handler._scrub_at_done(_scrub_done("it10"))
+    assert ran == [{"feeling": "curiosity", "intensity": 0.4}]
+    assert conn.sent == [("delete", "it10")]
+    assert "does not know" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_a_reply_with_markup_the_gate_passed_raises_the_alarm(caplog: Any) -> None:
     """11-11: <tool_code> led 22 replies before anyone knew; now the first one says so."""
     handler = _plain_handler()
