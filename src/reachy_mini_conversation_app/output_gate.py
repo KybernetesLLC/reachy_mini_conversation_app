@@ -87,9 +87,11 @@ _ATTR = re.compile(r"""([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 _NAME_KEYS: Final[frozenset[str]] = frozenset(
     {"name", "function", "function_name", "tool", "tool_name", "fn"}
 )
-# A tag with no attributes, which wraps a call's markup when no tool is named (11-11: "<p>
-# <interact> <call .../>"): skipped between shapes, and dropped from a reply a call leaked from.
-_PLAIN_TAG = re.compile(r"</?\s*[A-Za-z][\w-]{0,30}\s*/?>")
+# A tag that names no tool, which wraps a call's markup (11-11: "<p> <interact> <call .../>"):
+# skipped between shapes, and dropped from a reply a call leaked from.
+_PLAIN_TAG = re.compile(
+    r"""</?\s*[A-Za-z][\w-]{0,30}(?:\s+[\w:.-]+\s*=\s*(?:"[^"<>]*"|'[^'<>]*'))*\s*/?>"""
+)
 _TAG_CALL_END = re.compile(r"[^<>]*?(/?)>")
 _TAG_CALL_CLOSER = re.compile(r"</call(?::[\w.-]*)?\s*>", re.IGNORECASE)
 # A registered tool's name written as a bare tag (11-07: "<stay_quiet/>" 17 times in one
@@ -118,16 +120,52 @@ def _skip_ssml(text: str, i: int, tools: ToolNames | None) -> int:
     tool: "<speak><stay_quiet/></speak>" is the tag alone (11-07, the review)."""
     while True:
         i = _skip(text, i)
-        ssml = _SSML.match(text, i) or _plain_tag(text, i)
+        ssml = _SSML.match(text, i) or _plain_tag(text, i, tools)
         if not ssml or _tag_tool(ssml.group(), tools) is not None:
             return i
         i = ssml.end()
 
 
-def _plain_tag(text: str, i: int) -> re.Match[str] | None:
-    """A plain tag at text[i] that is no shape of its own: "<p>", "</interact>", not "<think>"."""
+def _plain_tag(text: str, i: int, tools: ToolNames | None) -> re.Match[str] | None:
+    """A plain tag at text[i] that is no shape of its own: "<p>", "</interact>", not "<think>"
+    or <call name="express"/>."""
     tag = _PLAIN_TAG.match(text, i)
-    return tag if tag and _angle_at(text, i) is None else None
+    if not tag or _angle_at(text, i) is not None or _attr_tool(tag.group(), tools):
+        return None
+    return tag
+
+
+# Markdown and brackets around nothing but calls (11-11): "`express(...)`", "*call:x{}*",
+# "(express(...))". "```" is a fence; "_" is left out, as tool names have underscores.
+_WRAP_DELIMS: Final[tuple[str, ...]] = ("**", "`", "*", "(")
+
+
+def _wrapped_calls(
+    text: str, i: int, final: bool, tools: ToolNames | None
+) -> tuple[str, int] | None:
+    """Match delimiters at text[i] whose inside is only call shapes: (kind, end), undecided
+    while a call inside is still open, or None (words, or nothing yet)."""
+    if tools is None or text.startswith("```", i):
+        return None
+    delim = next((d for d in _WRAP_DELIMS if text.startswith(d, i)), None)
+    if delim is None:
+        return None
+    close = ")" if delim == "(" else delim
+    j, found = i + len(delim), False
+    while True:
+        j = _skip_ssml(text, j, tools)
+        if j >= len(text):
+            return (_UNDECIDED, -1) if found and not final else None
+        if text.startswith(close, j):
+            return (_CALL, j + len(close)) if found else None
+        shape = _shape_at(text, j, final, tools)
+        if shape is None:
+            return None
+        if shape[0] in (_UNDECIDED, _TAG_WAIT):
+            return _UNDECIDED, -1
+        if shape[0] != _CALL:
+            return None
+        j, found = shape[1], True
 
 
 # Gemma 4's tool answer, written by the model itself after <|tool_response>: response:name{...}.
@@ -431,6 +469,9 @@ def _shape_at(
     response = _TOOL_RESPONSE.match(text, i)
     if response:  # no wait on its start: "Re..." starts too many replies
         return (*_closed(_CALL, _balanced_end(text, response.end() - 1)), None)
+    wrapped = _wrapped_calls(text, i, final, tools) if c in "`*(" else None
+    if wrapped:
+        return (*wrapped, None)
     if c == "`":
         if not rest.startswith("```"):
             return (_UNDECIDED, -1, None) if "```".startswith(rest) else None
@@ -567,7 +608,10 @@ def without_calls(text: str, tools: ToolNames | None = None) -> str:
         i += 1
     kept = "".join(out)
     if kept != text:  # a reply a call leaked from keeps no wrapper of it: "<p> <interact>"
-        kept = _PLAIN_TAG.sub(lambda m: m.group() if _tag_tool(m.group(), tools) else "", kept)
+        kept = _PLAIN_TAG.sub(
+            lambda m: m.group() if _tag_tool(m.group(), tools) or _attr_tool(m.group(), tools) else "",
+            kept,
+        )
     return re.sub(r"\s{2,}", " ", kept).strip()
 
 
@@ -594,7 +638,9 @@ def ends_in_open_call(text: str, tools: ToolNames | None = None) -> bool:
             shape = _shape_at(text, i, final=True, tools=tools)
             if shape is not None and shape[0] == _UNDECIDED:
                 rest = text[i:].lower()
-                if text[i] in _DIRECTION_CLOSERS:
+                if _wrapped_calls(text, i, True, tools) is not None:
+                    return True  # "Sure. `express(feel": a call inside markdown
+                elif text[i] in _DIRECTION_CLOSERS:
                     pass
                 elif text[i] == "<" and not _TAG_START.match(text, i):
                     pass  # "I <3 you", "a < b": no tag starts there (the review of 99feb02)
@@ -779,7 +825,8 @@ def leaked_tool_name(text: str, tools: ToolNames, final: bool) -> Verdict | None
         for kind, body, json_names in shapes:
             if kind != _CALL:
                 continue
-            names = json_names if json_names is not None else [_called_name(body)]
+            unwrapped = body.lstrip("`*( \t\r\n")  # "`express(...)`": the name inside
+            names = json_names if json_names is not None else [_called_name(unwrapped)]
             shape = "json" if json_names is not None else "markup"
             found = [tools.find(_normal(name)) for name in names if name]
             if json_names is None and _NAME_TAG.fullmatch(body):

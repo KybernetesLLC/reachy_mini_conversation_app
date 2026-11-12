@@ -78,6 +78,12 @@ MARKUP_SHAPES = (
     # vLLM's other parsers: hermes, mistral (v11+); their JSON forms are in JSON_SHAPES
     '<tool_call>\n{{"name": "{n}", "arguments": {{"a": 1}}}}\n</tool_call>',
     '[TOOL_CALLS]{n}[ARGS]{{"a": 1}}',
+    # markdown or brackets around nothing but a call, and a wrapper tag with attributes
+    '`{n}(a="x")`',
+    '**{n}(a="x")**',
+    "*call:{n}{{}}*",
+    '({n}(a="x"))',
+    '<interact type="feel"> <call name="{n}" args="{{a: 1}}"/> </interact>',
 )
 
 
@@ -827,6 +833,10 @@ def test_a_tool_name_before_brackets_in_words_plays(said: str) -> None:
         ("I love you <", False),
         ("Sure. <stay", True),
         ('<p> <interact> <call name="express" args="{feel', True),
+        ('Sure. `express(feeling="jo', True),
+        ('Sure. (express(feeling="jo', True),
+        ("Sure (jazz", False),
+        ("Sure *sigh", False),
         ("Call me later", False),
         ("I want to express", False),
         ("Please respo", False),
@@ -886,4 +896,30 @@ def test_a_tool_answer_the_model_writes_itself_is_cut_and_runs_nothing() -> None
 )
 def test_a_tag_whose_name_is_no_tool_or_whose_tool_is_in_another_key_plays(text: str) -> None:
     assert gate.judge(text, TOOLS, final=True) == gate.Verdict(gate.PLAY)
+    assert gate.without_calls(text, TOOLS) == text
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        LIVE_2113 + "</interact></p>",
+        '`express(feeling="happy", intensity=0.6)`',
+        '<function_calls><invoke name="express"><parameter name="feeling">x</parameter>'
+        "</invoke></function_calls>",
+        "<start_function_call>call:express{feeling:<escape>x<escape>}<end_function_call>",
+    ],
+)
+def test_no_prefix_of_a_new_shape_is_released(said: str) -> None:
+    """From the length a reply may wait (3 characters), the streamed text never plays."""
+    for k in range(4, len(said)):
+        assert gate.judge(said[:k], TOOLS).action != gate.PLAY, said[:k]
+    assert gate.judge(said, TOOLS, final=True).action == gate.CUT
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["`code` is fun.", "I love music (jazz most).", "*express yourself*", "(call me later)"],
+)
+def test_markdown_and_brackets_around_words_are_not_calls(text: str) -> None:
+    assert gate.judge(text, TOOLS, final=True).tool is None
     assert gate.without_calls(text, TOOLS) == text
