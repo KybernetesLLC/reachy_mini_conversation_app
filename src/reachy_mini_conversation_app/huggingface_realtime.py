@@ -47,6 +47,7 @@ from reachy_mini_conversation_app.config import (
 from reachy_mini_conversation_app.prompts import (
     get_session_voice,
     get_session_instructions,
+    get_thought_instructions,
     get_session_greeting_prompt,
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
@@ -1804,7 +1805,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             url = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
             content.append({"type": "input_image", "image_url": url})
         tag = {"companion": THOUGHT_TAG, THOUGHT_TAG: thought_id}
-        create = {"response": _out_of_band_request(tag, ["text"], None, content)}
+        # Its own instructions, never the session's: their block has words that stay in the room.
+        # Read here, not off the loop: no await between the in-flight check and the entry.
+        instructions = get_thought_instructions()
+        create = {"response": _out_of_band_request(tag, ["text"], instructions, content)}
         pictures = len(content) - (3 if turns else 2)
         self._thoughts[thought_id] = _Thought(sender, text, pictures, create)
         logger.info("thought %s queued: %d room turns, %d images", thought_id, len(turns), pictures)

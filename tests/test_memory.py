@@ -123,3 +123,41 @@ def test_the_companions_memory_file_replaces_the_apps_own(tmp_path: Path, monkey
     block.unlink()  # no memories yet: no block, and still not the app's own
     instructions = prompts_mod.get_session_instructions(instance_path=tmp_path)
     assert not instructions.startswith("Things you remember")
+
+
+def test_a_thoughts_instructions_are_the_thought_block_and_the_same_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Thoughts unit c3: the thought block in place of the session's, the profile part the same."""
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    session = tmp_path / "session-memory.md"
+    session.write_text("## Your memory\n[10:01] Someone: the guest's words\n")
+    thought = tmp_path / "thought-memory.md"
+    thought.write_text("## Your memory\n[10:01] (someone else talked with you here)\n")
+    monkeypatch.setenv("REACHY_COMPANION_SESSION_MEMORY", str(session))
+    monkeypatch.setenv("REACHY_COMPANION_THOUGHT_MEMORY", str(thought))
+
+    instructions = prompts_mod.get_thought_instructions()
+    profile = prompts_mod.get_session_instructions().split("\n\n", 1)[1]  # the session's own
+
+    assert instructions == f"## Your memory\n[10:01] (someone else talked with you here)\n\n{profile}"
+    assert "guest's words" not in instructions
+
+
+def test_a_thought_with_no_thought_block_gets_the_profile_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It fails closed: never the session's block, nor the app's own memories."""
+    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", None)
+    add_memory_fact(tmp_path, "Prefers concise answers")
+    session = tmp_path / "session-memory.md"
+    session.write_text("## Your memory\n[10:01] Someone: the guest's words\n")
+    monkeypatch.setenv("REACHY_COMPANION_SESSION_MEMORY", str(session))
+    profile = prompts_mod._profile_instructions()
+
+    monkeypatch.setenv("REACHY_COMPANION_THOUGHT_MEMORY", str(tmp_path / "thought-memory.md"))
+    assert prompts_mod.get_thought_instructions() == profile  # missing
+    (tmp_path / "thought-memory.md").write_text("  \n")
+    assert prompts_mod.get_thought_instructions() == profile  # empty
+    monkeypatch.delenv("REACHY_COMPANION_THOUGHT_MEMORY")
+    assert prompts_mod.get_thought_instructions() == profile  # unset

@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 from websockets.exceptions import ConnectionClosedError
 
+import reachy_mini_conversation_app.prompts as prompts_mod
 import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice
@@ -6300,9 +6301,14 @@ def _thought_session(
 async def test_a_thoughts_reply_is_asked_out_of_band_in_writing_with_the_room_inlined(
     monkeypatch: Any, tmp_path: Any
 ) -> None:
-    """Text only, no tools, no instructions; the room's turns, the labelled thought, each existing image."""
+    """Text only, no tools, the thought block's instructions; the room's turns, the labelled thought, each existing image."""
     picture = tmp_path / "boat.png"
     picture.write_bytes(b"png")
+    session_block, thought_block = tmp_path / "session-memory.md", tmp_path / "thought-memory.md"
+    session_block.write_text("## Your memory\n[10:01] Someone: the guest's words\n")
+    thought_block.write_text("## Your memory\n[10:01] (someone else talked with you here)\n")
+    monkeypatch.setenv("REACHY_COMPANION_SESSION_MEMORY", str(session_block))
+    monkeypatch.setenv("REACHY_COMPANION_THOUGHT_MEMORY", str(thought_block))
     handler, sent, _ = _thought_session(
         monkeypatch, "", images=[str(picture), str(tmp_path / "gone.jpg")]
     )
@@ -6310,7 +6316,10 @@ async def test_a_thoughts_reply_is_asked_out_of_band_in_writing_with_the_room_in
     await handler._run_realtime_session()
 
     body = sent[0][1]["response"]
-    assert body["conversation"] == "none" and "instructions" not in body
+    assert body["conversation"] == "none"
+    profile = prompts_mod._profile_instructions()
+    assert body["instructions"] == f"## Your memory\n[10:01] (someone else talked with you here)\n\n{profile}"
+    assert "guest's words" not in body["instructions"]
     assert body["output_modalities"] == ["text"] and body["tool_choice"] == "none"
     assert body["metadata"] == {"companion": "thought", "thought": "discord:1"}
     content = body["input"][0]["content"]

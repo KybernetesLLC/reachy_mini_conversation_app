@@ -37,18 +37,21 @@ def _active_profile() -> ProfileDefinition:
 # The companion supervisor keeps the robot's memory and writes it as one block,
 # read at each session start in place of the app's own memory.v1.json facts.
 COMPANION_MEMORY_ENV = "REACHY_COMPANION_SESSION_MEMORY"
+# The same block with only the household's words from the room (the companion, thoughts unit c3):
+# the instructions of a written reply to a thought.
+THOUGHT_MEMORY_ENV = "REACHY_COMPANION_THOUGHT_MEMORY"
 
 
-def _companion_memory() -> str:
+def _companion_memory(env: str = COMPANION_MEMORY_ENV) -> str:
     try:
-        return Path(os.environ[COMPANION_MEMORY_ENV]).read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        logger.info("No companion memory block: %s", exc)
+        return Path(os.environ[env]).read_text(encoding="utf-8").strip()
+    except (KeyError, OSError) as exc:
+        logger.info("No companion memory block (%s): %s", env, exc)
         return ""
 
 
-def get_session_instructions(instance_path: str | Path | None = None) -> str:
-    """Return instructions for the active profile with memory context."""
+def _profile_instructions() -> str:
+    """Return the active profile's instructions, the bundled default's if it has none."""
     selected_profile = config.REACHY_MINI_CUSTOM_PROFILE
     profile_name = selected_profile or DEFAULT_PROFILE_NAME
     try:
@@ -66,10 +69,29 @@ def get_session_instructions(instance_path: str | Path | None = None) -> str:
             raise RuntimeError("Default profile has no usable instructions") from exc
     if not instructions:
         raise RuntimeError("Default profile has no usable instructions")
+    return instructions
 
+
+def get_session_instructions(instance_path: str | Path | None = None) -> str:
+    """Return instructions for the active profile with memory context."""
+    instructions = _profile_instructions()
     memory_prompt = (
         _companion_memory() if COMPANION_MEMORY_ENV in os.environ else format_memory_for_prompt(instance_path)
     )
+    if memory_prompt:
+        return f"{memory_prompt}\n\n{instructions}"
+    return instructions
+
+
+def get_thought_instructions() -> str:
+    """Return the instructions of a written reply to a thought.
+
+    The companion's thought block and the profile, as get_session_instructions joins them. With no
+    thought block (unset, missing, unreadable or empty) the profile goes alone, never the session's
+    block, which carries words that stay in the room.
+    """
+    instructions = _profile_instructions()
+    memory_prompt = _companion_memory(THOUGHT_MEMORY_ENV)
     if memory_prompt:
         return f"{memory_prompt}\n\n{instructions}"
     return instructions
