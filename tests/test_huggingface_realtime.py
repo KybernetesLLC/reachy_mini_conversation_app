@@ -6,7 +6,7 @@ import logging
 import contextlib
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 from collections.abc import Callable
 
 import numpy as np
@@ -6239,3 +6239,167 @@ async def test_a_session_reply_ending_in_an_open_tag_is_scrubbed(monkeypatch: An
     monkeypatch.setattr(handler, "_scrub_at_done", scrub)
     await handler._run_realtime_session()
     assert conn.sent == [("delete", "it13")]
+
+
+# --- thoughts (the companion, 11-12): a message from afar, answered in writing ----------
+
+
+def _thought_response(
+    thought_id: str = "discord:1", status: str = "completed", reason: str | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id="resp-t",
+        metadata={"companion": "thought", "thought": thought_id},
+        status=status,
+        status_details=SimpleNamespace(reason=reason),
+        usage=None,
+        output=[],
+    )
+
+
+def _thought_session(
+    monkeypatch: Any, text: str, *done: SimpleNamespace, images: list[str] | None = None
+) -> tuple[HuggingFaceRealtimeHandler, list[tuple[str, Any]], list[tuple[Any, ...]]]:
+    """Run a session where one thought is asked and each `done` ends a response to it."""
+    sent: list[tuple[str, Any]] = []
+    replies: list[tuple[Any, ...]] = []
+    handler = _session_handler(monkeypatch, ())
+    handler.on_thought_reply = lambda *args: replies.append(args)
+
+    async def _think() -> None:
+        await handler.answer_thought(
+            "discord:1", "Hadley", "did you see the boat?", images or [], [("Matt", "hi")]
+        )
+        await asyncio.sleep(0.05)
+
+    events: list[Any] = [_think]
+    for response in done:
+        events += [
+            _FakeEvent("response.created", response=response),
+            _FakeEvent("response.output_text.done", text=text),
+            _FakeEvent("response.done", response=response),
+            lambda: asyncio.sleep(0.05),
+        ]
+    handler.client = _ordering_client(tuple(events), sent, handler)
+    return handler, sent, replies
+
+
+@pytest.mark.asyncio
+async def test_a_thoughts_reply_is_asked_out_of_band_in_writing_with_the_room_inlined(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    """Text only, no tools, no instructions; the room's turns, the labelled thought, each existing image."""
+    picture = tmp_path / "boat.png"
+    picture.write_bytes(b"png")
+    handler, sent, _ = _thought_session(
+        monkeypatch, "", images=[str(picture), str(tmp_path / "gone.jpg")]
+    )
+
+    await handler._run_realtime_session()
+
+    body = sent[0][1]["response"]
+    assert body["conversation"] == "none" and "instructions" not in body
+    assert body["output_modalities"] == ["text"] and body["tool_choice"] == "none"
+    assert body["metadata"] == {"companion": "thought", "thought": "discord:1"}
+    content = body["input"][0]["content"]
+    assert [part["type"] for part in content] == ["input_text"] * 3 + ["input_image"]
+    assert content[1]["text"] == "Matt: hi"
+    assert content[2]["text"] == "(a thought from Hadley) did you see the boat?"
+    assert content[3]["image_url"] == "data:image/png;base64," + base64.b64encode(b"png").decode()
+
+
+@pytest.mark.asyncio
+async def test_a_thoughts_reply_is_reported_noted_and_never_spoken(monkeypatch: Any) -> None:
+    """Reported after the gate, then noted in the talk; its transcript lines carry its id; ready; no head."""
+    handler, sent, replies = _thought_session(monkeypatch, "Yes, a big one!", _thought_response())
+    reasons: list[str] = []
+    handler.set_activity_observer(lambda reason, **_kw: reasons.append(reason))
+    lines: list[tuple[Any, ...]] = []
+    handler.set_transcript_observer(lambda *args, **kw: lines.append((*args, kw)))
+
+    await handler._run_realtime_session()
+
+    assert replies == [("discord:1", "Yes, a big one!", None)]
+    note = [payload for kind, payload in sent if kind == "item"]
+    assert len(note) == 1
+    assert note[0]["content"][0]["text"] == hf_mod.note_item_text(
+        "(a thought from Hadley) did you see the boat? You thought back: Yes, a big one!"
+    )
+    assert lines == [
+        ("user", "(a thought from Hadley) did you see the boat?", True, None, {"thought": "discord:1"}),
+        ("assistant", "Yes, a big one!", True, None, {"thought": "discord:1"}),
+    ]
+    assert "thought_done" in reasons and "response_done_silent" not in reasons
+    assert call(True) not in handler.deps.movement_manager.set_speaking.call_args_list
+    assert handler._thoughts == {}
+
+
+@pytest.mark.asyncio
+async def test_a_thoughts_leaked_call_is_cut_by_the_gate(monkeypatch: Any) -> None:
+    """A reply that is a leaked tool call is no reply: null, with the gate's why."""
+    handler, _sent, replies = _thought_session(monkeypatch, "<call:stay_quiet/>", _thought_response())
+
+    await handler._run_realtime_session()
+
+    assert len(replies) == 1
+    thought_id, text, why = replies[0]
+    assert thought_id == "discord:1" and text is None and why.startswith("gate:")
+
+
+@pytest.mark.asyncio
+async def test_a_thought_cut_off_by_room_speech_is_asked_again(monkeypatch: Any) -> None:
+    """Server VAD cancels an out-of-band response (probe, 11-12): the same create goes again."""
+    handler, sent, replies = _thought_session(
+        monkeypatch,
+        "Yes!",
+        _thought_response(status="cancelled", reason="turn_detected"),
+        _thought_response(),
+    )
+
+    await handler._run_realtime_session()
+
+    creates = [payload for kind, payload in sent if kind == "response.create"]
+    assert len(creates) == 2 and creates[0] == creates[1]
+    assert replies == [("discord:1", "Yes!", None)]
+
+
+@pytest.mark.asyncio
+async def test_a_thought_in_flight_is_not_asked_twice_and_a_lost_one_is_freed(
+    monkeypatch: Any,
+) -> None:
+    """Given again while in flight: one create. A create the sender gives up on frees the id."""
+    handler = _plain_handler()
+    handler.connection = MagicMock()
+    await handler.answer_thought("discord:1", "Hadley", "hi", [], [])
+    await handler.answer_thought("discord:1", "Hadley", "hi", [], [])
+    assert handler._pending_responses.qsize() == 1
+
+    # The send fails: the sender gives the create up, and the id is no longer in flight.
+    handler.connection.response.create = AsyncMock(side_effect=RuntimeError("closed"))
+    task = asyncio.create_task(handler._response_sender_loop())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert handler._thoughts == {}
+
+
+@pytest.mark.asyncio
+async def test_a_plain_create_never_merges_a_queued_thought(monkeypatch: Any) -> None:
+    """The empty-create coalesce drops queued plain creates and fillers, never a thought."""
+    sent: list[tuple[str, Any]] = []
+    handler = _session_handler(monkeypatch, ())
+
+    async def _queue() -> None:
+        await handler._safe_response_create()
+        await handler.answer_thought("discord:1", "Hadley", "hi", [], [])
+        await handler._safe_response_create(
+            response=hf_mod._out_of_band_request(hf_mod.FILLER_TAG, ["audio"], "Say: hm.", [])
+        )
+        await asyncio.sleep(0.05)
+
+    handler.client = _ordering_client((_queue,), sent, handler)
+    await handler._run_realtime_session()
+
+    creates = [payload for kind, payload in sent if kind == "response.create"]
+    assert [hf_mod._thought_id(c) for c in creates] == [None, "discord:1"]

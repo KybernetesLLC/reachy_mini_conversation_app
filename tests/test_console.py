@@ -4775,3 +4775,60 @@ async def test_the_send_watch_is_quiet_for_a_prompt_send() -> None:
     await task
 
     stream._rpc.broadcast_threadsafe.assert_not_called()
+
+
+def test_a_thought_is_queued_on_the_handlers_loop_and_answered_once_a_run() -> None:
+    """Queued on the handler's loop; an id answered this run is reported again, never asked again."""
+    stream, _manager, app = _pose_stream()
+    asked: list[tuple[Any, ...]] = []
+
+    async def answer_thought(*args: Any) -> None:
+        asked.append((*args, asyncio.get_running_loop()))
+
+    stream.handler.answer_thought = answer_thought
+    stream.handler._is_connected.return_value = True
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    params = {
+        "id": "discord:1",
+        "sender": "Hadley",
+        "text": "hi",
+        "images": ["/x/a.png"],
+        "turns": [{"who": "Matt", "text": "hello"}, {"who": "Alli"}],
+    }
+    try:
+        with TestClient(app).websocket_connect("/rpc") as ws:
+            ws.send_json({"jsonrpc": "2.0", "id": "1", "method": "conversation.thought", "params": params})
+            first = ws.receive_json()
+            stream._dispatch_thought_reply("discord:1", "Hi Hadley!", None)
+            reported = ws.receive_json()
+            stream.handler._is_connected.return_value = False
+            ws.send_json({"jsonrpc": "2.0", "id": "2", "method": "conversation.thought", "params": params})
+            messages = [ws.receive_json(), ws.receive_json()]
+    finally:
+        _stop_loop(loop, thread)
+    assert first["result"] == {"queued": True}
+    assert asked == [("discord:1", "Hadley", "hi", ["/x/a.png"], [("Matt", "hello")], loop)]
+    reply = next(m for m in messages if m.get("method") == "conversation.thought_reply")
+    assert reply["params"] == reported["params"] == {"id": "discord:1", "text": "Hi Hadley!", "why": None}
+    assert next(m for m in messages if "result" in m)["result"] == {"queued": True}
+
+
+def test_a_thought_with_nothing_in_it_or_no_session_is_not_queued() -> None:
+    """Empty, or no session: refused with the reason, as a note is."""
+    stream, _manager, app = _pose_stream()
+    stream.handler._is_connected.return_value = False
+    empty = _rpc_call(app, "conversation.thought", {"id": "d:1", "sender": "Hadley", "text": " "})
+    closed = _rpc_call(app, "conversation.thought", {"id": "d:1", "sender": "Hadley", "text": "hi"})
+    assert empty["result"] == {"queued": False, "reason": "empty"}
+    assert closed["result"] == {"queued": False, "reason": "no session"}
+
+
+def test_a_thoughts_done_turns_ready() -> None:
+    """A written reply has no transcript.done: its own reason maps the turn to ready."""
+    sent: list[tuple[str, Any]] = []
+    stream = LocalStream(MagicMock(), _rpc_robot())
+    stream._rpc = SimpleNamespace(_clients=set(), broadcast_threadsafe=lambda m, p: sent.append((m, p)))
+    stream._dispatch_activity("response_created")
+    stream._dispatch_activity("thought_done")
+    assert [p for m, p in sent if m == "conversation.turn"] == [{"state": "thinking"}, {"state": "ready"}]

@@ -435,6 +435,9 @@ class LocalStream:
         # here from activity + transcripts. Survives handler rebuilds (mounted once).
         self._rpc: Optional[JsonRpcServer] = None
         self._last_turn_state: Optional[str] = None
+        # Each thought answered this app run, by id: its conversation.thought_reply params.
+        # Given again, it is reported again, never answered again (ForkDedupe).
+        self._thought_replies: dict[str, dict[str, Any]] = {}
         # Per-role throttle timestamps for conversation.level (orb audio meter).
         self._last_level_emit: dict[str, float] = {}
         self._install_handler(handler)
@@ -463,6 +466,8 @@ class LocalStream:
             tool_call_setter(self._dispatch_tool_call)
         if hasattr(self.handler, "on_sight"):
             self.handler.on_sight = self._dispatch_sight
+        if hasattr(self.handler, "on_thought_reply"):
+            self.handler.on_thought_reply = self._dispatch_thought_reply
 
     def _dispatch_transcript(
         self,
@@ -471,17 +476,27 @@ class LocalStream:
         final: bool,
         artifact: str | None = None,
         item_id: str | None = None,
+        thought: str | None = None,
     ) -> None:
         """Push a conversation.transcript notification to JSON-RPC clients. A reply the
         output gate cut carries its kind as "artifact": the supervisor never keeps it. A user
-        transcript carries its realtime "item_id" when it has one."""
+        transcript carries its realtime "item_id" when it has one, and a thought's lines its id
+        as "thought"."""
         if self._rpc is not None:
             params: dict[str, Any] = {"role": role, "text": text, "final": final}
             if artifact:
                 params["artifact"] = artifact
             if item_id:
                 params["item_id"] = item_id
+            if thought:
+                params["thought"] = thought
             self._rpc.broadcast_threadsafe("conversation.transcript", params)
+
+    def _dispatch_thought_reply(self, thought_id: str, text: str | None, why: str | None) -> None:
+        """Keep a thought's reply for this run and push it as conversation.thought_reply."""
+        params = self._thought_replies.setdefault(thought_id, {"id": thought_id, "text": text, "why": why})
+        if self._rpc is not None:
+            self._rpc.broadcast_threadsafe("conversation.thought_reply", params)
 
     def _dispatch_sight(
         self, b64_jpeg: str, source: str, facts: dict[str, object] | None = None
@@ -554,6 +569,7 @@ class LocalStream:
         "tool_followup_skipped": "ready",  # the companion's interrupt: no reply comes
         "assistant_audio_delta": "speaking",
         "assistant_transcript_done": "ready",
+        "thought_done": "ready",  # a written reply has no transcript.done (Thought.tla ReadyAtDone)
     }
 
     def _dispatch_session(self, state: str) -> None:
@@ -1660,6 +1676,41 @@ class LocalStream:
             if not sent:
                 reason = getattr(self.handler, "note_drop_reason", None)
                 return {"queued": False, "reason": str(reason or "dropped")}
+            return {"queued": True}
+
+        @rpc.method("conversation.thought")  # type: ignore[untyped-decorator]
+        async def _rpc_thought(params: dict[str, object]) -> dict[str, object]:
+            # A thought (the companion, 11-12): a household member's message from afar,
+            # answered in writing as conversation.thought_reply, never aloud.
+            thought_id = str(params.get("id") or "").strip()
+            sender = str(params.get("sender") or "").strip()
+            if not thought_id or not sender:
+                raise JsonRpcError(
+                    "thought requires 'id' and 'sender'", reason="invalid_params", code=-32602
+                )
+            text = str(params.get("text") or "").strip()
+            raw_images = params.get("images")
+            images = [str(p) for p in raw_images if p] if isinstance(raw_images, list) else []
+            if not text and not images:
+                return {"queued": False, "reason": "empty"}
+            answered = self._thought_replies.get(thought_id)
+            if answered is not None:
+                rpc.broadcast_threadsafe("conversation.thought_reply", answered)
+                return {"queued": True}
+            if not self.handler._is_connected():
+                return {"queued": False, "reason": "no session"}
+            raw_turns = params.get("turns")
+            turns = [
+                (str(turn.get("who") or ""), str(turn.get("text") or ""))
+                for turn in (raw_turns if isinstance(raw_turns, list) else [])
+                if isinstance(turn, dict) and turn.get("text")
+            ]
+            try:
+                await self._on_handler_loop(
+                    self.handler.answer_thought(thought_id, sender, text, images, turns)
+                )
+            except RuntimeError:
+                return {"queued": False, "reason": "no session"}
             return {"queued": True}
 
         @rpc.method("conversation.session")  # type: ignore[untyped-decorator]

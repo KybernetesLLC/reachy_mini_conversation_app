@@ -7,7 +7,9 @@ import random
 import asyncio
 import logging
 import contextlib
-from typing import TYPE_CHECKING, Any, Final, Tuple, Callable, Optional
+import mimetypes
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Final, Tuple, Callable, Optional, NamedTuple
 from collections import deque
 
 import httpx
@@ -246,18 +248,49 @@ GREETING_TAG = {"companion": "greeting"}
 def _out_of_band_request(
     tag: dict[str, str],
     modalities: list[str],
-    instructions: str,
+    instructions: str | None,
     content: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Build a tagged response.create body outside the conversation (a filler)."""
-    return {
+    """Build a tagged response.create body outside the conversation; with no instructions, the session's apply."""
+    body: dict[str, Any] = {
         "conversation": "none",
         "output_modalities": modalities,
         "metadata": dict(tag),
-        "instructions": instructions,
         "tool_choice": "none",
         "input": [{"type": "message", "role": "user", "content": content}],
     }
+    if instructions is not None:
+        body["instructions"] = instructions
+    return body
+
+
+# A thought (the companion, 11-12): a household member's message from afar, answered in
+# writing only. Its reply is an out-of-band response tagged {"companion": "thought",
+# "thought": <id>}. An out-of-band response does not see the conversation, so the room's
+# recent turns go into its input as text.
+THOUGHT_TAG: Final[str] = "thought"
+THOUGHT_FRAME = (
+    "(The room's recent talk, then a thought sent to you from afar. "
+    "Think back in writing, or write nothing.)"
+)
+
+
+def thought_line(sender: str, text: str) -> str:
+    """Return a thought as he is given it, labelled with its sender."""
+    return f"(a thought from {sender}) {text}".strip()
+
+
+def _thought_id(create: dict[str, Any]) -> str | None:
+    """Return the thought id of a queued response.create's kwargs, if it is a thought's reply."""
+    metadata = (create.get("response") or {}).get("metadata") or {}
+    return metadata.get(THOUGHT_TAG) if metadata.get("companion") == THOUGHT_TAG else None
+
+
+class _Thought(NamedTuple):
+    sender: str
+    text: str
+    images: int
+    create: dict[str, Any]
 
 
 def session_size(session: Any) -> str:
@@ -496,6 +529,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # Each frame added to the conversation, handed to the companion for its sight
         # note (Claude Haiku, 2026-10-17): (base64 JPEG, source). Set by the console.
         self.on_sight: Callable[..., None] | None = None
+        # Thoughts in flight this session, by id; a response's text output (a thought's
+        # reply); and where a thought's reply goes, (id, text, why). Set by the console.
+        self._thoughts: dict[str, _Thought] = {}
+        self._out_text = ""
+        self.on_thought_reply: Callable[[str, str | None, str | None], None] | None = None
         # The cold-open brief (2026-10-17), per session: what went to the voice service,
         # and the glance at open against the first reply to a person's turn (monotonic).
         self._session_images = 0
@@ -1736,6 +1774,93 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return self._note_dropped(str(exc))
         return True
 
+    async def answer_thought(
+        self,
+        thought_id: str,
+        sender: str,
+        text: str,
+        images: list[str],
+        turns: list[tuple[str, str]],
+    ) -> None:
+        """Ask, out of band, for a written reply to a thought; one already in flight is not asked again."""
+        # Input: the frame, the room's recent turns (who: text), the labelled thought, its images.
+        if not self.connection:
+            raise RuntimeError("answer_thought: no active session")
+        if thought_id in self._thoughts:
+            logger.info("thought %s already in flight", thought_id)
+            return
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": THOUGHT_FRAME}]
+        if turns:
+            room = "\n".join(f"{who}: {said}" for who, said in turns)
+            content.append({"type": "input_text", "text": room})
+        content.append({"type": "input_text", "text": thought_line(sender, text)})
+        for path in images:
+            try:
+                data = Path(path).read_bytes()
+            except OSError as exc:
+                logger.warning("thought %s: an image was skipped (%s)", thought_id, type(exc).__name__)
+                continue
+            mime = mimetypes.guess_type(path)[0] or "image/jpeg"
+            url = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+            content.append({"type": "input_image", "image_url": url})
+        tag = {"companion": THOUGHT_TAG, THOUGHT_TAG: thought_id}
+        create = {"response": _out_of_band_request(tag, ["text"], None, content)}
+        pictures = len(content) - (3 if turns else 2)
+        self._thoughts[thought_id] = _Thought(sender, text, pictures, create)
+        logger.info("thought %s queued: %d room turns, %d images", thought_id, len(turns), pictures)
+        await self._safe_response_create(**create)
+
+    async def _thought_done(self, event: Any) -> None:
+        """Report a thought's reply after the output gate, then note the thought and reply in the talk."""
+        # Room speech cuts it off: asked again (Thought.tla RequeueOnCancel). A client's cancel
+        # reports nothing, and the companion gives it again.
+        response = getattr(event, "response", None)
+        thought_id = str((getattr(response, "metadata", None) or {}).get(THOUGHT_TAG) or "")
+        thought = self._thoughts.get(thought_id)
+        if thought is None:
+            logger.info("thought %s: a reply with nothing in flight, ignored", thought_id)
+            return
+        status = getattr(response, "status", None)
+        reason = getattr(getattr(response, "status_details", None), "reason", None)
+        if status == "cancelled" and reason == "turn_detected":
+            logger.info("thought %s: cut off by room speech, asked again", thought_id)
+            await self._safe_response_create(**thought.create)
+            return
+        del self._thoughts[thought_id]
+        if status == "cancelled":
+            logger.info("thought %s: its reply was cancelled (%s)", thought_id, reason)
+            return
+        reply: str | None = None
+        if status != "completed":
+            why: str | None = f"{status}: {reason}"
+        else:
+            written = without_ssml(self._out_text)[0].strip()
+            verdict = judge(written, self._gate_tools, final=True)
+            if verdict.action in (CUT, CUT_AND_EXECUTE):
+                why = f"gate: {verdict.kind or 'leaked tool call'}"
+            else:
+                reply = without_calls(written, self._gate_tools).strip() or None
+                why = None if reply else ("gate: leaked tool call" if written else "no text")
+        logger.info(
+            "thought %s answered: %s", thought_id, f"{len(reply)} chars" if reply else why
+        )
+        if self.on_thought_reply is not None:
+            try:
+                self.on_thought_reply(thought_id, reply, why)
+            except Exception:
+                logger.exception("thought %s: the reply could not be reported", thought_id)
+        self._mark_activity("thought_done")
+        if status != "completed":
+            return
+        line = thought_line(thought.sender, thought.text)
+        self._emit_transcript("user", line, True, thought=thought_id)
+        if reply:
+            self._emit_transcript("assistant", reply, True, thought=thought_id)
+        pictures = f" (with {thought.images} picture(s))" if thought.images else ""
+        answer = f" You thought back: {reply}" if reply else " You did not answer."
+        if self.connection is not None:
+            await self._send_note(f"{line}{pictures}{answer}", self.connection)
+
     def open_settled(self) -> None:
         """Start the greeting's hold: the console has finished this open, its pre-roll sent."""
         self._open_settled.set()
@@ -1813,8 +1938,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             # Parallel tool calls enqueue duplicate empty requests; coalesce to one.
             # An announcement is never merged: it keeps its place in the queue.
+            # A thought's reply is never merged either: it is out of band, and dropped it would
+            # never be answered (the companion's model, Thought.tla KeepTagged).
             if not kwargs:
-                self._requeue(lambda queued: bool(queued.get(_ANNOUNCEMENT)))
+                self._requeue(
+                    lambda queued: bool(queued.get(_ANNOUNCEMENT))
+                    or _thought_id(queued) is not None
+                )
             announcement: str | None = kwargs.pop(_ANNOUNCEMENT, None)
             announcement_added = False
 
@@ -1880,7 +2010,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     # 2026-10-21 16:51: a tool's follow-up after a say was never answered, and
                     # these steps logged only at debug. One line per create sent.
                     if kwargs.get("response", {}).get("conversation") == "none":
-                        kind = "filler"  # out of band: never a follow-up (the review of eea54bb)
+                        # out of band: never a follow-up (the review of eea54bb)
+                        kind = "thought" if _thought_id(kwargs) else "filler"
                     elif announcement_added:
                         kind = "announcement"
                     else:
@@ -1932,6 +2063,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     break
 
                 sent = True
+            thought_id = _thought_id(kwargs)
+            if not sent and thought_id and self._thoughts.pop(thought_id, None):
+                # Given up, or its done never came: the companion gives it again (Thought.tla
+                # ReportLoss), and with nothing in flight it is answered then.
+                logger.info("thought %s not answered: its create was not sent", thought_id)
             if (kwargs.get("response") or {}).get("metadata") == GREETING_TAG:
                 self._greeting_live = False  # done, cancelled, rejected or never sent
 
@@ -2195,6 +2331,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             dropped = drop_pending_responses(self._pending_responses)
             if dropped:
                 logger.info("Dropped %d queued response(s) from the last session.", dropped)
+            if self._thoughts:
+                logger.info("%d thought(s) of the last session not answered", len(self._thoughts))
+                self._thoughts.clear()
             self._followup_pending = self._followup_live = False
             # Session-state hygiene: the last session's batch is over. Its cancelled tools'
             # results are dropped by the tool manager, never handled here.
@@ -2288,10 +2427,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     if event.type == "response.output_text.delta":
                         self._response_spoke()
+                        self._out_text += getattr(event, "delta", "") or ""
                         logger.debug("response text delta")
 
                     if event.type == "response.output_text.done":
-                        logger.debug("response text done: %s", event.text)
+                        self._out_text = getattr(event, "text", None) or self._out_text
+                        logger.debug("response text done: %s", self._out_text)
 
                     if event.type == "response.created":
                         self._response_done_event.clear()
@@ -2307,15 +2448,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._followup_pending, self._followup_live = False, True
                         self._response_started()
                         self._gate_start()
+                        self._out_text = ""
+                        thought = _companion_tag(event) == THOUGHT_TAG
                         if (
                             _companion_tag(event) == GREETING_TAG["companion"]
                             and self._spoke_since_open
                         ):
                             await self._cancel_greeting()  # speech came between its create and now
                         self._mark_activity("response_created")
-                        self.deps.movement_manager.set_speaking(True)
+                        if not thought:  # written, never spoken: the head stays still
+                            self.deps.movement_manager.set_speaking(True)
                         if (
-                            self._turn_user_done_at is not None
+                            not thought
+                            and self._turn_user_done_at is not None
                             and self._turn_response_created_at is None
                         ):
                             self._turn_response_created_at = time.perf_counter()
@@ -2338,6 +2483,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             )
                             self._dropped_deltas = 0
                         await self._scrub_at_done(event)  # before a sender can wake (11-11)
+                        thought = _companion_tag(event) == THOUGHT_TAG
+                        if thought:  # its note, too, goes before a sender can wake
+                            await self._thought_done(event)
                         # Doesn't mean the audio is done playing
                         # Resume tracking for responses that emit no audio (text-only / tool-only).
                         self.deps.movement_manager.set_speaking(False)
@@ -2354,7 +2502,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         )
                         usage = getattr(getattr(event, "response", None), "usage", None)
                         self._log_usage(usage)
-                        if not self._gate_had_audio:
+                        if not self._gate_had_audio and not thought:
                             # A reply with no audio (tool-only): the companion's say waits on
                             # a transcript, so it learns at once that none is coming.
                             self._mark_activity("response_done_silent")

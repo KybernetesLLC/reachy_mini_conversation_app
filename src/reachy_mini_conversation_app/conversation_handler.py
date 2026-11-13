@@ -82,7 +82,7 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     def set_transcript_observer(self, observer: Callable[..., None] | None) -> None:
         """Attach/detach a transcript observer, called (role, text, final, artifact): artifact
         is the output gate's cut kind for a reply that was not spoken, else None. A user
-        transcript with a realtime item also passes item_id=..."""
+        transcript with a realtime item also passes item_id=...; a thought's lines pass thought=<id>."""
         self._transcript_observer = observer
 
     def set_tool_call_observer(self, observer: Callable[[dict[str, Any]], bool] | None) -> None:
@@ -90,13 +90,21 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         self._tool_call_observer = observer
 
     def _emit_transcript(
-        self, role: str, text: str, final: bool = True, artifact: str | None = None, item_id: str | None = None
+        self,
+        role: str,
+        text: str,
+        final: bool = True,
+        artifact: str | None = None,
+        item_id: str | None = None,
+        thought: str | None = None,
     ) -> None:
-        """Forward one transcript chunk to the observer, if attached."""
+        """Forward one transcript chunk to the observer, if attached; a thought's lines carry its id."""
         observer = self._transcript_observer
         if observer is not None and text:
             try:
-                if item_id is None:
+                if thought is not None:
+                    observer(role, text, final, artifact, thought=thought)
+                elif item_id is None:
                     observer(role, text, final, artifact)
                 else:
                     observer(role, text, final, artifact, item_id=item_id)
