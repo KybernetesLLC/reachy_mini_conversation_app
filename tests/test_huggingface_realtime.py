@@ -6321,8 +6321,10 @@ async def test_a_thoughts_reply_is_asked_out_of_band_in_writing_with_the_room_in
     assert body["instructions"] == f"## Your memory\n[10:01] (someone else talked with you here)\n\n{profile}"
     assert "guest's words" not in body["instructions"]
     assert body["output_modalities"] == ["text"] and body["tool_choice"] == "none"
+    assert body["tools"] == []  # 11-13: a call it made was dropped and left no text
     assert body["metadata"] == {"companion": "thought", "thought": "discord:1"}
     content = body["input"][0]["content"]
+    assert content[0]["text"] == hf_mod.THOUGHT_FRAME and "tools are not part" in content[0]["text"]
     assert [part["type"] for part in content] == ["input_text"] * 3 + ["input_image"]
     assert content[1]["text"] == "Matt: hi"
     assert content[2]["text"] == "(a thought from Hadley) did you see the boat?"

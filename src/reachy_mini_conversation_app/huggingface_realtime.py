@@ -270,9 +270,13 @@ def _out_of_band_request(
 # "thought": <id>}. An out-of-band response does not see the conversation, so the room's
 # recent turns go into its input as text.
 THOUGHT_TAG: Final[str] = "thought"
+# 11-13, the first live thought came back empty: the profile led him to a gesture call
+# (express) first, which tool_choice "none" drops, leaving no text in about half of the
+# replies. Saying his body and tools are not part of it, and offering none: 12 of 12 wrote.
 THOUGHT_FRAME = (
-    "(The room's recent talk, then a thought sent to you from afar. "
-    "Think back in writing, or write nothing.)"
+    "(The room's recent talk, then a thought sent to you from afar. Think back in writing, "
+    "or write nothing. Your body and your tools are not part of a written reply: only your "
+    "words reach them.)"
 )
 
 
@@ -1809,6 +1813,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # Read here, not off the loop: no await between the in-flight check and the entry.
         instructions = get_thought_instructions()
         create = {"response": _out_of_band_request(tag, ["text"], instructions, content)}
+        create["response"]["tools"] = []  # a call here is dropped and leaves no text (11-13)
         pictures = len(content) - (3 if turns else 2)
         self._thoughts[thought_id] = _Thought(sender, text, pictures, create)
         logger.info("thought %s queued: %d room turns, %d images", thought_id, len(turns), pictures)
@@ -1854,6 +1859,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         logger.info(
             "thought %s answered: %s", thought_id, f"{len(reply)} chars" if reply else why
         )
+        if not written:
+            shape = [
+                (getattr(item, "type", None), getattr(item, "name", None))
+                for item in (getattr(response, "output", None) or [])
+            ]
+            logger.info("thought %s: its output held %s", thought_id, shape or "nothing")
         if self.on_thought_reply is not None:
             try:
                 self.on_thought_reply(thought_id, reply, why)
