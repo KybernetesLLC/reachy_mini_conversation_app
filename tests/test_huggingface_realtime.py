@@ -6245,15 +6245,29 @@ async def test_a_session_reply_ending_in_an_open_tag_is_scrubbed(monkeypatch: An
 
 
 def _thought_response(
-    thought_id: str = "discord:1", status: str = "completed", reason: str | None = None
+    thought_id: str = "discord:1",
+    status: str = "completed",
+    reason: str | None = None,
+    output_text: str | None = None,
 ) -> SimpleNamespace:
+    output = (
+        []
+        if output_text is None
+        else [
+            SimpleNamespace(
+                type="message",
+                id="item-t",
+                content=[SimpleNamespace(type="output_text", text=output_text)],
+            )
+        ]
+    )
     return SimpleNamespace(
         id="resp-t",
         metadata={"companion": "thought", "thought": thought_id},
         status=status,
         status_details=SimpleNamespace(reason=reason),
         usage=None,
-        output=[],
+        output=output,
     )
 
 
@@ -6274,12 +6288,10 @@ def _thought_session(
 
     events: list[Any] = [_think]
     for response in done:
-        events += [
-            _FakeEvent("response.created", response=response),
-            _FakeEvent("response.output_text.done", text=text),
-            _FakeEvent("response.done", response=response),
-            lambda: asyncio.sleep(0.05),
-        ]
+        events.append(_FakeEvent("response.created", response=response))
+        if text:
+            events.append(_FakeEvent("response.output_text.done", text=text))
+        events += [_FakeEvent("response.done", response=response), lambda: asyncio.sleep(0.05)]
     handler.client = _ordering_client(tuple(events), sent, handler)
     return handler, sent, replies
 
@@ -6310,7 +6322,7 @@ async def test_a_thoughts_reply_is_asked_out_of_band_in_writing_with_the_room_in
 
 @pytest.mark.asyncio
 async def test_a_thoughts_reply_is_reported_noted_and_never_spoken(monkeypatch: Any) -> None:
-    """Reported after the gate, then noted in the talk; its transcript lines carry its id; ready; no head."""
+    """Reported after the gate, then a system item in the talk; transcript lines carry its id; ready; no head."""
     handler, sent, replies = _thought_session(monkeypatch, "Yes, a big one!", _thought_response())
     reasons: list[str] = []
     handler.set_activity_observer(lambda reason, **_kw: reasons.append(reason))
@@ -6321,10 +6333,18 @@ async def test_a_thoughts_reply_is_reported_noted_and_never_spoken(monkeypatch: 
 
     assert replies == [("discord:1", "Yes, a big one!", None)]
     note = [payload for kind, payload in sent if kind == "item"]
-    assert len(note) == 1
-    assert note[0]["content"][0]["text"] == hf_mod.note_item_text(
-        "(a thought from Hadley) did you see the boat? You thought back: Yes, a big one!"
-    )
+    assert note == [
+        {
+            "type": "message",
+            "role": "system",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "(a thought from Hadley, answered) did you see the boat? / (your reply) Yes, a big one!",
+                }
+            ],
+        }
+    ]
     assert lines == [
         ("user", "(a thought from Hadley) did you see the boat?", True, None, {"thought": "discord:1"}),
         ("assistant", "Yes, a big one!", True, None, {"thought": "discord:1"}),
@@ -6403,3 +6423,29 @@ async def test_a_plain_create_never_merges_a_queued_thought(monkeypatch: Any) ->
 
     creates = [payload for kind, payload in sent if kind == "response.create"]
     assert [hf_mod._thought_id(c) for c in creates] == [None, "discord:1"]
+
+
+@pytest.mark.asyncio
+async def test_a_thoughts_reply_sent_only_in_its_done_is_read_from_there(monkeypatch: Any) -> None:
+    """With no text events, the reply is the done's output_text parts."""
+    handler, _sent, replies = _thought_session(
+        monkeypatch, "", _thought_response(output_text="Yes, a big one!")
+    )
+
+    await handler._run_realtime_session()
+
+    assert replies == [("discord:1", "Yes, a big one!", None)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "incomplete", "cancelled"])
+async def test_a_thought_that_did_not_complete_is_freed_not_reported(
+    monkeypatch: Any, status: str
+) -> None:
+    """Only a completed reply is final: any other end frees the id, reporting and adding nothing."""
+    handler, sent, replies = _thought_session(monkeypatch, "Yes!", _thought_response(status=status))
+
+    await handler._run_realtime_session()
+
+    assert replies == [] and handler._thoughts == {}
+    assert [kind for kind, _ in sent] == ["response.create"]

@@ -1812,8 +1812,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _thought_done(self, event: Any) -> None:
         """Report a thought's reply after the output gate, then note the thought and reply in the talk."""
-        # Room speech cuts it off: asked again (Thought.tla RequeueOnCancel). A client's cancel
-        # reports nothing, and the companion gives it again.
+        # Room speech cuts it off: asked again (Thought.tla RequeueOnCancel). Only a completed
+        # reply is final; any other end reports nothing, and the companion gives it again.
         response = getattr(event, "response", None)
         thought_id = str((getattr(response, "metadata", None) or {}).get(THOUGHT_TAG) or "")
         thought = self._thoughts.get(thought_id)
@@ -1827,20 +1827,26 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             await self._safe_response_create(**thought.create)
             return
         del self._thoughts[thought_id]
-        if status == "cancelled":
-            logger.info("thought %s: its reply was cancelled (%s)", thought_id, reason)
-            return
-        reply: str | None = None
         if status != "completed":
-            why: str | None = f"{status}: {reason}"
+            logger.info("thought %s not answered: %s (%s)", thought_id, status, reason)
+            self._mark_activity("thought_done")
+            return
+        # A backend that sends no text events has the text only in the done's output.
+        written = self._out_text or "".join(
+            getattr(part, "text", None) or ""
+            for item in (getattr(response, "output", None) or [])
+            if getattr(item, "type", None) == "message"
+            for part in (getattr(item, "content", None) or [])
+            if getattr(part, "type", None) == "output_text"
+        )
+        written = without_ssml(written)[0].strip()
+        reply: str | None = None
+        verdict = judge(written, self._gate_tools, final=True)
+        if verdict.action in (CUT, CUT_AND_EXECUTE):
+            why: str | None = f"gate: {verdict.kind or 'leaked tool call'}"
         else:
-            written = without_ssml(self._out_text)[0].strip()
-            verdict = judge(written, self._gate_tools, final=True)
-            if verdict.action in (CUT, CUT_AND_EXECUTE):
-                why = f"gate: {verdict.kind or 'leaked tool call'}"
-            else:
-                reply = without_calls(written, self._gate_tools).strip() or None
-                why = None if reply else ("gate: leaked tool call" if written else "no text")
+            reply = without_calls(written, self._gate_tools).strip() or None
+            why = None if reply else ("gate: leaked tool call" if written else "no text")
         logger.info(
             "thought %s answered: %s", thought_id, f"{len(reply)} chars" if reply else why
         )
@@ -1850,16 +1856,32 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             except Exception:
                 logger.exception("thought %s: the reply could not be reported", thought_id)
         self._mark_activity("thought_done")
-        if status != "completed":
-            return
         line = thought_line(thought.sender, thought.text)
         self._emit_transcript("user", line, True, thought=thought_id)
         if reply:
             self._emit_transcript("assistant", reply, True, thought=thought_id)
-        pictures = f" (with {thought.images} picture(s))" if thought.images else ""
-        answer = f" You thought back: {reply}" if reply else " You did not answer."
+        pictures = f" with {thought.images} picture(s)" if thought.images else ""
+        note = f"(a thought from {thought.sender}{pictures}, answered) {thought.text} / (your reply) {reply or '(none)'}"
         if self.connection is not None:
-            await self._send_note(f"{line}{pictures}{answer}", self.connection)
+            await self._send_system_note(note, self.connection)
+
+    async def _send_system_note(self, text: str, session: "AsyncRealtimeConnection") -> bool:
+        """Add a system item with no response: an answered thought, which the backend does not act on."""
+        # The companion's probe, 11-12: this form led to no tool call in 3 sessions; the same
+        # text as a user item led to one in 3 of 3 (Thought.tla AppendNote).
+        if self.connection is not session:
+            return self._note_dropped("session changed")
+        try:
+            await session.conversation.item.create(
+                item={
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            )
+        except Exception as exc:
+            return self._note_dropped(str(exc))
+        return True
 
     def open_settled(self) -> None:
         """Start the greeting's hold: the console has finished this open, its pre-roll sent."""
