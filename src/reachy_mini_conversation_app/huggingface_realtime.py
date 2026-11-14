@@ -1698,7 +1698,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._note_tasks:
             await asyncio.gather(*list(self._note_tasks), return_exceptions=True)
 
-    def add_note(self, text: str, now: bool = False) -> "asyncio.Task[Any]":
+    def add_note(
+        self, text: str, now: bool = False, item_id: str | None = None
+    ) -> "asyncio.Task[Any]":
         """Add a companion note at the next quiet moment, with no response of its own.
 
         Who has joined, who is no longer in view. A user-role item: system items
@@ -1716,16 +1718,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # recorded here, and checked again after the quiet wait.
         session = self.connection
         if now:
-            coro = self._note_text_now(text, session)
+            coro = self._note_text_now(text, session, item_id)
         else:
-            coro = self._note_text_when_quiet(text, session)
+            coro = self._note_text_when_quiet(text, session, item_id)
         task = asyncio.create_task(coro, name="companion-note")
         self._note_tasks.add(task)
         task.add_done_callback(self._note_tasks.discard)
         return task
 
     async def _note_text_now(
-        self, text: str, session: "AsyncRealtimeConnection"
+        self, text: str, session: "AsyncRealtimeConnection", item_id: str | None = None
     ) -> bool:
         """Send a note now, even mid-speech; drop it if a response is in the way.
 
@@ -1738,7 +1740,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             or not self._pending_responses.empty()
         ):
             return self._note_dropped("response active")
-        return await self._send_note(text, session)
+        return await self._send_note(text, session, item_id)
 
     def _note_dropped(self, reason: str) -> bool:
         self.note_drop_reason = reason
@@ -1746,7 +1748,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         return False
 
     async def _note_text_when_quiet(
-        self, text: str, session: "AsyncRealtimeConnection"
+        self, text: str, session: "AsyncRealtimeConnection", item_id: str | None = None
     ) -> None:
         started = time.monotonic()
         while True:
@@ -1764,21 +1766,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 )
                 return
             await asyncio.sleep(_NOTE_POLL_SECONDS)
-        await self._send_note(text, session)
+        await self._send_note(text, session, item_id)
 
-    async def _send_note(self, text: str, session: "AsyncRealtimeConnection") -> bool:
+    async def _send_note(
+        self, text: str, session: "AsyncRealtimeConnection", item_id: str | None = None
+    ) -> bool:
         if not self.connection:
             return self._note_dropped("session closed")
         if self.connection is not session:
             return self._note_dropped("session changed")
         try:
-            await self.connection.conversation.item.create(
-                item={
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": note_item_text(text)}],
-                },
-            )
+            item: dict[str, Any] = {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": note_item_text(text)}],
+            }
+            if item_id:  # the companion's note id (W4, 11-14): the wire log joins on it
+                item["id"] = item_id
+            await self.connection.conversation.item.create(item=item)
         except Exception as exc:
             return self._note_dropped(str(exc))
         return True

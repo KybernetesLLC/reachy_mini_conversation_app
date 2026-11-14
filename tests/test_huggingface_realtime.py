@@ -2315,6 +2315,12 @@ async def test_note_now_sent_while_user_speaking() -> None:
     item = handler.connection.conversation.item.create.await_args.kwargs["item"]
     assert item["role"] == "user"
     assert "Alli (she/her) has joined." in item["content"][0]["text"]
+    assert "id" not in item  # no companion id: the server makes one
+
+    handler.add_note("Sam has left.", now=True, item_id="note_people_1a2b")
+    await handler._wait_notes()
+    item = handler.connection.conversation.item.create.await_args.kwargs["item"]
+    assert item["id"] == "note_people_1a2b"  # W4: the wire log joins on it
 
 
 @pytest.mark.asyncio

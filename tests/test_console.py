@@ -3317,9 +3317,16 @@ def test_a_note_over_the_rpc_passes_now_only_when_asked() -> None:
     try:
         _rpc_call(app, "conversation.note", {"text": "a"})
         _rpc_call(app, "conversation.note", {"text": "b", "now": True})
+        _rpc_call(app, "conversation.note", {"text": "c", "id": "note_mention_3f9a"})
+        _rpc_call(app, "conversation.note", {"text": "d", "id": "bad id\n" + "x" * 40})
     finally:
         _stop_loop(loop, thread)
-    assert calls == [("a", {}), ("b", {"now": True})]
+    assert calls == [
+        ("a", {}),
+        ("b", {"now": True}),
+        ("c", {"item_id": "note_mention_3f9a"}),  # W4: the companion's note id
+        ("d", {}),  # not short and plain: not used
+    ]
 
 
 def test_a_note_that_asks_for_a_reply_gets_one_only_when_it_was_sent() -> None:

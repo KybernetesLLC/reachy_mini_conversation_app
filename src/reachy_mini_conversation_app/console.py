@@ -5,6 +5,7 @@ served via the Reachy Mini Apps settings server so users can configure it.
 """
 
 import os
+import re
 import math
 import time
 import base64
@@ -89,6 +90,8 @@ except Exception:  # pragma: no cover - only loaded when settings_app is used
     BaseModel = object  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+NOTE_ID = re.compile(r"[A-Za-z0-9_-]{1,32}")  # a companion note id the app uses as an item id
 
 
 def _detach_framework_root_routes(app: "FastAPI") -> None:
@@ -1650,17 +1653,21 @@ class LocalStream:
             # sent now, then a reply asked for in-band, as the warm-up test did. Never while a
             # response is active: the note is dropped then, and no reply is asked.
             respond = bool(params.get("respond", False))
+            # The companion's note id (W4, 11-14), used as the item's id so the wire log can be
+            # joined to its record of the note; one that is not short and plain is not used.
+            raw_id = params.get("id")
+            ids = {"item_id": raw_id} if isinstance(raw_id, str) and NOTE_ID.fullmatch(raw_id) else {}
 
             async def _add_note() -> bool:
                 if respond:
-                    sent = bool(await self.handler.add_note(text, now=True))
+                    sent = bool(await self.handler.add_note(text, now=True, **ids))
                     if sent:
                         await self.handler.request_reply()
                     return sent
                 if now:
                     # Awaited here, on the handler's loop: the answer is whether it was sent.
-                    return bool(await self.handler.add_note(text, now=True))
-                self.handler.add_note(text)
+                    return bool(await self.handler.add_note(text, now=True, **ids))
+                self.handler.add_note(text, **ids)
                 return True
 
             # On the handler's own loop: add_note's asyncio.create_task must bind to
