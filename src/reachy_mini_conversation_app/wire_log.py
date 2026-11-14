@@ -240,6 +240,10 @@ class WireLog:
         """Note an event received."""
         self._put(("in", sid, time.time(), event))
 
+    def mark(self, sid: int, kind: str, data: dict[str, Any]) -> None:
+        """Note something the app decided about the session (a meta row), such as a drop."""
+        self._put(("mark", sid, time.time(), kind, data))
+
     def wrap(self, conn: Any, **meta: Any) -> Tapped:
         """Return ``conn`` wrapped so every send and receive is recorded."""
         return Tapped(conn, self, self.open_session(**meta))
@@ -375,6 +379,10 @@ class WireLog:
             for key in [k for k in self._audio_out if k[0] == entry[1]]:
                 del self._audio_out[key]
             return True
+        if kind == "mark":
+            _, _, t, name, data = entry
+            self._row(db, row, t, "meta", name, data)
+            return True
         if kind == "out":
             _, sid, t, name, args, kwargs = entry
             data: Any = to_jsonable(kwargs) if kwargs else {}
@@ -477,6 +485,10 @@ class Tapped:
         if name in NAMESPACES:
             return _Space(attr, name, self._log, self._sid)
         return attr
+
+    def wire_mark(self, kind: str, **data: Any) -> None:
+        """Note an app decision about this session in the log (``context.dropped``)."""
+        self._log.mark(self._sid, kind, data)
 
     def __aiter__(self) -> Any:
         """Iterate the connection's events, each one recorded."""

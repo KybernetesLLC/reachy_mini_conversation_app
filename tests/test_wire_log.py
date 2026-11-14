@@ -280,3 +280,15 @@ async def test_the_handlers_session_is_recorded(monkeypatch: pytest.MonkeyPatch,
     assert ("out", "session.update") in kinds
     assert ("in", "conversation.item.input_audio_transcription.completed") in kinds
     monkeypatch.setattr(wire_log, "_LOG", None)
+
+
+def test_an_app_decision_is_a_meta_row(tmp_path: Path) -> None:
+    """The handler marks where it decided the backend dropped the conversation (W2 review)."""
+    path = tmp_path / "wire.db"
+    log = WireLog(path, **FAST)
+    tapped = log.wrap(_Conn([]))
+    tapped.wire_mark("context.dropped", input_tokens=4100)
+    log.flush()
+    (row,) = _rows(path)
+    assert row[:2] == ("meta", "context.dropped")
+    assert _payload(path, row) == {"input_tokens": 4100}

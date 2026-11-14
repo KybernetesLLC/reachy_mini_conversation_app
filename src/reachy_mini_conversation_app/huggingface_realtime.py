@@ -1619,6 +1619,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         wanted (a session opened on this connection, or a drop), one send at a time."""
         if self._watch_context(usage):
             self._instructions_wanted = "the conversation was dropped"
+            mark = getattr(self.connection, "wire_mark", None)  # the wire log's reader clears here
+            if callable(mark):
+                mark("context.dropped", input_tokens=getattr(usage, "input_tokens", None))
         if (
             self._prune.due(time.monotonic())
             and (self._prune_task is None or self._prune_task.done())

@@ -4815,7 +4815,11 @@ async def test_a_drop_or_a_wish_sends_the_instructions_once_at_a_reply_end(
     from reachy_mini_conversation_app import huggingface_realtime as hr
 
     handler = _handler()
-    handler.connection = SimpleNamespace(session=SimpleNamespace(update=AsyncMock()))
+    marks: list = []
+    handler.connection = SimpleNamespace(
+        session=SimpleNamespace(update=AsyncMock()),
+        wire_mark=lambda kind, **data: marks.append((kind, data)),
+    )
     text = {"now": "memory A"}
     monkeypatch.setattr(hr, "get_session_instructions", lambda *_: text["now"])
     handler._instructions_sent = "memory A"
@@ -4828,7 +4832,9 @@ async def test_a_drop_or_a_wish_sends_the_instructions_once_at_a_reply_end(
         handler._after_reply(u(t))
     assert handler._ctx_base == 11401 and handler._instructions_task is None
     text["now"] = "memory B"
+    assert marks == []
     handler._after_reply(u(11601))  # the drop
+    assert marks == [("context.dropped", {"input_tokens": 11601})]  # the wire log's mark
     handler._after_reply(
         u(11650)
     )  # the next reply before it lands: measured afresh, no second
