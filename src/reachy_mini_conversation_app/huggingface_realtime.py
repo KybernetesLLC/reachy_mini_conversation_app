@@ -34,6 +34,7 @@ from openai.types.realtime.realtime_audio_input_turn_detection_param import Serv
 from reachy_mini_conversation_app.tools import camera as camera_tool
 from reachy_mini_conversation_app.tools import core_tools
 from reachy_mini_conversation_app import talk_prune
+from reachy_mini_conversation_app import wire_log
 from reachy_mini_conversation_app.config import (
     HF_LOCAL_CONNECTION_MODE,
     config,
@@ -2334,6 +2335,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             "max_size": REALTIME_MAX_MESSAGE_BYTES
         }
         async with self.client.realtime.connect(**connect_kwargs) as conn:
+            wire = wire_log.from_env()  # the companion's wire log (11-14): off unless its path is set
+            if wire is not None:
+                conn = wire.wrap(
+                    conn,
+                    backend_host=str(getattr(self.client, "base_url", "") or "") or None,
+                    profile=getattr(config, "REACHY_MINI_CUSTOM_PROFILE", None),
+                )
             try:
                 session_config = self._get_session_config(tool_specs)
                 await conn.session.update(session=session_config)
