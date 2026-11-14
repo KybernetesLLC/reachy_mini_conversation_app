@@ -18,3 +18,5 @@ os.environ["REACHY_MINI_SKIP_DOTENV"] = "1"
 os.environ.pop("REACHY_MINI_CUSTOM_PROFILE", None)
 os.environ.pop("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY", None)
 os.environ.pop("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY", None)
+# The wire log records only when its path is set: never from a test run, even on the robot.
+os.environ.pop("REACHY_COMPANION_WIRE_LOG", None)

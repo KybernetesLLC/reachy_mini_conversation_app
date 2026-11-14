@@ -2334,14 +2334,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         connect_kwargs["websocket_connection_options"] = {
             "max_size": REALTIME_MAX_MESSAGE_BYTES
         }
-        async with self.client.realtime.connect(**connect_kwargs) as conn:
-            wire = wire_log.from_env()  # the companion's wire log (11-14): off unless its path is set
-            if wire is not None:
-                conn = wire.wrap(
-                    conn,
-                    backend_host=str(getattr(self.client, "base_url", "") or "") or None,
-                    profile=getattr(config, "REACHY_MINI_CUSTOM_PROFILE", None),
-                )
+        # The companion's wire log (11-14): every send and receive recorded while the session runs;
+        # the connection as is when the log is off (its path unset).
+        async with self.client.realtime.connect(**connect_kwargs) as raw_conn, wire_log.tap(
+            raw_conn,
+            backend_host=str(getattr(self.client, "base_url", "") or "") or None,
+            profile=getattr(config, "REACHY_MINI_CUSTOM_PROFILE", None),
+        ) as conn:
             try:
                 session_config = self._get_session_config(tool_specs)
                 await conn.session.update(session=session_config)
