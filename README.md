@@ -36,7 +36,7 @@ Conversational app for the Reachy Mini robot combining realtime voice, vision, p
 - Low-latency audio conversation through the Hugging Face realtime backend, using the built-in server or a local endpoint.
 - Vision is handled by the realtime backend when the `camera` tool is used.
 - Layered motion system queues primary moves (dances, emotions, goto poses, breathing) while blending speech-reactive wobble.
-- Async tools integrate motion, camera capture, and MCP Tool Spaces. The optional web UI (`--ui`) manages conversations, personalities, tools, and settings.
+- Async tools integrate motion, camera capture, and MCP Tool Spaces. The optional web UI (`--ui`) manages the conversation and settings.
 
 ## Architecture
 
@@ -177,14 +177,14 @@ The app runs in console mode. Add `--ui` to serve the web interface at http://12
 # Audio-only conversation (no camera)
 reachy-mini-conversation-app --no-camera
 
-# Launch with the minimal web UI for personality/mic/settings control
+# Launch with the minimal web UI for mic/settings control
 reachy-mini-conversation-app --ui
 ```
 
 ## LLM tools exposed to the assistant
 
-The default profile exposes these tools. Use Tools → Tool access to customize any profile.
-Every bundled profile enables `head_tracking` by default; users can still disable it per personality.
+The default profile exposes these tools. Change a profile's tools in its `default_tools` in `profile.md`. A `profile_toolsets.json` override for the profile, which installing a tool space writes, still wins over `default_tools`.
+Every bundled profile enables `head_tracking` by default; a profile can still leave it out of its `default_tools`.
 
 | Tool | Action | Dependencies |
 |------|--------|--------------|
@@ -212,7 +212,7 @@ Create one Python module per tool, with the file name matching the tool's unique
 
 Each tool subclasses `Tool` and defines `name`, a model-facing `description`, an object-shaped JSON Schema in `parameters_schema`, and an async `__call__` method. Use `ToolDependencies` for runtime services, and set `needs_response = False` for actions that should not trigger a spoken follow-up. Catch expected operational failures, log them with the module logger, and return `{"error": "..."}` so the conversation can continue.
 
-Restart the app after adding the module. Use Tools → Tool access to enable it for a personality, or add its name to that profile's `default_tools` in `profile.md`. See [External profiles and tools](#external-profiles-and-tools) for external directories and autoload behavior.
+Restart the app after adding the module. Add its name to a profile's `default_tools` in `profile.md` to enable it. See [External profiles and tools](#external-profiles-and-tools) for external directories and autoload behavior.
 
 ### Hugging Face Space tools
 
@@ -232,7 +232,7 @@ Built-in motion content is published as open Hugging Face datasets:
 
 Create custom profiles with dedicated instructions and per-profile tool access.
 
-Select and save a startup profile in the UI. The choice is stored in `startup_settings.json`. Before one is saved, `REACHY_MINI_CUSTOM_PROFILE=<name>` can select `profiles/<name>/`; otherwise the app uses `default`.
+When `startup_settings.json` exists, its profile is used (the default if it names none); `REACHY_MINI_CUSTOM_PROFILE=<name>` (selecting `profiles/<name>/`) applies only when the file is absent.
 
 Every profile directory contains one strict schema-version-1 `profile.md`. TOML metadata is enclosed by `+++`; the remaining Markdown body is the realtime assistant prompt:
 
@@ -254,23 +254,13 @@ default_tools = [
 You are a concise, friendly robot guide.
 ```
 
-`schema_version`, `default_tools`, and a non-empty Markdown body are required. `voice`, `greeting`, and `hidden` are optional. Set `hidden = true` to omit a profile from the UI. An empty `default_tools` list is valid and inherits nothing.
-
-`default_tools` is the authored baseline. Tools → Tool access stores overrides in instance-local `profile_toolsets.json` without changing bundled profiles. Restoring defaults removes the override. Active-profile changes reconnect the conversation; other changes apply when selected.
+`schema_version`, `default_tools`, and a non-empty Markdown body are required. `voice`, `greeting`, and `hidden` are optional. An empty `default_tools` list is valid and inherits nothing.
 
 Profile directories are data-only. Python tool implementations belong in `src/reachy_mini_conversation_app/tools/`, or in `REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY` for external tools. Each enabled tool ID must resolve to a shared tool, an external tool, or a tool from an installed Hugging Face Space.
 
 See [Creating and adding tools](#creating-and-adding-tools) for the local tool interface and a maintained example.
 
-To manage personalities in the UI:
-
-With `--ui`, Home lists the available profiles and the built-in default:
-
-- Tap a card to apply that personality and start talking.
-- Tap "Manage tools" on a saved personality to open its tool access directly.
-- Tap "Custom" to create a personality with a name, instructions, and optional greeting. It inherits the default tools, which can be changed under "Manage tools". Managed instances store it at `user_personalities/<name>/profile.md`; standalone runs use `external_content/user_personalities/<name>/profile.md`.
-
-Switching a personality reloads its prompt and effective tools through a quick backend reconnect. Editing `profile.md` directly requires re-selecting the profile or restarting the app.
+Editing `profile.md` directly requires restarting the app.
 
 </details>
 
@@ -281,7 +271,7 @@ To create a locked variant of the app that cannot switch profiles, edit `src/rea
 ```python
 LOCKED_PROFILE: str | None = "mars_rover"  # Lock to this profile
 ```
-When set, the app ignores saved startup settings, `REACHY_MINI_CUSTOM_PROFILE`, and UI selection. The UI marks the profile as locked and disables editing.
+When set, the app ignores saved startup settings and `REACHY_MINI_CUSTOM_PROFILE`.
 
 </details>
 
