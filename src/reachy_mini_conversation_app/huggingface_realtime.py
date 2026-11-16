@@ -783,44 +783,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             except Exception:
                 pass
 
-    async def _restart_session(self) -> None:
-        """Force-close the current session and start a fresh one in background.
-
-        Does not block the caller while the new session is establishing.
-        """
-        try:
-            if self.connection is not None:
-                try:
-                    await self.connection.close()
-                except Exception:
-                    pass
-                finally:
-                    self.connection = None
-
-            # Ensure we have a client (start_up must have run once)
-            if getattr(self, "client", None) is None:
-                logger.warning("Cannot restart: realtime client not initialized yet.")
-                return
-
-            # Fire-and-forget new session and wait briefly for connection
-            try:
-                self._connected_event.clear()
-            except Exception:
-                pass
-            self.client = await self._build_realtime_client()
-            asyncio.create_task(
-                self._run_realtime_session(), name="realtime-session-restart"
-            )
-            try:
-                await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
-                logger.info("Realtime session restarted and connected.")
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Realtime session restart timed out; continuing in background."
-                )
-        except Exception as e:
-            logger.warning("_restart_session failed: %s", e)
-
     async def _recover_refused_reply(self) -> bool:
         """Send a reply the server refused while a tool's output was owed, once the outputs are in.
 

@@ -624,14 +624,11 @@ async def test_change_voice_updates_live_hf_session_without_restart(
         ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
     )
     handler.connection = FakeConnection()
-    restart = AsyncMock(return_value=None)
-    monkeypatch.setattr(handler, "_restart_session", restart)
 
     result = await handler.change_voice("Serena")
 
     assert result == "Voice changed to Serena."
     assert handler.get_current_voice() == "Serena"
-    restart.assert_not_awaited()
     session = captured_update["session"]
     assert session["audio"]["output"]["voice"] == "Serena"
 
