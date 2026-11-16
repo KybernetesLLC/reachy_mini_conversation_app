@@ -594,6 +594,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if tool_name == "camera" and "b64_im" in tool_result:
             sanitized = dict(tool_result)
             sanitized.pop("b64_im", None)
+            sanitized.pop("pose", None)  # for the companion's kept picture, not for the model
             sanitized["image_attached"] = True
             return sanitized
         return tool_result
