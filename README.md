@@ -183,7 +183,7 @@ reachy-mini-conversation-app --ui
 
 ## LLM tools exposed to the assistant
 
-The default profile exposes these tools. Change a profile's tools in its `default_tools` in `profile.md`.
+The default profile exposes these tools. Change a profile's tools in its `default_tools` in `profile.md`. A `profile_toolsets.json` override for the profile, which installing a tool space writes, still wins over `default_tools`.
 Every bundled profile enables `head_tracking` by default; a profile can still leave it out of its `default_tools`.
 
 | Tool | Action | Dependencies |
@@ -232,7 +232,7 @@ Built-in motion content is published as open Hugging Face datasets:
 
 Create custom profiles with dedicated instructions and per-profile tool access.
 
-A startup profile saved in `startup_settings.json` is used when present. Otherwise, `REACHY_MINI_CUSTOM_PROFILE=<name>` can select `profiles/<name>/`; otherwise the app uses `default`.
+When `startup_settings.json` exists, its profile is used (the default if it names none); `REACHY_MINI_CUSTOM_PROFILE=<name>` (selecting `profiles/<name>/`) applies only when the file is absent.
 
 Every profile directory contains one strict schema-version-1 `profile.md`. TOML metadata is enclosed by `+++`; the remaining Markdown body is the realtime assistant prompt:
 
@@ -271,7 +271,7 @@ To create a locked variant of the app that cannot switch profiles, edit `src/rea
 ```python
 LOCKED_PROFILE: str | None = "mars_rover"  # Lock to this profile
 ```
-When set, the app ignores saved startup settings, `REACHY_MINI_CUSTOM_PROFILE`, and UI selection.
+When set, the app ignores saved startup settings and `REACHY_MINI_CUSTOM_PROFILE`.
 
 </details>
 
