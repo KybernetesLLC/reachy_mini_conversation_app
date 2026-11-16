@@ -190,12 +190,31 @@ FILLER_LINES = (
     "Just a second.",
 )
 FILLER_AFTER_S = 1.0  # a lookup tool still running this long gets a filler
+# A tool says what kind it is with its `kind` attribute (core_tools.Tool). These names are only the
+# fallback for a tool that declares none: Pollen's get_weather, a Space's or the SDK's search_web, an
+# older companion's app tools.
 SEARCH_TOOLS = ("search_web", "web_search")  # by name ending: always slow enough
 # Matched by name ending: "weather" is the companion's tool (2026-10-24) and Pollen's get_weather.
 LOOKUP_TOOLS = ("flights", "boats", "transit", "events", "why_lit", "weather")
 # Tools that only move the body. A response that already spoke and called only these gets
 # no follow-up: on 2026-10-23 08:42 the greeting's follow-up read its context aloud.
 GESTURE_TOOLS = frozenset({"express"})
+
+
+def tool_kind(name: str, registry: dict[str, Any]) -> str:
+    """Return the kind of the named tool: what it declares, else what its name says ("plain" for neither)."""
+    declared = getattr(registry.get(name), "kind", None)
+    if declared is not None:
+        return str(declared)
+    if name.endswith(SEARCH_TOOLS):
+        return "search"
+    if name.endswith(LOOKUP_TOOLS):
+        return "lookup"
+    if name in GESTURE_TOOLS:
+        return "gesture"
+    return "plain"
+
+
 LOOKUP_PROMISE = re.compile(
     r"\b(let me (check|look|find out|search)(?! at you)|let me see (what|if|whether)"
     r"|(looking|look) (it|that|this) up|i'?ll (check|find out|look (it|that|this) up))\b",
@@ -1198,7 +1217,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _spoke_and_only_gestured(self, completed_tool: ToolNotification) -> bool:
         return (
-            completed_tool.tool_name in GESTURE_TOOLS
+            tool_kind(completed_tool.tool_name, core_tools.get_tools()) == "gesture"
             and completed_tool.error is None
             and completed_tool.turn_id in self._spoken_responses
         )
@@ -1246,10 +1265,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         At once for a search, after FILLER_AFTER_S for another lookup tool. Never for a
         tool that is itself the response.
         """
-        name = tool_name or ""
-        if name.endswith(SEARCH_TOOLS):
+        kind = tool_kind(tool_name or "", core_tools.get_tools())
+        if kind == "search":
             await self._play_filler()
-        elif name.endswith(LOOKUP_TOOLS):
+        elif kind == "lookup":
             task = asyncio.create_task(self._filler_if_slow(call_id))
             self._filler_tasks.add(
                 task
@@ -2033,7 +2052,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
         self._log_tool_latency(completed_tool)
-        if completed_tool.tool_name.endswith(SEARCH_TOOLS):
+        if tool_kind(completed_tool.tool_name, core_tools.get_tools()) == "search":
             self._search_answer_pending = True  # its answer's first audio is logged
         if completed_tool.error is not None:
             logger.error(

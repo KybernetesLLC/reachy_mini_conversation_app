@@ -66,6 +66,8 @@ class Tool(abc.ABC):
     Tools may override:
       - needs_response: bool = True  # set False to skip the spoken follow-up after this tool runs
       - leak_safe: bool = False  # set True to run it when the model writes its call as text
+      - kind: "lookup", "search" or "gesture" to say what kind of tool it is (None: not declared, and the
+        handler falls back to matching the name)
     """
 
     _auto_register: ClassVar[bool] = True
@@ -73,6 +75,10 @@ class Tool(abc.ABC):
     # The output gate cuts a reply that is only this tool's name or call markup; it runs
     # the tool too only when this is True. Opt in only for tools whose effect is nothing.
     leak_safe: ClassVar[bool] = False
+    # What kind of tool this is, for the handler: "lookup" (slow: a filler after a moment), "search"
+    # (always slow: a filler at once) or "gesture" (moves the body only: no follow-up after a spoken
+    # response), or "plain". None means not declared; the handler then matches the name.
+    kind: ClassVar[Literal["plain", "lookup", "search", "gesture"] | None] = None
 
     name: str
     description: str
