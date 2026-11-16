@@ -6290,3 +6290,51 @@ async def test_a_thought_that_did_not_complete_is_freed_not_reported(
 
     assert replies == [] and handler._thoughts == {}
     assert [kind for kind, _ in sent] == ["response.create"]
+
+
+# --- tools say what kind they are (companion ticket 40) -----------------------------------------
+
+
+def _kind_tool(kind: str | None) -> Any:
+    return type("T", (), {"kind": kind})
+
+
+def test_tool_kind_reads_what_the_tool_declares_before_its_name() -> None:
+    registry = {"lookup_thing": _kind_tool("lookup"), "web_search": _kind_tool("plain")}
+    assert hf_mod.tool_kind("lookup_thing", registry) == "lookup"
+    assert hf_mod.tool_kind("web_search", registry) == "plain"  # a declaration wins over the name
+
+
+def test_tool_kind_falls_back_to_the_name_for_a_tool_that_declares_none() -> None:
+    registry = {"flights": _kind_tool(None)}
+    expected = {
+        "flights": "lookup",
+        "pollen_robotics_weather__get_weather": "lookup",
+        "pollen_robotics_reachy_mini_search_tool__search_web": "search",
+        "web_search": "search",
+        "express": "gesture",
+        "get_express": "plain",
+        "music": "plain",
+    }
+    for name, kind in expected.items():
+        assert hf_mod.tool_kind(name, registry) == kind, name
+
+
+def test_with_the_companion_every_tool_keeps_the_kind_its_name_gave(companion_on: Any) -> None:
+    """The join: the companion's app tools declare the kind the old name lists gave them."""
+    import ast
+
+    old_names = {"boats": "lookup", "flights": "lookup", "transit": "lookup", "events": "lookup",
+                 "why_lit": "lookup", "weather": "lookup", "web_search": "search", "express": "gesture"}
+    declared: dict[str, Any] = {}
+    for path in sorted((companion_on / "app_tools").glob("companion_*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ClassDef):
+                attrs = {t.id: n.value.value for n in node.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
+                         for t in n.targets if isinstance(t, ast.Name)}
+                if "name" in attrs:
+                    declared[attrs["name"]] = attrs.get("kind")
+    for name, kind in old_names.items():
+        assert declared.get(name) == kind, name
+        assert hf_mod.tool_kind(name, {}) == kind  # and an old companion's tool, by name alone, agrees
+    assert all(hf_mod.tool_kind(n, {n: _kind_tool(k)}) == (k or hf_mod.tool_kind(n, {})) for n, k in declared.items())
