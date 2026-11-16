@@ -3875,22 +3875,21 @@ def test_a_barge_in_marks_the_reply_flushed_never_unheard() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pushes_and_barge_ins_reach_the_phantom_watch() -> None:
-    """The phantom-speech detector knows what the app pushed and what a barge-in dropped."""
+async def test_pushes_reach_the_phantom_watch_and_the_tracker_keeps_the_playout_end() -> None:
+    """The detector hears of the push; the one playout end is the tracker's, and a barge-in cuts it."""
     robot = _audio_robot(push_audio_sample=MagicMock())
     handler = MagicMock()
     stream = LocalStream(handler, robot)
     stream._now = lambda: 42.0
-    seen: list[tuple[str, float, float | None]] = []
-    stream._phantom = SimpleNamespace(
-        pushed=lambda now, seconds: seen.append(("pushed", now, seconds)),
-        flushed=lambda now: seen.append(("flushed", now, None)),
-    )
+    seen: list[float] = []
+    stream._phantom = SimpleNamespace(pushed=seen.append)
     frame = np.full(2400, 9830, dtype=np.int16)  # 0.1 s at 24 kHz
     handler.emit = AsyncMock(side_effect=_stop_after(stream, (24000, frame)))
     await stream.play_loop()
+    assert seen == [42.0]
+    assert stream._replies.play_end(42.0) == pytest.approx(42.1)
     stream.clear_audio_queue()
-    assert seen == [("pushed", 42.0, pytest.approx(0.1)), ("flushed", 42.0, None)]
+    assert stream._replies.play_end(42.0) == 42.0
 
 
 @pytest.mark.asyncio
@@ -3901,7 +3900,7 @@ async def test_the_phantom_watch_hears_of_a_push_before_the_audio_is_pushed() ->
     robot = _audio_robot(push_audio_sample=push)
     handler = MagicMock()
     stream = LocalStream(handler, robot)
-    stream._phantom = SimpleNamespace(pushed=lambda now, seconds: order.append("phantom"))
+    stream._phantom = SimpleNamespace(pushed=lambda now: order.append("phantom"))
     frame = np.full(2400, 9830, dtype=np.int16)
     handler.emit = AsyncMock(side_effect=_stop_after(stream, (24000, frame)))
     await stream.play_loop()

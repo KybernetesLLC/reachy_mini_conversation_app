@@ -121,37 +121,33 @@ class PhantomDetector:
         self,
         sound: Callable[[], tuple[bool, float | None]] | None = None,
         pending: Callable[[float], bool] | None = None,
+        play_end: Callable[[float], float | None] | None = None,
     ) -> None:
         """``sound`` returns (a sound is open, when the last one closed); SOUNDS by default.
 
         ``pending(now)`` says whether a pushed reply has not been heard yet (ReplyTracker).
+        ``play_end(now)`` returns when the audio pushed so far plays out (ReplyTracker.play_end).
+        Both are read under this lock, so the lock order is the detector's, then the tracker's.
         """
         self._sound = sound or SOUNDS.state
         self._pending = pending or (lambda now: False)
+        self._play_end = play_end or (lambda now: None)
         self.errors = ErrorCount()
         self._lock = threading.Lock()
         self._last_buffer: float | None = None  # the last monitor buffer while an episode is open
         self._last_push: float | None = None
-        self._play_end: float | None = None  # when the audio pushed so far has played out
         # (start, loud seconds, last loud) of sound that may open an episode
         self._candidate: tuple[float, float, float] | None = None
         self._episode: PhantomEpisode | None = None
         self._events: list[PhantomEvent] = []
 
-    def pushed(self, now: float, seconds: float) -> None:
-        """Note audio pushed at ``now``: it plays after what is queued; an open episode ends."""
+    def pushed(self, now: float) -> None:
+        """Note audio pushed at ``now``; an open episode ends."""
         with self._lock:
             self._last_push = now
-            self._play_end = max(self._play_end or now, now) + seconds
             self._candidate = None
             if self._episode is not None:
                 self._end(self._episode.last_loud, "the app pushed audio")
-
-    def flushed(self, now: float) -> None:
-        """Note a barge-in: the queued audio was dropped."""
-        with self._lock:
-            if self._play_end is not None:
-                self._play_end = min(self._play_end, now)
 
     def app_quiet(self, now: float) -> bool:
         """Return whether no sound of the app's own played for PHANTOM_QUIET_S."""
@@ -160,7 +156,7 @@ class PhantomDetector:
 
     def _app_quiet(self, now: float) -> bool:
         """Whether no sound of the app's own played for PHANTOM_QUIET_S. Holds the lock."""
-        for t in (self._last_push, self._play_end):
+        for t in (self._last_push, self._play_end(now)):
             if t is not None and now - t < PHANTOM_QUIET_S:
                 return False
         if self._pending(now):
@@ -555,7 +551,7 @@ def _describe_playbin(audio: Any) -> str:
 class PhantomWatch:
     """The detector, the speech-sink probe and the report, for the console.
 
-    monitored() runs on the speaker monitor's streaming thread; pushed(), flushed() and
+    monitored() runs on the speaker monitor's streaming thread; pushed() and
     take() on the event loop; keep() and act() in a worker thread.
     """
 
@@ -566,12 +562,14 @@ class PhantomWatch:
         pad: PadLevel | None = None,
         clock: Callable[[], float] = time.monotonic,
         pending: Callable[[float], bool] | None = None,
+        play_end: Callable[[float], float | None] | None = None,
     ) -> None:
         """Build with the module's sound state and pw-dump.
 
         ``pending(now)``: whether a pushed reply is still unheard (ReplyTracker.pending).
+        ``play_end(now)``: when the audio pushed so far plays out (ReplyTracker.play_end).
         """
-        self.detector = PhantomDetector(sound=sound, pending=pending)
+        self.detector = PhantomDetector(sound=sound, pending=pending, play_end=play_end)
         self.monitored = self.detector.monitored  # the monitor's streaming thread; never raises
         self.pad = pad or PadLevel()
         self._clock = clock
@@ -586,15 +584,11 @@ class PhantomWatch:
         self._probe_since = 0.0
         self._errors_logged_at: float | None = None
 
-    def pushed(self, now: float, seconds: float) -> None:
+    def pushed(self, now: float) -> None:
         """Note audio the app is pushing, before it is pushed: the speech-sink probe comes off."""
         with self._probe_gate:
-            self.detector.pushed(now, seconds)
+            self.detector.pushed(now)
             self.pad.detach()
-
-    def flushed(self, now: float) -> None:
-        """Note a barge-in: the queued audio was dropped."""
-        self.detector.flushed(now)
 
     def take(self) -> list[PhantomEvent]:
         """Return the events to act on, off the event loop."""

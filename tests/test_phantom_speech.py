@@ -45,6 +45,17 @@ def _kinds(det: ps.PhantomDetector) -> list[str]:
     return [e.kind for e in det.take()]
 
 
+def _wired() -> ph.ReplyTracker:
+    """Return a tracker for the detector's play_end: ReplyTracker keeps the one playout end."""
+    return ph.ReplyTracker(rebuilt_at=lambda: None)
+
+
+def _push(unit: Any, tracker: ph.ReplyTracker, now: float, seconds: float) -> None:
+    """Push as the console does: the detector or watch first, then the tracker."""
+    unit.pushed(now)
+    tracker.pushed(now, seconds, seconds)
+
+
 # --- the detector: pure, times passed in ---------------------------------------------------
 
 
@@ -78,8 +89,9 @@ def test_a_blip_under_half_a_second_is_not_an_episode() -> None:
 
 def test_the_apps_own_reply_is_never_an_episode() -> None:
     """Sound while the app's reply plays is the reply."""
-    det = ps.PhantomDetector(sound=lambda: (False, None))
-    det.pushed(10.0, 2.0)
+    tracker = _wired()
+    det = ps.PhantomDetector(sound=lambda: (False, None), play_end=tracker.play_end)
+    _push(det, tracker, 10.0, 2.0)
     _monitor(det, 10.0, 12.2, loud=True)
     _monitor(det, 12.2, 20.0, loud=False)
     assert det.take() == []
@@ -87,9 +99,10 @@ def test_the_apps_own_reply_is_never_an_episode() -> None:
 
 def test_audio_queued_faster_than_real_time_is_still_the_apps_while_it_plays() -> None:
     """Six seconds pushed in half a second plays until 16 s: the push 5 s ago is no phantom."""
-    det = ps.PhantomDetector(sound=lambda: (False, None))
+    tracker = _wired()
+    det = ps.PhantomDetector(sound=lambda: (False, None), play_end=tracker.play_end)
     for i in range(6):
-        det.pushed(10.0 + 0.1 * i, 1.0)
+        _push(det, tracker, 10.0 + 0.1 * i, 1.0)
     _monitor(det, 10.2, 16.2, loud=True)
     _monitor(det, 16.2, 22.0, loud=False)
     assert det.take() == []
@@ -97,9 +110,10 @@ def test_audio_queued_faster_than_real_time_is_still_the_apps_while_it_plays() -
 
 def test_a_barge_in_drops_the_queued_estimate() -> None:
     """After a barge-in the dropped audio no longer counts as playing."""
-    det = ps.PhantomDetector(sound=lambda: (False, None))
-    det.pushed(10.0, 6.0)
-    det.flushed(11.0)
+    tracker = _wired()
+    det = ps.PhantomDetector(sound=lambda: (False, None), play_end=tracker.play_end)
+    _push(det, tracker, 10.0, 6.0)
+    tracker.flushed(11.0)
     _monitor(det, 11.0, 14.5, loud=False)
     _monitor(det, 14.5, 15.5, loud=True)
     assert _kinds(det) == ["started"]
@@ -120,9 +134,10 @@ def test_a_sound_playing_or_just_ended_is_not_an_episode() -> None:
 
 def test_the_app_pushing_ends_an_episode() -> None:
     """A push during an episode ends it there."""
-    det = ps.PhantomDetector(sound=lambda: (False, None))
+    tracker = _wired()
+    det = ps.PhantomDetector(sound=lambda: (False, None), play_end=tracker.play_end)
     _monitor(det, 100.0, 101.0, loud=True)
-    det.pushed(101.0, 1.0)
+    _push(det, tracker, 101.0, 1.0)
     _monitor(det, 101.0, 101.5, loud=True)
     events = det.take()
     assert [e.kind for e in events] == ["started", "ended"]
@@ -132,8 +147,9 @@ def test_the_app_pushing_ends_an_episode() -> None:
 
 def test_the_last_push_age_is_kept_on_the_episode() -> None:
     """The episode says how long before it the app last pushed."""
-    det = ps.PhantomDetector(sound=lambda: (False, None))
-    det.pushed(50.0, 1.0)
+    tracker = _wired()
+    det = ps.PhantomDetector(sound=lambda: (False, None), play_end=tracker.play_end)
+    _push(det, tracker, 50.0, 1.0)
     _monitor(det, 100.0, 101.0, loud=True)
     (event,) = det.take()
     assert event.episode.last_push_age_s == pytest.approx(50.0, abs=0.2)
@@ -331,12 +347,14 @@ def test_an_episode_is_reported_once_with_the_sink_inputs_and_the_pad(
     fakes = _Fakes()
     fakes.pad = ps.PadLevel(clock=lambda: 99.5)
     fakes.pad.attach(SimpleNamespace(get_static_pad=lambda name: _FakePad()))
+    tracker = _wired()
     watch = ps.PhantomWatch(
         sound=lambda: (False, None),
         list_inputs=fakes.list_inputs,
         pad=fakes.pad,
+        play_end=tracker.play_end,
     )
-    watch.pushed(10.0, 1.0)
+    _push(watch, tracker, 10.0, 1.0)
     for i in range(20):
         fakes.pad._record(100.0 + 0.1 * i, 0.0, "F32LE")  # the app's sink: silence only
     _monitor(watch.detector, 100.0, 102.0, loud=True)
@@ -409,9 +427,10 @@ def test_an_episode_ended_before_its_listing_ran_still_lists_the_sink_inputs(
 ) -> None:
     """Each event runs in its own worker: an end handled first lists the sink inputs itself."""
     fakes = _Fakes()
-    watch = ps.PhantomWatch(sound=lambda: (False, None), list_inputs=fakes.list_inputs)
+    tracker = _wired()
+    watch = ps.PhantomWatch(sound=lambda: (False, None), list_inputs=fakes.list_inputs, play_end=tracker.play_end)
     _monitor(watch.detector, 100.0, 101.0, loud=True)
-    watch.pushed(101.0, 1.0)  # ends the episode: started and ended come out together
+    _push(watch, tracker, 101.0, 1.0)  # ends the episode: started and ended come out together
     started, ended = watch.take()
     audio = SimpleNamespace(_playbin=None)
     with caplog.at_level(logging.INFO, logger=ps.logger.name):
@@ -557,11 +576,12 @@ def test_the_probe_is_on_only_while_the_app_is_quiet(monkeypatch: pytest.MonkeyP
     """A push removes it before the reply's buffers flow; a later suspicion puts it back."""
     _gst()
     audio, pad = _probe_rig(monkeypatch, [True])
-    watch = ps.PhantomWatch(sound=lambda: (False, None))
+    tracker = _wired()
+    watch = ps.PhantomWatch(sound=lambda: (False, None), play_end=tracker.play_end)
     _suspect(watch, 99.7, 100.0)  # loud with nothing ever pushed: suspected
     watch.keep(audio, 100.0)
     assert len(pad.probes) == 1
-    watch.pushed(101.0, 2.0)
+    _push(watch, tracker, 101.0, 2.0)
     assert pad.probes == {}  # removed at the push, before the audio reaches the sink
     _monitor(watch.detector, 103.5, 104.0, loud=True)  # the reply's sound: not suspected
     watch.keep(audio, 104.0)
@@ -592,9 +612,10 @@ def test_a_detached_probe_sees_none_of_a_real_reply() -> None:
         "audiotestsrc num-buffers=20 wave=sine volume=0.5 ! "
         "audio/x-raw,format=F32LE,rate=16000,channels=1 ! fakesink name=sink sync=false"
     )
-    watch = ps.PhantomWatch(sound=lambda: (False, None))
+    tracker = _wired()
+    watch = ps.PhantomWatch(sound=lambda: (False, None), play_end=tracker.play_end)
     assert watch.pad.attach(pipeline.get_by_name("sink"))
-    watch.pushed(time.monotonic(), 1.0)
+    _push(watch, tracker, time.monotonic(), 1.0)
     pipeline.set_state(Gst.State.PLAYING)
     done = Gst.MessageType.EOS | Gst.MessageType.ERROR
     pipeline.get_bus().timed_pop_filtered(5 * Gst.SECOND, done)
@@ -690,7 +711,8 @@ def test_a_keep_that_checked_quiet_before_a_push_cannot_attach_after_it(
     """The gate: keep's quiet check and attach are one step, so a push's detach comes after."""
     _gst()
     audio, pad = _probe_rig(monkeypatch, [True])
-    watch = ps.PhantomWatch(sound=lambda: (False, None))
+    tracker = _wired()
+    watch = ps.PhantomWatch(sound=lambda: (False, None), play_end=tracker.play_end)
     inside, go = threading.Event(), threading.Event()
     quiet = watch.detector.app_quiet
 
@@ -705,7 +727,7 @@ def test_a_keep_that_checked_quiet_before_a_push_cannot_attach_after_it(
     keeper = threading.Thread(target=watch.keep, args=(audio, 100.0))
     keeper.start()
     assert inside.wait(2.0)
-    pusher = threading.Thread(target=watch.pushed, args=(100.1, 2.0))
+    pusher = threading.Thread(target=watch.pushed, args=(100.1,))
     pusher.start()
     pusher.join(0.2)
     go.set()
@@ -720,9 +742,8 @@ def test_a_keep_that_checked_quiet_before_a_push_cannot_attach_after_it(
 def test_a_reply_pushed_but_not_yet_heard_is_never_a_phantom() -> None:
     """A reply the server plays 50 s late is the app's own: ReplyTracker still has it pending."""
     tracker = ph.ReplyTracker(rebuilt_at=lambda: None)
-    tracker.pushed(10.0, 2.0, 2.0)
     det = ps.PhantomDetector(sound=lambda: (False, None), pending=tracker.pending)
-    det.pushed(10.0, 2.0)
+    _push(det, tracker, 10.0, 2.0)
     _monitor(det, 60.0, 62.0, loud=True)  # the late reply, at last
     assert det.take() == []
 
@@ -818,10 +839,11 @@ def test_an_episode_closes_after_120_s_with_no_monitor_buffers() -> None:
 
 def test_an_episode_a_push_closes_ends_at_its_last_loud_buffer() -> None:
     """The pad window ends at the sound, not at the push."""
-    det = ps.PhantomDetector(sound=lambda: (False, None))
+    tracker = _wired()
+    det = ps.PhantomDetector(sound=lambda: (False, None), play_end=tracker.play_end)
     _monitor(det, 100.0, 101.0, loud=True)
     _monitor(det, 101.0, 102.5, loud=False)
-    det.pushed(102.5, 1.0)
+    _push(det, tracker, 102.5, 1.0)
     ended = det.take()[-1]
     assert ended.episode.end == pytest.approx(101.0)
 
@@ -882,10 +904,9 @@ def test_monitor_errors_are_counted_not_raised(caplog: pytest.LogCaptureFixture)
 def test_a_late_reply_opens_no_episode_while_it_plays() -> None:
     """In console order: each monitor buffer goes to the real tracker, then the detector."""
     tracker = ph.ReplyTracker(rebuilt_at=lambda: None)
-    det = ps.PhantomDetector(sound=lambda: (False, None), pending=tracker.pending)
+    det = ps.PhantomDetector(sound=lambda: (False, None), pending=tracker.pending, play_end=tracker.play_end)
     for i in range(20):  # 2 s of reply pushed at 10 s, in 0.1 s chunks
-        tracker.pushed(10.0 + 0.01 * i, 0.1, 0.1)
-        det.pushed(10.0 + 0.01 * i, 0.1)
+        _push(det, tracker, 10.0 + 0.01 * i, 0.1)
 
     def feed(start: float, end: float, loud: bool) -> None:
         t = start
@@ -906,7 +927,7 @@ def test_a_late_reply_opens_no_episode_while_it_plays() -> None:
 def _console_rig(rebuilt_at: Any = None) -> tuple[ph.ReplyTracker, ps.PhantomDetector]:
     """Build the real tracker and detector, wired as the console wires them."""
     tracker = ph.ReplyTracker(rebuilt_at=rebuilt_at or (lambda: None))
-    det = ps.PhantomDetector(sound=lambda: (False, None), pending=tracker.pending)
+    det = ps.PhantomDetector(sound=lambda: (False, None), pending=tracker.pending, play_end=tracker.play_end)
     return tracker, det
 
 
@@ -919,8 +940,7 @@ def test_a_late_reply_heard_while_still_pushed_opens_no_episode(rate: float) -> 
         t = round(10.0 + 0.1 * step, 6)
         if pushed < 15.0 - 1e-9:
             chunk = min(0.1 * rate, 15.0 - pushed)
-            tracker.pushed(t, chunk, chunk)
-            det.pushed(t, chunk)
+            _push(det, tracker, t, chunk)
             pushed += chunk
         speech = 0.1 if 15.0 < t <= 30.0 + 1e-9 else 0.0
         tracker.monitored(t, 0.1, speech)
@@ -933,8 +953,7 @@ def test_a_late_reply_heard_while_still_pushed_opens_no_episode(rate: float) -> 
 def _late_reply_then_sound(tracker: ph.ReplyTracker, det: ps.PhantomDetector, cut: Any) -> None:
     """Push a 30 s reply at 10 s, heard from 15 s; ``cut(t)`` at 22 s; sound 24 to 30 s."""
     for i in range(300):
-        tracker.pushed(10.0 + 0.001 * i, 0.1, 0.1)
-        det.pushed(10.0 + 0.001 * i, 0.1)
+        _push(det, tracker, 10.0 + 0.001 * i, 0.1)
     for step in range(1, 251):  # 10.1 s to 35.0 s
         t = round(10.0 + 0.1 * step, 6)
         if abs(t - 22.0) < 1e-9:
@@ -945,12 +964,11 @@ def _late_reply_then_sound(tracker: ph.ReplyTracker, det: ps.PhantomDetector, cu
 
 
 def test_sound_after_a_barge_in_on_a_late_reply_opens_an_episode() -> None:
-    """A barge-in cuts the heard reply short, as it cuts the detector's queued audio."""
+    """A barge-in cuts the heard reply short, as it cuts the pushed end."""
     tracker, det = _console_rig()
 
     def barge_in(t: float) -> None:
-        tracker.flushed(t)  # console order: the tracker, then the detector
-        det.flushed(t)
+        tracker.flushed(t)  # the tracker keeps the one playout end
 
     _late_reply_then_sound(tracker, det, barge_in)
     started = [e.episode.start for e in det.take() if e.kind == "started"]
@@ -1012,3 +1030,34 @@ def test_keep_monitor_uses_the_sink_it_is_given(monkeypatch: pytest.MonkeyPatch)
     sink = SimpleNamespace(get_factory=lambda: factory, get_property=lambda name: "dev")
     monitor = SimpleNamespace(source="dev.monitor", last_buffer_at=9.0)
     assert ph.keep_monitor(monitor, None, 10.0, found=(True, sink)) == "running"
+
+
+# --- one playout end (ticket 39) ---------------------------------------------------------------
+
+
+def test_play_end_carries_the_lag_and_the_detector_stays_quiet_on_a_late_reply() -> None:
+    """Heard 5 s late, a 2 s reply plays to 17 s: play_end carries the lag (the detector's take is
+    covered by pending() as well, so only the play_end assertion depends on the heard-end term)."""
+    tracker, det = _console_rig()
+    _push(det, tracker, 10.0, 2.0)
+    for step in range(1, 100):  # 10.1 s to 20.0 s
+        t = round(10.0 + 0.1 * step, 6)
+        speech = 0.1 if 15.0 < t <= 17.0 + 1e-9 else 0.0
+        tracker.monitored(t, 0.1, speech)
+        det.monitored(t, 0.1, speech)
+    assert tracker.play_end(16.0) == pytest.approx(17.1)  # the heard end, past the zero-lag 12.0
+    assert det.take() == []
+
+
+def test_the_play_end_is_the_later_of_the_pushed_end_and_the_heard_end() -> None:
+    """With the monitor down the zero-lag end stands; a heard reply's end counts when it is later."""
+    tracker = _wired()
+    assert tracker.play_end(1.0) is None
+    for i in range(3):
+        tracker.pushed(10.0 + 0.1 * i, 1.0, 1.0)  # queued faster than real time
+    assert tracker.play_end(10.0) == pytest.approx(13.0)
+    tracker.flushed(11.0)
+    assert tracker.play_end(11.0) == pytest.approx(11.0)
+    tracker.pushed(20.0, 2.0, 2.0)
+    tracker.monitored(26.0, 0.1, 0.1)  # heard 6 s late
+    assert tracker.play_end(26.0) == pytest.approx(28.0)  # the heard end, past the zero-lag 22.0

@@ -648,6 +648,8 @@ class ReplyTracker:
             None  # when the last heard reply has played out
         )
         self._heard_at: float | None = None  # when the last heard reply was first heard
+        # when the audio pushed so far plays out if it starts at its push: no lag (burst pushes chain)
+        self._pushed_end: float | None = None
         self.unheard_in_a_row = 0
         self.armed = False
         self.last_pushed_at: float | None = None
@@ -656,6 +658,7 @@ class ReplyTracker:
         """Note audio pushed to the speaker at ``now``."""
         with self._lock:
             self.last_pushed_at = now
+            self._pushed_end = max(self._pushed_end or now, now) + seconds
             current = self._replies[-1] if self._replies else None
             if (
                 current is None
@@ -716,6 +719,8 @@ class ReplyTracker:
                 if reply["lag"] == "pending":
                     reply["lag"] = "none"
             self._before = None
+            if self._pushed_end is not None:
+                self._pushed_end = min(self._pushed_end, now)
             if (
                 self._heard_until is not None
             ):  # the heard reply's queued rest was dropped too
@@ -808,6 +813,20 @@ class ReplyTracker:
                     if reply["speech"] >= MIN_SPEECH_S:
                         return True
             return False
+
+    def play_end(self, now: float) -> float | None:
+        """Return when the audio pushed so far plays out, or None with nothing pushed.
+
+        The later of the zero-lag end of the pushes and the heard reply's end, which carries the
+        measured lag. The detector's quiet test already covers a late reply through pending(),
+        which holds not-quiet until REPLY_TAIL_S past the heard end; this term is the same
+        decision because REPLY_TAIL_S and PHANTOM_QUIET_S are both 3.0, so the two are coupled:
+        change one and the other must follow. The phantom detector reads it under its lock.
+        """
+        with self._lock:
+            self._expire(now)  # first, so a rebuild has cut the heard reply short
+            ends = [t for t in (self._pushed_end, self._heard_until) if t is not None]
+            return max(ends) if ends else None
 
     def last_lag(self) -> tuple[float, float] | None:
         """Return (seconds, measured at) of the last measured reply lag, or None."""
