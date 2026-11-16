@@ -446,3 +446,46 @@ def test_jpeg_size_reads_the_frame_header() -> None:
 
     assert model_image.jpeg_size(_jpeg(1056, 594)) == (1056, 594)
     assert model_image.jpeg_size(b"\xff\xd8fresh\xff\xd9") is None
+
+
+# --- 2026-11-16 (arch 35): the pose at the grab ---
+
+
+def _pose_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """Return the 4x4 head pose the daemon would report for these "xyz" Euler angles."""
+    from scipy.spatial.transform import Rotation
+
+    pose = np.eye(4)
+    pose[:3, :3] = Rotation.from_euler("xyz", [roll, pitch, yaw]).as_matrix()
+    return pose
+
+
+@pytest.mark.asyncio
+async def test_the_result_carries_the_pose_read_at_the_grab(monkeypatch, tmp_path) -> None:
+    """Head yaw and pitch from the head pose, body yaw from head joint 0; all measured, radians."""
+    encoded: list = []
+    deps = _big_deps(monkeypatch, tmp_path, encoded)
+    deps.reachy_mini.get_current_head_pose.return_value = _pose_matrix(0.1, 0.2, -0.5)
+    deps.reachy_mini.get_current_joint_positions.return_value = ([0.7, 0, 0, 0, 0, 0, 0], [0.0, 0.0])
+
+    result = await Camera()(deps, question="what is it")
+
+    assert result["pose"] == pytest.approx({"head_yaw": -0.5, "head_pitch": 0.2, "body_yaw": 0.7})
+    assert "pose" in camera_mod.FACT_KEYS
+
+
+@pytest.mark.asyncio
+async def test_a_pose_that_does_not_read_is_left_out_and_the_picture_is_sent(monkeypatch, tmp_path) -> None:
+    """A failed read leaves its keys out; with both failed there is no pose and the picture stays."""
+    encoded: list = []
+    deps = _big_deps(monkeypatch, tmp_path, encoded)
+    deps.reachy_mini.get_current_head_pose.side_effect = AssertionError("No head pose received yet.")
+    deps.reachy_mini.get_current_joint_positions.return_value = ([0.7], [0.0, 0.0])
+
+    result = await Camera()(deps, question="what is it")
+    assert result["pose"] == {"body_yaw": 0.7} and "b64_im" in result
+
+    deps.reachy_mini.get_current_joint_positions.side_effect = AssertionError("no joints")
+    FakeCamera.scripts = [[1.0]]
+    result = await Camera()(deps, question="what is it")
+    assert "pose" not in result and "b64_im" in result

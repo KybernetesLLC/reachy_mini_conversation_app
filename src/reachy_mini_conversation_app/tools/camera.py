@@ -216,7 +216,30 @@ def no_picture(source: str, reason: str) -> Dict[str, Any]:
 
 # The facts handed to the companion with the frame, for its kept copy (the frame store's
 # `camera` kind, 24 h; the owner, 11-09): what the result says, and the question asked.
-FACT_KEYS = ("closer", "frame", "box", "image_width", "image_height", "jpeg_bytes", "zoom", "taken_at")
+FACT_KEYS = ("closer", "frame", "box", "image_width", "image_height", "jpeg_bytes", "zoom", "taken_at", "pose")
+
+
+def read_pose(robot: Any) -> Dict[str, float]:
+    """Return his measured pose now, in radians: head_yaw, head_pitch and body_yaw.
+
+    Arch 35: the companion keeps it with the picture (its eyes.clean_pose form). Both reads
+    are the SDK client's last pushed state, no round trip. The head's yaw and pitch are the
+    head pose matrix's, as the daemon's present_head_pose gives them; the body yaw is head
+    joint 0, as present_body_yaw does. A read that fails leaves its keys out.
+    """
+    pose: Dict[str, float] = {}
+    try:
+        rot = np.asarray(robot.get_current_head_pose(), dtype=np.float64)
+        # roll, pitch, yaw as the daemon's "xyz" Euler angles: R = Rz(yaw) Ry(pitch) Rx(roll)
+        pose["head_yaw"] = float(np.arctan2(rot[1, 0], rot[0, 0]))
+        pose["head_pitch"] = float(np.arcsin(np.clip(-rot[2, 0], -1.0, 1.0)))
+    except Exception:
+        logger.debug("camera: head pose not read", exc_info=True)
+    try:
+        pose["body_yaw"] = float(robot.get_current_joint_positions()[0][0])
+    except Exception:
+        logger.debug("camera: body yaw not read", exc_info=True)
+    return pose
 
 
 def picture_facts(closer: Optional[str], meta: Dict[str, Any], jpeg: bytes) -> Dict[str, Any]:
@@ -291,6 +314,9 @@ class Camera(Tool):
             return no_picture("camera", why_not or "no frame")
         result: Dict[str, Any] = {"b64_im": base64.b64encode(jpeg_bytes).decode("utf-8")}
         result.update(picture_facts(closer, meta, jpeg_bytes))
+        pose = read_pose(deps.reachy_mini)  # at the grab: the frame was just read
+        if pose:
+            result["pose"] = pose
         whole = "box" in meta and meta["box"] == [0, 0, *meta["frame"]]  # a frame no larger than the cut
         if closer is not None and not whole:
             where = (

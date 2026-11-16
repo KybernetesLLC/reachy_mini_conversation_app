@@ -982,6 +982,14 @@ def test_sanitize_tool_result_strips_camera_image() -> None:
     assert sanitized == {"seen": "cat", "image_attached": True}
 
 
+def test_sanitize_tool_result_keeps_the_pose_from_the_model() -> None:
+    """The pose is for the companion's kept picture (arch 35); the model is not told it."""
+    sanitized = HuggingFaceRealtimeHandler._sanitize_tool_result_for_model(
+        "camera", {"b64_im": "x", "pose": {"head_yaw": 0.1}}
+    )
+    assert sanitized == {"image_attached": True}
+
+
 def test_sanitize_tool_result_passthrough_for_non_camera() -> None:
     """Non-camera results are returned unchanged."""
     result = {"status": "ok"}
