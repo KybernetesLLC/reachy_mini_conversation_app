@@ -1,8 +1,90 @@
 from __future__ import annotations
+import os
+import math
+import stat
 import logging
 import argparse
 import warnings
-from typing import Optional
+from typing import Mapping, Callable, Optional
+from pathlib import Path
+
+from reachy_mini_conversation_app import companion
+
+
+logger = logging.getLogger(__name__)
+
+
+_clamp: Callable[[float, float, float], float] | None = None
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    """Return ``x`` held within ``lo`` to ``hi``: the companion's numeric.clamp, else the same expression.
+
+    The companion's function is looked up once, at the first call.
+    """
+    global _clamp
+    if _clamp is None:
+        _clamp = companion.value("numeric", "clamp", lambda v, low, high: max(low, min(high, v)))
+    return _clamp(x, lo, hi)
+
+
+def finite_number(value: object) -> float | None:
+    """Return a finite int or float as a float; None for a bool, a string, None, NaN or infinity.
+
+    The one number check for what arrives over JSON-RPC or a command: a bool or a string is no number.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def b64_size(text: str) -> int:
+    """Return the exact decoded size in bytes of a base64 string (its padding is not data). Pure."""
+    return len(text) * 3 // 4 - text[-2:].count("=")
+
+
+def env_number(name: str, default: float, environ: Mapping[str, str] | None = None) -> float:
+    """Return a number >= 0 from the environment, or ``default`` when it is unset, blank or invalid (invalid warns)."""
+    raw = str((os.environ if environ is None else environ).get(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not math.isfinite(value) or value < 0:
+        logger.warning("%s=%r is not a number >= 0; using %s", name, raw, default)
+        return default
+    return value
+
+
+def env_flag(name: str, off: str) -> bool:
+    """Return False when the environment value is ``off``; True when it is unset, blank or ``default``.
+
+    Any other value warns and keeps True.
+    """
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in ("", "default"):
+        return True
+    if raw == off:
+        return False
+    logger.warning("%s=%r is not %r; keeping the default", name, raw, off)
+    return True
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Write ``text`` as UTF-8, whole or not at all, keeping the file's mode (the companion's
+    jsonfile.write_bytes_atomic); a plain write when the companion has none."""
+    write = companion.value("jsonfile", "write_bytes_atomic", None)
+    if write is None:
+        path.write_text(text, encoding="utf-8")
+        return
+    try:
+        mode: int | None = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = None
+    write(path, text.encode("utf-8"), mode=mode, mkdir=False)
 
 
 def parse_args() -> tuple[argparse.Namespace, list]:  # type: ignore

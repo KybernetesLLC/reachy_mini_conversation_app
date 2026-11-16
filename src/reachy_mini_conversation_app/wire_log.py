@@ -38,6 +38,7 @@ from typing import Any, AsyncIterator
 from pathlib import Path
 
 from reachy_mini_conversation_app import companion
+from reachy_mini_conversation_app.utils import b64_size
 
 
 logger = logging.getLogger(__name__)
@@ -149,7 +150,7 @@ def b64_bytes(value: Any) -> int:
     if isinstance(value, (bytes, bytearray)):
         return len(value)
     if isinstance(value, str) and value:
-        return len(value) * 3 // 4 - value[-2:].count("=")
+        return b64_size(value)
     return 0
 
 

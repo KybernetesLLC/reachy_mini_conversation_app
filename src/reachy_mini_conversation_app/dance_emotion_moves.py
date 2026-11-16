@@ -14,6 +14,7 @@ from numpy.typing import NDArray
 from reachy_mini.motion.move import Move
 from reachy_mini.motion.recorded_move import RecordedMoves
 from reachy_mini_dances_library.dance_move import DanceMove
+from reachy_mini_conversation_app.utils import clamp
 
 
 logger = logging.getLogger(__name__)
@@ -167,7 +168,7 @@ class GotoQueueMove(Move):  # type: ignore
             from reachy_mini.utils.interpolation import linear_pose_interpolation
 
             # Clamp t to [0, 1] for interpolation
-            t_clamped = max(0, min(1, t / self.duration))
+            t_clamped = clamp(t / self.duration, 0, 1)
 
             # Use start pose if available, otherwise neutral
             if self.start_head_pose is not None:

@@ -166,3 +166,61 @@ def test_the_room_reads_the_same_light_log_either_way(tmp_path, monkeypatch, req
     assert camera_mod._room_luma() == 61.5
     light.write_text(f"ts,posture,quiet,people,luma_mean\n{old},awake,0,1,61.5\n")
     assert camera_mod._room_luma() is None
+
+
+# --- shared constants and helpers (companion ticket 38) --------------------------------------
+
+
+def test_a_constant_comes_from_the_companion_or_the_default(companion_on) -> None:
+    assert companion.value("facing", "NO_SUCH_CONSTANT", 7) == 7
+    assert companion.value("facing", "TURN_LEFT_DEFAULT_DEG", 7) == 106.0
+
+
+def test_the_fallback_literals_equal_the_companions_constants(companion_on) -> None:
+    """The fork keeps its own figure for each constant it reads; a pin that the two agree today."""
+    from reachy_mini_conversation_app import moves, console
+
+    assert companion.value("facing", "TURN_LEFT_DEFAULT_DEG", None) == moves.TURN_LEFT_DEFAULT_DEG == 106.0
+    assert companion.value("facing", "TURN_RIGHT_DEFAULT_DEG", None) == moves.TURN_RIGHT_DEFAULT_DEG == 115.0
+    assert tuple(companion.value("facing", "TURN_RANGE_DEG", None)) == moves.TURN_RANGE_DEG == (10.0, 160.0)
+    assert companion.value("facing", "TURN_SPEED", None) == moves.TURN_SPEED
+    assert tuple(companion.value("idle", "BREATHING_SCALE_RANGE", None)) == console.BREATHING_SCALE_RANGE
+    assert companion.value("idle", "BREATHING_PITCH_MAX", None) == console.BREATHING_PITCH_MAX
+    from reachy_companion import mood_expression as me  # re-exports the names it had
+
+    assert me.SCALE_RANGE == console.BREATHING_SCALE_RANGE and me.PITCH_MAX == console.BREATHING_PITCH_MAX
+
+
+def test_the_chars_per_token_is_the_companions(companion_on) -> None:
+    from reachy_mini_conversation_app import huggingface_realtime as hf
+
+    cfg = {"instructions": "x" * 100, "tools": []}
+    assert companion.value("context_size", "CHARS_PER_TOKEN", None) == 4
+    assert hf.session_size(cfg).endswith("~25 tokens")  # (100 + len("[]")) // 4
+
+
+def test_the_model_image_is_sized_as_the_companions_glance(companion_on) -> None:
+    """The idle glance sends the camera's frame scaled to the app's own conversation frames."""
+    from reachy_mini_conversation_app import model_image
+
+    pytest.importorskip("gi")
+    glance_size = companion.function("people", "glance_size")
+    if glance_size is None:
+        pytest.skip("the companion has no people.glance_size")
+    long_side = model_image.MODEL_IMAGE.long_side
+    assert long_side == companion.value("people", "GLANCE_LONG_SIDE", None)
+    for width, height in [(1920, 1080), (1080, 1920), (1056, 1056), (640, 480), (3, 1), (4000, 3001), (1057, 33)]:
+        assert model_image._target_size(width, height, long_side) == glance_size(width, height)
+
+
+def test_an_atomic_write_leaves_no_temp_file_and_falls_back_without_the_companion(tmp_path, request) -> None:
+    from reachy_mini_conversation_app.utils import write_text_atomic
+
+    for on in (True, False):
+        request.getfixturevalue("companion_on" if on else "companion_off")
+        target = tmp_path / ("on" if on else "off") / "settings.json"
+        target.parent.mkdir()
+        write_text_atomic(target, "oneé\n")
+        write_text_atomic(target, "twoé\n")
+        assert target.read_text(encoding="utf-8") == "twoé\n"
+        assert [p.name for p in target.parent.iterdir()] == ["settings.json"]

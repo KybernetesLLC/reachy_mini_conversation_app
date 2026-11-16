@@ -1,3 +1,4 @@
+import math
 import asyncio
 from typing import TypeVar, TypeAlias
 from collections.abc import Mapping, Callable
@@ -52,3 +53,19 @@ def audio_to_float32(audio: AudioArray) -> NDArray[np.float32]:
     if audio.dtype == np.float32:
         return audio.astype(np.float32, copy=False)
     raise TypeError(f"Unsupported audio data type: {audio.dtype}")
+
+
+def frame_rms(samples: NDArray[np.generic]) -> float | None:
+    """Return the RMS of an array of samples (any shape: every element counts), or None for none. Pure.
+
+    Floats are taken as they are; int16 samples count as full scale 32768. The one RMS of the app:
+    the speaker monitor, the phantom detector's pad probe and the console's level and health
+    readings all use it.
+    """
+    if samples.size == 0:
+        return None
+    samples = samples.reshape(-1)
+    if samples.dtype.kind in "iu":
+        wide = samples.astype(np.int64)
+        return math.sqrt(float(np.dot(wide, wide)) / samples.size) / 32768.0
+    return math.sqrt(float(samples.dot(samples)) / samples.size)

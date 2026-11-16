@@ -7,6 +7,8 @@ import logging
 from pathlib import Path
 from dataclasses import dataclass
 
+from reachy_mini_conversation_app.utils import write_text_atomic
+
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +88,7 @@ def write_startup_settings(
     if settings.voice is not None:
         payload["voice"] = settings.voice
 
-    settings_path.write_text(f"{json.dumps(payload, indent=2, sort_keys=True)}\n", encoding="utf-8")
+    write_text_atomic(settings_path, f"{json.dumps(payload, indent=2, sort_keys=True)}\n")
 
 
 def load_startup_settings_into_runtime(instance_path: str | Path | None) -> StartupSettings:

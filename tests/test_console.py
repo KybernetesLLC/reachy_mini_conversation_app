@@ -4288,6 +4288,18 @@ def test_breathing_rpc_clamps_and_returns_the_applied_values() -> None:
     assert manager.breathing_feel == (1.3, 0.7, -0.05)
 
 
+@pytest.mark.parametrize("bad", [True, "0.9", None, float("nan")])
+def test_a_bool_or_a_string_where_a_number_belongs_is_invalid_params(bad: Any) -> None:
+    """One number check for the RPC layer: no bool, no string (-32602), and nothing is applied."""
+    _stream, manager, app = _pose_stream()
+    before = manager.breathing_feel
+
+    resp = _rpc_call(app, "conversation.breathing", {"rate_scale": bad})
+
+    assert resp["error"]["code"] == -32602
+    assert manager.breathing_feel == before
+
+
 def test_breathing_rpc_works_when_the_current_move_is_not_breathing() -> None:
     """A hold is current: the values wait for the next BreathingMove, and a new one takes them."""
     _stream, manager, app = _pose_stream()

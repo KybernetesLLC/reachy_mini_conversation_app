@@ -38,7 +38,8 @@ import gi
 import numpy as np
 
 from reachy_mini_conversation_app import playback_health
-from reachy_mini_conversation_app.playback_health import SOUNDS, LOUD_RMS, rms
+from reachy_mini_conversation_app.streaming import frame_rms
+from reachy_mini_conversation_app.playback_health import SOUNDS, LOUD_RMS
 
 
 gi.require_version("Gst", "1.0")
@@ -376,13 +377,9 @@ def describe_sink_inputs(inputs: Sequence[dict[str, Any]]) -> str:
 def buffer_rms(data: bytes, fmt: str) -> float | None:
     """Return the RMS of raw F32LE or S16LE samples, or None for another format or none. Pure."""
     if fmt == "F32LE":
-        return rms(np.frombuffer(data, dtype="<f4", count=len(data) // 4))
+        return frame_rms(np.frombuffer(data, dtype="<f4", count=len(data) // 4))
     if fmt == "S16LE":
-        ints = np.frombuffer(data, dtype="<i2", count=len(data) // 2)
-        if ints.size == 0:
-            return None
-        wide = ints.astype(np.int64)
-        return float(np.sqrt(np.dot(wide, wide) / ints.size)) / 32768.0
+        return frame_rms(np.frombuffer(data, dtype="<i2", count=len(data) // 2))
     return None
 
 
