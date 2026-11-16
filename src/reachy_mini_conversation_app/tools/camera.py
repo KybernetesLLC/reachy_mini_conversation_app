@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from reachy_mini_conversation_app import model_image
+from reachy_mini_conversation_app import companion, model_image
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
 
 
@@ -31,9 +31,17 @@ except Exception:  # no GStreamer here: nothing to reopen
 # 0.4 s, and its frames matched the room's light. FRAME_WAIT_SECONDS bounds the
 # wait for the first frame.
 FRAME_WAIT_SECONDS = 2.0
-# A frame this dark (mean of BGR, 0-255) while the companion's light log, under
+# A frame this dark (its mean luma, 0-255) while the companion's light log, under
 # LIGHT_LOG_MAX_AGE_SECONDS old, says the room is at least ROOM_LIT is not the
 # room: it is tried once more and then refused rather than shown to the model.
+# Companion ticket 33: the frame is measured with the companion's Rec.709 luma
+# (its luma.py, the light log's own measure), no longer the plain BGR mean. The
+# numbers stay. ROOM_LIT was always read against the log's Rec.709 luma_mean. For
+# DARK_FRAME the two measures agree on a grey frame (the weights sum to 1), and the
+# camera's auto white balance keeps frames near grey: a warm cast it leaves, R:G:B
+# 1.3:1:0.7, reads luma 1.04 times the mean, 20.8 for 20. The companion's 35/60
+# (presence.py: dark, dim, lit) are words for the room; 40 keeps a margin above
+# an unlit night's 90th percentile (33) so a dark room's frame is never refused.
 DARK_FRAME = 20.0
 ROOM_LIT = 40.0
 LIGHT_LOG_MAX_AGE_SECONDS = 120.0
@@ -46,6 +54,10 @@ def _light_log() -> Path:
 
 def _room_luma() -> Optional[float]:
     """Return the companion's last light reading if recent: its camera's mean luma."""
+    read = companion.function("luma", "last_luma")
+    if read is not None:
+        value = os.getenv("REACHY_COMPANION_LIGHT_LOG")
+        return read(Path(value) if value else None, LIGHT_LOG_MAX_AGE_SECONDS)
     try:
         lines = _light_log().read_text().splitlines()
         header, last = lines[0].split(","), lines[-1].split(",")
@@ -170,7 +182,13 @@ def _fresh_frame_held(
         frame = camera.read()
     if frame is None:
         return None, None
-    return _encode(camera, frame if cut is None else cut(frame)), float(np.mean(frame))
+    return _encode(camera, frame if cut is None else cut(frame)), _brightness(frame)
+
+
+def _brightness(frame: np.ndarray) -> float:
+    """Return a BGR frame's mean luma: the companion's Rec.709, else the plain mean."""
+    mean_luma = companion.function("luma", "mean_luma")
+    return mean_luma(frame) if mean_luma is not None else float(np.mean(frame))
 
 
 def fresh_jpeg(

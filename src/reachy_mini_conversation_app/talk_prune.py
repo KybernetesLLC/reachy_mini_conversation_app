@@ -20,6 +20,8 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from reachy_mini_conversation_app import companion
+
 logger = logging.getLogger(__name__)
 
 CHECK_S = 60.0
@@ -35,7 +37,13 @@ def companion_db() -> Path:
 
 
 def read_summary(path: Path | None = None) -> tuple[float, str] | None:
-    """(up_to, text) from the companion's store, read only; None without one."""
+    """(up_to, text) from the companion's store, read only; None without one.
+
+    The companion's own read (talk_summary.read, its ticket 33); without it, this one.
+    """
+    read = companion.function("talk_summary", "read")
+    if read is not None:
+        return read(path)
     try:
         con = sqlite3.connect(f"file:{path or companion_db()}?mode=ro", uri=True, timeout=1.0)
         try:
