@@ -551,7 +551,7 @@ def _describe_playbin(audio: Any) -> str:
 class PhantomWatch:
     """The detector, the speech-sink probe and the report, for the console.
 
-    monitored() runs on the speaker monitor's streaming thread; pushed(), flushed() and
+    monitored() runs on the speaker monitor's streaming thread; pushed() and
     take() on the event loop; keep() and act() in a worker thread.
     """
 

@@ -818,8 +818,10 @@ class ReplyTracker:
         """Return when the audio pushed so far plays out, or None with nothing pushed.
 
         The later of the zero-lag end of the pushes and the heard reply's end, which carries the
-        measured lag. The zero-lag end alone misses a reply that plays late; the heard end alone
-        falls back when the monitor missed a reply. The phantom detector reads it under its lock.
+        measured lag. The detector's quiet test already covers a late reply through pending(),
+        which holds not-quiet until REPLY_TAIL_S past the heard end; this term is the same
+        decision because REPLY_TAIL_S and PHANTOM_QUIET_S are both 3.0, so the two are coupled:
+        change one and the other must follow. The phantom detector reads it under its lock.
         """
         with self._lock:
             self._expire(now)  # first, so a rebuild has cut the heard reply short

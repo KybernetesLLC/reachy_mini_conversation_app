@@ -1035,8 +1035,9 @@ def test_keep_monitor_uses_the_sink_it_is_given(monkeypatch: pytest.MonkeyPatch)
 # --- one playout end (ticket 39) ---------------------------------------------------------------
 
 
-def test_a_push_whose_lag_runs_past_the_zero_lag_end_is_still_the_apps() -> None:
-    """Heard 5 s late, a 2 s reply plays to 17 s: past its zero-lag end (12 s) plus 3 s."""
+def test_play_end_carries_the_lag_and_the_detector_stays_quiet_on_a_late_reply() -> None:
+    """Heard 5 s late, a 2 s reply plays to 17 s: play_end carries the lag (the detector's take is
+    covered by pending() as well, so only the play_end assertion depends on the heard-end term)."""
     tracker, det = _console_rig()
     _push(det, tracker, 10.0, 2.0)
     for step in range(1, 100):  # 10.1 s to 20.0 s
