@@ -314,7 +314,7 @@ class Camera(Tool):
             return no_picture("camera", why_not or "no frame")
         result: Dict[str, Any] = {"b64_im": base64.b64encode(jpeg_bytes).decode("utf-8")}
         result.update(picture_facts(closer, meta, jpeg_bytes))
-        pose = read_pose(deps.reachy_mini)  # at the grab: the frame was just read
+        pose = read_pose(deps.reachy_mini)  # just after the encode (and any dark-frame retry), not at the grab
         if pose:
             result["pose"] = pose
         whole = "box" in meta and meta["box"] == [0, 0, *meta["frame"]]  # a frame no larger than the cut
