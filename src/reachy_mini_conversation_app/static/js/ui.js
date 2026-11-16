@@ -38,17 +38,3 @@ function appendChildren(parent, children) {
 export function $(selector, root = document) {
   return root.querySelector(selector);
 }
-
-export function prettifyProfileName(name) {
-  const stripped = name.replace(/^user_personalities\//, "");
-  return stripped
-    .split(/[_-]/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
-export function prettifyToolName(toolId) {
-  const leafName = toolId.includes("__") ? toolId.split("__").at(-1) : toolId;
-  return prettifyProfileName(leafName);
-}

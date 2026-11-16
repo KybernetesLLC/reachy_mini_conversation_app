@@ -3,16 +3,14 @@ import time
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, TypeAlias
+from typing import Any, TypeAlias
 from collections.abc import Callable
 
 import numpy as np
 from numpy.typing import NDArray
 
-from reachy_mini_conversation_app.config import config
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, AsyncStreamHandler, wait_for_item
-from reachy_mini_conversation_app.idle_policy import start_idle_tool_call
-from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, get_tool_specs
+from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.tools.background_tool_manager import BackgroundToolManager
 
 
@@ -37,15 +35,12 @@ def drop_pending_responses(pending: asyncio.Queue[Any]) -> int:
 
 
 class ConversationHandler(AsyncStreamHandler, ABC):
-    """Shared app handler contract and idle behavior for realtime conversation backends."""
-
-    IDLE_BEHAVIOR_THRESHOLD_S: ClassVar[float] = 180.0
+    """Shared app handler contract for realtime conversation backends."""
 
     deps: ToolDependencies
     tool_manager: BackgroundToolManager
     output_queue: asyncio.Queue[QueueItem]
     last_activity_time: float
-    last_idle_behavior_time: float
     _activity_observer: Callable[[str], None] | None = None
     _transcript_observer: Callable[[str, str, bool], None] | None = None
     # The tool-call-log brief (2026-10-11): one report per finished (or refused)
@@ -56,10 +51,9 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     _session_observer: Callable[[str], None] | None = None
 
     def __init__(self) -> None:
-        """Initialize the stream handler and shared idle/activity tracking."""
+        """Initialize the stream handler and its activity tracking."""
         super().__init__()
         self.last_activity_time = time.monotonic()
-        self.last_idle_behavior_time = self.last_activity_time
 
     def set_activity_observer(self, observer: Callable[..., None] | None) -> None:
         """Attach or detach an activity observer, called (reason) or, for a user turn's realtime
@@ -125,45 +119,9 @@ class ConversationHandler(AsyncStreamHandler, ABC):
             except Exception:
                 logger.debug("activity observer raised (ignored)", exc_info=True)
 
-    def _idle_behavior_ready(self) -> bool:
-        """Return whether idle behavior may run now. Backends can add guards."""
-        return True
-
     async def emit(self) -> HandlerOutput:
-        """Emit the next queued output, triggering local idle behavior when due."""
-        now = time.monotonic()
-        idle_duration = now - self.last_activity_time
-        idle_behavior_duration = now - self.last_idle_behavior_time
-        if (
-            config.IDLE_BEHAVIOR
-            and idle_duration > self.IDLE_BEHAVIOR_THRESHOLD_S
-            and idle_behavior_duration > self.IDLE_BEHAVIOR_THRESHOLD_S
-            and self._idle_behavior_ready()
-            and self.deps.movement_manager.is_idle()
-        ):
-            try:
-                await self.send_idle_signal(idle_duration)
-            except Exception as e:
-                logger.warning("Idle tool skipped (connection closed?): %s", e)
-                return None
-            self.last_idle_behavior_time = now
-        handler_output = await wait_for_item(self.output_queue)
-        return handler_output
-
-    async def send_idle_signal(self, idle_duration: float) -> None:
-        """Run a locally selected idle tool without sending an idle turn to the model."""
-        if not self._is_connected():
-            logger.debug("No active session; cannot run idle tool")
-            return
-
-        available_tool_names = {spec["name"] for spec in get_tool_specs()}
-        await start_idle_tool_call(
-            deps=self.deps,
-            tool_manager=self.tool_manager,
-            output_queue=self.output_queue,
-            available_tool_names=available_tool_names,
-            idle_duration=idle_duration,
-        )
+        """Emit the next queued output."""
+        return await wait_for_item(self.output_queue)
 
     @abstractmethod
     def _is_connected(self) -> bool:
@@ -183,11 +141,6 @@ class ConversationHandler(AsyncStreamHandler, ABC):
     @abstractmethod
     async def receive(self, frame: AudioFrame) -> None:
         """Receive an input audio frame."""
-        ...
-
-    @abstractmethod
-    async def apply_personality(self, profile: str | None) -> str:
-        """Apply a personality profile."""
         ...
 
     @abstractmethod

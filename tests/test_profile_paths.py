@@ -8,13 +8,9 @@ import pytest
 
 import reachy_mini_conversation_app.config as config_mod
 import reachy_mini_conversation_app.prompts as prompts_mod
-import reachy_mini_conversation_app.personality as headless_mod
 import reachy_mini_conversation_app.profile_store as profile_store_mod
 from reachy_mini_conversation_app.config import DEFAULT_PROFILES_DIRECTORY, config
-from reachy_mini_conversation_app.personality import (
-    list_personalities,
-)
-from reachy_mini_conversation_app.profile_store import read_profile, write_profile, read_profile_from_directory
+from reachy_mini_conversation_app.profile_store import write_profile, read_profile_from_directory
 
 
 # Path characters budget computation
@@ -196,93 +192,6 @@ def test_session_greeting_prompt_uses_builtin_default_without_profile(
     monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", None)
 
     assert prompts_mod.get_session_greeting_prompt() == prompts_mod.DEFAULT_GREETING_PROMPT
-
-
-def test_headless_profile_write_can_store_greeting(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """New headless profiles can persist a greeting in one profile document."""
-    monkeypatch.setattr(config, "INSTANCE_PATH", tmp_path)
-
-    headless_mod.save_user_personality(
-        "with_greeting",
-        "test instructions",
-        greeting="Open with a quick astronomy joke.",
-    )
-
-    profile_path = tmp_path / "user_personalities" / "with_greeting" / "profile.md"
-    assert 'greeting = "Open with a quick astronomy joke."' in profile_path.read_text(encoding="utf-8")
-    assert read_profile("user_personalities/with_greeting").greeting == "Open with a quick astronomy joke."
-
-
-def test_headless_profile_write_skips_empty_greeting(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Empty custom greetings should be omitted from the profile metadata."""
-    monkeypatch.setattr(config, "INSTANCE_PATH", tmp_path)
-
-    headless_mod.save_user_personality("without_greeting", "test instructions", greeting="")
-
-    profile_text = (tmp_path / "user_personalities" / "without_greeting" / "profile.md").read_text(encoding="utf-8")
-    assert "greeting =" not in profile_text
-
-
-def test_headless_profile_write_defaults_voice_at_call_time(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """New headless profiles should use the Hugging Face default voice."""
-    monkeypatch.setattr(config, "INSTANCE_PATH", tmp_path)
-
-    headless_mod.save_user_personality("runtime_voice_default", "test instructions")
-
-    profile = read_profile_from_directory(
-        "runtime_voice_default",
-        tmp_path / "user_personalities" / "runtime_voice_default",
-    )
-    assert profile.voice == "Aiden"
-
-
-def test_headless_profile_write_uses_terminal_storage_without_instance(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Standalone creation should write to terminal runtime storage, not packaged profiles."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(config, "INSTANCE_PATH", None)
-
-    selection = headless_mod.save_user_personality("terminal_guide", "Be concise.")
-
-    assert selection == "user_personalities/terminal_guide"
-    assert (tmp_path / "external_content" / "user_personalities" / "terminal_guide" / "profile.md").is_file()
-    assert read_profile(selection).instructions == "Be concise."
-
-
-def test_headless_profile_write_rejects_unsafe_name(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Headless callers must not escape the user-personality storage root."""
-    monkeypatch.setattr(config, "INSTANCE_PATH", tmp_path)
-
-    with pytest.raises(ValueError, match="letters, numbers, dashes"):
-        headless_mod.save_user_personality("../outside", "Unsafe.")
-
-    assert not (tmp_path / "outside").exists()
-
-
-def test_user_profile_round_trips_through_instance_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """UI-created profiles persist in the writable instance dir and load back from it."""
-    monkeypatch.setattr(config, "INSTANCE_PATH", tmp_path)
-    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "user_personalities/zen_master")
-
-    headless_mod.save_user_personality("zen_master", "Be calm.")
-
-    assert (tmp_path / "user_personalities" / "zen_master" / "profile.md").is_file()
-    assert "user_personalities/zen_master" in list_personalities()
-    assert prompts_mod.get_session_instructions(instance_path=tmp_path) == "Be calm."
 
 
 def test_packaged_profiles_win_outside_source_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

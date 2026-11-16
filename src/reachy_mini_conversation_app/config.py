@@ -344,8 +344,6 @@ class Config:
     TOOLS_DIRECTORY = Path(_tools_directory_env) if _tools_directory_env else None
     AUTOLOAD_EXTERNAL_TOOLS = _env_flag("AUTOLOAD_EXTERNAL_TOOLS", default=False)
     EXCLUDED_TOOLS = excluded_tools()
-    # Off: the app never runs its own idle tool (the companion's supervisor draws idle moments itself).
-    IDLE_BEHAVIOR = _env_flag("REACHY_MINI_IDLE_BEHAVIOR", default=True)
     REACHY_MINI_CUSTOM_PROFILE = LOCKED_PROFILE or os.getenv("REACHY_MINI_CUSTOM_PROFILE")
 
     logger.debug(f"Custom Profile: {REACHY_MINI_CUSTOM_PROFILE}")

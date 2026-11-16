@@ -2,16 +2,9 @@
 
 import { ROUTES } from "./constants.js";
 import { createRouter } from "./router.js";
-import {
-  hidePersonalityBadge,
-  mountPersonalityBadge,
-  showPersonalityBadge,
-} from "./personality-badge.js";
 import { $ } from "./ui.js";
-import { mountHomeView } from "./views/home.js";
 import { mountTalkView } from "./views/talk.js";
 import { mountSettingsView } from "./views/settings.js";
-import { mountToolsView } from "./views/tools.js";
 
 const SETTINGS_RETURN_KEY = "settings-return-route";
 
@@ -19,9 +12,7 @@ const SETTINGS_RETURN_KEY = "settings-return-route";
 function readSettingsReturn() {
   try {
     const route = sessionStorage.getItem(SETTINGS_RETURN_KEY) || "";
-    return [ROUTES.TALK, ROUTES.PERSONALITIES, ROUTES.TOOLS].includes(route.split("?")[0])
-      ? route
-      : ROUTES.TALK;
+    return route.split("?")[0] === ROUTES.TALK ? route : ROUTES.TALK;
   } catch {
     return ROUTES.TALK;
   }
@@ -55,22 +46,13 @@ function boot() {
   const router = createRouter(
     {
       [ROUTES.TALK]: (ctx) => mountTalkView(ctx),
-      [ROUTES.PERSONALITIES]: (ctx) => mountHomeView({ ...ctx, navigate: router.navigate }),
       [ROUTES.SETTINGS]: (ctx) => mountSettingsView(ctx),
-      [ROUTES.TOOLS]: (ctx) => mountToolsView(ctx),
     },
     { fallback: ROUTES.TALK, outlet, onRouteChange: syncHeaderForRoute }
   );
 
   // Settings is an overlay: closing it returns to where it was opened
   let settingsReturn = readSettingsReturn();
-  const tools = $('[data-action="open-tools"]');
-  if (tools) {
-    tools.addEventListener("click", (event) => {
-      event.preventDefault();
-      router.navigate(ROUTES.TOOLS);
-    });
-  }
   const gear = $('[data-action="open-settings"]');
   if (gear) {
     gear.addEventListener("click", () => {
@@ -93,11 +75,6 @@ function boot() {
     });
   }
 
-  const personalityBadge = $('[data-action="open-personalities"]');
-  if (personalityBadge) {
-    personalityBadge.addEventListener("click", () => router.navigate(ROUTES.PERSONALITIES));
-  }
-
   const back = $('[data-action="go-back"]');
   if (back) {
     back.addEventListener("click", () => {
@@ -105,27 +82,14 @@ function boot() {
       const routeName = route.split("?")[0];
       if (routeName === ROUTES.SETTINGS) {
         router.navigate(settingsReturn);
-      } else if (
-        routeName === ROUTES.TOOLS &&
-        new URLSearchParams(route.split("?")[1] || "").get("from") === "personalities"
-      ) {
-        router.navigate(ROUTES.PERSONALITIES);
       } else {
         router.navigate(ROUTES.TALK);
       }
     });
   }
 
-  mountPersonalityBadge(document);
-
   function syncHeaderForRoute(route = router.currentRoute() || ROUTES.TALK) {
     const routeName = route.split("?")[0];
-    if (tools) {
-      const onTools = routeName === ROUTES.TOOLS;
-      tools.classList.toggle("is-active", onTools);
-      if (onTools) tools.setAttribute("aria-current", "page");
-      else tools.removeAttribute("aria-current");
-    }
     if (gear) {
       const onSettings = routeName === ROUTES.SETTINGS;
       gear.classList.toggle("is-active", onSettings);
@@ -133,21 +97,8 @@ function boot() {
     }
     if (back) {
       back.hidden = routeName === ROUTES.TALK;
-      let backLabel = "Back to conversation";
-      if (routeName === ROUTES.SETTINGS) {
-        const returnName = settingsReturn.split("?")[0];
-        if (returnName === ROUTES.PERSONALITIES) backLabel = "Back to personalities";
-        if (returnName === ROUTES.TOOLS) backLabel = "Back to tools";
-      } else if (
-        routeName === ROUTES.TOOLS &&
-        new URLSearchParams(route.split("?")[1] || "").get("from") === "personalities"
-      ) {
-        backLabel = "Back to personalities";
-      }
-      back.setAttribute("aria-label", backLabel);
+      back.setAttribute("aria-label", "Back to conversation");
     }
-    if (routeName === ROUTES.TALK) showPersonalityBadge();
-    else hidePersonalityBadge();
   }
   router.start();
 }

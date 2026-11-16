@@ -31,15 +31,12 @@ from reachy_mini_conversation_app import startup, phantom_speech, playback_healt
 from reachy_mini_conversation_app.moves import BODY_YAW_LOW, BODY_YAW_HIGH
 from reachy_mini_conversation_app.config import (
     HF_BACKEND,
-    LOCKED_PROFILE,
     HF_REALTIME_WS_URL_ENV,
     HF_LOCAL_CONNECTION_MODE,
     HF_DEPLOYED_CONNECTION_MODE,
     HF_REALTIME_CONNECTION_MODE_ENV,
-    config,
     get_default_voice,
     get_hf_session_url,
-    set_custom_profile,
     get_available_voices,
     get_hf_direct_ws_url,
     build_hf_direct_ws_url,
@@ -48,23 +45,15 @@ from reachy_mini_conversation_app.config import (
     get_hf_connection_selection,
     refresh_runtime_config_from_env,
 )
-from reachy_mini_conversation_app.prompts import (
-    get_session_voice,
-    get_session_instructions,
-)
+from reachy_mini_conversation_app.prompts import get_session_voice
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_float32
+from reachy_mini_conversation_app.voice_routes import (
+    build_voice_ops,
+    register_voice_methods,
+)
 from reachy_mini_conversation_app.startup_settings import (
     read_startup_settings,
     write_startup_settings,
-)
-from reachy_mini_conversation_app.tools.core_tools import initialize_tools
-from reachy_mini_conversation_app.tool_space_routes import register_tool_space_methods
-from reachy_mini_conversation_app.personality_routes import (
-    build_personality_ops,
-    register_personality_methods,
-)
-from reachy_mini_conversation_app.profile_tool_routes import (
-    register_profile_tool_methods,
 )
 from reachy_mini_conversation_app.audio.startup_config import apply_audio_startup_config
 from reachy_mini_conversation_app.conversation_handler import (
@@ -175,10 +164,6 @@ LOCAL_PLAYER_BACKEND = (
 
 HandlerFactory = Callable[[Optional[str]], ConversationHandler]
 
-LEGACY_STARTUP_ENV_NAMES = (
-    "REACHY_MINI_CUSTOM_PROFILE",
-    "REACHY_MINI_VOICE_OVERRIDE",
-)
 BACKEND_RETRY_DELAY_SECONDS = 5.0
 # At most this many seconds of recent mic frames are kept while no realtime
 # connection is up, so a wake word and the command spoken in the same breath
@@ -1230,51 +1215,6 @@ class LocalStream:
         )
         self._remove_persisted_env_values(("HF_REALTIME_SESSION_URL",))
 
-    def _persist_personality(
-        self, profile: Optional[str], voice_override: Optional[str] = None
-    ) -> None:
-        """Persist startup profile and voice in instance-local UI settings."""
-        if LOCKED_PROFILE is not None:
-            return
-        selection = (profile or "").strip() or None
-        normalized_voice_override = (voice_override or "").strip() or None
-        set_custom_profile(selection)
-
-        if not self._instance_path:
-            return
-        try:
-            write_startup_settings(
-                self._instance_path,
-                profile=selection,
-                voice=normalized_voice_override,
-            )
-            self._remove_persisted_env_values(LEGACY_STARTUP_ENV_NAMES)
-            logger.info(
-                "Persisted startup personality settings to %s",
-                Path(self._instance_path),
-            )
-        except Exception as e:
-            logger.warning("Failed to persist startup personality settings: %s", e)
-
-    def _read_persisted_personality(self) -> Optional[str]:
-        """Read the saved startup personality from instance-local UI settings."""
-        return read_startup_settings(self._instance_path).profile
-
-    async def apply_personality(self, profile: Optional[str]) -> str:
-        """Apply a personality by updating config and restarting the active backend."""
-        previous_profile = config.REACHY_MINI_CUSTOM_PROFILE
-        set_custom_profile(profile)
-        try:
-            get_session_instructions()
-            get_session_voice(default=get_default_voice())
-            initialize_tools(force=True)
-        except Exception:
-            set_custom_profile(previous_profile)
-            raise
-
-        await self.request_backend_restart("personality_changed")
-        return "Applied personality and restarting backend."
-
     async def get_available_voices(self) -> list[str]:
         """Return the voices available for the Hugging Face backend."""
         return get_available_voices()
@@ -2074,46 +2014,18 @@ class LocalStream:
         self._rpc = rpc
 
         try:
-            personality_ops = build_personality_ops(
+            voice_ops = build_voice_ops(
                 self.handler,
                 lambda: self._asyncio_loop,
-                persist_personality=self._persist_personality,
-                get_persisted_personality=self._read_persisted_personality,
-                apply_personality=self.apply_personality,
                 get_voices=self.get_available_voices,
                 get_current_voice=self.get_current_voice,
                 change_voice=self.change_voice,
             )
-            # personalities.* / voices.* over JSON-RPC — the local UI and remote
-            # clients drive personalities the same way, one control surface.
-            register_personality_methods(rpc, personality_ops)
+            # voices.* over JSON-RPC.
+            register_voice_methods(rpc, voice_ops)
         except Exception:
             logger.exception(
-                "Failed to register personality methods; the personality UI will be unavailable"
-            )
-
-        try:
-            register_tool_space_methods(
-                rpc,
-                lambda: self._asyncio_loop,
-                self.request_backend_restart,
-                instance_path=self._instance_path,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to register Tool Space methods; remote tool settings will be unavailable"
-            )
-
-        try:
-            register_profile_tool_methods(
-                rpc,
-                lambda: self._asyncio_loop,
-                self.request_backend_restart,
-                instance_path=self._instance_path,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to register profile tool methods; personality tool settings will be unavailable"
+                "Failed to register voice methods; the voice picker will be unavailable"
             )
 
         self._settings_initialized = True

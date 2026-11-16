@@ -1,7 +1,6 @@
 /** JSON-RPC-over-WebSocket client for the settings backend (/rpc). */
 
 const DEFAULT_TIMEOUT_MS = 8000;
-const TOOL_SPACE_TIMEOUT_MS = 60000;
 
 const RPC_URL = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/rpc`;
 
@@ -127,13 +126,6 @@ export async function untilReady(requestFn, signal, onRetry) {
 
 export const getStatus = () => rpcCall("conversation.status");
 
-export const listPersonalities = () => rpcCall("personalities.list");
-export const loadPersonality = (name) => rpcCall("personalities.load", { name });
-export const savePersonality = (payload) => rpcCall("personalities.save", payload);
-export const applyPersonality = (name, { persist = false, force = false } = {}) =>
-  rpcCall("personalities.apply", { name, persist, force });
-export const deletePersonality = (name) => rpcCall("personalities.delete", { name });
-
 export const getMicState = () => rpcCall("conversation.mic", {});
 export const setMicMuted = (muted) => rpcCall("conversation.mic", { muted });
 
@@ -142,19 +134,6 @@ export const getCurrentVoice = () => rpcCall("voices.current");
 export const applyVoice = (voice) => rpcCall("voices.apply", { voice });
 
 export const saveBackendConfig = (payload) => rpcCall("backend.config", payload);
-
-export const listToolSpaces = () => rpcCall("tool_spaces.list");
-export const addToolSpace = (slug) =>
-  rpcCall("tool_spaces.add", { slug }, { timeoutMs: TOOL_SPACE_TIMEOUT_MS });
-export const removeToolSpace = (slug) =>
-  rpcCall("tool_spaces.remove", { slug }, { timeoutMs: TOOL_SPACE_TIMEOUT_MS });
-
-export const getProfileTools = (profile) =>
-  rpcCall("profile_tools.get", profile ? { profile } : {});
-export const saveProfileTools = (profile, enabledTools) =>
-  rpcCall("profile_tools.save", { profile, enabled_tools: enabledTools });
-export const resetProfileTools = (profile) =>
-  rpcCall("profile_tools.reset", { profile });
 
 /** Backend error codes that need friendlier copy than the raw code. */
 const ERROR_MESSAGES = Object.freeze({
@@ -165,18 +144,8 @@ const ERROR_MESSAGES = Object.freeze({
   invalid_hf_port: "That Hugging Face port doesn't look right.",
   invalid_hf_mode: "Unknown Hugging Face mode.",
   missing_hf_session_url: "Couldn't reach the Hugging Face Space. Check it's running.",
-  invalid_name: "Enter a valid profile name.",
-  invalid_instructions: "Enter personality instructions.",
-  profile_exists: "A personality with this name already exists.",
-  invalid_tool_space_slug: "Enter a Space in owner/name format.",
-  invalid_tool_selection: "One or more selected tools are no longer available.",
-  unknown_profile: "That personality is no longer available.",
   missing_voice: "Choose a voice first.",
-  profile_locked: "Profile switching is locked by the administrator.",
-  profile_in_use: "This personality is active or set to load at startup. Switch to another one first.",
-  not_deletable: "This personality can't be deleted.",
   loop_unavailable: "Reachy is still starting up. Try again in a moment.",
-  tool_space_not_installed: "That Tool Space is no longer installed.",
 });
 
 /** Map a thrown error to user-facing copy, falling back to its raw message. */

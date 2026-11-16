@@ -6,7 +6,6 @@ import logging
 from pathlib import Path
 
 from reachy_mini_conversation_app.config import config, get_default_voice
-from reachy_mini_conversation_app.memory import format_memory_for_prompt
 from reachy_mini_conversation_app.profile_store import (
     DEFAULT_PROFILE_NAME,
     ProfileDefinition,
@@ -35,7 +34,7 @@ def _active_profile() -> ProfileDefinition:
 
 
 # The companion supervisor keeps the robot's memory and writes it as one block,
-# read at each session start in place of the app's own memory.v1.json facts.
+# read at each session start.
 COMPANION_MEMORY_ENV = "REACHY_COMPANION_SESSION_MEMORY"
 # The same block with only the household's words from the room (the companion, thoughts unit c3):
 # the instructions of a written reply to a thought.
@@ -75,9 +74,7 @@ def _profile_instructions() -> str:
 def get_session_instructions(instance_path: str | Path | None = None) -> str:
     """Return instructions for the active profile with memory context."""
     instructions = _profile_instructions()
-    memory_prompt = (
-        _companion_memory() if COMPANION_MEMORY_ENV in os.environ else format_memory_for_prompt(instance_path)
-    )
+    memory_prompt = _companion_memory()
     if memory_prompt:
         return f"{memory_prompt}\n\n{instructions}"
     return instructions

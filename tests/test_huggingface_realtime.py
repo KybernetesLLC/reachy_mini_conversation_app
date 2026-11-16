@@ -14,7 +14,6 @@ import pytest
 from websockets.exceptions import ConnectionClosedError
 
 import reachy_mini_conversation_app.prompts as prompts_mod
-import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
@@ -248,28 +247,6 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 
     assert handler.input_transcript_chunks_by_item.item_id == "item-1"
     assert handler.input_transcript_chunks_by_item.deltas == ["Hey, how are you?"]
-
-
-@pytest.mark.asyncio
-async def test_emit_skips_idle_signal_while_response_active(monkeypatch: Any) -> None:
-    """Idle tools should not trigger while a response is still active."""
-    movement_manager = MagicMock()
-    movement_manager.is_idle.return_value = True
-    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager)
-    handler = HuggingFaceRealtimeHandler(deps)
-    handler.last_activity_time = time.monotonic() - (
-        handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0
-    )
-    handler._response_done_event.clear()
-
-    send_idle_signal = AsyncMock()
-    monkeypatch.setattr(handler, "send_idle_signal", send_idle_signal)
-    monkeypatch.setattr(conv_mod, "wait_for_item", AsyncMock(return_value=None))
-
-    result = await handler.emit()
-
-    assert result is None
-    send_idle_signal.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -627,79 +604,6 @@ async def test_build_realtime_client_deployed_resolves_hf_token(
     assert client_kwargs["base_url"] == "https://hf.example.test/v1"
     assert client_kwargs["websocket_base_url"] == "wss://hf.example.test/v1"
     assert handler._realtime_connect_query == {"session_token": "allocated"}
-
-
-@pytest.mark.asyncio
-async def test_apply_personality_uses_selected_voice_for_lb_allocated_sessions(
-    monkeypatch: Any,
-) -> None:
-    """Live personality updates should honor the selected Qwen CustomVoice speaker."""
-    monkeypatch.setattr(
-        hf_mod,
-        "get_session_instructions",
-        lambda _instance_path=None: "new instructions",
-    )
-    monkeypatch.setattr(
-        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Serena"
-    )
-    monkeypatch.setattr(
-        config, "HF_REALTIME_SESSION_URL", "https://lb.example.test/session"
-    )
-
-    captured_update: dict[str, Any] = {}
-
-    class FakeSession:
-        async def update(self, **kwargs: Any) -> None:
-            captured_update.update(kwargs)
-
-    class FakeConnection:
-        session = FakeSession()
-
-    handler = HuggingFaceRealtimeHandler(
-        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
-    )
-    handler.connection = FakeConnection()
-    monkeypatch.setattr(handler, "_restart_session", AsyncMock(return_value=None))
-
-    result = await handler.apply_personality("mars_rover")
-
-    assert "restarted realtime session" in result.lower()
-    session = captured_update["session"]
-    assert session["instructions"] == "new instructions"
-    assert session["audio"]["output"]["voice"] == "Serena"
-
-
-@pytest.mark.asyncio
-async def test_apply_personality_restores_profile_when_tools_fail(
-    monkeypatch: Any,
-) -> None:
-    """A failed tool reload should leave the previous profile selected."""
-    selected_profiles: list[str | None] = []
-
-    def select_profile(profile: str | None) -> None:
-        selected_profiles.append(profile)
-        config.REACHY_MINI_CUSTOM_PROFILE = profile
-
-    def fail_tool_reload(*, force: bool = False) -> None:
-        raise RuntimeError("tool reload failed")
-
-    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "default")
-    monkeypatch.setattr(hf_mod, "set_custom_profile", select_profile)
-    monkeypatch.setattr(
-        hf_mod,
-        "get_session_instructions",
-        lambda _instance_path=None: "new instructions",
-    )
-    monkeypatch.setattr(hf_mod.core_tools, "initialize_tools", fail_tool_reload)
-    handler = HuggingFaceRealtimeHandler(
-        ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
-    )
-
-    result = await handler.apply_personality("broken")
-
-    assert result == "Failed to apply personality: tool reload failed"
-    assert config.REACHY_MINI_CUSTOM_PROFILE == "default"
-    assert selected_profiles == ["broken", "default"]
 
 
 @pytest.mark.asyncio
@@ -1475,48 +1379,6 @@ async def test_emit_debounced_partial_skips_stale_snapshot() -> None:
     assert handler.output_queue.empty()
 
 
-@pytest.mark.asyncio
-async def test_emit_runs_idle_behavior_when_due(monkeypatch: Any) -> None:
-    """Emit runs the idle behavior once the idle thresholds are exceeded and the robot is idle."""
-    handler = _plain_handler()
-    handler.last_activity_time = time.monotonic() - (
-        handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0
-    )
-    handler.last_idle_behavior_time = handler.last_activity_time
-    handler.deps.movement_manager.is_idle.return_value = True
-    handler._response_done_event.set()
-    send_idle_signal = AsyncMock()
-    monkeypatch.setattr(handler, "send_idle_signal", send_idle_signal)
-    monkeypatch.setattr(conv_mod, "wait_for_item", AsyncMock(return_value=None))
-
-    before = time.monotonic()
-    await handler.emit()
-
-    send_idle_signal.assert_awaited_once()
-    assert handler.last_idle_behavior_time >= before
-
-
-@pytest.mark.asyncio
-async def test_emit_keeps_idle_timer_when_idle_behavior_fails(monkeypatch: Any) -> None:
-    """A failing idle behavior returns None and does not advance the idle-behavior timer."""
-    handler = _plain_handler()
-    handler.last_activity_time = time.monotonic() - (
-        handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0
-    )
-    handler.last_idle_behavior_time = handler.last_activity_time
-    handler.deps.movement_manager.is_idle.return_value = True
-    handler._response_done_event.set()
-    monkeypatch.setattr(
-        handler, "send_idle_signal", AsyncMock(side_effect=RuntimeError("closed"))
-    )
-
-    previous = handler.last_idle_behavior_time
-    result = await handler.emit()
-
-    assert result is None
-    assert handler.last_idle_behavior_time == previous
-
-
 def test_mark_activity_swallows_observer_errors() -> None:
     """The activity observer is notified, and a raising observer is ignored."""
     handler = _plain_handler()
@@ -1530,33 +1392,6 @@ def test_mark_activity_swallows_observer_errors() -> None:
 
     handler.set_activity_observer(_raise)
     handler._mark_activity("later")  # must not raise
-
-
-@pytest.mark.asyncio
-async def test_send_idle_signal_noop_without_connection(monkeypatch: Any) -> None:
-    """No idle tool runs when there is no active connection."""
-    handler = _plain_handler()
-    handler.connection = None
-    start_idle = AsyncMock()
-    monkeypatch.setattr(conv_mod, "start_idle_tool_call", start_idle)
-
-    await handler.send_idle_signal(200.0)
-
-    start_idle.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_send_idle_signal_dispatches_idle_tool(monkeypatch: Any) -> None:
-    """With an active connection the locally selected idle tool is dispatched."""
-    handler = _plain_handler()
-    handler.connection = _FakeConnection()
-    monkeypatch.setattr(conv_mod, "get_tool_specs", lambda: [{"name": "dance"}])
-    start_idle = AsyncMock()
-    monkeypatch.setattr(conv_mod, "start_idle_tool_call", start_idle)
-
-    await handler.send_idle_signal(200.0)
-
-    start_idle.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -3829,28 +3664,6 @@ async def test_a_played_reply_of_only_markup_reaches_the_supervisor_marked(
     )
     await handler._run_realtime_session()
     assert seen == [("assistant", "Hello there.", "leaked tool call")]
-
-
-@pytest.mark.asyncio
-async def test_emit_never_runs_idle_behavior_when_switched_off(
-    monkeypatch: Any,
-) -> None:
-    """REACHY_MINI_IDLE_BEHAVIOR=off: the companion's supervisor owns idle (2026-10-21)."""
-    handler = _plain_handler()
-    handler.last_activity_time = time.monotonic() - (
-        handler.IDLE_BEHAVIOR_THRESHOLD_S + 10.0
-    )
-    handler.last_idle_behavior_time = handler.last_activity_time
-    handler.deps.movement_manager.is_idle.return_value = True
-    handler._response_done_event.set()
-    send_idle_signal = AsyncMock()
-    monkeypatch.setattr(handler, "send_idle_signal", send_idle_signal)
-    monkeypatch.setattr(conv_mod, "wait_for_item", AsyncMock(return_value=None))
-    monkeypatch.setattr(conv_mod.config, "IDLE_BEHAVIOR", False)
-
-    await handler.emit()
-
-    send_idle_signal.assert_not_awaited()
 
 
 def test_a_retired_leak_safe_name_stays_known_to_the_gate() -> None:

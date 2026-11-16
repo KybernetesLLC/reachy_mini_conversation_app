@@ -30,14 +30,7 @@ from reachy_mini_conversation_app.moves import (
 from reachy_mini_conversation_app.config import HF_AVAILABLE_VOICES, config
 from reachy_mini_conversation_app.console import LocalStream
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
-from reachy_mini_conversation_app.startup_settings import (
-    StartupSettings,
-    load_startup_settings_into_runtime,
-)
-from reachy_mini_conversation_app.personality_routes import (
-    RouteError,
-    build_personality_ops,
-)
+from reachy_mini_conversation_app.voice_routes import build_voice_ops
 
 
 def _rpc_call(app: FastAPI, method: str, params: Any = None) -> dict[str, Any]:
@@ -1188,152 +1181,23 @@ async def test_startup_loop_rebuilds_handler_on_restart_request(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_personality_ops_return_hf_voices() -> None:
+async def test_voice_ops_return_hf_voices() -> None:
     """With no running loop, voices() falls back to the Hugging Face catalog."""
-    ops = build_personality_ops(MagicMock(), lambda: None)
+    ops = build_voice_ops(MagicMock(), lambda: None)
     assert await ops.voices() == HF_AVAILABLE_VOICES
 
 
-def test_personality_ops_delete_builtin_is_not_deletable() -> None:
-    """Deleting a built-in personality raises not_deletable (was REST 404)."""
-    ops = build_personality_ops(MagicMock(), lambda: None)
-    with pytest.raises(RouteError) as ei:
-        ops.delete("mad_scientist_assistant")
-    assert ei.value.reason == "not_deletable"
-
-
-def test_personality_ops_load_builtin_default_profile() -> None:
-    """The bulk personality API should retain the complete profile payload."""
-    ops = build_personality_ops(MagicMock(), lambda: None)
-    data = ops.load("default")
-    assert "Reachy Mini" in data["instructions"]
-    assert data["tools_text"]
-    assert data["enabled_tools"]
-    assert data["available_tools"]
-
-
 @pytest.mark.asyncio
-async def test_personality_ops_apply_voice() -> None:
+async def test_voice_ops_apply_voice() -> None:
     """apply_voice delegates to the handler and reports the status."""
     handler = MagicMock()
     handler.change_voice = AsyncMock(return_value="Voice changed to cedar.")
-    ops = build_personality_ops(handler, lambda: asyncio.get_running_loop())
+    ops = build_voice_ops(handler, lambda: asyncio.get_running_loop())
 
     result = await ops.apply_voice("cedar")
 
     assert result == {"ok": True, "status": "Voice changed to cedar."}
     handler.change_voice.assert_awaited_once_with("cedar")
-
-
-@pytest.mark.asyncio
-async def test_personality_ops_persist_startup_with_voice_override() -> None:
-    """Applying with persist=True saves the active manual voice override."""
-    handler = MagicMock()
-    handler.apply_personality = AsyncMock(return_value="Applied personality and restarted realtime session.")
-    handler.get_current_voice = MagicMock(return_value="shimmer")
-    persist_personality = MagicMock()
-    ops = build_personality_ops(handler, lambda: asyncio.get_running_loop(), persist_personality=persist_personality)
-
-    result = await ops.apply("sorry_bro", persist=True)
-
-    assert result["ok"] is True
-    handler.apply_personality.assert_awaited_once_with("sorry_bro")
-    persist_personality.assert_called_once_with("sorry_bro", "shimmer")
-
-
-@pytest.mark.asyncio
-async def test_personality_ops_apply_same_profile_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Re-applying the active personality is a no-op for the realtime handler."""
-    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "sorry_bro")
-    handler = MagicMock()
-    handler.apply_personality = AsyncMock(return_value="should not be called")
-    handler.get_current_voice = MagicMock(return_value="shimmer")
-    ops = build_personality_ops(handler, lambda: None)
-
-    result = await ops.apply("sorry_bro")
-
-    assert result["status"] == "Personality unchanged."
-    handler.apply_personality.assert_not_awaited()
-    handler.get_current_voice.assert_not_called()
-
-
-def test_personality_ops_startup_choice_survives_runtime_change(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Runtime profile switching should not redefine the saved startup personality."""
-    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "captain_circuit")
-    ops = build_personality_ops(MagicMock(), lambda: None)
-
-    first = ops.get_choices()
-    assert first["current"] == "captain_circuit"
-    assert first["startup"] == "captain_circuit"
-
-    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "chess_coach")
-
-    second = ops.get_choices()
-    assert second["current"] == "chess_coach"
-    assert second["startup"] == "captain_circuit"
-
-
-@pytest.mark.asyncio
-async def test_personality_ops_use_apply_callback() -> None:
-    """Apply delegates to the injected apply_personality callback, not the handler."""
-    handler = MagicMock()
-    handler.apply_personality = AsyncMock(return_value="handler should not be called")
-    apply_personality = AsyncMock(return_value="Applied personality and restarting backend.")
-    get_current_voice = MagicMock(return_value="cedar")
-    ops = build_personality_ops(
-        handler,
-        lambda: asyncio.get_running_loop(),
-        apply_personality=apply_personality,
-        get_current_voice=get_current_voice,
-    )
-
-    result = await ops.apply("sorry_bro")
-
-    assert result["status"] == "Applied personality and restarting backend."
-    apply_personality.assert_awaited_once_with("sorry_bro")
-    handler.apply_personality.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_apply_personality_propagates_restart_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Cancellation during backend restart should not be converted into a status string."""
-    monkeypatch.setattr(console_mod, "set_custom_profile", lambda _profile: None)
-    monkeypatch.setattr(console_mod, "get_session_instructions", lambda _instance_path=None: "instructions")
-    monkeypatch.setattr(console_mod, "get_session_voice", lambda default: default)
-
-    stream = LocalStream(MagicMock(), MagicMock())
-
-    async def cancel_restart(_reason: str) -> None:
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(stream, "request_backend_restart", cancel_restart)
-
-    with pytest.raises(asyncio.CancelledError):
-        await stream.apply_personality("sorry_bro")
-
-
-@pytest.mark.asyncio
-async def test_apply_personality_restores_profile_when_tool_initialization_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A failed tool rebuild must not leave the rejected profile selected."""
-    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "default")
-    monkeypatch.setattr(
-        console_mod,
-        "set_custom_profile",
-        lambda profile: setattr(config, "REACHY_MINI_CUSTOM_PROFILE", profile),
-    )
-    monkeypatch.setattr(console_mod, "get_session_instructions", lambda: "instructions")
-    monkeypatch.setattr(console_mod, "get_session_voice", lambda default: default)
-    monkeypatch.setattr(console_mod, "initialize_tools", MagicMock(side_effect=RuntimeError("invalid tools")))
-    stream = LocalStream(MagicMock(), MagicMock())
-
-    with pytest.raises(RuntimeError, match="invalid tools"):
-        await stream.apply_personality("broken")
-
-    assert config.REACHY_MINI_CUSTOM_PROFILE == "default"
 
 
 @pytest.mark.asyncio
@@ -1350,49 +1214,6 @@ async def test_local_stream_change_voice_delegates_without_backend_restart() -> 
     handler.change_voice.assert_awaited_once_with("Serena")
     assert stream._voice_override == "Serena"
     assert not stream._restart_requested.is_set()
-
-
-def test_local_stream_persist_personality_stores_voice_override(tmp_path) -> None:
-    """Persisting startup settings should write both profile and voice override."""
-    stream = LocalStream(MagicMock(), MagicMock(), instance_path=str(tmp_path))
-
-    stream._persist_personality("sorry_bro", "shimmer")
-
-    settings_path = tmp_path / "startup_settings.json"
-    assert settings_path.exists()
-    assert settings_path.read_text(encoding="utf-8") == '{\n  "profile": "sorry_bro",\n  "voice": "shimmer"\n}\n'
-    assert stream._read_persisted_personality() == "sorry_bro"
-
-
-def test_local_stream_persist_personality_clears_legacy_startup_env_overrides(tmp_path, monkeypatch) -> None:
-    """Saving startup settings should remove legacy `.env` profile and voice overrides."""
-    env_path = tmp_path / ".env"
-    env_path.write_text(
-        "HF_TOKEN=test-token\n"
-        "REACHY_MINI_CUSTOM_PROFILE=mad_scientist_assistant\n"
-        "REACHY_MINI_VOICE_OVERRIDE=shimmer\n",
-        encoding="utf-8",
-    )
-    stream = LocalStream(MagicMock(), MagicMock(), instance_path=str(tmp_path))
-
-    stream._persist_personality(None, "Aiden")
-
-    env_text = env_path.read_text(encoding="utf-8")
-    assert "HF_TOKEN=test-token" in env_text
-    assert "REACHY_MINI_CUSTOM_PROFILE=" not in env_text
-    assert "REACHY_MINI_VOICE_OVERRIDE=" not in env_text
-
-    applied_profiles: list[str | None] = []
-    monkeypatch.delenv("REACHY_MINI_CUSTOM_PROFILE", raising=False)
-    monkeypatch.setattr(
-        "reachy_mini_conversation_app.config.set_custom_profile",
-        lambda profile: applied_profiles.append(profile),
-    )
-
-    settings = load_startup_settings_into_runtime(tmp_path)
-
-    assert settings == StartupSettings(voice="Aiden")
-    assert applied_profiles == [None]
 
 
 def test_local_stream_launch_waits_for_missing_hf_target_without_starting_media(
@@ -2459,23 +2280,17 @@ def test_tool_call_observer_is_wired_to_handler_on_attach() -> None:
 
 
 def test_rpc_settings_methods() -> None:
-    """Personality, voice, and tool settings are reachable over /rpc."""
+    """Voice settings are reachable over /rpc, and the removed personality and tool settings are not."""
     app = FastAPI()
     stream = LocalStream(MagicMock(), _rpc_robot(), settings_app=app)
     stream._init_settings_ui_if_needed()
     with TestClient(app).websocket_connect("/rpc") as ws:
-        ws.send_json({"jsonrpc": "2.0", "id": "1", "method": "personalities.list"})
-        r1 = ws.receive_json()
         ws.send_json({"jsonrpc": "2.0", "id": "2", "method": "voices.list"})
         r2 = ws.receive_json()
-        ws.send_json({"jsonrpc": "2.0", "id": "3", "method": "tool_spaces.list"})
-        r3 = ws.receive_json()
-        ws.send_json({"jsonrpc": "2.0", "id": "4", "method": "profile_tools.get"})
-        r4 = ws.receive_json()
-    assert "choices" in r1["result"] and "current" in r1["result"]
+        ws.send_json({"jsonrpc": "2.0", "id": "1", "method": "personalities.list"})
+        r1 = ws.receive_json()
     assert isinstance(r2["result"], list)
-    assert "spaces" in r3["result"]
-    assert "enabled_tools" in r4["result"]
+    assert "error" in r1
 
 
 def test_a_parked_start_has_no_session_wanted(monkeypatch: pytest.MonkeyPatch) -> None:
