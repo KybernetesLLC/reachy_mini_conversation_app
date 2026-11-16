@@ -1,21 +1,5 @@
 /** Shared constants for the modern web UI. */
 
-export const AVATAR_BY_PROFILE = Object.freeze({
-  bored_teenager: "bored-teenager.svg",
-  captain_circuit: "captain-circuit.svg",
-  chess_coach: "chess-coach.svg",
-  cosmic_kitchen: "cosmic-kitchen.svg",
-  default: "default.svg",
-  hype_bot: "hype-bot.svg",
-  mad_scientist_assistant: "mad-scientist.svg",
-  mars_rover: "mars-rover.svg",
-  nature_documentarian: "nature-doc.svg",
-  noir_detective: "noir-detective.svg",
-  sorry_bro: "sorry-bro.svg",
-  time_traveler: "time-traveler.svg",
-  victorian_butler: "victorian-butler.svg",
-});
-
 export const ORB_STATES = Object.freeze({
   MUTED: "muted",
   IDLE: "idle",
@@ -38,12 +22,5 @@ export const GLOW_BY_STATE = Object.freeze({
 
 export const ROUTES = Object.freeze({
   TALK: "#/",
-  PERSONALITIES: "#/personalities",
   SETTINGS: "#/settings",
-  TOOLS: "#/tools",
 });
-
-export function avatarFor(profileName) {
-  const file = AVATAR_BY_PROFILE[profileName] || AVATAR_BY_PROFILE.default;
-  return `/static/avatars/${file}`;
-}

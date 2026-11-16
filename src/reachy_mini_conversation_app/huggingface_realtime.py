@@ -39,7 +39,6 @@ from reachy_mini_conversation_app.config import (
     HF_LOCAL_CONNECTION_MODE,
     config,
     get_default_voice,
-    set_custom_profile,
     get_available_voices,
     get_hf_direct_ws_url,
     parse_hf_realtime_url,
@@ -680,10 +679,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Return whether the realtime connection is open."""
         return self.connection is not None
 
-    def _idle_behavior_ready(self) -> bool:
-        """Hold idle behavior while a model response is still active."""
-        return self._response_done_event.is_set()
-
     async def _cancel_partial_transcript_task(self) -> None:
         if self.partial_transcript_task and not self.partial_transcript_task.done():
             self.partial_transcript_task.cancel()
@@ -730,51 +725,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
             or default_voice
         )
-
-    async def apply_personality(self, profile: str | None) -> str:
-        """Apply a personality to the active or next realtime connection."""
-        previous_profile = config.REACHY_MINI_CUSTOM_PROFILE
-        set_custom_profile(profile)
-        try:
-            instructions = get_session_instructions(self.instance_path)
-            voice = self.get_current_voice()
-            core_tools.initialize_tools(force=True)
-        except Exception as exc:
-            set_custom_profile(previous_profile)
-            logger.error("Failed to resolve personality %r: %s", profile, exc)
-            return f"Failed to apply personality: {exc}"
-
-        if self.connection is not None:
-            try:
-                await self.connection.session.update(
-                    session=RealtimeSessionCreateRequestParam(
-                        type="realtime",
-                        instructions=instructions,
-                        audio=RealtimeAudioConfigParam(
-                            output=RealtimeAudioConfigOutputParam(
-                                voice=voice,
-                            ),
-                        ),
-                    ),
-                )
-                logger.info(
-                    "Applied personality via live update: %s", profile or "default"
-                )
-            except Exception as exc:
-                logger.warning("Live update failed; will restart session: %s", exc)
-
-            try:
-                await self._restart_session()
-                return "Applied personality and restarted realtime session."
-            except Exception as exc:
-                logger.warning("Failed to restart session after apply: %s", exc)
-                return "Applied personality. Will take effect on next connection."
-
-        logger.info(
-            "Applied personality recorded: %s (no live connection; will apply on next session)",
-            profile or "default",
-        )
-        return "Applied personality. Will take effect on next connection."
 
     async def _emit_debounced_partial(
         self, transcript: str, item_id: str, sequence_counter: int
@@ -833,44 +783,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._connected_event.clear()
             except Exception:
                 pass
-
-    async def _restart_session(self) -> None:
-        """Force-close the current session and start a fresh one in background.
-
-        Does not block the caller while the new session is establishing.
-        """
-        try:
-            if self.connection is not None:
-                try:
-                    await self.connection.close()
-                except Exception:
-                    pass
-                finally:
-                    self.connection = None
-
-            # Ensure we have a client (start_up must have run once)
-            if getattr(self, "client", None) is None:
-                logger.warning("Cannot restart: realtime client not initialized yet.")
-                return
-
-            # Fire-and-forget new session and wait briefly for connection
-            try:
-                self._connected_event.clear()
-            except Exception:
-                pass
-            self.client = await self._build_realtime_client()
-            asyncio.create_task(
-                self._run_realtime_session(), name="realtime-session-restart"
-            )
-            try:
-                await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
-                logger.info("Realtime session restarted and connected.")
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Realtime session restart timed out; continuing in background."
-                )
-        except Exception as e:
-            logger.warning("_restart_session failed: %s", e)
 
     async def _recover_refused_reply(self) -> bool:
         """Send a reply the server refused while a tool's output was owed, once the outputs are in.

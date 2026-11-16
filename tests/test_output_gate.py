@@ -13,7 +13,6 @@ import pytest
 
 from reachy_mini_conversation_app import output_gate as gate
 from reachy_mini_conversation_app.tools import core_tools
-from reachy_mini_conversation_app.tools.idle_do_nothing import IdleDoNothing
 
 
 # The companion's live registry, from the app's "Tools to be used in conversation" line
@@ -221,7 +220,6 @@ def test_with_no_registry_the_artifact_rule_alone_decides() -> None:
 
 def test_tools_opt_in_to_running_when_leaked() -> None:
     assert core_tools.Tool.leak_safe is False
-    assert IdleDoNothing.leak_safe is True
 
 
 # 2026-10-20 evening: 4 of 19 replies leaked Gemma call markup. The whole-reply leaks had
