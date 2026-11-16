@@ -213,6 +213,8 @@ def tool_kind(name: str, registry: dict[str, Any]) -> str:
     if name in GESTURE_TOOLS:
         return "gesture"
     return "plain"
+
+
 LOOKUP_PROMISE = re.compile(
     r"\b(let me (check|look|find out|search)(?! at you)|let me see (what|if|whether)"
     r"|(looking|look) (it|that|this) up|i'?ll (check|find out|look (it|that|this) up))\b",

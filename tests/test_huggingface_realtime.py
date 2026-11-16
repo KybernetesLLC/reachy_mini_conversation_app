@@ -6330,8 +6330,13 @@ def test_with_the_companion_every_tool_keeps_the_kind_its_name_gave(companion_on
     for path in sorted((companion_on / "app_tools").glob("companion_*.py")):
         for node in ast.walk(ast.parse(path.read_text())):
             if isinstance(node, ast.ClassDef):
-                attrs = {t.id: n.value.value for n in node.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
-                         for t in n.targets if isinstance(t, ast.Name)}
+                attrs = {
+                    t.id: n.value.value
+                    for n in node.body
+                    if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
+                    for t in n.targets
+                    if isinstance(t, ast.Name)
+                }
                 if "name" in attrs:
                     declared[attrs["name"]] = attrs.get("kind")
     for name, kind in old_names.items():
