@@ -37,9 +37,10 @@ FRAME_WAIT_SECONDS = 2.0
 # Companion ticket 33: the frame is measured with the companion's Rec.709 luma
 # (its luma.py, the light log's own measure), no longer the plain BGR mean. The
 # numbers stay. ROOM_LIT was always read against the log's Rec.709 luma_mean. For
-# DARK_FRAME the two measures agree on a grey frame (the weights sum to 1), and the
-# camera's auto white balance keeps frames near grey: a warm cast it leaves, R:G:B
-# 1.3:1:0.7, reads luma 1.04 times the mean, 20.8 for 20. The companion's 35/60
+# DARK_FRAME the two measures agree on a grey frame (the weights sum to 1). Over
+# 294,567 logged frames the luma / plain-mean ratio was 0.884-1.051 (median 1.005);
+# in the 15-25 band its 1st-99th percentile was 0.978-1.018, so 20 moves by under
+# 0.5 luma. The companion's 35/60
 # (presence.py: dark, dim, lit) are words for the room; 40 keeps a margin above
 # an unlit night's 90th percentile (33) so a dark room's frame is never refused.
 DARK_FRAME = 20.0
