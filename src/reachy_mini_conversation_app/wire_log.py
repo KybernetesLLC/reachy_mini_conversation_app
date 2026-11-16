@@ -16,7 +16,9 @@ cannot open is retried each minute. Nothing here can block or break the conversa
 
 On only when ``REACHY_COMPANION_WIRE_LOG`` names a database path. Rows older than the
 companion's turn retention (``REACHY_COMPANION_TURN_RETENTION_DAYS``, 90) are deleted at
-start and daily.
+start and daily. The path, the open and the retention are the companion's own reads
+(``data_paths``, ``turn_retention``; its ticket 33): a retention value the supervisor refuses
+keeps the log off. Without the companion, the app's own reads below are used.
 """
 
 from __future__ import annotations
@@ -34,6 +36,8 @@ import contextlib
 import subprocess
 from typing import Any, AsyncIterator
 from pathlib import Path
+
+from reachy_mini_conversation_app import companion
 
 
 logger = logging.getLogger(__name__)
@@ -162,7 +166,14 @@ def _ids(data: Any) -> tuple[str | None, str | None, str | None]:
 
 
 def retention_days() -> int:
-    """Return the days kept: the companion's turn retention, 90 when unset or not a number."""
+    """Return the days kept: the companion's turn retention.
+
+    Through the companion's read, which raises ValueError for a value it refuses (it stops the
+    supervisor); else 90 when unset or not a number.
+    """
+    read = companion.function("turn_retention", "retention_days_from_env")
+    if read is not None:
+        return read(os.environ)
     try:
         return max(1, int(os.environ.get(RETENTION_ENV, "90")))
     except ValueError:
@@ -183,6 +194,9 @@ def _app_commit() -> str | None:
 
 def _companion_commit() -> str | None:
     """Return the companion's commit, the first word of DEPLOYED_FROM (no .git on the robot)."""
+    read = companion.function("data_paths", "deployed_commit")
+    if read is not None:
+        return read()
     try:
         words = (Path.home() / "reachy-companion" / "DEPLOYED_FROM").read_text().split()
         return words[0] if words else None
@@ -264,14 +278,21 @@ class WireLog:
 
     def _connect(self) -> sqlite3.Connection | None:
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
             new = not self.path.exists()
-            db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
-            if new:
-                db.execute("PRAGMA auto_vacuum=INCREMENTAL")
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA synchronous=NORMAL")
-            db.execute("PRAGMA busy_timeout=5000")
+            connect = companion.function("data_paths", "connect")
+            if connect is not None:  # its folder made, WAL, synchronous NORMAL, a 5 s busy wait
+                db = connect(self.path)
+                if new:  # WAL is set first there, so the empty file is rebuilt to take it
+                    db.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                    db.execute("VACUUM")
+            else:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
+                if new:
+                    db.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("PRAGMA synchronous=NORMAL")
+                db.execute("PRAGMA busy_timeout=5000")
             db.executescript(SCHEMA)
             db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             return db
@@ -506,12 +527,22 @@ _LOG: WireLog | None = None
 def from_env() -> WireLog | None:
     """Return the process's wire log, started on first use, or None when it is off."""
     global _LOG
-    path = os.environ.get(ENV, "").strip()
-    if not path or path.lower() == "off":
+    named = companion.function("data_paths", "wire_log_path")
+    if named is not None:
+        found = named()
+        path = "" if found is None else str(found)
+    else:
+        path = os.environ.get(ENV, "").strip()
+        path = "" if path.lower() == "off" else os.path.expanduser(path)
+    if not path:
         return None
-    path = os.path.expanduser(path)
     if _LOG is None or str(_LOG.path) != path:
-        _LOG = WireLog(path)
+        try:
+            days = retention_days()
+        except ValueError as exc:  # the supervisor refuses to start on it; the log stays off
+            logger.error("wire log: off: %s", exc)
+            return None
+        _LOG = WireLog(path, retention=days)
     return _LOG
 
 
