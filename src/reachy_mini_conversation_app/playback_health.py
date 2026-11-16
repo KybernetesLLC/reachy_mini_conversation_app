@@ -42,6 +42,9 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib  # noqa: E402
 
+from reachy_mini_conversation_app.utils import env_number  # noqa: E402
+from reachy_mini_conversation_app.streaming import frame_rms  # noqa: E402
+
 
 logger = logging.getLogger(__name__)
 
@@ -236,24 +239,6 @@ IDLE_REBUILD: Setting = ("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", 3 * 3600.0)
 ROUTINE_TRIGGERS = frozenset({"idle rebuild"})
 
 
-def seconds_from_env(setting: Setting, environ: Any = os.environ) -> float:
-    """Return a setting's seconds from the environment, or its default if missing or invalid."""
-    name, default = setting
-    raw = str(environ.get(name, "")).strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        value = -1.0
-    if not math.isfinite(value) or value < 0:
-        logger.warning(
-            "%s=%r is not a number of seconds >= 0; using %.0f", name, raw, default
-        )
-        return default
-    return value
-
-
 class IdlePolicy(NamedTuple):
     """When a speech stream left idle is rebuilt, and how soon a tried rebuild is tried again."""
 
@@ -265,10 +250,10 @@ class IdlePolicy(NamedTuple):
 def idle_policies(environ: Any = os.environ) -> tuple[IdlePolicy, IdlePolicy]:
     """Return (the session open's refresh, the watchdog tick's rebuild), from the environment."""
     return (
-        IdlePolicy("idle refresh", seconds_from_env(REFRESH_IDLE, environ)),
+        IdlePolicy("idle refresh", env_number(*REFRESH_IDLE, environ)),
         IdlePolicy(
             "idle rebuild",
-            seconds_from_env(IDLE_REBUILD, environ),
+            env_number(*IDLE_REBUILD, environ),
             REBUILD_COOLDOWN_MAX_S,
         ),
     )
@@ -546,17 +531,6 @@ REPLY_TAIL_S = (
 )
 
 
-def rms(samples: Any) -> float | None:
-    """Return the RMS of a 1-D array of float samples, or None for none. Pure.
-
-    The speaker monitor (loud_seconds) and the phantom detector's pad probe both use it,
-    with the one LOUD_RMS floor, so the two cannot disagree about what is loud.
-    """
-    if samples.size == 0:
-        return None
-    return math.sqrt(float(samples.dot(samples)) / samples.size)
-
-
 def loud_seconds(samples: Any, rate: int) -> tuple[float, float]:
     """Return (seconds, seconds above LOUD_RMS) of a buffer of float samples, in 10 ms blocks."""
     import numpy as np
@@ -571,7 +545,7 @@ def loud_seconds(samples: Any, rate: int) -> tuple[float, float]:
         blocks = np.sqrt(np.mean(np.square(data[:usable].reshape(-1, block)), axis=1))
         loud = int(np.count_nonzero(blocks > LOUD_RMS)) * block
     rest = data[usable:]
-    if rest.size and (rms(rest) or 0.0) > LOUD_RMS:
+    if rest.size and (frame_rms(rest) or 0.0) > LOUD_RMS:
         loud += rest.size
     return data.size / rate, loud / rate
 

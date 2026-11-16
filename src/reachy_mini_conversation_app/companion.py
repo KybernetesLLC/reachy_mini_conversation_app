@@ -45,3 +45,9 @@ def function(module: str, name: str) -> Optional[Callable[..., Any]]:
             _found[key] = None
             logger.warning("companion: no %s.%s (%s); the app's own read is used", module, name, exc)
     return _found[key]
+
+
+def value(module: str, name: str, default: Any) -> Any:
+    """Return ``reachy_companion.<module>.<name>`` (a constant or a function), or ``default`` when it is not there."""
+    found = function(module, name)
+    return default if found is None else found

@@ -33,8 +33,9 @@ from openai.types.realtime.realtime_audio_input_turn_detection_param import Serv
 
 from reachy_mini_conversation_app.tools import camera as camera_tool
 from reachy_mini_conversation_app.tools import core_tools
-from reachy_mini_conversation_app import talk_prune
+from reachy_mini_conversation_app import companion, talk_prune
 from reachy_mini_conversation_app import wire_log
+from reachy_mini_conversation_app.utils import b64_size
 from reachy_mini_conversation_app.config import (
     HF_LOCAL_CONNECTION_MODE,
     config,
@@ -319,14 +320,16 @@ class _Thought(NamedTuple):
 
 def session_size(session: Any) -> str:
     """What a session.update sends, sized: instructions and tool definitions, with a rough
-    token count (4 characters a token). The owner, 2026-10-20: leaks grew with the context.
+    token count (the companion's context_size.CHARS_PER_TOKEN, 4 characters a token). The owner,
+    2026-10-20: leaks grew with the context.
     """
     instructions = str(session.get("instructions") or "")
     tools = list(session.get("tools") or [])
     tools_chars = len(json.dumps(tools, default=str))
+    chars_per_token = companion.value("context_size", "CHARS_PER_TOKEN", 4)
     return (
         f"instructions {len(instructions)} chars, {len(tools)} tools {tools_chars} chars, "
-        f"~{(len(instructions) + tools_chars) // 4} tokens"
+        f"~{(len(instructions) + tools_chars) // chars_per_token} tokens"
     )
 
 
@@ -1605,7 +1608,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _count_image(self, b64_jpeg: str) -> None:
         self._session_images += 1
-        self._session_image_bytes += (len(b64_jpeg) * 3) // 4
+        self._session_image_bytes += b64_size(b64_jpeg)
 
     def open_glance_in(self) -> None:
         """Mark the glance at a session's open as in, and judge it against the first reply."""
@@ -2171,7 +2174,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 jpeg_bytes = (
                     jpeg_bytes_value
                     if isinstance(jpeg_bytes_value, int)
-                    else (len(b64_im) * 3) // 4
+                    else b64_size(b64_im)
                 )
                 self._count_image(b64_im)
                 await self.connection.conversation.item.create(

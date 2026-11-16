@@ -3632,6 +3632,29 @@ async def test_a_reply_logs_the_context_or_says_once_that_none_came(
 
 
 @pytest.mark.asyncio
+async def test_the_session_size_line_is_the_one_the_companions_senses_page_parses(
+    monkeypatch: Any, caplog: Any, companion_on: Any
+) -> None:
+    """The app logs 'Realtime session size: ...'; the companion's context_size regex reads it."""
+    handler = _session_handler(
+        monkeypatch, _reply_events("Hello there.", audio_first=False)
+    )
+    handler._clear_queue = lambda: None
+    with caplog.at_level(logging.INFO, logger=hf_mod.logger.name):
+        await handler._run_realtime_session()
+    from reachy_companion import context_size
+
+    line = next(
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("Realtime session size: ")
+    )
+    parsed = context_size.session_size(line)
+    assert parsed is not None and parsed["instructions"] > 0
+    assert f"~{(parsed['instructions'] + parsed['tool_chars']) // context_size.CHARS_PER_TOKEN} tokens" in line
+
+
+@pytest.mark.asyncio
 async def test_an_open_call_with_no_transcript_done_is_judged_whole_and_cut(
     monkeypatch: Any,
 ) -> None:

@@ -30,6 +30,7 @@ import numpy as np
 import pytest
 
 from reachy_mini_conversation_app import playback_health as ph
+from reachy_mini_conversation_app.utils import env_number
 
 
 USE_SDK_DEVICES = os.environ.get("REACHY_PLAYBACK_TEST_SINK") == "sdk"
@@ -1779,7 +1780,7 @@ def test_the_idle_thresholds_come_from_the_environment(
     assert ph.IDLE_REBUILD == ("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", 10800.0)
     env, default = setting
     environ = {} if raw is None else {env: raw}
-    assert ph.seconds_from_env(setting, environ) == (
+    assert env_number(*setting, environ) == (
         default if expected is None else expected
     )
 

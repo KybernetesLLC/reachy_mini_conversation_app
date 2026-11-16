@@ -14,6 +14,7 @@ from typing import Any, Dict, Callable, Optional, Coroutine
 
 from pydantic import Field, BaseModel, PrivateAttr
 
+from reachy_mini_conversation_app.utils import clamp
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolDependencies,
     dispatch_tool_call,
@@ -306,7 +307,7 @@ class BackgroundToolManager(BaseModel):
             # Tool not tracking progress
             return False
 
-        tool.progress = ToolProgress(progress=max(0.0, min(1.0, progress)), message=message)
+        tool.progress = ToolProgress(progress=clamp(progress, 0.0, 1.0), message=message)
         logger.debug(f"Tool {tool_id} progress: {progress:.1%} - {message or ''}")
         return True
 

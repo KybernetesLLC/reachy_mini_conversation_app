@@ -24,7 +24,6 @@ Safety
 """
 
 from __future__ import annotations
-import os
 import math
 import time
 import logging
@@ -46,6 +45,8 @@ from reachy_mini.utils.interpolation import (
     compose_world_offset,
     linear_pose_interpolation,
 )
+from reachy_mini_conversation_app import companion
+from reachy_mini_conversation_app.utils import env_number, finite_number
 from reachy_mini_conversation_app.dance_emotion_moves import EmotionQueueMove
 
 
@@ -61,35 +62,28 @@ HOLD_RETURN_SECONDS = (
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
 
 
-def _idle_setting(name: str, default: float) -> float:
-    """Read a non-negative number from the environment, or return the default (with one warning)."""
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        value = -1.0
-    if value < 0 or not math.isfinite(value) or raw.strip() == "":
-        logger.warning("%s=%r is not a non-negative number; using %s", name, raw, default)
-        return default
-    return value
+# The body's turn limits, from the companion's facing.py (this app's own as the fallback): the
+# defaults of the two commanded limits, the range a setting may take, and the turn speed.
+TURN_LEFT_DEFAULT_DEG = float(companion.value("facing", "TURN_LEFT_DEFAULT_DEG", 106.0))
+TURN_RIGHT_DEFAULT_DEG = float(companion.value("facing", "TURN_RIGHT_DEFAULT_DEG", 115.0))
+TURN_RANGE_DEG = tuple(companion.value("facing", "TURN_RANGE_DEG", (10.0, 160.0)))
+TURN_SPEED = float(companion.value("facing", "TURN_SPEED", math.radians(20.0)))
 
 
 def _body_limit(name: str, default: float) -> float:
     """A commanded body limit in degrees, from the setting the supervisor reads (facing.py), with
     the same range; outside it, the default (with one warning)."""
-    value = _idle_setting(name, default)
-    if not 10.0 <= value <= 160.0:
-        logger.warning("%s=%s is not 10 to 160 degrees; using %s", name, value, default)
+    value = env_number(name, default)
+    if not TURN_RANGE_DEG[0] <= value <= TURN_RANGE_DEG[1]:
+        logger.warning("%s=%s is not %.0f to %.0f degrees; using %s", name, value, *TURN_RANGE_DEG, default)
         return default
     return value
 
 
 def _body_limits() -> Tuple[float, float]:
     """The commanded body limits (lowest, highest, radians); positive yaw is his left."""
-    left = _body_limit("REACHY_COMPANION_BODY_TURN_LEFT_DEG", 106.0)
-    right = _body_limit("REACHY_COMPANION_BODY_TURN_RIGHT_DEG", 115.0)
+    left = _body_limit("REACHY_COMPANION_BODY_TURN_LEFT_DEG", TURN_LEFT_DEFAULT_DEG)
+    right = _body_limit("REACHY_COMPANION_BODY_TURN_RIGHT_DEG", TURN_RIGHT_DEFAULT_DEG)
     return math.radians(-right), math.radians(left)
 
 
@@ -99,7 +93,7 @@ def _body_limits() -> Tuple[float, float]:
 BODY_YAW_LOW, BODY_YAW_HIGH = _body_limits()
 # A body already past a limit comes back at most this far per send: the supervisor's turn speed
 # (facing.TURN_SPEED, 20 degrees a second) at the control loop's rate.
-BODY_INWARD_STEP = math.radians(20.0) / CONTROL_LOOP_FREQUENCY_HZ
+BODY_INWARD_STEP = TURN_SPEED / CONTROL_LOOP_FREQUENCY_HZ
 
 
 def _within_body_range(
@@ -216,9 +210,9 @@ class BreathingMove(Move):  # type: ignore
         # Breathing parameters
         # The owner, 2026-09-30: a calmer idle, so the motor loop's brief stalls
         # (one per presence check) do not show as a stutter in a wide, fast sway.
-        self.breathing_z_amplitude = _idle_setting("REACHY_BREATHING_Z_MM", 3.0) / 1000.0
-        self.antenna_sway_amplitude = np.deg2rad(_idle_setting("REACHY_BREATHING_ANTENNA_DEG", 5.0))
-        self.antenna_frequency = _idle_setting("REACHY_BREATHING_ANTENNA_HZ", 0.25)
+        self.breathing_z_amplitude = env_number("REACHY_BREATHING_Z_MM", 3.0) / 1000.0
+        self.antenna_sway_amplitude = np.deg2rad(env_number("REACHY_BREATHING_ANTENNA_DEG", 5.0))
+        self.antenna_frequency = env_number("REACHY_BREATHING_ANTENNA_HZ", 0.25)
         self.breathing_frequency = 0.1  # Hz (6 breaths per minute)
 
         # The companion's mood (task 8.2): read each cycle (the movement
@@ -899,9 +893,10 @@ class MovementManager:
             logger.info("Turning the idle body to %.2f rad over %.1fs", yaw, duration)
         elif command == "set_breathing":
             try:
-                rate, depth, pitch = (float(v) for v in payload)
-                if not all(math.isfinite(v) for v in (rate, depth, pitch)):
-                    raise ValueError("not finite")
+                numbers = [finite_number(v) for v in payload]
+                if len(numbers) != 3 or None in numbers:
+                    raise ValueError("not three finite numbers")
+                rate, depth, pitch = numbers
             except (TypeError, ValueError):
                 logger.warning("Ignored set_breathing command with invalid payload: %s", payload)
                 return

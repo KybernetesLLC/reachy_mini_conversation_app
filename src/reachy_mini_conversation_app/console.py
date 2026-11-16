@@ -27,8 +27,9 @@ from reachy_mini.utils import create_head_pose
 from reachy_mini.io.jsonrpc import JsonRpcError
 from reachy_mini.apps.jsonrpc_server import JsonRpcServer
 from reachy_mini.media.media_manager import MediaBackend
-from reachy_mini_conversation_app import startup, phantom_speech, playback_health
+from reachy_mini_conversation_app import startup, companion, phantom_speech, playback_health
 from reachy_mini_conversation_app.moves import BODY_YAW_LOW, BODY_YAW_HIGH
+from reachy_mini_conversation_app.utils import clamp, finite_number, write_text_atomic
 from reachy_mini_conversation_app.config import (
     HF_BACKEND,
     HF_REALTIME_WS_URL_ENV,
@@ -46,7 +47,7 @@ from reachy_mini_conversation_app.config import (
     refresh_runtime_config_from_env,
 )
 from reachy_mini_conversation_app.prompts import get_session_voice
-from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_float32
+from reachy_mini_conversation_app.streaming import AdditionalOutputs, frame_rms, audio_to_float32
 from reachy_mini_conversation_app.voice_routes import (
     build_voice_ops,
     register_voice_methods,
@@ -105,12 +106,9 @@ def _detach_framework_root_routes(app: "FastAPI") -> None:
 
 
 def _finite_float(value: object, message: str) -> float:
-    """Parse a JSON-RPC parameter as a finite float, or raise invalid_params."""
-    try:
-        parsed = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        raise JsonRpcError(message, reason="invalid_params", code=-32602)
-    if not math.isfinite(parsed):
+    """Parse a JSON-RPC parameter as a finite number (no bool, no string), or raise invalid_params."""
+    parsed = finite_number(value)
+    if parsed is None:
         raise JsonRpcError(message, reason="invalid_params", code=-32602)
     return parsed
 
@@ -122,8 +120,9 @@ DANCE_WOBBLE_SLACK_S = 30.0
 DANCE_MAX_S = 60.0  # the companion's dances are at most 20 s; wobbling is off throughout
 
 
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+# conversation.breathing's limits (the companion's idle.py), with this app's own as the fallback.
+BREATHING_SCALE_RANGE = tuple(companion.value("idle", "BREATHING_SCALE_RANGE", (0.7, 1.3)))
+BREATHING_PITCH_MAX = float(companion.value("idle", "BREATHING_PITCH_MAX", 0.05))
 
 
 # reachy_mini 1.10.0: yaw_body is capped at 160 degrees (URDF, max_body_yaw).
@@ -187,10 +186,8 @@ def _anchor_ago(value: object) -> float | None:
     Seconds since the wake word peaked, as the opener measured them. Anything
     unusable means no anchor.
     """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    ago = float(value)
-    return ago if math.isfinite(ago) and 0.0 <= ago <= PREROLL_BUFFER_SECONDS else None
+    ago = finite_number(value)
+    return ago if ago is not None and 0.0 <= ago <= PREROLL_BUFFER_SECONDS else None
 
 
 def _flush_appsrc(appsrc: Any) -> None:
@@ -525,20 +522,24 @@ class LocalStream:
     _LEVEL_INTERVAL_S = 1.0 / 15.0
     _LEVEL_GAIN = 6.0
 
-    def _emit_level(self, role: str, frame: Any) -> None:
-        """Emit a throttled conversation.level (RMS) for ``role`` (user/assistant)."""
+    def _emit_level(self, role: str, frame: Any, rms: float | None = None) -> None:
+        """Emit a throttled conversation.level (RMS) for ``role`` (user/assistant).
+
+        ``rms`` is the frame's level when the caller has measured it already (the microphone's,
+        by _note_frame); else it is measured here.
+        """
         if self._rpc is None:
             return
         now = time.monotonic()
         if now - self._last_level_emit.get(role, 0.0) < self._LEVEL_INTERVAL_S:
             return
         self._last_level_emit[role] = now
-        try:
-            samples = audio_to_float32(frame)
-            rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
-        except Exception:
-            return
-        level = max(0.0, min(1.0, rms * self._LEVEL_GAIN))
+        if rms is None:
+            try:
+                rms = frame_rms(audio_to_float32(frame)) or 0.0
+            except Exception:
+                return
+        level = clamp(rms * self._LEVEL_GAIN, 0.0, 1.0)
         self._rpc.broadcast_threadsafe(
             "conversation.level", {"role": role, "rms": round(level, 3)}
         )
@@ -1150,7 +1151,7 @@ class LocalStream:
                 if not replaced:
                     lines.append(f"{env_name}={value}")
             final_text = "\n".join(lines) + "\n"
-            env_path.write_text(final_text, encoding="utf-8")
+            write_text_atomic(env_path, final_text)
             logger.info(
                 "Persisted %s to %s", ", ".join(sorted(normalized_updates)), env_path
             )
@@ -1195,7 +1196,7 @@ class LocalStream:
             final_text = "\n".join(filtered_lines)
             if final_text:
                 final_text += "\n"
-            env_path.write_text(final_text, encoding="utf-8")
+            write_text_atomic(env_path, final_text)
             logger.info("Removed %s from %s", ", ".join(normalized_names), env_path)
         except Exception as e:
             logger.warning("Failed to remove %s: %s", ", ".join(normalized_names), e)
@@ -1491,27 +1492,25 @@ class LocalStream:
                 raise JsonRpcError("movement manager unavailable", reason="not_running")
             # A field the call leaves out keeps its stored value.
             kept_rate, kept_depth, kept_pitch = manager.breathing_feel
-            rate = _clamp(
+            rate = clamp(
                 _finite_float(
                     params.get("rate_scale", kept_rate), "rate_scale must be numeric"
                 ),
-                0.7,
-                1.3,
+                *BREATHING_SCALE_RANGE,
             )
-            depth = _clamp(
+            depth = clamp(
                 _finite_float(
                     params.get("depth_scale", kept_depth), "depth_scale must be numeric"
                 ),
-                0.7,
-                1.3,
+                *BREATHING_SCALE_RANGE,
             )
-            pitch = _clamp(
+            pitch = clamp(
                 _finite_float(
                     params.get("pitch_offset", kept_pitch),
                     "pitch_offset must be numeric",
                 ),
-                -0.05,
-                0.05,
+                -BREATHING_PITCH_MAX,
+                BREATHING_PITCH_MAX,
             )
             manager.set_breathing(rate, depth, pitch)
             return {"rate_scale": rate, "depth_scale": depth, "pitch_offset": pitch}
@@ -2341,14 +2340,20 @@ class LocalStream:
         if loop is not None and loop.is_running():
             asyncio.run_coroutine_threadsafe(self._end_user_turn(), loop)
 
-    def _note_frame(self, frame: Any) -> None:
-        """Count a microphone frame and its level, for conversation.audio_health."""
+    def _note_frame(self, frame: Any) -> float | None:
+        """Count a microphone frame and its level, for conversation.audio_health.
+
+        The frame is measured once. Returns its RMS as the level meter reads it (an int16 frame at
+        full scale 32768, a float32 one as it is), or None for any other dtype or a failed read.
+        """
         now = time.monotonic()
+        level = None
         try:
             samples = np.asarray(frame, dtype=np.float32)
-            if samples.dtype.kind in "iu" or np.abs(samples).max(initial=0.0) > 1.5:
-                samples = samples / 32768.0
-            rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
+            raw = frame_rms(samples) or 0.0
+            rms = raw / 32768.0 if np.abs(samples).max(initial=0.0) > 1.5 else raw
+            kind = getattr(frame, "dtype", None)
+            level = raw / 32768.0 if kind == np.int16 else raw if kind == np.float32 else None
         except Exception:
             rms = 0.0
         self._last_frame_at = now
@@ -2357,6 +2362,7 @@ class LocalStream:
             self._recent_frames and now - self._recent_frames[0][0] > _HEALTH_WINDOW_S
         ):
             self._recent_frames.popleft()
+        return level
 
     def audio_health(self) -> dict[str, object]:
         """Report what the microphone actually delivers (the companion's audio audit, A2).
@@ -2518,7 +2524,7 @@ class LocalStream:
                 # long as the mute lasts.
                 self._clear_preroll()
             elif audio_frame is not None:
-                self._note_frame(audio_frame)
+                level = self._note_frame(audio_frame)
                 frame = (input_sample_rate, audio_frame)
                 connected = self._backend_connected()
                 if connected and self._preroll_flush_pending:
@@ -2535,7 +2541,7 @@ class LocalStream:
                     self._sent()
                     if not connected:
                         self._append_preroll(frame)
-                self._emit_level("user", audio_frame)
+                self._emit_level("user", audio_frame, level)
             await asyncio.sleep(0)  # avoid busy loop
 
     def _sent(self) -> None:
