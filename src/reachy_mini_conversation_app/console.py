@@ -377,7 +377,8 @@ class LocalStream:
         # The phantom-speech detector (2026-10-26): speaker sound the app did not push.
         # A reply pushed but not yet heard may still play late: the app's own sound.
         self._phantom = phantom_speech.PhantomWatch(
-            pending=lambda now: self._replies.pending(now)
+            pending=lambda now: self._replies.pending(now),
+            play_end=lambda now: self._replies.play_end(now),
         )
         self._speaker_sink_cache: dict[str, Any] = {}
         # Every play_sound caller is seen from the start (the app tools use it directly),
@@ -2412,7 +2413,6 @@ class LocalStream:
         cut = self._replies.flushed(
             self._now()
         )  # dropped audio is not unheard; (seconds, unplayed)
-        self._phantom.flushed(self._now())
         audio = getattr(self._robot.media, "audio", None)
         if audio is not None:
             appsrc = getattr(audio, "_appsrc", None)
@@ -2653,7 +2653,7 @@ class LocalStream:
                 )
                 # First: the speech-sink probe comes off before the reply can reach the sink.
                 now = self._now()
-                self._phantom.pushed(now, seconds)
+                self._phantom.pushed(now)
                 self._robot.media.push_audio_sample(audio_frame)
                 self._replies.pushed(now, seconds, speech)
                 self._emit_level("assistant", audio_frame)
