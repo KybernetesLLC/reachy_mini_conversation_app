@@ -89,7 +89,11 @@ async def fresh_jpeg(
         left = deadline - time.monotonic()
         if left <= 0:
             break
-        answer = await ask(purpose, closer, question, wait_s=left, cancelable=purpose == "camera")
+        try:
+            answer = await ask(purpose, closer, question, wait_s=left, cancelable=purpose == "camera")
+        except Exception as exc:  # the companion's store: locked, or migrating
+            logger.warning("camera: the grab request failed: %s", exc)
+            return None, None, "the request failed", {}
         if answer.get("refused") != DARK_FRAME_REASON:
             break
         logger.warning("camera frame dark (luma %s) in a lit room; trying once more", answer.get("luma"))
@@ -123,10 +127,16 @@ NO_PICTURE = (
 )
 
 
+# The reasons the model is told, as before unit 62b; any other (the companion's refusal, a timeout,
+# a cancel) is logged as it is and told as "no frame", so what he is told does not change.
+MODEL_REASONS = ("camera disabled", DARK_FRAME_REASON)
+
+
 def no_picture(source: str, reason: str) -> Dict[str, Any]:
     """Log the miss and return the tool result that tells the model it has no picture."""
     logger.warning("camera: no frame for %s/%s", source, reason)
-    return {"no_picture": True, "instruction": NO_PICTURE.format(reason=reason)}
+    told = reason if reason in MODEL_REASONS else "no frame"
+    return {"no_picture": True, "instruction": NO_PICTURE.format(reason=told)}
 
 
 # The facts handed to the companion with the frame, for its sight note (the frame store's `camera`

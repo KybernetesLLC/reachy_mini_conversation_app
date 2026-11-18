@@ -613,9 +613,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     ) -> dict[str, Any]:
         """Remove bulky transport-only fields before echoing tool output back to the model."""
         if tool_name == "camera" and "b64_im" in tool_result:
-            sanitized = dict(tool_result)
-            sanitized.pop("b64_im", None)
-            sanitized.pop("pose", None)  # for the companion's kept picture, not for the model
+            # the pose and the Frame id are for the companion's kept picture, not for the model
+            drop = ("b64_im", "pose", "frame_id")
+            sanitized = {k: v for k, v in tool_result.items() if k not in drop}
             sanitized["image_attached"] = True
             return sanitized
         return tool_result

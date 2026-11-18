@@ -149,7 +149,8 @@ async def test_no_picture_says_why(monkeypatch, caplog, answer, reason) -> None:
         result = await Camera()(_deps(), question="what is it")
 
     assert "b64_im" not in result and result["no_picture"] is True
-    assert reason in result["instruction"] and "Do not describe" in result["instruction"]
+    assert "(no frame)" in result["instruction"] and "Do not describe" in result["instruction"]
+    assert reason not in result["instruction"]  # the model is told the old phrase; the log says why
     assert f"camera: no frame for camera/{reason}" in caplog.text
 
 
@@ -160,7 +161,7 @@ async def test_with_no_companion_there_is_no_camera(monkeypatch) -> None:
 
     result = await Camera()(_deps(), question="what is it")
 
-    assert result["no_picture"] is True and "no camera" in result["instruction"]
+    assert result["no_picture"] is True and "(no frame)" in result["instruction"]
     assert camera_mod.cancel_grabs("x") == 0
 
 
@@ -189,7 +190,23 @@ async def test_a_missing_file_is_no_picture(monkeypatch, tmp_path) -> None:
 
     result = await Camera()(_deps(), question="what is it")
 
-    assert result["no_picture"] is True and "the picture was not there" in result["instruction"]
+    assert result["no_picture"] is True and "(no frame)" in result["instruction"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_request_is_no_picture(monkeypatch, caplog) -> None:
+    """A store the request cannot be written to (locked, migrating) is no picture, not its error text."""
+
+    async def ask(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(camera_mod.companion, "function", lambda module, name: ask if name == "ask" else None)
+
+    with caplog.at_level("WARNING"):
+        result = await Camera()(_deps(), question="what is it")
+
+    assert result["no_picture"] is True and "(no frame)" in result["instruction"]
+    assert "database is locked" in caplog.text and "camera/the request failed" in caplog.text
 
 
 @pytest.mark.asyncio
