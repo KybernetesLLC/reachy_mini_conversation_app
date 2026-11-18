@@ -1,4 +1,6 @@
+import time
 import base64
+import asyncio
 import logging
 from typing import Any, Dict, Tuple, Optional
 from pathlib import Path
@@ -56,6 +58,19 @@ def _fit(jpeg: bytes) -> Optional[bytes]:
     return model_image.jpeg_from_jpeg(jpeg)
 
 
+def _read(path: Path, scratch: bool) -> Tuple[Optional[bytes], Optional[str]]:
+    """Return (the picture fitted for the model, why not); a scratch file is deleted once read. Off the loop."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None, "the picture was not there"
+    finally:
+        if scratch:  # not kept: read once
+            path.unlink(missing_ok=True)
+    jpeg = _fit(raw)
+    return (jpeg, None) if jpeg is not None else (None, "the picture did not decode")
+
+
 async def fresh_jpeg(
     purpose: str, closer: Optional[str] = None, question: Optional[str] = None
 ) -> Tuple[Optional[bytes], Optional[float], Optional[str], Dict[str, Any]]:
@@ -68,8 +83,13 @@ async def fresh_jpeg(
     if ask is None:
         return None, None, "no camera", {}
     answer: Dict[str, Any] = {}
+    wait_s = companion.value("grab_request", "WAIT_SECONDS", 8.0)
+    deadline = time.monotonic() + wait_s  # one deadline for both asks: the retry fits inside it
     for _ in range(2):
-        answer = await ask(purpose, closer, question, cancelable=purpose == "camera")
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        answer = await ask(purpose, closer, question, wait_s=left, cancelable=purpose == "camera")
         if answer.get("refused") != DARK_FRAME_REASON:
             break
         logger.warning("camera frame dark (luma %s) in a lit room; trying once more", answer.get("luma"))
@@ -77,17 +97,9 @@ async def fresh_jpeg(
     if status != "done":
         why = answer.get("refused") or _NOT_DONE.get(str(status), status)
         return None, None, str(why or "no frame"), answer
-    path = Path(str(answer.get("path")))
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return None, None, "the picture was not there", answer
-    finally:
-        if "id" not in answer:  # a scratch file, not kept: read once
-            path.unlink(missing_ok=True)
-    jpeg = _fit(raw)
+    jpeg, why_not = await asyncio.to_thread(_read, Path(str(answer.get("path"))), "id" not in answer)
     if jpeg is None:
-        return None, None, "the picture did not decode", answer
+        return None, None, why_not, answer
     luma = answer.get("luma")
     logger.info("camera frame %s: luma %s", answer.get("frame_id"), "-" if luma is None else luma)
     return jpeg, luma if isinstance(luma, (int, float)) else None, None, answer

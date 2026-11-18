@@ -32,8 +32,13 @@ class FakeCompanion:
         self.asked: List[tuple] = []
         self.cancels: List[str] = []
 
-    async def ask(self, purpose: str, closer: Optional[str], question: Optional[str], *, cancelable: bool) -> Dict:
+    WAIT_SECONDS = 8.0
+
+    async def ask(
+        self, purpose: str, closer: Optional[str], question: Optional[str], *, wait_s: float, cancelable: bool
+    ) -> Dict:
         """Answer the next scripted grab."""
+        assert 0 < wait_s <= self.WAIT_SECONDS  # one deadline for the call, the retry inside it
         self.asked.append((purpose, closer, question, cancelable))
         return self.answers.pop(0)
 
