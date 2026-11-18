@@ -1,14 +1,9 @@
-import os
 import time
 import base64
 import asyncio
 import logging
-import datetime
-import threading
-from typing import Any, Dict, Tuple, Callable, Optional
+from typing import Any, Dict, Tuple, Optional
 from pathlib import Path
-
-import numpy as np
 
 from reachy_mini_conversation_app import companion, model_image
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
@@ -16,203 +11,108 @@ from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
 
 logger = logging.getLogger(__name__)
 
-try:
-    from reachy_mini.media.camera_gstreamer import GStreamerCamera
+# Companion unit 62b (its ticket 62, the owner's ticket 48 Q5): the app no longer grabs. The camera
+# tool and the glance ask the companion's supervisor for a picture through its request queue
+# (reachy_companion.grab_request): it takes the camera under the same lock as its own moves and
+# looks, reads his pose just before the pull, and its Eyes cuts the region, encodes the picture as
+# the model gets it (1056 px, quality 80: model_image.MODEL_IMAGE) and keeps it (the camera tool's,
+# 24 h) or writes a scratch file (a glance's). The app reads the file and fits it for the model.
+# With no companion there is no picture: no fallback to a grab of the app's own, which could run
+# during one of his moves or while he sleeps (the companion's LookAfterMove.tla `fork62`).
+# The dark-frame check (a frame under 20 mean luma in a room the light log says is lit) is the
+# companion's; a dark frame is refused, never written, and asked for once more here.
+DARK_FRAME_REASON = "dark frame in a lit room"
 
-    # Cameras reopened on every call (the daemon's IPC reader). Tests swap in a fake.
-    _REOPENABLE: Tuple[type, ...] = (GStreamerCamera,)
-except Exception:  # no GStreamer here: nothing to reopen
-    _REOPENABLE = ()
-
-# 2026-10-06: the daemon releases its media at every sleep and re-acquires it at
-# the wake, and the app's IPC camera pipeline ends at the release and never comes
-# back: the tool then returned the last buffered frame (a dark one, from the fold)
-# and later nothing. So every call opens a fresh pipeline; on the robot that took
-# 0.4 s, and its frames matched the room's light. FRAME_WAIT_SECONDS bounds the
-# wait for the first frame.
-FRAME_WAIT_SECONDS = 2.0
-# A frame this dark (its mean luma, 0-255) while the companion's light log, under
-# LIGHT_LOG_MAX_AGE_SECONDS old, says the room is at least ROOM_LIT is not the
-# room: it is tried once more and then refused rather than shown to the model.
-# Companion ticket 33: the frame is measured with the companion's Rec.709 luma
-# (its luma.py, the light log's own measure), no longer the plain BGR mean. The
-# numbers stay. ROOM_LIT was always read against the log's Rec.709 luma_mean. For
-# DARK_FRAME the two measures agree on a grey frame (the weights sum to 1). Over
-# 294,567 logged frames the luma / plain-mean ratio was 0.884-1.051 (median 1.005);
-# in the 15-25 band its 1st-99th percentile was 0.978-1.018, so 20 moves by under
-# 0.5 luma. The companion's 35/60
-# (presence.py: dark, dim, lit) are words for the room; 40 keeps a margin above
-# an unlit night's 90th percentile (33) so a dark room's frame is never refused.
-DARK_FRAME = 20.0
-ROOM_LIT = 40.0
-LIGHT_LOG_MAX_AGE_SECONDS = 120.0
-
-
-def _light_log() -> Path:
-    value = os.getenv("REACHY_COMPANION_LIGHT_LOG")
-    return Path(value) if value else Path.home() / ".local/share/reachy-companion/light.csv"
-
-
-def _room_luma() -> Optional[float]:
-    """Return the companion's last light reading if recent: its camera's mean luma."""
-    read = companion.function("luma", "last_luma")
-    if read is not None:
-        value = os.getenv("REACHY_COMPANION_LIGHT_LOG")
-        return read(Path(value) if value else None, LIGHT_LOG_MAX_AGE_SECONDS)
-    try:
-        lines = _light_log().read_text().splitlines()
-        header, last = lines[0].split(","), lines[-1].split(",")
-        row = dict(zip(header, last))
-        at = datetime.datetime.fromisoformat(row["ts"])
-        age = (datetime.datetime.now(at.tzinfo) - at).total_seconds()
-        return float(row["luma_mean"]) if age <= LIGHT_LOG_MAX_AGE_SECONDS else None
-    except (OSError, IndexError, KeyError, ValueError):
-        return None
-
-
-# Look closer (companion ticket visual-perception/11-look-closer.md, the owner, 11-09): a
-# CLOSE_W x CLOSE_H cut of the frame at native pixels instead of the whole frame scaled down.
-# The hosted model rescales every image to about 1056 wide, so the whole 1920x1080 view
-# reaches it at about half its pixels; the cut reaches it at all of them, 1.8x the detail
-# across about 45 of the view's 82 degrees, at the same size and cost. The nine regions
-# overlap. `held` is the middle below where a face would be: head tracking keeps a face near
-# the centre, and a thing held up to show him sits below it. It is fixed for now; the
-# detector aims it later only if the log shows it missing. The cut is fixed in pixels for
-# the default 1080p stream: a frame no larger than it is sent whole, and at 4K the nine
-# regions would leave gaps (the review, 11-09; neither is configured on the robot).
-CLOSE_W, CLOSE_H = 1056, 594
-REGIONS: Dict[str, Tuple[float, float]] = {  # name: (x, y), 0 the left or top edge, 1 the other
-    "top left": (0.0, 0.0),
-    "top": (0.5, 0.0),
-    "top right": (1.0, 0.0),
-    "left": (0.0, 0.5),
-    "center": (0.5, 0.5),
-    "right": (1.0, 0.5),
-    "bottom left": (0.0, 1.0),
-    "bottom": (0.5, 1.0),
-    "bottom right": (1.0, 1.0),
-    "held": (0.5, 1.0),
-}
+# Look closer (companion ticket visual-perception/11-look-closer.md, the owner, 11-09): the parts
+# of the view the tool can send at full detail. The cut itself is the companion's (people.close_box).
+REGIONS: Tuple[str, ...] = (
+    "top left",
+    "top",
+    "top right",
+    "left",
+    "center",
+    "right",
+    "bottom left",
+    "bottom",
+    "bottom right",
+    "held",
+)
 CLOSE_UP_NOTE = "This picture is a close-up of {where} at full detail, not your whole view."
 
 
-def close_box(width: int, height: int, closer: str) -> Tuple[int, int, int, int]:
-    """Return the (x0, y0, x1, y1) cut of a width x height frame for the region `closer`."""
-    fx, fy = REGIONS[closer]
-    w, h = min(CLOSE_W, width), min(CLOSE_H, height)
-    x0, y0 = round((width - w) * fx), round((height - h) * fy)
-    return x0, y0, x0 + w, y0 + h
+_NOT_DONE = {
+    "timeout": "the camera did not answer in time",
+    "canceled": "the turn ended",
+    "failed": "the camera failed",
+}
 
 
-def _cut(closer: Optional[str], meta: Optional[Dict[str, Any]] = None) -> Optional[Callable[[np.ndarray], np.ndarray]]:
-    """Return a function cutting a frame to the region `closer`, or None for the whole frame.
+def _fit(jpeg: bytes) -> Optional[bytes]:
+    """Return the companion's picture fitted for the model.
 
-    `meta`, when given, is filled with the frame's size, the box sent and when the frame
-    was taken; the whole frame then goes through the function too.
+    As it is when under the byte cap (it is already at the model's size and quality), else encoded
+    again smaller.
     """
-    if closer is None and meta is None:
-        return None
-
-    def cut(frame: np.ndarray) -> np.ndarray:
-        height, width = frame.shape[:2]
-        x0, y0, x1, y1 = (0, 0, width, height) if closer is None else close_box(width, height, closer)
-        if closer is not None:
-            logger.info("camera: closer=%s box=%d,%d,%d,%d of %dx%d", closer, x0, y0, x1, y1, width, height)
-        if meta is not None:
-            meta.update(
-                frame=[width, height],
-                box=[x0, y0, x1, y1],
-                taken_at=datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"),
-            )
-        return frame[y0:y1, x0:x1]
-
-    return cut
+    if len(jpeg) <= model_image.MODEL_IMAGE.max_bytes:
+        return jpeg
+    return model_image.jpeg_from_jpeg(jpeg)
 
 
-# One reopen at a time: the camera tool and a glance may both want a frame, and
-# each closes and replaces the shared camera (the review, 2026-10-07).
-_CAMERA_LOCK = threading.Lock()
-
-
-def _encode(camera: Any, frame: Any) -> Optional[bytes]:
-    """Encode this frame, the one measured, as a JPEG for the model.
-
-    2026-10-16: no longer the camera's own encoder, at full resolution and its
-    default quality: model_image fits it to one size and a byte cap. The frame
-    goes nowhere else. OpenCV is not in the app's environment on the robot.
-    """
-    return model_image.jpeg_from_frame(frame)
-
-
-def _fresh_frame(
-    media: Any, closer: Optional[str] = None, meta: Optional[Dict[str, Any]] = None
-) -> Tuple[Optional[bytes], Optional[float]]:
-    """Reopen the IPC camera; return (JPEG, mean luma) of one frame, under the lock."""
-    with _CAMERA_LOCK:
-        return _fresh_frame_held(media, closer, meta)
-
-
-def _fresh_frame_held(
-    media: Any, closer: Optional[str] = None, meta: Optional[Dict[str, Any]] = None
-) -> Tuple[Optional[bytes], Optional[float]]:
-    """Reopen the IPC camera and return (JPEG for the model, the whole frame's mean luma).
-
-    Runs in a worker thread: opening waits for the pipeline. A camera that is
-    not the IPC reader is read as before, with no luma. `closer` cuts the JPEG to
-    one region of the frame; `meta` is filled as `_cut` says.
-    """
-    cut = _cut(closer, meta)
-    old = getattr(media, "camera", None)
-    if not _REOPENABLE or not isinstance(old, _REOPENABLE):
-        jpeg = media.get_frame_jpeg()
-        if jpeg is None:
-            return None, None
-        return (model_image.jpeg_from_jpeg(jpeg) if cut is None else model_image.jpeg_from_jpeg(jpeg, cut=cut)), None
-    specs = getattr(old, "camera_specs", None)
+def _read(path: Path, scratch: bool) -> Tuple[Optional[bytes], Optional[str]]:
+    """Return (the picture fitted for the model, why not); a scratch file is deleted once read. Off the loop."""
     try:
-        old.close()
-    except Exception:
-        logger.debug("closing the old camera pipeline failed", exc_info=True)
-    camera = type(old)(camera_specs=specs)
-    camera.open()
-    media.camera = camera
-    deadline = time.monotonic() + FRAME_WAIT_SECONDS
-    frame = camera.read()
-    while frame is None and time.monotonic() < deadline:
-        time.sleep(0.05)
-        frame = camera.read()
-    if frame is None:
-        return None, None
-    return _encode(camera, frame if cut is None else cut(frame)), _brightness(frame)
+        raw = path.read_bytes()
+    except OSError:
+        return None, "the picture was not there"
+    finally:
+        if scratch:  # not kept: read once
+            path.unlink(missing_ok=True)
+    jpeg = _fit(raw)
+    return (jpeg, None) if jpeg is not None else (None, "the picture did not decode")
 
 
-def _brightness(frame: np.ndarray) -> float:
-    """Return a BGR frame's mean luma: the companion's Rec.709, else the plain mean."""
-    mean_luma = companion.function("luma", "mean_luma")
-    return mean_luma(frame) if mean_luma is not None else float(np.mean(frame))
+async def fresh_jpeg(
+    purpose: str, closer: Optional[str] = None, question: Optional[str] = None
+) -> Tuple[Optional[bytes], Optional[float], Optional[str], Dict[str, Any]]:
+    """Return (JPEG, luma, why not, the companion's answer) from a fresh picture; for the tool and the glance.
 
-
-def fresh_jpeg(
-    media: Any, closer: Optional[str] = None, meta: Optional[Dict[str, Any]] = None
-) -> Tuple[Optional[bytes], Optional[float], Optional[str]]:
-    """Return (JPEG, luma, why not) from a fresh frame; for the tool and the glance.
-
-    A dark frame in a lit room is tried once more, then refused. Runs in a worker
-    thread: reopening the camera waits for its first frame. `closer` names a region
-    of the view (REGIONS) to send at full detail instead of the whole view; `meta`
-    is filled with the frame, the box and the time it was taken.
+    `purpose` is "camera" (the tool: canceled when its turn ends, its picture kept by the
+    companion) or "glance". A dark frame in a lit room is asked for once more, then refused.
     """
-    room = _room_luma()
-    jpeg, luma = _fresh_frame(media, closer, meta)
-    if luma is not None and room is not None and luma < DARK_FRAME <= ROOM_LIT <= room:
-        logger.warning("camera frame dark (luma %.1f) in a lit room (%.1f); trying once more", luma, room)
-        jpeg, luma = _fresh_frame(media, closer, meta)
-        if luma is not None and luma < DARK_FRAME:
-            return None, luma, "dark frame in a lit room"
+    ask = companion.function("grab_request", "ask")
+    if ask is None:
+        return None, None, "no camera", {}
+    answer: Dict[str, Any] = {}
+    wait_s = companion.value("grab_request", "WAIT_SECONDS", 8.0)
+    deadline = time.monotonic() + wait_s  # one deadline for both asks: the retry fits inside it
+    for _ in range(2):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        try:
+            answer = await ask(purpose, closer, question, wait_s=left, cancelable=purpose == "camera")
+        except Exception as exc:  # the companion's store: locked, or migrating
+            logger.warning("camera: the grab request failed: %s", exc)
+            return None, None, "the request failed", {}
+        if answer.get("refused") != DARK_FRAME_REASON:
+            break
+        logger.warning("camera frame dark (luma %s) in a lit room; trying once more", answer.get("luma"))
+    status = answer.get("status")
+    if status != "done":
+        why = answer.get("refused") or _NOT_DONE.get(str(status), status)
+        return None, None, str(why or "no frame"), answer
+    jpeg, why_not = await asyncio.to_thread(_read, Path(str(answer.get("path"))), "id" not in answer)
     if jpeg is None:
-        return None, None, "no frame"
-    logger.info("camera frame: luma %s, room %s", "-" if luma is None else f"{luma:.1f}", room)
-    return jpeg, luma, None
+        return None, None, why_not, answer
+    luma = answer.get("luma")
+    logger.info("camera frame %s: luma %s", answer.get("frame_id"), "-" if luma is None else luma)
+    return jpeg, luma if isinstance(luma, (int, float)) else None, None, answer
+
+
+def cancel_grabs(why: str) -> int:
+    """Cancel the camera tool's grabs still waiting, as the turn ended (the glance's are not); return how many."""
+    cancel_all = companion.function("grab_request", "cancel_all")
+    return 0 if cancel_all is None else cancel_all(why)
 
 
 # 2026-10-17: with no frame the tool said only "No frame available", and the model
@@ -227,38 +127,33 @@ NO_PICTURE = (
 )
 
 
+# The reasons the model is told, as before unit 62b; any other (the companion's refusal, a timeout,
+# a cancel) is logged as it is and told as "no frame", so what he is told does not change.
+MODEL_REASONS = ("camera disabled", DARK_FRAME_REASON)
+
+
 def no_picture(source: str, reason: str) -> Dict[str, Any]:
     """Log the miss and return the tool result that tells the model it has no picture."""
     logger.warning("camera: no frame for %s/%s", source, reason)
-    return {"no_picture": True, "instruction": NO_PICTURE.format(reason=reason)}
+    told = reason if reason in MODEL_REASONS else "no frame"
+    return {"no_picture": True, "instruction": NO_PICTURE.format(reason=told)}
 
 
-# The facts handed to the companion with the frame, for its kept copy (the frame store's
-# `camera` kind, 24 h; the owner, 11-09): what the result says, and the question asked.
-FACT_KEYS = ("closer", "frame", "box", "image_width", "image_height", "jpeg_bytes", "zoom", "taken_at", "pose")
-
-
-def read_pose(robot: Any) -> Dict[str, float]:
-    """Return his measured pose now, in radians: head_yaw, head_pitch and body_yaw.
-
-    Arch 35: the companion keeps it with the picture (its eyes.clean_pose form). Both reads
-    are the SDK client's last pushed state, no round trip. The head's yaw and pitch are the
-    head pose matrix's, as the daemon's present_head_pose gives them; the body yaw is head
-    joint 0, as present_body_yaw does. A read that fails leaves its keys out.
-    """
-    pose: Dict[str, float] = {}
-    try:
-        rot = np.asarray(robot.get_current_head_pose(), dtype=np.float64)
-        # roll, pitch, yaw as the daemon's "xyz" Euler angles: R = Rz(yaw) Ry(pitch) Rx(roll)
-        pose["head_yaw"] = float(np.arctan2(rot[1, 0], rot[0, 0]))
-        pose["head_pitch"] = float(np.arcsin(np.clip(-rot[2, 0], -1.0, 1.0)))
-    except Exception:
-        logger.debug("camera: head pose not read", exc_info=True)
-    try:
-        pose["body_yaw"] = float(robot.get_current_joint_positions()[0][0])
-    except Exception:
-        logger.debug("camera: body yaw not read", exc_info=True)
-    return pose
+# The facts handed to the companion with the frame, for its sight note (the frame store's `camera`
+# kind, 24 h, the owner 11-09, is now kept by the companion at the grab): what the result says, the
+# question asked, and the Frame id, by which the companion knows the picture is kept already.
+FACT_KEYS = (
+    "closer",
+    "frame",
+    "box",
+    "image_width",
+    "image_height",
+    "jpeg_bytes",
+    "zoom",
+    "taken_at",
+    "pose",
+    "frame_id",
+)
 
 
 def picture_facts(closer: Optional[str], meta: Dict[str, Any], jpeg: bytes) -> Dict[str, Any]:
@@ -274,7 +169,7 @@ def picture_facts(closer: Optional[str], meta: Dict[str, Any], jpeg: bytes) -> D
     if "box" in meta:
         frame_w = meta["frame"][0]
         cut_w = meta["box"][2] - meta["box"][0]
-        facts.update(frame=meta["frame"], box=meta["box"], taken_at=meta["taken_at"])
+        facts.update(frame=meta["frame"], box=meta["box"], taken_at=meta.get("taken_at"))
         if size is not None and cut_w > 0:
             whole_w = min(model_image.MODEL_IMAGE.long_side, frame_w)
             facts["zoom"] = round(size[0] / cut_w * frame_w / whole_w, 2)
@@ -327,15 +222,15 @@ class Camera(Tool):
         if not deps.camera_enabled:
             return no_picture("camera", "camera disabled")
 
-        meta: Dict[str, Any] = {}
-        jpeg_bytes, _luma, why_not = await asyncio.to_thread(fresh_jpeg, deps.reachy_mini.media, closer, meta)
+        jpeg_bytes, _luma, why_not, meta = await fresh_jpeg("camera", closer, question)
         if jpeg_bytes is None:
             return no_picture("camera", why_not or "no frame")
         result: Dict[str, Any] = {"b64_im": base64.b64encode(jpeg_bytes).decode("utf-8")}
         result.update(picture_facts(closer, meta, jpeg_bytes))
-        pose = read_pose(deps.reachy_mini)  # just after the encode (and any dark-frame retry), not at the grab
-        if pose:
-            result["pose"] = pose
+        if isinstance(meta.get("pose"), dict) and meta["pose"]:  # read under the lock just before the pull
+            result["pose"] = meta["pose"]
+        if isinstance(meta.get("frame_id"), str):
+            result["frame_id"] = meta["frame_id"]
         whole = "box" in meta and meta["box"] == [0, 0, *meta["frame"]]  # a frame no larger than the cut
         if closer is not None and not whole:
             where = (

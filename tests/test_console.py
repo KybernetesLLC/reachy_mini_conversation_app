@@ -2655,7 +2655,11 @@ class _GlanceHandler(_FakeSessionHandler):
 def _fake_frames(monkeypatch: pytest.MonkeyPatch, result: tuple) -> None:
     from reachy_mini_conversation_app.tools import camera as camera_mod
 
-    monkeypatch.setattr(camera_mod, "fresh_jpeg", lambda media: result)
+    async def fresh(purpose: str) -> tuple:
+        assert purpose == "glance"  # a grab request to the companion (its unit 62b)
+        return (*result, {})
+
+    monkeypatch.setattr(camera_mod, "fresh_jpeg", fresh)
 
 
 @pytest.mark.asyncio
@@ -2668,9 +2672,9 @@ async def test_the_preroll_goes_in_before_the_glance_at_open(monkeypatch: pytest
 
     monkeypatch.setattr(console_mod, "has_hf_realtime_target", lambda: True)
 
-    def slow_frame(media: Any) -> tuple:
-        time.sleep(0.05)
-        return (b"jpg", 91.0, None)
+    async def slow_frame(purpose: str) -> tuple:
+        await asyncio.sleep(0.05)
+        return (b"jpg", 91.0, None, {})
 
     monkeypatch.setattr(camera_mod, "fresh_jpeg", slow_frame)
     events: list[str] = []
@@ -2807,9 +2811,9 @@ async def test_a_glance_never_lands_in_a_session_opened_during_its_capture(
     handler.deps = SimpleNamespace(camera_enabled=True)
     handler.connection = object()
 
-    def reopened_meanwhile(media: Any) -> tuple:
+    async def reopened_meanwhile(purpose: str) -> tuple:
         handler.connection = object()
-        return (b"jpg", 91.0, None)
+        return (b"jpg", 91.0, None, {})
 
     monkeypatch.setattr(camera_mod, "fresh_jpeg", reopened_meanwhile)
     stream = LocalStream(handler, SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))

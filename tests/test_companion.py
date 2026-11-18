@@ -139,33 +139,29 @@ def test_without_the_companion_a_bad_retention_is_still_ninety(monkeypatch, comp
     assert wire_log.retention_days() == 90
 
 
-# --- the camera: one brightness -------------------------------------------------------------
+# --- the camera: a grab request to the companion (its unit 62b) -----------------------------
 
 
-def test_the_frame_is_measured_in_the_companions_luma(companion_on) -> None:
-    blue = np.zeros((4, 4, 3), np.uint8)
-    blue[..., 0] = 255  # BGR
-    assert camera_mod._brightness(blue) == pytest.approx(18.4, abs=0.05)
+@pytest.mark.asyncio
+async def test_the_grab_is_the_companions_request(tmp_path, companion_on) -> None:
+    """Write the tool's grab through the companion's own request writer.
+
+    A `grab` row with the tool's goal, canceled by the tool at its deadline when nobody answers.
+    """
+    ask = companion.function("grab_request", "ask")
+    assert ask is not None and companion.function("grab_request", "cancel_all") is not None
+    db = tmp_path / "companion.db"
+    assert await ask("camera", "held", "what is it?", wait_s=0.05, db=db) == {"status": "timeout"}
+    con = sqlite3.connect(db)
+    [(kind, status, detail)] = con.execute("SELECT kind, status, detail FROM requests").fetchall()
+    con.close()
+    assert (kind, status) == ("grab", "canceled")
+    assert json.loads(detail)["closer"] == "held" and json.loads(detail)["question"] == "what is it?"
 
 
-def test_without_the_companion_the_frame_is_the_plain_mean(companion_off) -> None:
-    blue = np.zeros((4, 4, 3), np.uint8)
-    blue[..., 0] = 255
-    assert camera_mod._brightness(blue) == pytest.approx(85.0)
-
-
-@pytest.mark.parametrize("on", [False, True])
-def test_the_room_reads_the_same_light_log_either_way(tmp_path, monkeypatch, request, on) -> None:
-    request.getfixturevalue("companion_on" if on else "companion_off")
-    light = tmp_path / "light.csv"
-    now = datetime.datetime.now().astimezone()
-    old = (now - datetime.timedelta(minutes=5)).isoformat(timespec="seconds")
-    light.write_text(f"ts,posture,quiet,people,luma_mean\n{old},awake,0,1,12.0\n"
-                     f"{now.isoformat(timespec='seconds')},awake,0,1,61.5\n")
-    monkeypatch.setenv("REACHY_COMPANION_LIGHT_LOG", str(light))
-    assert camera_mod._room_luma() == 61.5
-    light.write_text(f"ts,posture,quiet,people,luma_mean\n{old},awake,0,1,61.5\n")
-    assert camera_mod._room_luma() is None
+def test_without_the_companion_the_tool_has_no_camera(companion_off) -> None:
+    """Find no request writer and cancel nothing without the companion."""
+    assert companion.function("grab_request", "ask") is None and camera_mod.cancel_grabs("x") == 0
 
 
 # --- shared constants and helpers (companion ticket 38) --------------------------------------

@@ -613,9 +613,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     ) -> dict[str, Any]:
         """Remove bulky transport-only fields before echoing tool output back to the model."""
         if tool_name == "camera" and "b64_im" in tool_result:
-            sanitized = dict(tool_result)
-            sanitized.pop("b64_im", None)
-            sanitized.pop("pose", None)  # for the companion's kept picture, not for the model
+            # the pose and the Frame id are for the companion's kept picture, not for the model
+            drop = ("b64_im", "pose", "frame_id")
+            sanitized = {k: v for k, v in tool_result.items() if k not in drop}
             sanitized["image_attached"] = True
             return sanitized
         return tool_result
@@ -1429,6 +1429,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """
         self._gate_drop_held()
         self._interrupted_id = self._live_response_id
+        # The turn is over: a camera picture still being taken for it is canceled and never sent
+        # (the companion's unit 62b, Requests.tla NoSendAfterCancel). The tool answers no picture.
+        camera_tool.cancel_grabs("the companion interrupted the reply")
         if self._response_done_event.is_set() or not self.connection:
             return
         self._dropping_cancelled = True
