@@ -1429,6 +1429,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """
         self._gate_drop_held()
         self._interrupted_id = self._live_response_id
+        # The turn is over: a camera picture still being taken for it is canceled and never sent
+        # (the companion's unit 62b, Requests.tla NoSendAfterCancel). The tool answers no picture.
+        camera_tool.cancel_grabs("the companion interrupted the reply")
         if self._response_done_event.is_set() or not self.connection:
             return
         self._dropping_cancelled = True

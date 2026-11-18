@@ -993,9 +993,9 @@ class LocalStream:
         # The capture takes about 1 s: a session closed and reopened meanwhile does not
         # get this one's frame (the review, 2026-10-17).
         session = getattr(self.handler, "connection", None)
-        jpeg, luma, why_not = await asyncio.to_thread(
-            camera_tool.fresh_jpeg, self._robot.media
-        )
+        # A grab request to the companion (its unit 62b): no turn to end, so only its deadline
+        # cancels it, and the session check below drops a frame for a closed session.
+        jpeg, luma, why_not, _answer = await camera_tool.fresh_jpeg("glance")
         if jpeg is None:
             reason = why_not or "no frame"
             # Nothing reaches the model, so there is nothing to tell it; logged for the stats.
