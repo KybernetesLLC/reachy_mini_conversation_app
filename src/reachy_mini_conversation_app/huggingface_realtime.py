@@ -1907,8 +1907,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             except Exception as e:
                 logger.debug("could not cancel the greeting's response (%s)", e)
 
-    def _with_nudge_instructions(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+    def _with_nudge_instructions(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
         """Return the create to send: for the nudge, the instructions last sent plus the note.
+
+        None drops the nudge: with no instructions sent yet, it would replace them with the note alone.
 
         Built at every send attempt (ConvoAll Ffrozen: a retry sent the copy made at the queue).
         response.instructions replaces the session's for that reply only, so it carries them all.
@@ -1917,8 +1919,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return kwargs
         base = self._instructions_sent
         if base is None:
-            logger.warning("missed-call nudge sent without its note: no instructions sent yet")
-            return kwargs
+            logger.warning("missed-call nudge dropped: no instructions sent yet")
+            return None
         return {**kwargs, "response": {**kwargs["response"], "instructions": f"{base}\n\n{MISSED_CALL_NOTE}"}}
 
     async def _response_sender_loop(self) -> None:
@@ -1951,6 +1953,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     or _thought_id(queued) is not None
                     or _is_nudge(queued)
                 )
+            elif _is_nudge(kwargs):
+                # The nudge's reply answers a plain create queued behind it: they merge.
+                self._requeue(bool)
             announcement: str | None = kwargs.pop(_ANNOUNCEMENT, None)
             announcement_added = False
 
@@ -1958,7 +1963,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             max_retries = 5
             attempts = 0
             while not sent and self.connection and attempts < max_retries:
-                if await self._wait_for_owed_outputs(kwargs) and not kwargs:
+                released = await self._wait_for_owed_outputs(kwargs)
+                if released and _is_nudge(kwargs):
+                    # The tool's follow-up, queued while the nudge was held, merges into it.
+                    self._requeue(bool)
+                if released and not kwargs:
                     # Released behind a tool: the tool's plain follow-up, queued just
                     # before the release, merges with a plain create. An announcement
                     # lets that follow-up answer first, then goes as its own reply.
@@ -2011,6 +2020,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
                 to_send = self._with_nudge_instructions(kwargs)  # at this attempt, never at the queue
+                if to_send is None:
+                    break
                 try:
                     await self.connection.response.create(**to_send)
                     self._session_creates += 1
