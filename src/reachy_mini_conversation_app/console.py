@@ -27,6 +27,7 @@ from reachy_mini.utils import create_head_pose
 from reachy_mini.io.jsonrpc import JsonRpcError
 from reachy_mini.apps.jsonrpc_server import JsonRpcServer
 from reachy_mini.media.media_manager import MediaBackend
+from reachy_mini_conversation_app import parts as parts_record
 from reachy_mini_conversation_app import startup, companion, phantom_speech, playback_health
 from reachy_mini_conversation_app.moves import BODY_YAW_LOW, BODY_YAW_HIGH
 from reachy_mini_conversation_app.utils import clamp, finite_number, write_text_atomic
@@ -420,6 +421,9 @@ class LocalStream:
         # Notifications (conversation.turn/phase/transcript/activity) are pushed
         # here from activity + transcripts. Survives handler rebuilds (mounted once).
         self._rpc: Optional[JsonRpcServer] = None
+        # The companion's parts (route all, Unit 2): the latest version of each, kept here so a
+        # handler rebuild keeps them. Changed only on the handler's loop; nothing reads them yet.
+        self._parts = parts_record.Parts(held={})
         self._last_turn_state: Optional[str] = None
         # Each thought answered this app run, by id: its conversation.thought_reply params.
         # Given again, it is reported again, never answered again (ForkDedupe).
@@ -1624,6 +1628,19 @@ class LocalStream:
                 reason = getattr(self.handler, "note_drop_reason", None)
                 return {"queued": False, "reason": str(reason or "dropped")}
             return {"queued": True}
+
+        @rpc.method("conversation.parts")  # type: ignore[untyped-decorator]
+        async def _rpc_parts(params: dict[str, object]) -> dict[str, object]:
+            # The companion's parts (parts.py): kept with or without a session open. Applied on
+            # the handler's loop and awaited, so the answer's acks mean the parts are held, in
+            # the order the link sent them.
+            def _take() -> list[dict[str, object]]:
+                self._parts, acks, changes = parts_record.apply(self._parts, params)
+                if changes:
+                    logger.info("parts: %s", "; ".join(changes))
+                return acks
+
+            return {"acks": await self._call_on_handler_loop(_take)}
 
         @rpc.method("conversation.thought")  # type: ignore[untyped-decorator]
         async def _rpc_thought(params: dict[str, object]) -> dict[str, object]:

@@ -3206,6 +3206,37 @@ def test_a_now_note_reports_whether_it_was_sent() -> None:
     assert sent.get("result") == {"queued": True}
 
 
+def test_parts_over_the_rpc_are_kept_on_the_handlers_loop_without_a_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The companion's parts (route all, Unit 2) are kept on the handler's loop.
+
+    Each is acked with the version held, and kept while no session is open.
+    """
+    stream, _manager, app = _pose_stream()
+    stream.handler._is_connected.return_value = False
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    seen: list[asyncio.AbstractEventLoop] = []
+    real_apply = console_mod.parts_record.apply
+
+    def spy(parts: Any, params: Any) -> Any:
+        seen.append(asyncio.get_running_loop())
+        return real_apply(parts, params)
+
+    monkeypatch.setattr(console_mod.parts_record, "apply", spy)
+    part = {"name": "summary", "version": 2, "value": "s"}
+    try:
+        response = _rpc_call(
+            app, "conversation.parts", {"snapshot": True, "version": 2, "parts": [part]}
+        )
+    finally:
+        _stop_loop(loop, thread)
+    assert response.get("result") == {"acks": [{"name": "summary", "version": 2}]}
+    assert seen == [loop]
+    assert stream._parts.held["summary"].value == "s"
+
+
 def test_a_note_needs_text() -> None:
     """Empty text is refused as a result, not an error -- the brief's own contract."""
     _stream, _manager, app = _pose_stream()
