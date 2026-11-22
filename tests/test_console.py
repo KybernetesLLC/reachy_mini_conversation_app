@@ -3228,11 +3228,13 @@ def test_parts_over_the_rpc_are_kept_on_the_handlers_loop_without_a_session(
     part = {"name": "summary", "version": 2, "value": "s"}
     try:
         response = _rpc_call(
-            app, "conversation.parts", {"snapshot": True, "version": 2, "parts": [part]}
+            app,
+            "conversation.parts",
+            {"epoch": "e1", "snapshot": True, "version": 2, "parts": [part]},
         )
     finally:
         _stop_loop(loop, thread)
-    assert response.get("result") == {"acks": [{"name": "summary", "version": 2}]}
+    assert response.get("result") == {"epoch": "e1", "acks": [{"name": "summary", "version": 2}]}
     assert seen == [loop]
     assert stream._parts.held["summary"].value == "s"
 

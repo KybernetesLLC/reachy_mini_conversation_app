@@ -1634,13 +1634,13 @@ class LocalStream:
             # The companion's parts (parts.py): kept with or without a session open. Applied on
             # the handler's loop and awaited, so the answer's acks mean the parts are held, in
             # the order the link sent them.
-            def _take() -> list[dict[str, object]]:
+            def _take() -> dict[str, object]:
                 self._parts, acks, changes = parts_record.apply(self._parts, params)
                 if changes:
                     logger.info("parts: %s", "; ".join(changes))
-                return acks
+                return {"epoch": self._parts.epoch, "acks": acks}
 
-            return {"acks": await self._call_on_handler_loop(_take)}
+            return dict(await self._call_on_handler_loop(_take))
 
         @rpc.method("conversation.thought")  # type: ignore[untyped-decorator]
         async def _rpc_thought(params: dict[str, object]) -> dict[str, object]:
