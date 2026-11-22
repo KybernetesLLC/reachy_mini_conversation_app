@@ -264,6 +264,11 @@ GREETING_SETTLE_WAIT_S = 2.0
 # The greeting is its own out-of-band response, tagged, so nothing of it stays in the
 # conversation to be answered late. Re-checked at send; cancelled if the person starts.
 GREETING_TAG = {"companion": "greeting"}
+# The missed-call nudge is its own in-band reply (route all, rule 7): its create carries the
+# session's instructions plus MISSED_CALL_NOTE as response.instructions, built at each send
+# attempt, so no system item is written and no later reply reads the note. Tagged like the
+# greeting so a merge of plain creates (_requeue) never drops it.
+NUDGE_TAG = {"companion": "nudge"}
 
 
 def _out_of_band_request(
@@ -370,6 +375,17 @@ def _companion_tag(event: Any) -> str | None:
     """Return the companion tag of a response.created/done event's response, if any."""
     metadata = getattr(getattr(event, "response", None), "metadata", None)
     return metadata.get("companion") if isinstance(metadata, dict) else None
+
+
+def _band_tag(event: Any) -> str | None:
+    """Return the tag of an out-of-band response; None for his replies and the nudge's, both in-band."""
+    tag = _companion_tag(event)
+    return None if tag == NUDGE_TAG["companion"] else tag
+
+
+def _is_nudge(create: dict[str, Any]) -> bool:
+    """Return whether a queued response.create's kwargs are the missed-call nudge's."""
+    return (create.get("response") or {}).get("metadata") == NUDGE_TAG
 
 
 # The audio cut (2026-10-16): the output gate (output_gate.py) judges each reply's
@@ -1077,7 +1093,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         Judged from the response's own text, so a reply with no transcript.done is scrubbed too.
         Ids only are logged."""
         conn = self.connection
-        if conn is None or _companion_tag(event) is not None:
+        if conn is None or _band_tag(event) is not None:
             return
         text = self._gate_text or ""
         marked = text and (
@@ -1248,18 +1264,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         logger.warning("missed tool call: %r", text)
         if not self.connection:
             return False
-        try:
-            await self.connection.conversation.item.create(
-                item={
-                    "type": "message",
-                    "role": "system",
-                    "content": [{"type": "input_text", "text": MISSED_CALL_NOTE}],
-                },
-            )
-        except Exception as e:
-            logger.warning("the missed-call note could not be added (%s)", e)
-            return False
-        await self._safe_response_create()
+        # Its own reply; the instructions are built at the send (_response_sender_loop).
+        await self._safe_response_create(response={"metadata": dict(NUDGE_TAG)})
         return True
 
     async def _tool_started(self, tool_name: str, call_id: str) -> None:
@@ -1901,6 +1907,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             except Exception as e:
                 logger.debug("could not cancel the greeting's response (%s)", e)
 
+    def _with_nudge_instructions(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Return the create to send: for the nudge, the instructions last sent plus the note.
+
+        Built at every send attempt (ConvoAll Ffrozen: a retry sent the copy made at the queue).
+        response.instructions replaces the session's for that reply only, so it carries them all.
+        """
+        if not _is_nudge(kwargs):
+            return kwargs
+        base = self._instructions_sent
+        if base is None:
+            logger.warning("missed-call nudge sent without its note: no instructions sent yet")
+            return kwargs
+        return {**kwargs, "response": {**kwargs["response"], "instructions": f"{base}\n\n{MISSED_CALL_NOTE}"}}
+
     async def _response_sender_loop(self) -> None:
         """Dedicated worker that sends ``response.create()`` calls serially.
 
@@ -1923,11 +1943,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Parallel tool calls enqueue duplicate empty requests; coalesce to one.
             # An announcement is never merged: it keeps its place in the queue.
             # A thought's reply is never merged either: it is out of band, and dropped it would
-            # never be answered (the companion's model, Thought.tla KeepTagged).
+            # never be answered (the companion's model, Thought.tla KeepTagged). Nor is the nudge's
+            # (ConvoAll NudgeGoes).
             if not kwargs:
                 self._requeue(
                     lambda queued: bool(queued.get(_ANNOUNCEMENT))
                     or _thought_id(queued) is not None
+                    or _is_nudge(queued)
                 )
             announcement: str | None = kwargs.pop(_ANNOUNCEMENT, None)
             announcement_added = False
@@ -1988,14 +2010,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._greeting_live = True
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
+                to_send = self._with_nudge_instructions(kwargs)  # at this attempt, never at the queue
                 try:
-                    await self.connection.response.create(**kwargs)
+                    await self.connection.response.create(**to_send)
                     self._session_creates += 1
                     # 2026-10-21 16:51: a tool's follow-up after a say was never answered, and
                     # these steps logged only at debug. One line per create sent.
                     if kwargs.get("response", {}).get("conversation") == "none":
                         # out of band: never a follow-up (the review of eea54bb)
                         kind = "thought" if _thought_id(kwargs) else "filler"
+                    elif _is_nudge(kwargs):
+                        kind = "nudge"
                     elif announcement_added:
                         kind = "announcement"
                     else:
@@ -2434,7 +2459,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._cut_mid_reply = (
                             False  # answered: an empty turn asks for no other reply
                         )
-                        if self._followup_pending and _companion_tag(event) is None:
+                        if self._followup_pending and _band_tag(event) is None:
                             self._followup_pending, self._followup_live = False, True
                         self._response_started()
                         self._gate_start()
@@ -2481,7 +2506,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self.deps.movement_manager.set_speaking(False)
                         self._response_done_event.set()
                         self._response_started_or_rejected_event.set()
-                        if _companion_tag(event) is None:
+                        if _band_tag(event) is None:
                             self._followup_live = False
                         elif _companion_tag(event) == GREETING_TAG["companion"]:
                             self._greeting_live = False
@@ -2496,7 +2521,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             # A reply with no audio (tool-only): the companion's say waits on
                             # a transcript, so it learns at once that none is coming.
                             self._mark_activity("response_done_silent")
-                        if _companion_tag(event) is None:
+                        if _band_tag(event) is None:
                             self._after_reply(usage)
                         if not self._gate_transcript_done and (
                             self._gate_text or self._gate_had_audio

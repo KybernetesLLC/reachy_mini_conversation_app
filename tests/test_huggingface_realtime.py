@@ -2478,9 +2478,9 @@ async def test_a_spoken_promise_with_no_call_is_caught_once(
     with caplog.at_level(logging.WARNING):
         assert await handler._response_finished(_done()) is True
     assert any("missed tool call" in r.getMessage() for r in caplog.records)
-    item = handler.connection.conversation.item.create.await_args.kwargs["item"]
-    assert item["role"] == "system" and "web_search" in item["content"][0]["text"]
+    handler.connection.conversation.item.create.assert_not_awaited()  # no system item (route all)
     assert create.await_count == 1
+    assert create.await_args.kwargs == {"response": {"metadata": hf_mod.NUDGE_TAG}}
     # The same turn: never again, never a loop.
     handler._response_started()
     handler._response_transcript("Yes, I'm looking it up for you now.")
@@ -2491,6 +2491,88 @@ async def test_a_spoken_promise_with_no_call_is_caught_once(
     handler._response_started()
     handler._response_transcript("Let me find out.")
     assert await handler._response_finished(_done()) is True
+
+
+async def _run_sender(handler: HuggingFaceRealtimeHandler, until: Any) -> None:
+    task = asyncio.create_task(handler._response_sender_loop())
+    for _ in range(200):
+        if until():
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def _sender_handler(monkeypatch: Any) -> tuple[HuggingFaceRealtimeHandler, list[dict[str, Any]]]:
+    """Build a handler whose connection records each response.create and answers it at once."""
+    monkeypatch.setattr(hf_mod, "_RESPONSE_REJECTION_RETRY_DELAY", 0)
+    handler = _plain_handler()
+    handler.connection = MagicMock()
+    handler.connection.conversation.item.create = AsyncMock()
+    handler.connection.session.update = AsyncMock()
+    handler._instructions_sent = "BASE"
+    sent: list[dict[str, Any]] = []
+
+    async def _create(**kwargs: Any) -> None:
+        sent.append(kwargs)
+        handler._response_started_or_rejected_event.set()
+        handler._response_done_event.set()
+
+    handler.connection.response.create = AsyncMock(side_effect=_create)
+    return handler, sent
+
+
+@pytest.mark.asyncio
+async def test_the_nudge_writes_no_item_and_no_later_reply_reads_it(monkeypatch: Any) -> None:
+    """The nudge rides on its own create; the next create carries no instructions of its own."""
+    handler, sent = _sender_handler(monkeypatch)
+    handler._start_user_turn()
+    handler._response_started()
+    handler._response_transcript("Let me check.")
+    assert await handler._response_finished(_done()) is True
+    await handler._safe_response_create()  # a later plain reply
+    await _run_sender(handler, lambda: len(sent) == 2)
+
+    handler.connection.conversation.item.create.assert_not_awaited()
+    handler.connection.session.update.assert_not_awaited()
+    assert hf_mod.MISSED_CALL_NOTE in sent[0]["response"]["instructions"]
+    assert sent[0]["response"]["instructions"].startswith("BASE")
+    assert sent[0]["response"]["metadata"] == hf_mod.NUDGE_TAG
+    assert sent[1] == {}  # nothing of the nudge is in the later reply
+
+
+@pytest.mark.asyncio
+async def test_a_nudge_retry_carries_the_instructions_current_at_that_attempt(monkeypatch: Any) -> None:
+    """Ffrozen: the first attempt is rejected, the instructions change, the retry sends the new ones."""
+    handler, sent = _sender_handler(monkeypatch)
+    attempts: list[str] = []
+
+    async def _create(**kwargs: Any) -> None:
+        attempts.append(kwargs["response"]["instructions"])
+        if len(attempts) == 1:
+            handler._last_response_rejected = True
+            handler._instructions_sent = "NEW"  # the composition changed before the retry
+        handler._response_started_or_rejected_event.set()
+        handler._response_done_event.set()
+
+    handler.connection.response.create = AsyncMock(side_effect=_create)
+    await handler._safe_response_create(response={"metadata": dict(hf_mod.NUDGE_TAG)})
+    await _run_sender(handler, lambda: len(attempts) == 2)
+
+    assert attempts == [f"BASE\n\n{hf_mod.MISSED_CALL_NOTE}", f"NEW\n\n{hf_mod.MISSED_CALL_NOTE}"]
+
+
+@pytest.mark.asyncio
+async def test_a_queued_nudge_survives_a_plain_creates_merge(monkeypatch: Any) -> None:
+    """NudgeGoes: the empty-create coalesce drops queued plain creates, never the nudge."""
+    handler, sent = _sender_handler(monkeypatch)
+    await handler._safe_response_create()
+    await handler._safe_response_create(response={"metadata": dict(hf_mod.NUDGE_TAG)})
+    await handler._safe_response_create()
+    await _run_sender(handler, lambda: len(sent) == 2 and handler._pending_responses.empty())
+
+    assert [hf_mod._is_nudge(c) for c in sent] == [False, True]
 
 
 @pytest.mark.asyncio
