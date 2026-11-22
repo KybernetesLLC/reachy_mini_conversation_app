@@ -122,3 +122,23 @@ def test_a_trim_never_takes_an_open_tool_pair_or_an_unheard_point() -> None:
     for n in range(tp.TRIM_AT):
         prune.seen(_item(f"note{n}"))  # notes only: the companion has no turn to bound at
     assert prune.trim_point() is None
+
+
+def test_a_trim_point_is_never_the_latest_user_item_when_the_newer_are_notes() -> None:
+    """The Units 3+4 review, finding 6: with the newer user items all unheard notes, no heard turn
+    lies where the trim would cut, so there is no point; never the latest user item."""
+    prune = tp.TalkPrune()
+    _chat(prune, tp.TRIM_AT - 6)
+    for n in range(6):
+        prune.seen(_item(f"note{n}"))
+    assert len(prune.users) == tp.TRIM_AT
+    assert prune.trim_point() is None
+    # the same with the latest a heard turn: the only heard item the cut reaches is the latest
+    prune.forget("note5")
+    prune.seen(_item("last"))
+    prune.mark_heard("last")
+    assert prune.trim_point() is None
+    # all heard: the point is exactly the turn that leaves TRIM_TO
+    prune = tp.TalkPrune()
+    users = _chat(prune, tp.TRIM_AT)
+    assert prune.trim_point() == users[tp.TRIM_AT - tp.TRIM_TO - 1]
