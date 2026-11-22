@@ -75,7 +75,7 @@ def test_prompts_load_from_compact_builtin_profile(tmp_path: Path, monkeypatch: 
         DEFAULT_PROFILES_DIRECTORY / "mad_scientist_assistant",
     ).instructions
 
-    assert prompts_mod.get_session_instructions(instance_path=tmp_path) == expected
+    assert prompts_mod.get_profile_instructions() == expected
 
 
 def test_default_session_instructions_load_from_default_profile(
@@ -87,7 +87,7 @@ def test_default_session_instructions_load_from_default_profile(
 
     expected = read_profile_from_directory("default", DEFAULT_PROFILES_DIRECTORY / "default").instructions
 
-    assert prompts_mod.get_session_instructions(instance_path=tmp_path) == expected
+    assert prompts_mod.get_profile_instructions() == expected
 
 
 def test_bracketed_prompt_line_stays_plain_text(
@@ -101,7 +101,7 @@ def test_bracketed_prompt_line_stays_plain_text(
     monkeypatch.setattr(config, "PROFILES_DIRECTORY", tmp_path)
     monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "literal_prompt")
 
-    assert prompts_mod.get_session_instructions(instance_path=tmp_path) == "[custom_prompt]\n\nStay extra brief."
+    assert prompts_mod.get_profile_instructions() == "[custom_prompt]\n\nStay extra brief."
 
 
 def test_session_instructions_fall_back_to_default_for_incomplete_profile(
@@ -117,7 +117,7 @@ def test_session_instructions_fall_back_to_default_for_incomplete_profile(
 
     expected = read_profile_from_directory("default", DEFAULT_PROFILES_DIRECTORY / "default").instructions
 
-    assert prompts_mod.get_session_instructions(instance_path=tmp_path) == expected
+    assert prompts_mod.get_profile_instructions() == expected
 
 
 def test_explicit_default_profile_does_not_fall_back_to_itself(
@@ -135,7 +135,7 @@ def test_explicit_default_profile_does_not_fall_back_to_itself(
 
     with caplog.at_level(logging.WARNING, logger="reachy_mini_conversation_app.prompts"):
         with pytest.raises(RuntimeError, match="Default profile has no usable instructions"):
-            prompts_mod.get_session_instructions(instance_path=tmp_path)
+            prompts_mod.get_profile_instructions()
 
     assert "Using default profile instructions" not in caplog.text
 

@@ -422,7 +422,8 @@ class LocalStream:
         # here from activity + transcripts. Survives handler rebuilds (mounted once).
         self._rpc: Optional[JsonRpcServer] = None
         # The companion's parts (route all, Unit 2): the latest version of each, kept here so a
-        # handler rebuild keeps them. Changed only on the handler's loop; nothing reads them yet.
+        # handler rebuild keeps them. Changed only on the handler's loop; the handler's writer of
+        # his instructions composes from them (Unit 4).
         self._parts = parts_record.Parts(held={})
         self._last_turn_state: Optional[str] = None
         # Each thought answered this app run, by id: its conversation.thought_reply params.
@@ -458,6 +459,8 @@ class LocalStream:
             self.handler.on_sight = self._dispatch_sight
         if hasattr(self.handler, "on_thought_reply"):
             self.handler.on_thought_reply = self._dispatch_thought_reply
+        if hasattr(self.handler, "parts_source"):  # the companion's parts, for the writer
+            self.handler.parts_source = lambda: self._parts
 
     def _dispatch_transcript(
         self,
@@ -566,15 +569,20 @@ class LocalStream:
         "thought_done": "ready",  # a written reply has no transcript.done (Thought.tla ReadyAtDone)
     }
 
-    def _dispatch_session(self, state: str) -> None:
+    def _dispatch_session(self, state: str, item_id: str | None = None) -> None:
         """Push a conversation.realtime notification: a new realtime session ("started"), with
-        when the handler read the companion's block for it, when it says (11-07)."""
+        when the handler read the companion's block for it, when it says (11-07); or the
+        backend's drop of older history in it ("context_dropped", route all rule 9), with that
+        session's mark and the latest heard user item, for the companion to bound the block."""
         params: dict[str, Any] = {"state": state}
         if state == "started":
             self._last_turn_state = None  # the last session's state must not outlive it
+        if state in ("started", "context_dropped"):
             read = getattr(self.handler, "memory_read_at", None)
             if isinstance(read, (int, float)):
                 params["memory_read_at"] = float(read)
+        if state == "context_dropped":
+            params["item_id"] = item_id
         if self._rpc is not None:
             self._rpc.broadcast_threadsafe("conversation.realtime", params)
 
@@ -1638,6 +1646,9 @@ class LocalStream:
                 self._parts, acks, changes = parts_record.apply(self._parts, params)
                 if changes:
                     logger.info("parts: %s", "; ".join(changes))
+                    changed = getattr(self.handler, "parts_changed", None)
+                    if callable(changed):  # the writer of his instructions (route all, Unit 4)
+                        changed(self._parts)
                 return {"epoch": self._parts.epoch, "acks": acks}
 
             return dict(await self._call_on_handler_loop(_take))

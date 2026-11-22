@@ -3237,6 +3237,9 @@ def test_parts_over_the_rpc_are_kept_on_the_handlers_loop_without_a_session(
     assert response.get("result") == {"epoch": "e1", "acks": [{"name": "summary", "version": 2}]}
     assert seen == [loop]
     assert stream._parts.held["summary"].value == "s"
+    # route all, Unit 4: the handler's writer is told, and reads the record through parts_source
+    stream.handler.parts_changed.assert_called_once_with(stream._parts)
+    assert stream.handler.parts_source() is stream._parts
 
 
 def test_a_note_needs_text() -> None:
@@ -4540,6 +4543,20 @@ def test_a_session_start_says_when_the_companions_block_was_read() -> None:
     handler.memory_read_at = 1234.5
     stream._dispatch_session("started")
     assert ("conversation.realtime", {"state": "started", "memory_read_at": 1234.5}) in sent
+
+
+def test_a_context_drop_is_reported_with_its_session_and_the_latest_heard_item() -> None:
+    """Route all, rule 9: the companion bounds the block at the item, for that session only."""
+    sent: list[tuple[str, dict]] = []
+    rpc = SimpleNamespace(_clients=set(), broadcast_threadsafe=lambda m, p: sent.append((m, p)))
+    handler = _FakeSessionHandler()
+    stream = LocalStream(handler, SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))
+    stream._rpc = rpc
+    handler.memory_read_at = 1234.5
+    stream._dispatch_session("context_dropped", item_id="item_9")
+    assert sent == [
+        ("conversation.realtime", {"state": "context_dropped", "memory_read_at": 1234.5, "item_id": "item_9"})
+    ]
 
 
 def test_a_new_session_forgets_the_last_turn_state() -> None:

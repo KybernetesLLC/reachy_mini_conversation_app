@@ -64,12 +64,15 @@ class ConversationHandler(AsyncStreamHandler, ABC):
         """Attach/detach the observer told "started" at each new realtime session."""
         self._session_observer = observer
 
-    def _notify_session(self, state: str) -> None:
-        """Tell the session observer, if attached. Not activity: it holds off nothing."""
+    def _notify_session(self, state: str, **extra: Any) -> None:
+        """Tell the session observer, if attached. Not activity: it holds off nothing.
+
+        `extra`: a "context_dropped" report's item_id (route all, rule 9).
+        """
         observer = self._session_observer
         if observer is not None:
             try:
-                observer(state)
+                observer(state, **extra) if extra else observer(state)
             except Exception:
                 logger.debug("session observer raised (ignored)", exc_info=True)
 

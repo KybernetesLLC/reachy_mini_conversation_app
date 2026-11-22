@@ -171,7 +171,7 @@ def _session_handler(
 ) -> HuggingFaceRealtimeHandler:
     """Build a handler wired to a fake realtime client yielding `events`, ready to run a session."""
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -216,7 +216,7 @@ def _report_payload(name: str) -> dict[str, Any]:
 async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> None:
     """Partial transcription snapshots should replace older snapshots for the same item."""
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden"
@@ -253,7 +253,7 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> None:
     """Parallel tool calls in one turn should yield one response, not one per completed tool."""
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden"
@@ -365,7 +365,7 @@ async def test_run_realtime_session_uses_default_voice_for_lb_allocated_sessions
 ) -> None:
     """Use the backend default speaker when no profile voice is selected for the hf LB."""
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -411,7 +411,7 @@ async def test_run_realtime_session_passes_allocated_session_query(
 ) -> None:
     """Hugging Face sessions must forward the allocated session token to the websocket connect call."""
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -435,7 +435,7 @@ async def test_run_realtime_session_passes_allocated_session_query(
 async def test_run_realtime_session_raises_the_receive_limit(monkeypatch: Any) -> None:
     """The server echoes image data URLs back; 1 MiB (the websockets default) closed with 1009."""
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -1476,7 +1476,7 @@ async def test_handler_reopens_a_session_after_shutdown(monkeypatch: Any) -> Non
     _shutdown_active_handler's callers always rebuild. This pins it down.
     """
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -1565,7 +1565,7 @@ async def test_handler_reopens_a_session_after_closing_a_live_connection(
     next event -- the situation Task 3's close verb actually faces.
     """
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -1665,7 +1665,7 @@ def _greeting_handler(
     monkeypatch: Any,
 ) -> tuple[HuggingFaceRealtimeHandler, list[_ScriptedConn]]:
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -2493,6 +2493,17 @@ async def test_a_spoken_promise_with_no_call_is_caught_once(
     assert await handler._response_finished(_done()) is True
 
 
+def _compose_as(handler: HuggingFaceRealtimeHandler, base: str | None) -> None:
+    """Set the writer's composition to `base` alone (None: no session composed yet)."""
+    from reachy_mini_conversation_app import instructions_writer as iw
+
+    if base is None:
+        handler._writer.view = None
+        return
+    block = iw.Block("", 0, None, None, 0, 0.0)
+    handler._writer.view = iw.View(base, None, block, None, 0.0)
+
+
 async def _run_sender(handler: HuggingFaceRealtimeHandler, until: Any) -> None:
     task = asyncio.create_task(handler._response_sender_loop())
     for _ in range(200):
@@ -2511,7 +2522,7 @@ def _sender_handler(monkeypatch: Any) -> tuple[HuggingFaceRealtimeHandler, list[
     handler.connection = MagicMock()
     handler.connection.conversation.item.create = AsyncMock()
     handler.connection.session.update = AsyncMock()
-    handler._instructions_sent = "BASE"
+    _compose_as(handler, "BASE")
     sent: list[dict[str, Any]] = []
 
     async def _create(**kwargs: Any) -> None:
@@ -2563,7 +2574,7 @@ async def test_a_nudge_retry_carries_the_instructions_current_at_that_attempt(mo
         attempts.append(kwargs["response"]["instructions"])
         if len(attempts) == 1:
             handler._last_response_rejected = True
-            handler._instructions_sent = "NEW"  # the composition changed before the retry
+            _compose_as(handler, "NEW")  # the composition changed before the retry
         handler._response_started_or_rejected_event.set()
         handler._response_done_event.set()
 
@@ -2608,9 +2619,9 @@ async def test_a_follow_up_queued_behind_the_nudge_merges_into_it(monkeypatch: A
 
 @pytest.mark.asyncio
 async def test_a_nudge_with_no_instructions_sent_is_dropped(monkeypatch: Any) -> None:
-    """With no instructions sent yet the nudge would replace them with the note alone: it is dropped."""
+    """With no instructions composed yet the nudge would replace them with the note alone: dropped."""
     handler, sent = _sender_handler(monkeypatch)
-    handler._instructions_sent = None
+    _compose_as(handler, None)
     await handler._safe_response_create(response={"metadata": dict(hf_mod.NUDGE_TAG)})
     await _run_sender(handler, lambda: handler._pending_responses.empty())
     await asyncio.sleep(0.05)
@@ -2648,6 +2659,49 @@ async def test_a_done_of_the_nudge_is_handled_as_his_reply(
     assert (conn.sent == [("delete", "it20")]) is in_band
     assert (len(after) == 1) is in_band
     assert handler._followup_live is (not in_band)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tag", [None, hf_mod.NUDGE_TAG])
+async def test_the_done_write_goes_before_the_done_event(monkeypatch: Any, tag: Any) -> None:
+    """Rule 2: at a reply's done the writer's change goes before _response_done_event is set, so
+    the next create cannot go ahead of it. The nudge's done is a reply's done (Unit 1 review,
+    finding 3, settled in the code's direction)."""
+    events = list(_reply_events("Hello.", audio_first=False))
+    events[0] = _FakeEvent("response.created", response=SimpleNamespace(metadata=tag))
+    events[-1] = _scrub_done("it21", tag=tag)
+    handler = _session_handler(monkeypatch, tuple(events))
+    handler._clear_queue = lambda: None
+    seen: list[bool] = []
+
+    async def at_done() -> None:
+        seen.append(handler._response_done_event.is_set())
+
+    monkeypatch.setattr(handler._writer, "at_done", at_done)
+    await handler._run_realtime_session()
+    assert seen == [False]
+
+
+@pytest.mark.asyncio
+async def test_the_doubling_the_file_is_read_only_at_a_sessions_open(monkeypatch: Any) -> None:
+    """Round 6 (the doubling): a block re-read mid-session holds this connection's turns, which are
+    its chat items too. The file is read at the open only; later blocks are the companion's parts,
+    and the first write is the writer's composition, base first."""
+    events = _reply_events("Hello.", audio_first=False)
+    handler = _session_handler(monkeypatch, events)
+    handler._clear_queue = lambda: None
+    reads: list[int] = []
+
+    def read() -> tuple[str, dict[str, Any]]:
+        reads.append(1)
+        return "## Your memory\nold turns", {"top": 3}
+
+    monkeypatch.setattr(hf_mod, "read_session_block", read)
+    await handler._run_realtime_session()
+    handler.want_instructions("a session opened on a live connection")
+    handler.parts_changed(SimpleNamespace(held={}))
+    assert reads == [1]
+    assert handler._writer.sent == "test\n\n## Your memory\nold turns"
 
 
 @pytest.mark.asyncio
@@ -4500,7 +4554,7 @@ async def test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next(
             return {"status": "done"}
 
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -4807,56 +4861,38 @@ def test_a_dropped_conversation_is_told_from_this_mornings_numbers() -> None:
     assert context_dropped(11401, 14562, 11679)
     assert not context_dropped(11401, 15410, 15000)  # a small dip
     assert not context_dropped(11401, 12100, 11700)  # under the margin from the peak
+    # The round-6 review (11-14): the least compaction fell 861, the largest other fall 365.
+    assert hf_mod.CONTEXT_DROP_TOKENS == 600
+    assert context_dropped(11401, 12400, 12400 - 861)
+    assert not context_dropped(11401, 12400, 12400 - 365)
     assert not context_dropped(None, None, 11601)  # no base yet
 
 
 @pytest.mark.asyncio
-async def test_a_drop_or_a_wish_sends_the_instructions_once_at_a_reply_end(
-    monkeypatch,
-) -> None:
-    """Review of the refresh: on the handler's loop at a reply's end, one send at a time, only
-    when they changed; a drop measures afresh at once; the least since is the base."""
-    from reachy_mini_conversation_app import huggingface_realtime as hr
-
+async def test_a_drop_is_reported_with_the_latest_heard_item_and_sends_nothing_itself() -> None:
+    """Route all, rule 9 (a_noctxblock): a drop at a reply's end is reported to the companion with
+    the latest heard user item; nothing is re-read or sent here (the writer sends the companion's
+    block when it comes). The least since the instructions is the base; a drop measures afresh."""
     handler = _handler()
     marks: list = []
+    reports: list = []
     handler.connection = SimpleNamespace(
         session=SimpleNamespace(update=AsyncMock()),
         wire_mark=lambda kind, **data: marks.append((kind, data)),
     )
-    text = {"now": "memory A"}
-    monkeypatch.setattr(hr, "get_session_instructions", lambda *_: text["now"])
-    handler._instructions_sent = "memory A"
+    handler.set_session_observer(lambda state, **kw: reports.append((state, kw)))
+    handler._heard_item = "item_7"
     u = lambda t: SimpleNamespace(input_tokens=t)  # noqa: E731
-    for t in (
-        12900,
-        11401,
-        15410,
-    ):  # an opening glance's reply first: the least is the base
+    for t in (11900, 11401, 15410):  # an opening glance's reply first: the least is the base
         handler._after_reply(u(t))
-    assert handler._ctx_base == 11401 and handler._instructions_task is None
-    text["now"] = "memory B"
-    assert marks == []
+    assert handler._ctx_base == 11401 and marks == [] and reports == []
     handler._after_reply(u(11601))  # the drop
     assert marks == [("context.dropped", {"input_tokens": 11601})]  # the wire log's mark
-    handler._after_reply(
-        u(11650)
-    )  # the next reply before it lands: measured afresh, no second
-    await handler._instructions_task
-    handler.connection.session.update.assert_awaited_once()
-    assert (
-        handler.connection.session.update.await_args.kwargs["session"]["instructions"]
-        == "memory B"
-    )
-    handler.want_instructions("a session opened on a live connection")
-    handler._after_reply(u(11700))
-    await handler._instructions_task  # unchanged since sent: nothing goes
-    handler.connection.session.update.assert_awaited_once()
-    text["now"] = "memory C"
-    handler.connection.session.update = AsyncMock(side_effect=RuntimeError("closed"))
-    handler.want_instructions("x")
-    handler._after_reply(u(11700))
-    await handler._instructions_task  # a failure is logged, never raised
+    assert reports == [("context_dropped", {"item_id": "item_7"})]
+    assert handler._writer._drop == "item_7"
+    handler._after_reply(u(11650))  # measured afresh: no second report
+    assert len(reports) == 1
+    handler.connection.session.update.assert_not_awaited()
 
 
 def _handler():
@@ -6343,7 +6379,7 @@ async def test_a_thoughts_reply_is_asked_out_of_band_in_writing_with_the_room_in
 
 @pytest.mark.asyncio
 async def test_a_thoughts_reply_is_reported_noted_and_never_spoken(monkeypatch: Any) -> None:
-    """Reported after the gate, then a system item in the talk; transcript lines carry its id; ready; no head."""
+    """Reported after the gate, then in the thought record he is told (no system item); lines carry its id."""
     handler, sent, replies = _thought_session(monkeypatch, "Yes, a big one!", _thought_response())
     reasons: list[str] = []
     handler.set_activity_observer(lambda reason, **_kw: reasons.append(reason))
@@ -6353,19 +6389,10 @@ async def test_a_thoughts_reply_is_reported_noted_and_never_spoken(monkeypatch: 
     await handler._run_realtime_session()
 
     assert replies == [("discord:1", "Yes, a big one!", None)]
-    note = [payload for kind, payload in sent if kind == "item"]
-    assert note == [
-        {
-            "type": "message",
-            "role": "system",
-            "content": [
-                {
-                    "type": "input_text",
-                    "text": "(a thought from Hadley, answered) did you see the boat? / (your reply) Yes, a big one!",
-                }
-            ],
-        }
-    ]
+    assert [payload for kind, payload in sent if kind == "item"] == []  # route all: no system slot
+    assert handler._writer.view.thoughts == (
+        "(a thought from Hadley, answered) did you see the boat? / (your reply) Yes, a big one!",
+    )
     assert lines == [
         ("user", "(a thought from Hadley) did you see the boat?", True, None, {"thought": "discord:1"}),
         ("assistant", "Yes, a big one!", True, None, {"thought": "discord:1"}),

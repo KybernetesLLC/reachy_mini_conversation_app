@@ -10,7 +10,8 @@ its epoch is the one held and it is newer than the part held and than the last s
 part named that is held is acknowledged with the version held, taken or not, and the answer
 names the epoch held, so a companion the record is not from sends a snapshot.
 
-Nothing reads the parts yet (Unit 4 will). `expires_at` is stored, not acted on (Unit 5).
+The writer of his instructions composes from them (instructions_writer, Unit 4). `expires_at` is
+stored, not acted on (Unit 5).
 """
 
 from __future__ import annotations
