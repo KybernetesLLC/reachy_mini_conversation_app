@@ -2383,6 +2383,7 @@ _DANCE = {
         {"name": "uh_huh_tilt", "beats": 4, "amplitude": 0.7},
     ],
     "bpm": 120.0,
+    "grid": {"at": 1_792_500_000.25, "period_s": 0.5},  # the music's beat grid, a move beat
 }
 
 
@@ -2394,24 +2395,27 @@ def _wait_waiter(stream: LocalStream) -> None:
 
 
 def test_a_dance_over_rpc_queues_its_moves_at_its_tempo() -> None:
-    """conversation.dance queues one move each at the bpm; seconds is the beats at the bpm.
+    """conversation.dance queues one move placed on the grid, its steps at the grid's tempo;
+    seconds is the beats at the bpm and at most one beat's wait for the grid.
 
-    Each move plays its beats, its amplitudes scaled, the antennas still.
+    Each step plays its beats, its amplitudes scaled, the antennas still.
     """
     from reachy_mini_dances_library.collection.dance import AVAILABLE_MOVES
-    from reachy_mini_conversation_app.dance_emotion_moves import DanceQueueMove
+    from reachy_mini_conversation_app.dance_emotion_moves import DanceQueueMove, GridDanceMove
 
     stream, manager, app = _dance_stream()
     library = {n: dict(AVAILABLE_MOVES[n][1]) for n in ("groovy_sway_and_roll", "interwoven_spirals")}
 
     resp = _rpc_call(app, "conversation.dance", _DANCE)
 
-    assert resp["result"] == {"queued": 3, "seconds": 8.0}  # 16 beats at 120 bpm
+    assert resp["result"] == {"queued": 3, "seconds": 8.5}  # 16 beats at 120 bpm, a beat's wait
     stream._robot.disable_wobbling.assert_called_once()
     _drive_manager(manager)
-    moves = [manager.state.current_move, *manager.move_queue]
+    dance = manager.state.current_move
+    assert isinstance(dance, GridDanceMove) and dance.ends_on_release and not manager.move_queue
+    moves = dance.steps
     assert [m.move_name for m in moves] == ["groovy_sway_and_roll", "interwoven_spirals", "uh_huh_tilt"]
-    assert all(isinstance(m, DanceQueueMove) and m.ends_on_release for m in moves)
+    assert all(isinstance(m, DanceQueueMove) for m in moves)
     assert [m.duration for m in moves] == [2.0, 4.0, 2.0]
     first = moves[0].dance_move.move_params
     assert first["y_amplitude_m"] == library["groovy_sway_and_roll"]["y_amplitude_m"] * 0.7
@@ -2430,7 +2434,10 @@ def test_a_dance_over_rpc_queues_its_moves_at_its_tempo() -> None:
         ({**_DANCE, "moves": []}, "invalid_params"),
         ({**_DANCE, "bpm": None}, "invalid_params"),
         ({**_DANCE, "bpm": 400}, "invalid_params"),
-        ({**_DANCE, "bpm": 60, "moves": [{"name": "simple_nod", "beats": 64}]}, "invalid_params"),
+        ({**_DANCE, "bpm": 60, "moves": [{"name": "simple_nod", "beats": 64}], "grid": {"at": 1.0, "period_s": 1.0}}, "invalid_params"),
+        ({k: v for k, v in _DANCE.items() if k != "grid"}, "invalid_params"),
+        ({**_DANCE, "grid": {"at": 1.0, "period_s": 0.6}}, "invalid_params"),  # not the bpm's beat
+        ({**_DANCE, "grid": {"at": None, "period_s": 0.5}}, "invalid_params"),
     ],
 )
 def test_a_bad_dance_is_refused_and_moves_nothing(params: dict[str, Any], reason: str) -> None:
@@ -2446,17 +2453,46 @@ def test_a_bad_dance_is_refused_and_moves_nothing(params: dict[str, Any], reason
 
 
 def test_wobbling_comes_back_once_the_dance_has_played() -> None:
-    """The last move's end turns wobbling back on."""
+    """The dance's end turns wobbling back on: its steps and at most one beat's wait for the grid."""
     stream, manager, app = _dance_stream()
     _rpc_call(app, "conversation.dance", _DANCE)
     t = manager._now()
     _drive_manager(manager, t)
-    for step in (2.0, 6.0, 8.0):  # each move's end
-        _drive_manager(manager, t + step + 0.01)
+    _drive_manager(manager, t + 8.0 - 0.01)  # its steps; the wait is still to come
+    assert getattr(manager.state.current_move, "ends_on_release", False)
+    _drive_manager(manager, t + 8.5 + 0.01)  # 16 beats at 120 bpm and one beat's wait
     assert not getattr(manager.state.current_move, "ends_on_release", False)
     assert len(manager.move_queue) == 0
     _wait_waiter(stream)
     stream._robot.enable_wobbling.assert_called_once()
+
+
+def test_a_dance_is_placed_on_the_grid_by_the_managers_own_sampling() -> None:
+    """Place the dance on the grid's next beat at the manager's first sample (the second review's 5).
+
+    Through the manager's pose path; its length is then that wait and the steps.
+    """
+    import time
+
+    from reachy_mini_conversation_app.dance_emotion_moves import GridDanceMove
+
+    stream, manager, app = _dance_stream()
+    now = time.time()
+    _rpc_call(app, "conversation.dance", {**_DANCE, "grid": {"at": now + 100.3, "period_s": 0.5}})
+    t = manager._now()
+    _drive_manager(manager, t)
+    dance = manager.state.current_move
+    assert isinstance(dance, GridDanceMove) and dance.wait_s is None
+    manager._get_primary_pose(t)
+    assert dance.wait_s is not None and 0.0 <= dance.wait_s < 0.5
+    # the beat it starts on is the grid's: 0.3 s past a whole second, give or take the test's own time
+    began = time.time() - (manager._now() - t)
+    phase = (began + dance.wait_s - (now + 100.3)) % 0.5
+    assert min(phase, 0.5 - phase) < 0.02
+    assert abs(dance.duration - (dance.wait_s + 8.0)) < 1e-9
+    _drive_manager(manager, t + dance.duration + 0.01)
+    assert not getattr(manager.state.current_move, "ends_on_release", False)
+    _wait_waiter(stream)
 
 
 def test_a_hold_ends_the_dance_and_wobbling_comes_back() -> None:
