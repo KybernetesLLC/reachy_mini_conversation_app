@@ -6639,3 +6639,33 @@ def test_with_the_companion_every_tool_keeps_the_kind_its_name_gave(companion_on
         assert declared.get(name) == kind, name
         assert hf_mod.tool_kind(name, {}) == kind  # and an old companion's tool, by name alone, agrees
     assert all(hf_mod.tool_kind(n, {n: _kind_tool(k)}) == (k or hf_mod.tool_kind(n, {})) for n, k in declared.items())
+
+
+@pytest.mark.asyncio
+async def test_a_thoughts_done_reaches_his_instructions_by_the_companions_part(monkeypatch: Any) -> None:
+    """Unit 6: a thought's reply, published back by a fake companion as the part, is composed."""
+    from reachy_mini_conversation_app import parts as parts_mod
+
+    handler, _sent, replies = _thought_session(monkeypatch, "Yes, a big one!", _thought_response())
+    record = parts_mod.Parts(held={})
+
+    def companion(thought_id: str, text: str | None, why: str | None) -> None:
+        nonlocal record
+        replies.append((thought_id, text, why))
+        line = f"(a thought from Hadley, answered) did you see the boat? / (your reply) {text or '(none)'}"
+        wire = {"name": "messages", "version": 1, "value": [line], "session": None, "expires_at": None}
+        record, _, _ = parts_mod.apply(record, {"epoch": "e1", "snapshot": True, "version": 1, "parts": [wire]})
+        handler.parts_changed(record)
+
+    handler.on_thought_reply = companion
+
+    await handler._run_realtime_session()
+
+    assert replies == [("discord:1", "Yes, a big one!", None)]
+    assert handler._writer.view.messages == (
+        "(a thought from Hadley, answered) did you see the boat? / (your reply) Yes, a big one!",
+    )
+    assert handler._writer.current().endswith(
+        "### Thoughts you answered in this conversation\n"
+        "(a thought from Hadley, answered) did you see the boat? / (your reply) Yes, a big one!"
+    )

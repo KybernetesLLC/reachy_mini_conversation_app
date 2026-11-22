@@ -201,7 +201,7 @@ async def test_a_done_write_and_a_batched_write_never_reset_the_drop_measure() -
     writer, conn, _, measured = _writer(batch_s=0.01)
     await _open(writer, conn)
     writer.parts_changed({"messages": _part("messages", 2, [HI], session=None)})
-    await asyncio.sleep(0.05)  # the batch
+    await asyncio.sleep(0.05)  # an answered message: at once, with no measure reset
     writer.parts_changed({"block": _block(2, "## Your memory\nmood changed")})
     await writer.at_done()
     assert [k for k, _ in conn.wire] == ["update", "update"] and measured == []
@@ -314,16 +314,22 @@ def _messages(version: int, lines: list[str] | None) -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_the_messages_part_is_in_the_composition_batched_and_never_in_the_slot() -> None:
-    """An answered message is the companion's part, batched, in the instructions, never an item."""
-    writer, conn, _, measured = _writer(batch_s=0.01)
+async def test_the_messages_part_is_in_the_composition_at_once_and_never_in_the_slot() -> None:
+    """An answered message is the companion's part, sent at once, in the instructions, never an item."""
+    writer, conn, _, measured = _writer()  # a batch that never fires: only an at-once send goes
     await _open(writer, conn)
     writer.parts_changed({"messages": _messages(2, [HI])})
     await _settle()
-    assert conn.wire == []  # batched, not at once
-    await asyncio.sleep(0.05)
-    assert [k for k, _ in conn.wire] == ["update"] and measured == []
+    assert [k for k, _ in conn.wire] == ["update"]
+    assert measured == []  # the drop measure is not started again
     assert conn.wire[0][1].endswith(f"{iw.MESSAGES_HEADING}\n{HI}")
+
+
+def test_only_lines_of_text_are_taken_from_the_part() -> None:
+    """A blank or a non-text entry in the part is never a line he is told."""
+    assert iw.part_messages(_messages(2, [HI, "", "   ", 3, None, ["x"]])) == (HI,)
+    assert iw.part_messages(_messages(2, {"lines": [HI]})) == ()
+    assert iw.part_messages(None) == ()
 
 
 @pytest.mark.asyncio

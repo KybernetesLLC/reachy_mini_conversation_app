@@ -17,6 +17,8 @@ text. The writer sends (rules 3-5, 9):
 
 - a join of S, a clear (of S or of the messages), the reconnect's catch-up (the companion marks it: the read at the open
   held less than the bound) and a drop's block go at once, on the handler's loop;
+- an answered message goes at once too, but does not start the drop measure again (Unit 6
+  review: S's join goes at once, and the record is S-shaped);
 - any other change is batched, BATCH_S, and goes in a tool's window too (no hold), and never
   sooner than BATCHED_GAP_S after the last write (the Units 3+4 review: trims and awareness
   refreshes came to 5-8 writes a minute, 70-117 KB each with the echo);
@@ -153,8 +155,9 @@ def take(view: View, held: dict[str, Any], now: float) -> tuple[View, list[str]]
     if s is not view.s:
         urgent.append("S joined" if s is not None and s.get("text") else "S cleared")
     # The messages are read from the record as held: it keeps the newest version (parts.apply)
-    # and drops a part a snapshot lacks. An answered message is batched; a clear (the talk's
-    # end, a forget) goes at once, as S's does (ClearedGone).
+    # and drops a part a snapshot lacks. A clear (the talk's end, a forget) is urgent, as S's
+    # is (ClearedGone); an answered message goes at once too, from parts_changed, with no
+    # measure reset, so it is not listed here.
     messages = part_messages(held.get("messages"))
     if view.messages and not messages:
         urgent.append("messages cleared")
@@ -249,10 +252,13 @@ class InstructionsWriter:
         """Take the companion's changed parts record (on the handler's loop)."""
         if self.view is None:
             return
+        before = self.view.messages
         view, urgent = take(self.view, held, self.clock())
         self.view = view
         if urgent:
             self._send_now(", ".join(urgent))
+        elif view.messages and view.messages != before:
+            self._send_now("a message answered", measure=False)
         elif compose(view) != self.sent:
             self._schedule()
 
@@ -305,9 +311,9 @@ class InstructionsWriter:
                 await asyncio.sleep(wait)
         await self.send("a part changed")
 
-    def _send_now(self, why: str) -> None:
+    def _send_now(self, why: str, *, measure: bool = True) -> None:
         try:
-            task = asyncio.get_running_loop().create_task(self.send(why, measure=True))
+            task = asyncio.get_running_loop().create_task(self.send(why, measure=measure))
         except RuntimeError:
             return
         self._now.add(task)
