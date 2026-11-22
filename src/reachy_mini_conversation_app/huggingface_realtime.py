@@ -593,6 +593,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # (context_dropped).
         self._ctx_base: int | None = None
         self._ctx_peak: int | None = None
+        self._ctx_skip = False  # a reply in flight at a reset read the chat before it
         self._session_image_bytes = 0
         self._session_creates = 0
         self._open_glance_at: float | None = None
@@ -1540,6 +1541,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         tokens = getattr(usage, "input_tokens", None)
         if not isinstance(tokens, int) or tokens <= 0:
             return False
+        if self._ctx_skip:  # created before the write or its deletes: not this chat's size
+            self._ctx_skip = False
+            return False
         if self._ctx_base is None or self._ctx_peak is None:
             self._ctx_base = self._ctx_peak = tokens
             return False
@@ -1569,8 +1573,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._writer.want(why)
 
     def _instructions_landed(self) -> None:
-        """The writer sent his instructions: the next reply measures the context afresh."""
+        """The writer sent his instructions, or deleted items: the measure starts afresh.
+
+        A reply already in flight read the chat as it was before, so its end is not measured
+        (a trim's deletes would otherwise show as a drop at the next reply).
+        """
         self._ctx_base = self._ctx_peak = None
+        self._ctx_skip = not self._response_done_event.is_set()
 
     def _after_reply(self, usage: Any) -> None:
         """At an in-band reply's end, on the handler's loop, after the writer's done write: a
@@ -2342,6 +2351,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 False  # each session says once whether usage comes
             )
             self._ctx_base = self._ctx_peak = None
+            self._ctx_skip = False
             self._heard_item = None
             self._open_glance_at = self._first_reply_at = None
             # A turn left open by the session before is not this session's first turn

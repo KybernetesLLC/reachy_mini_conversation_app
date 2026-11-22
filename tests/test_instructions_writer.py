@@ -97,7 +97,8 @@ async def test_fjoinbatch_s_joins_at_once_in_one_send_before_its_deletes() -> No
     assert conn.wire[0][0] == "update" and "Alli asked about ferries." in conn.wire[0][1]
     assert conn.wire[1] == ("delete_before", "u2")
     assert prune.calls == [("u2", False, 1000.0)]  # the time cut's fallback travels with it
-    assert measured == ["reset"]  # a join starts the drop detector's measure again (item 3)
+    # a join starts the drop detector's measure again (item 3), and again after its deletes
+    assert measured == ["reset", "reset"]
 
 
 @pytest.mark.asyncio

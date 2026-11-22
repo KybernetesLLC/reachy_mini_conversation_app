@@ -291,7 +291,8 @@ class InstructionsWriter:
         naming it. One send at a time; never raises. `measure`: a write that changes the block or
         S at once (a join, a clear, the catch-up, a drop's block) starts the drop detector's
         measure again (`on_sent`); a done write or a batched one does not, or a drop would never
-        show (the round-6 review, item 3).
+        show (the round-6 review, item 3). Deletes shrink the chat on purpose, so once they
+        are done the measure starts again too: a trim or S's join is not a drop.
         """
         if self._lock is None:
             self._lock = asyncio.Lock()
@@ -311,11 +312,15 @@ class InstructionsWriter:
                 if measure and self.on_sent is not None:
                     self.on_sent()
             try:
-                await self._deletes(conn, view)
+                deleted = await self._deletes(conn, view)
             except Exception as exc:
                 logger.warning("Talk prune: not applied (%s): %s", why, exc)
+                deleted = 1  # some may have gone
+            if deleted and self.on_sent is not None:
+                self.on_sent()
 
-    async def _deletes(self, conn: Any, view: View) -> None:
+    async def _deletes(self, conn: Any, view: View) -> int:
+        deleted = 0
         s = view.s
         if s is not None and s_version(s) > self._joined:
             self._joined = s_version(s)
@@ -323,10 +328,11 @@ class InstructionsWriter:
                 up_to = s.get("up_to")
                 up_to = float(up_to) if isinstance(up_to, (int, float)) else None
                 # by its cut item; by its time when the item is not in this session's ledger
-                await self.prune.delete_before(conn, s.get("cut") or None, up_to=up_to)
+                deleted += await self.prune.delete_before(conn, s.get("cut") or None, up_to=up_to)
         if self._drop is not None and view.block.through == self._drop:
             item, self._drop = self._drop, None
-            await self.prune.delete_before(conn, item, through=True)
+            deleted += await self.prune.delete_before(conn, item, through=True)
+        return deleted
 
     def _log(self, why: str, text: str) -> None:
         view, now = self.view, self.clock()

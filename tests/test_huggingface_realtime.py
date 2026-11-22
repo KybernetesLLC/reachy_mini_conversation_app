@@ -4923,6 +4923,42 @@ async def test_a_trim_reports_its_point_and_deletes_nothing_before_its_block() -
     deletes.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_a_trims_deletes_never_show_as_a_drop() -> None:
+    """The trim and S's join shrink the chat on purpose. A reply in flight at the write read the
+    chat before the deletes; the reply after them reads it smaller. Neither is a drop."""
+    from reachy_mini_conversation_app import talk_prune as tp
+
+    handler = _handler()
+    handler.connection = SimpleNamespace(
+        session=SimpleNamespace(update=AsyncMock()),
+        conversation=SimpleNamespace(item=SimpleNamespace(delete=AsyncMock())),
+    )
+    reports: list = []
+    handler.set_session_observer(lambda state, **kw: reports.append((state, kw)))
+    handler._writer.connect(5.0, "BASE", "## Your memory\nold", {"top": 1}, {})
+    for n in range(tp.TRIM_AT):
+        handler._prune.seen(SimpleNamespace(id=f"u{n}", type="message", role="user"))
+        handler._prune.mark_heard(f"u{n}")
+    handler._after_reply(SimpleNamespace(input_tokens=9000))  # the measure before
+    handler._maybe_trim()
+    point = handler._writer._drop
+    handler._response_done_event.clear()  # this turn's reply is in flight
+    block = {"text": "## Your memory\nthrough the point", "top": 4, "through": point, "s": None,
+             "catch_up": None}  # fmt: skip
+    handler._writer.parts_changed(
+        {"block": SimpleNamespace(name="block", version=2, value=block, session=5.0, expires_at=None)}
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert handler.connection.conversation.item.delete.await_count > 0  # the trim went
+    handler._after_reply(SimpleNamespace(input_tokens=9200))  # in flight: read the chat before
+    handler._response_done_event.set()
+    handler._after_reply(SimpleNamespace(input_tokens=9200 - 1500))  # after the deletes
+    handler._after_reply(SimpleNamespace(input_tokens=7900))
+    assert [kw.get("why") for state, kw in reports if state == "context_dropped"] == ["trim"]
+
+
 def _handler():
     return HuggingFaceRealtimeHandler(
         ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
