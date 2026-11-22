@@ -2139,7 +2139,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     )
                 except Exception as e:
                     logger.info("_response_sender_loop: send failed: %s", e)
-                    self._response_done_event.set()
+                    if not self._responses:  # nothing created: none of them ended
+                        self._response_done_event.set()
                     break
 
                 try:
@@ -2388,7 +2389,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
             self.connection = None
-            self._response_done_event.set()
+            self._clear_tracked()
         finally:
             if isinstance(completed_tool.id, str):
                 # After the follow-up create is queued, so a held create merges with it.
@@ -3031,7 +3032,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # which waits for it) stays off with no session open (the companion, 2026-10-19).
         await self.end_user_turn()
         # Unblock the response sender worker so it can exit
-        self._response_done_event.set()
+        self._clear_tracked()
 
         # Stop background tool manager tasks (listener + cleanup)
         await self.tool_manager.shutdown()

@@ -6782,3 +6782,15 @@ async def test_a_normal_done_writes_then_sets_the_done_event(monkeypatch: Any) -
     assert handler._responses == {} and "r1" not in handler._forced
     await conns[0].close()
     await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_session_end_releases_a_tool_output_waiting_on_its_reply() -> None:
+    """A session that ends forgets its responses: a tool output waiting on one is dropped."""
+    handler = _plain_handler()
+    handler._track_created("r1", in_band=True)
+    waiting = asyncio.create_task(handler._wait_for_response_done_before_tool_result("r1"))
+    await _settle(5)
+    handler._clear_tracked()
+    assert await asyncio.wait_for(waiting, timeout=1.0) is False
+    assert handler._responses == {} and handler._response_done_event.is_set()
