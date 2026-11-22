@@ -9,14 +9,16 @@ profile, first, for the prompt cache) and then the parts:
   at the turns this session's chat does not hold;
 - S, the talk's earlier part in short: the newer, by S's own version, of the S the block names
   and the companion's "summary" part (rule 8: S arrives by both; a clear is a newer version);
-- the thoughts answered in this conversation, which the app builds itself (the thought record,
-  until Unit 6's recent text messages part).
+- the recent text messages he answered in this talk: the companion's "messages" part (Unit 6,
+  ConvoAll rule 4 as S), its lines composed as they come. The app keeps no record of its own.
 
 `take` and `compose` are pure: what the parts record changes, what goes at once and why, and the
 text. The writer sends (rules 3-5, 9):
 
-- a join of S, a clear, the reconnect's catch-up (the companion marks it: the read at the open
+- a join of S, a clear (of S or of the messages), the reconnect's catch-up (the companion marks it: the read at the open
   held less than the bound) and a drop's block go at once, on the handler's loop;
+- an answered message goes at once too, but does not start the drop measure again (Unit 6
+  review: S's join goes at once, and the record is S-shaped);
 - any other change is batched, BATCH_S, and goes in a tool's window too (no hold), and never
   sooner than BATCHED_GAP_S after the last write (the Units 3+4 review: trims and awareness
   refreshes came to 5-8 writes a minute, 70-117 KB each with the echo);
@@ -43,9 +45,8 @@ logger = logging.getLogger(__name__)
 BATCH_S = 1.0
 BATCHED_GAP_S = 5.0  # a batched write goes at most this often; the at-once ones are not held
 DROP_WAIT_S = 30.0  # a drop's or trim's block not come by then is let go
-THOUGHTS_MAX = 5  # the thoughts answered in this conversation, newest kept
 S_HEADING = "### Earlier in this talk, in short"
-THOUGHTS_HEADING = "### Thoughts you answered in this conversation"
+MESSAGES_HEADING = "### Thoughts you answered in this conversation"
 _NONE = float("-inf")
 
 
@@ -76,7 +77,7 @@ class View:
     block: Block
     s: Optional[dict[str, Any]]
     s_at: float
-    thoughts: tuple[str, ...] = ()
+    messages: tuple[str, ...] = ()
 
 
 def _s(raw: Any) -> Optional[dict[str, Any]]:
@@ -120,6 +121,14 @@ def part_block(part: Any, at: float) -> Optional[Block]:
     )
 
 
+def part_messages(part: Any) -> tuple[str, ...]:
+    """Return the lines of the companion's "messages" part; none for a clear or no part."""
+    value = getattr(part, "value", None)
+    if not isinstance(value, list):
+        return ()
+    return tuple(line for line in value if isinstance(line, str) and line.strip())
+
+
 def take(view: View, held: dict[str, Any], now: float) -> tuple[View, list[str]]:
     """Return the view after the parts record `held` changed, and why it goes at once.
 
@@ -145,18 +154,25 @@ def take(view: View, held: dict[str, Any], now: float) -> tuple[View, list[str]]
             s, s_at = candidate, now
     if s is not view.s:
         urgent.append("S joined" if s is not None and s.get("text") else "S cleared")
-    return replace(view, block=block, s=s, s_at=s_at), urgent
+    # The messages are read from the record as held: it keeps the newest version (parts.apply)
+    # and drops a part a snapshot lacks. A clear (the talk's end, a forget) is urgent, as S's
+    # is (ClearedGone); an answered message goes at once too, from parts_changed, with no
+    # measure reset, so it is not listed here.
+    messages = part_messages(held.get("messages"))
+    if view.messages and not messages:
+        urgent.append("messages cleared")
+    return replace(view, block=block, s=s, s_at=s_at, messages=messages), urgent
 
 
 def compose(view: View) -> str:
-    """Return his instructions: the stable base first, then the block, S and the thoughts answered."""
+    """Return his instructions: the stable base first, then the block, S and the messages answered."""
     parts = [view.base.strip()]
     if view.block.text.strip():
         parts.append(view.block.text.strip())
     if view.s is not None and str(view.s.get("text") or "").strip():
         parts.append(f"{S_HEADING}\n{' '.join(str(view.s['text']).split())}")
-    if view.thoughts:
-        parts.append(f"{THOUGHTS_HEADING}\n" + "\n".join(view.thoughts))
+    if view.messages:
+        parts.append(f"{MESSAGES_HEADING}\n" + "\n".join(view.messages))
     return "\n\n".join(p for p in parts if p)
 
 
@@ -236,19 +252,15 @@ class InstructionsWriter:
         """Take the companion's changed parts record (on the handler's loop)."""
         if self.view is None:
             return
+        before = self.view.messages
         view, urgent = take(self.view, held, self.clock())
         self.view = view
         if urgent:
             self._send_now(", ".join(urgent))
+        elif view.messages and view.messages != before:
+            self._send_now("a message answered", measure=False)
         elif compose(view) != self.sent:
             self._schedule()
-
-    def add_thought(self, line: str) -> None:
-        """Add a thought answered to the record he is told, never a system item (Unit 4)."""
-        if self.view is None:
-            return
-        self.view = replace(self.view, thoughts=(*self.view.thoughts, line)[-THOUGHTS_MAX:])
-        self._schedule()
 
     def report_drop(self, item: str | None) -> None:
         """Note a reported drop's item (rule 9): its items go after the block naming it."""
@@ -299,9 +311,9 @@ class InstructionsWriter:
                 await asyncio.sleep(wait)
         await self.send("a part changed")
 
-    def _send_now(self, why: str) -> None:
+    def _send_now(self, why: str, *, measure: bool = True) -> None:
         try:
-            task = asyncio.get_running_loop().create_task(self.send(why, measure=True))
+            task = asyncio.get_running_loop().create_task(self.send(why, measure=measure))
         except RuntimeError:
             return
         self._now.add(task)
@@ -376,7 +388,7 @@ class InstructionsWriter:
         # with tokens at 3.5 chars each: drops have come at 14.4k-22k input tokens (11-03)
         logger.info(
             "Instructions sent (%s): %d chars, about %d tokens; block v%d to row %d, %.1f s old; "
-            "%s; %d thought(s); %d write(s) in the last minute",
+            "%s; %d message(s); %d write(s) in the last minute",
             why,
             len(text),
             round(len(text) / 3.5),
@@ -384,6 +396,6 @@ class InstructionsWriter:
             block.top,
             now - block.at,
             s_part,
-            len(view.thoughts),
+            len(view.messages),
             len(self._writes),
         )
