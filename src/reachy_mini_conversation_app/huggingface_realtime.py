@@ -2383,7 +2383,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
-                    if event.type in ("conversation.item.created", "conversation.item.added"):
+                    # his replies and tool calls come only as response.output_item.added (the
+                    # backend at ff4aec3; 11-14: 164 messages, 25 calls, none by item.created)
+                    if event.type in (
+                        "conversation.item.created",
+                        "conversation.item.added",
+                        "response.output_item.added",
+                    ):
                         self._prune.seen(getattr(event, "item", None))
                         self._maybe_trim()
                     if event.type == "input_audio_buffer.speech_started":

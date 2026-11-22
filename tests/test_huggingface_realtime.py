@@ -4959,6 +4959,32 @@ async def test_a_trims_deletes_never_show_as_a_drop() -> None:
     assert [kw.get("why") for state, kw in reports if state == "context_dropped"] == ["trim"]
 
 
+@pytest.mark.asyncio
+async def test_his_reply_and_tool_call_reach_the_ledger(monkeypatch: Any) -> None:
+    """The backend (ff4aec3) names his replies and tool calls only by
+    response.output_item.added; conversation.item.created is for user and client items. Both
+    reach TalkPrune's ledger, or trimmed turns' replies and every tool pair stay forever (the
+    Units 3+4 review, finding 1)."""
+    user = SimpleNamespace(id="u1", type="message", role="user")
+    reply = SimpleNamespace(id="a1", type="message", role="assistant")
+    call = SimpleNamespace(id="fc1", type="function_call", call_id="c1")
+    out = SimpleNamespace(id="fco1", type="function_call_output", call_id="c1")
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("conversation.item.created", item=user),
+            _FakeEvent("response.output_item.added", item=call),
+            _FakeEvent("conversation.item.created", item=out),
+            _FakeEvent("response.output_item.added", item=reply),
+        ),
+    )
+    await handler._run_realtime_session()
+    assert "u1" in handler._prune.items
+    assert "a1" in handler._prune.items, "his reply never reaches the ledger"
+    assert handler._prune.calls["c1"][0] is not None, "the call half is never recorded"
+    assert handler._prune.calls["c1"][1] is not None
+
+
 def _handler():
     return HuggingFaceRealtimeHandler(
         ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
