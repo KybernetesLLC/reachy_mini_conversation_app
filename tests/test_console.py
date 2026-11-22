@@ -2467,6 +2467,34 @@ def test_wobbling_comes_back_once_the_dance_has_played() -> None:
     stream._robot.enable_wobbling.assert_called_once()
 
 
+def test_a_dance_is_placed_on_the_grid_by_the_managers_own_sampling() -> None:
+    """Place the dance on the grid's next beat at the manager's first sample (the second review's 5).
+
+    Through the manager's pose path; its length is then that wait and the steps.
+    """
+    import time
+
+    from reachy_mini_conversation_app.dance_emotion_moves import GridDanceMove
+
+    stream, manager, app = _dance_stream()
+    now = time.time()
+    _rpc_call(app, "conversation.dance", {**_DANCE, "grid": {"at": now + 100.3, "period_s": 0.5}})
+    t = manager._now()
+    _drive_manager(manager, t)
+    dance = manager.state.current_move
+    assert isinstance(dance, GridDanceMove) and dance.wait_s is None
+    manager._get_primary_pose(t)
+    assert dance.wait_s is not None and 0.0 <= dance.wait_s < 0.5
+    # the beat it starts on is the grid's: 0.3 s past a whole second, give or take the test's own time
+    began = time.time() - (manager._now() - t)
+    phase = (began + dance.wait_s - (now + 100.3)) % 0.5
+    assert min(phase, 0.5 - phase) < 0.02
+    assert abs(dance.duration - (dance.wait_s + 8.0)) < 1e-9
+    _drive_manager(manager, t + dance.duration + 0.01)
+    assert not getattr(manager.state.current_move, "ends_on_release", False)
+    _wait_waiter(stream)
+
+
 def test_a_hold_ends_the_dance_and_wobbling_comes_back() -> None:
     """A hold replaces the dance's moves, and the dropped last move brings wobbling back."""
     stream, manager, app = _dance_stream()
