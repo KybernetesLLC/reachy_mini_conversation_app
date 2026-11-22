@@ -2277,8 +2277,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             connect_kwargs["extra_query"] = self._realtime_connect_query
         # 2026-10-16: the server echoes image data URLs back in conversation.item.created;
         # the websockets default of 1 MiB closed the session with 1009. Upstream's value.
+        # No permessage-deflate (the companion, 11-22): websockets offers it by default and the
+        # server took it, so every 80 ms mic chunk, base64 text that barely compresses, went
+        # through zlib: about 6% of a core on the Pi during talk, for a few bytes saved.
         connect_kwargs["websocket_connection_options"] = {
-            "max_size": REALTIME_MAX_MESSAGE_BYTES
+            "max_size": REALTIME_MAX_MESSAGE_BYTES,
+            "compression": None,
         }
         # The companion's wire log (11-14): every send and receive recorded while the session runs;
         # the connection as is when the log is off (its path unset).

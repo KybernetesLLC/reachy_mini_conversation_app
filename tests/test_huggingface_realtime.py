@@ -450,7 +450,10 @@ async def test_run_realtime_session_raises_the_receive_limit(monkeypatch: Any) -
 
     await handler._run_realtime_session()
 
-    assert captured_connect["websocket_connection_options"] == {"max_size": 16 * 2**20}
+    assert captured_connect["websocket_connection_options"] == {
+        "max_size": 16 * 2**20,
+        "compression": None,  # no permessage-deflate (11-22)
+    }
 
 
 @pytest.mark.parametrize(
