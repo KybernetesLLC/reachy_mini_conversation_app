@@ -118,7 +118,7 @@ def _finite_float(value: object, message: str) -> float:
 # how long past the dance's own length the wobbler's return waits for its last move.
 DANCE_BPM_LOW, DANCE_BPM_HIGH = 40.0, 240.0
 DANCE_WOBBLE_SLACK_S = 30.0
-DANCE_MAX_S = 60.0  # the companion's dances are at most 20 s; wobbling is off throughout
+DANCE_MAX_S = 60.0  # the companion's dances are at most 40 s with a beat's wait; wobbling is off throughout
 
 
 # conversation.breathing's limits (the companion's idle.py), with this app's own as the fallback.
@@ -663,7 +663,7 @@ class LocalStream:
             raise JsonRpcError("movement manager unavailable", reason="not_running")
         try:
             from reachy_mini_dances_library.collection.dance import AVAILABLE_MOVES
-            from reachy_mini_conversation_app.dance_emotion_moves import DanceQueueMove
+            from reachy_mini_conversation_app.dance_emotion_moves import DanceQueueMove, GridDanceMove
         except ImportError:
             raise JsonRpcError("dance library unavailable", reason="not_running")
         bpm = _finite_float(params.get("bpm"), "dance needs a numeric bpm")
@@ -673,6 +673,15 @@ class LocalStream:
                 reason="invalid_params",
                 code=-32602,
             )
+        # The music's beat grid (the companion's design 2026-11-22): a move beat's wall time and
+        # its period, the bpm's own beat within 1%. The moves are timed by the grid's period.
+        grid = params.get("grid")
+        if not isinstance(grid, dict):
+            raise JsonRpcError("dance requires 'grid', {at, period_s}", reason="invalid_params", code=-32602)
+        grid_at = _finite_float(grid.get("at"), "dance grid at must be numeric")
+        period = _finite_float(grid.get("period_s"), "dance grid period_s must be numeric")
+        if not 60.0 / DANCE_BPM_HIGH <= period <= 60.0 / DANCE_BPM_LOW or abs(60.0 / period / bpm - 1) > 0.01:
+            raise JsonRpcError("dance grid period_s must be the bpm's beat", reason="invalid_params", code=-32602)
         raw = params.get("moves")
         if not isinstance(raw, list) or not raw:
             raise JsonRpcError(
@@ -691,18 +700,17 @@ class LocalStream:
             amplitude = _finite_float(item.get("amplitude", 1.0), "dance amplitude must be numeric")
             if not 0 < amplitude <= 1:
                 raise JsonRpcError("dance amplitude must be in (0, 1]", reason="invalid_params", code=-32602)
-            move = DanceQueueMove(name, bpm=bpm, beats=beats, amplitude=amplitude, antennas=False)
+            move = DanceQueueMove(name, bpm=60.0 / period, beats=beats, amplitude=amplitude, antennas=False)
             move.ends_on_release = True
             moves.append(move)
-        if sum(m.duration for m in moves) > DANCE_MAX_S:
+        dance = GridDanceMove(moves, grid_at=grid_at, period_s=period)
+        if dance.duration > DANCE_MAX_S:
             raise JsonRpcError(f"a dance is at most {DANCE_MAX_S:.0f}s", reason="invalid_params", code=-32602)
         self._dance_number += 1
         number = self._dance_number
         await asyncio.to_thread(self._wobbling, False)
-        for move in moves[:-1]:
-            manager.queue_move(move)
-        done = manager.queue_watched_move(moves[-1])
-        seconds = sum(m.duration for m in moves)
+        done = manager.queue_watched_move(dance)
+        seconds = dance.duration  # at most one beat's wait for the grid, then its moves
         waiter = threading.Thread(
             target=self._wobble_after_dance,
             args=(manager, done, number, seconds + DANCE_WOBBLE_SLACK_S),
