@@ -17,12 +17,16 @@ text. The writer sends (rules 3-5, 9):
 
 - a join of S, a clear, the reconnect's catch-up (the companion marks it: the read at the open
   held less than the bound) and a drop's block go at once, on the handler's loop;
-- any other change is batched, BATCH_S, and goes in a tool's window too (no hold);
+- any other change is batched, BATCH_S, and goes in a tool's window too (no hold), and never
+  sooner than BATCHED_GAP_S after the last write (the Units 3+4 review: trims and awareness
+  refreshes came to 5-8 writes a minute, 70-117 KB each with the echo);
 - at a reply's done, any change goes before the done event is set (H calls `at_done`);
 - after the write that carries a newly joined S, the items S covers are deleted; after a drop's
   block, the items through the reported item (talk_prune), in that order, in one coroutine.
 
-Every send is logged with its parts' versions and ages, and counts only.
+Every send is logged with its parts' versions and ages, the writes in the last minute, and
+counts only. A reported drop or trim whose block has not come in DROP_WAIT_S (a companion
+restarted mid-session) is let go, so trims and drops are not stalled for the session.
 """
 
 from __future__ import annotations
@@ -30,12 +34,15 @@ import time
 import asyncio
 import logging
 from typing import Any, Callable, Optional
+from collections import deque
 from dataclasses import replace, dataclass
 
 
 logger = logging.getLogger(__name__)
 
 BATCH_S = 1.0
+BATCHED_GAP_S = 5.0  # a batched write goes at most this often; the at-once ones are not held
+DROP_WAIT_S = 30.0  # a drop's or trim's block not come by then is let go
 THOUGHTS_MAX = 5  # the thoughts answered in this conversation, newest kept
 S_HEADING = "### Earlier in this talk, in short"
 THOUGHTS_HEADING = "### Thoughts you answered in this conversation"
@@ -163,6 +170,7 @@ class InstructionsWriter:
         connection: Callable[[], Any],
         clock: Callable[[], float] = time.monotonic,
         batch_s: float = BATCH_S,
+        gap_s: float = BATCHED_GAP_S,
         on_sent: Callable[[], None] | None = None,
     ) -> None:
         """Hold no view until a session's open (`connect`)."""
@@ -170,11 +178,14 @@ class InstructionsWriter:
         self._connection = connection
         self.clock = clock
         self.batch_s = batch_s
+        self.gap_s = gap_s
         self.on_sent = on_sent
         self.view: View | None = None
         self.sent: str | None = None  # the instructions the session holds, as last written
         self._joined = _NONE  # the S version whose deletes went
         self._drop: str | None = None  # the drop item reported, until its block is sent
+        self._drop_at = 0.0  # when it was reported (the clock)
+        self._writes: deque[float] = deque()  # when each write went, the last minute's
         self._lock: asyncio.Lock | None = None
         self._batch: asyncio.Task[None] | None = None
         self._now: set[asyncio.Task[None]] = set()
@@ -241,10 +252,17 @@ class InstructionsWriter:
 
     def report_drop(self, item: str | None) -> None:
         """Note a reported drop's item (rule 9): its items go after the block naming it."""
-        self._drop = item
+        self._drop, self._drop_at = item, self.clock()
 
     def drop_pending(self) -> bool:
-        """Return whether a reported drop or trim waits for its block."""
+        """Return whether a reported drop or trim waits for its block, letting go of a stale one.
+
+        A block not come in DROP_WAIT_S (a companion restarted mid-session publishes none) is
+        let go and logged; its items stay in the chat until the next trim or S.
+        """
+        if self._drop is not None and self.clock() - self._drop_at > DROP_WAIT_S:
+            logger.info("Talk prune: no block for the reported item in %.0f s; let go", DROP_WAIT_S)
+            self._drop = None
         return self._drop is not None
 
     def want(self, why: str) -> None:
@@ -274,6 +292,11 @@ class InstructionsWriter:
 
     async def _after_batch(self) -> None:
         await asyncio.sleep(self.batch_s)
+        last = self._writes[-1] if self._writes else None
+        if last is not None:  # the floor on batched writes, from the last write of any kind
+            wait = last + self.gap_s - self.clock()
+            if wait > 0:
+                await asyncio.sleep(wait)
         await self.send("a part changed")
 
     def _send_now(self, why: str) -> None:
@@ -308,6 +331,10 @@ class InstructionsWriter:
                     logger.warning("Instructions not sent (%s): %s", why, exc)
                     return
                 self.sent = target
+                now = self.clock()
+                self._writes.append(now)
+                while self._writes and self._writes[0] < now - 60.0:
+                    self._writes.popleft()
                 self._log(why, target)
                 if measure and self.on_sent is not None:
                     self.on_sent()
@@ -349,7 +376,7 @@ class InstructionsWriter:
         # with tokens at 3.5 chars each: drops have come at 14.4k-22k input tokens (11-03)
         logger.info(
             "Instructions sent (%s): %d chars, about %d tokens; block v%d to row %d, %.1f s old; "
-            "%s; %d thought(s)",
+            "%s; %d thought(s); %d write(s) in the last minute",
             why,
             len(text),
             round(len(text) / 3.5),
@@ -358,4 +385,5 @@ class InstructionsWriter:
             now - block.at,
             s_part,
             len(view.thoughts),
+            len(self._writes),
         )

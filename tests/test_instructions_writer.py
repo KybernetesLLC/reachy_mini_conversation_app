@@ -268,3 +268,38 @@ def test_nothing_else_sends_his_session_instructions() -> None:
                     segment = ast.get_source_segment(text, node) or ""
                     others.append((path.name, fn.name, "instructions" in segment))
     assert others == [("huggingface_realtime.py", "change_voice", False)]
+
+
+@pytest.mark.asyncio
+async def test_batched_writes_keep_a_floor_and_at_once_writes_do_not(caplog) -> None:
+    """The Units 3+4 review, finding 2: a batched change goes at most once every gap_s; an S join
+    is not held by it. The send log counts the writes in the last minute."""
+    conn = Conn()
+    writer = iw.InstructionsWriter(Prune(conn), connection=lambda: conn, batch_s=0.01, gap_s=0.3)
+    await _open(writer, conn)
+    writer.parts_changed({"block": _block(2, "## Your memory\ntwo")})
+    await asyncio.sleep(0.05)
+    assert len(conn.wire) == 1  # the first batched write: none before it
+    writer.parts_changed({"block": _block(3, "## Your memory\nthree")})
+    await asyncio.sleep(0.1)
+    assert len(conn.wire) == 1  # held by the floor
+    with caplog.at_level("INFO", logger=iw.__name__):
+        writer.parts_changed({"summary": _part("summary", 4, S1, session=None)})
+        await _settle()
+    assert conn.wire[1][0] == "update" and "Alli asked" in conn.wire[1][1]  # S joins at once
+    assert "2 write(s) in the last minute" in caplog.text
+    await asyncio.sleep(0.4)
+    assert [k for k, _ in conn.wire].count("update") == 2  # the batch found nothing left to send
+
+
+def test_a_reported_drop_with_no_block_is_let_go() -> None:
+    """The Units 3+4 review, finding 3: a companion restarted mid-session publishes no block; the
+    wait ends after DROP_WAIT_S, so trims and drops are not stalled for the session."""
+    clock = {"t": 0.0}
+    conn = Conn()
+    writer = iw.InstructionsWriter(Prune(conn), connection=lambda: conn, clock=lambda: clock["t"])
+    writer.report_drop("u4")
+    clock["t"] = iw.DROP_WAIT_S - 1
+    assert writer.drop_pending()
+    clock["t"] = iw.DROP_WAIT_S + 1
+    assert not writer.drop_pending() and writer._drop is None

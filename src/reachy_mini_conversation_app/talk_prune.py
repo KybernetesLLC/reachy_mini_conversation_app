@@ -38,9 +38,10 @@ logger = logging.getLogger(__name__)
 LEDGER_MAX = 2000
 LAG_S = 60.0  # the time cut: an item arrives before its transcript is stamped
 # The trim: the hosted backend's chat_size is not known (about 14, estimated; its default is 10 at
-# the backend source at SV:370), so the trim starts at 10 user items and leaves 6.
+# the backend source at SV:370), so the trim starts at 10 user items. It leaves 3 (the Units 3+4
+# review: notes are half the user items, and leaving 6 trimmed every 2.4 turns).
 TRIM_AT = 10
-TRIM_TO = 6
+TRIM_TO = 3
 
 
 class TalkPrune:
