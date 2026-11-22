@@ -675,7 +675,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         (ConvoAll rule 6, ToolDrop): a lost done drops this output and no other reply's.
         """
         if response_id is not None:
-            return await self._response_ended(response_id, force=False)
+            return await self._response_ended(response_id)
         if self._response_done_event.is_set():
             return True
 
@@ -691,7 +691,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     # --- each response by its id (ConvoAll rule 6) ------------------------------------------
 
     def _track_created(self, response_id: str | None, *, in_band: bool) -> None:
-        """Track a response from its response.created, with its own deadline."""
+        """Track a response from its response.created, with its own deadline.
+
+        The backend runs one response at a time and emits created only once the last one is
+        over (RH:821-826), so a response still tracked here lost its done: it ends now.
+        """
+        for older in [rid for rid in self._responses if rid != response_id]:
+            logger.info("Response %s ended at a newer response.created: its done was lost", older)
+            self._end_tracked(older, real=False)
         self._responses[response_id] = _Live(
             self._heard_item, time.monotonic() + _RESPONSE_DONE_TIMEOUT, in_band
         )
@@ -741,20 +748,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     async def _wait_all_ended(self) -> bool:
         """Wait until no response is live, forcing each only at its own deadline.
 
-        Return whether the forced path ran. The done event cleared with nothing tracked keeps
-        the old hold: one timeout, then the event is set.
+        Return whether the forced path ran.
         """
         forced = False
-        while not self._response_done_event.is_set():
-            if not self._responses:
-                try:
-                    await asyncio.wait_for(
-                        self._response_done_event.wait(), timeout=_RESPONSE_DONE_TIMEOUT
-                    )
-                except asyncio.TimeoutError:
-                    self._response_done_event.set()
-                    forced = True
-                break
+        while self._responses and not self._response_done_event.is_set():
             first = min(live.deadline for live in self._responses.values())
             try:
                 await asyncio.wait_for(
@@ -765,10 +762,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 forced = await self._force_overdue() or forced
         return forced
 
-    async def _response_ended(self, response_id: str | None, *, force: bool) -> bool:
+    async def _response_ended(self, response_id: str | None) -> bool:
         """Wait for one response's end, up to its deadline; return whether its own done came.
 
-        At the deadline the fork's own create is forced (W_ForceOwn); a tool's output is not.
+        A tool's output waits here; it never forces its reply's end (ToolDrop).
         """
         live = self._responses.get(response_id)
         if live is None:
@@ -778,8 +775,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 live.ended.wait(), timeout=max(0.0, live.deadline - time.monotonic())
             )
         except asyncio.TimeoutError:
-            if force:
-                await self._force(response_id)
             return False
         return live.real
 
@@ -2116,7 +2111,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._greeting_live = True
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
-                before = self._live_response_id
+                conn = self.connection
                 to_send = self._with_nudge_instructions(kwargs)  # at this attempt, never at the queue
                 if to_send is None:
                     break
@@ -2139,8 +2134,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     )
                 except Exception as e:
                     logger.info("_response_sender_loop: send failed: %s", e)
-                    if not self._responses:  # nothing created: none of them ended
-                        self._response_done_event.set()
                     break
 
                 try:
@@ -2169,13 +2162,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
                     continue
 
-                # This create's own done, to its own deadline (W_ForceOwn); unseen, every one.
-                own = self._live_response_id
-                if own != before:
-                    ended = await self._response_ended(own, force=True)
-                else:
-                    ended = not await self._wait_all_ended()
-                if not ended:
+                # This create's own done, to its own deadline (W_ForceOwn): one response runs
+                # at a time, so it is the one tracked.
+                forced = await self._wait_all_ended()
+                if self.connection is not conn:
+                    logger.info("The session ended before this create's response.done (a reconnect)")
+                    break
+                if forced:
                     logger.info(
                         "Timed out waiting for response.done; assuming response completed"
                     )

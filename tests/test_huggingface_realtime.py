@@ -1771,11 +1771,11 @@ async def test_speech_between_the_silence_check_and_the_send_drops_the_greeting(
         hf_mod, "GREETING_SETTLE_WAIT_S", 10.0
     )  # the test drives the greeting
     task = await _connect(handler, greet=True)
-    handler._response_done_event.clear()  # something still in flight: the sender holds the create
+    handler._track_created("r0", in_band=True)  # in flight: the sender holds the create
     await handler._send_startup_greeting_prompt()  # silence held until now
     conns[0].push(_FakeEvent("input_audio_buffer.speech_started"))
     await asyncio.sleep(0.05)
-    handler._response_done_event.set()  # the sender may send now
+    handler._end_tracked("r0", real=True)  # the sender may send now
     await asyncio.sleep(0.1)
     assert not conns[0].greeted()
     conns[0].response.create.assert_not_awaited()
@@ -6664,37 +6664,74 @@ async def _settle(n: int = 50) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_lost_done_ends_only_the_overdue_reply(monkeypatch: Any) -> None:
-    """Fforceall, correction 52: turn 1's done is lost while turn 2's reply runs.
+async def test_a_lost_done_ends_at_the_next_created(monkeypatch: Any) -> None:
+    """Correction 52 as this backend runs it: one response at a time (RH:821-826).
 
-    The forced path ends turn 1's reply alone, with its done write. Turn 2's reply is still
-    awaited, so a create waiting behind it does not go until its own done.
+    Turn 1's done is lost and turn 2's reply is created, so turn 1's is over. It ends alone, as
+    lost; turn 2's reply is still awaited, and a create waiting behind it goes at its done.
     """
     handler, conns = _reconnect_handler(monkeypatch)
     task = await _session(handler)
-    at_done = AsyncMock()
-    monkeypatch.setattr(handler._writer, "at_done", at_done)
     handler._heard_item = "u1"
     conns[0].push(_created_by_id("r1"))
     await conns[0].processed()
-    handler._heard_item = "u2"
-    conns[0].push(_created_by_id("r2"))  # turn 2's reply runs; r1's done never comes
-    await conns[0].processed()
     assert handler._responses["r1"].heard == "u1"
-    _overdue(handler, "r1")
+    conns[0].push(_created_by_id("r2"))  # r1's done never came
+    await conns[0].processed()
+    assert list(handler._responses) == ["r2"] and "r1" in handler._forced
+    assert not handler._response_done_event.is_set()
 
     await handler._safe_response_create()
     await _settle()
-
-    assert "r1" not in handler._responses and "r2" in handler._responses
-    assert at_done.await_count == 1  # the forced path's done write, for r1
-    assert not handler._response_done_event.is_set()
     assert conns[0].response.create.await_count == 0  # turn 2's reply still runs
 
     conns[0].push(_done_by_id("r2"))
     await conns[0].processed()
     await _settle()
     assert handler._response_done_event.is_set()
+    assert conns[0].response.create.await_count == 1
+    await conns[0].close()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_newer_reply_done_leaves_nothing_tracked(monkeypatch: Any) -> None:
+    """The review's repro: created r1, created r2, done r2. The backend is idle, so is the fork.
+
+    A reply after a note is asked and goes; no stale r1 holds it until a deadline.
+    """
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    for event in (_created_by_id("r1"), _created_by_id("r2"), _done_by_id("r2")):
+        conns[0].push(event)
+        await conns[0].processed()
+    assert handler._responses == {} and handler._response_done_event.is_set()
+
+    assert await handler.request_reply() is True
+    await _settle()
+    assert conns[0].response.create.await_count == 1
+    await conns[0].close()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_an_overdue_done_is_forced_before_the_next_create(monkeypatch: Any) -> None:
+    """r1's done is lost and nothing newer is created: the sender forces it at its deadline.
+
+    It ends with its done write, and the waiting create goes.
+    """
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    at_done = AsyncMock()
+    monkeypatch.setattr(handler._writer, "at_done", at_done)
+    conns[0].push(_created_by_id("r1"))
+    await conns[0].processed()
+    _overdue(handler, "r1")
+
+    await handler._safe_response_create()
+    await _settle()
+    assert handler._responses == {} and "r1" in handler._forced
+    assert at_done.await_count == 1
     assert conns[0].response.create.await_count == 1
     await conns[0].close()
     await asyncio.wait_for(task, timeout=1.0)
@@ -6728,24 +6765,24 @@ async def test_a_fork_creates_own_overdue_done_ends_it_alone(monkeypatch: Any) -
 
 @pytest.mark.asyncio
 async def test_a_tool_output_waits_for_its_own_reply_only() -> None:
-    """ToolDrop (fCommit >= fuT): a tool's output follows its own reply's done.
+    """ToolDrop (fCommit >= fuT), as this backend runs: r1 created, its done lost, r2 created.
 
-    Another reply still running does not hold it, and another reply's lost done does not drop
-    it; only its own reply's lost done does.
+    r1's tool output is dropped at once; r2 running does not hold it. r2's own output waits to
+    r2's deadline and is then dropped, without ending r2. After r2's real done it goes.
     """
     handler = _plain_handler()
     handler._track_created("r1", in_band=True)
-    handler._track_created("r2", in_band=True)
-    handler._end_tracked("r1", real=True)
-    assert await handler._wait_for_response_done_before_tool_result("r1") is True  # r2 runs
+    handler._track_created("r2", in_band=True)  # r1's done was lost
+    assert await handler._wait_for_response_done_before_tool_result("r1") is False
 
     handler._responses["r2"].deadline = time.monotonic() + 0.01
     assert await handler._wait_for_response_done_before_tool_result("r2") is False
     assert "r2" in handler._responses  # the tool's drop does not end its reply
 
-    await handler._force("r2")
-    assert await handler._wait_for_response_done_before_tool_result("r2") is False
-    assert await handler._wait_for_response_done_before_tool_result("r1") is True
+    handler._track_created("r3", in_band=True)
+    handler._end_tracked("r3", real=True)
+    assert await handler._wait_for_response_done_before_tool_result("r3") is True
+    assert await handler._wait_for_response_done_before_tool_result("r1") is False
 
 
 @pytest.mark.asyncio
@@ -6794,3 +6831,105 @@ async def test_a_session_end_releases_a_tool_output_waiting_on_its_reply() -> No
     handler._clear_tracked()
     assert await asyncio.wait_for(waiting, timeout=1.0) is False
     assert handler._responses == {} and handler._response_done_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a_tool_result_waits_on_its_own_turn_id(monkeypatch: Any) -> None:
+    """_handle_tool_result passes its call's turn_id to the wait.
+
+    r1's done was lost, so its output is dropped at once, not sent when r2, still running, ends.
+    """
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(handler, "_safe_response_create", AsyncMock())
+    handler._in_flight_tool_calls = {"call_a"}
+    handler._track_created("r1", in_band=True)
+    handler._track_created("r2", in_band=True)  # r1's done was lost
+    handling = asyncio.create_task(
+        handler._handle_tool_result(
+            ToolNotification(
+                id="call_a",
+                tool_name="test__probe",
+                is_idle_tool_call=False,
+                status=ToolState.COMPLETED,
+                result={"ok": True},
+                turn_id="r1",
+            )
+        )
+    )
+    await _settle()
+    handler._end_tracked("r2", real=True)
+    await asyncio.wait_for(handling, timeout=1.0)
+    outputs = [
+        c
+        for c in handler.connection.conversation.item.create.await_args_list
+        if (c.kwargs.get("item") or {}).get("type") == "function_call_output"
+    ]
+    assert outputs == []
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_forgets_the_last_sessions_responses(monkeypatch: Any) -> None:
+    """The reset at a new session clears every tracked response and wakes its waiters."""
+    handler, conns = _reconnect_handler(monkeypatch)
+    first = await _session(handler)
+    conns[0].push(_created_by_id("r1"))
+    await conns[0].processed()
+    live = handler._responses["r1"]
+    await _dropped(handler, conns[0], first)
+
+    second = await _session(handler)
+    assert handler._responses == {} and live.ended.is_set() and not live.real
+    assert handler._response_done_event.is_set()
+    await conns[1].close()
+    await asyncio.wait_for(second, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_forgets_the_tracked_responses(monkeypatch: Any) -> None:
+    """Shutdown clears the tracked responses, so the sender and a waiting tool output wake."""
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    conns[0].push(_created_by_id("r1"))
+    await conns[0].processed()
+    live = handler._responses["r1"]
+    await handler.shutdown()
+    assert handler._responses == {} and live.ended.is_set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_the_forced_path_writes_only_for_an_in_band_response(monkeypatch: Any) -> None:
+    """An out-of-band response (a thought, a filler) gets no done write when forced; his reply does."""
+    handler = _plain_handler()
+    at_done = AsyncMock()
+    monkeypatch.setattr(handler._writer, "at_done", at_done)
+    handler._track_created("oob", in_band=False)
+    await handler._force("oob")
+    assert at_done.await_count == 0 and handler._responses == {}
+    handler._track_created("reply", in_band=True)
+    await handler._force("reply")
+    assert at_done.await_count == 1 and handler._responses == {}
+
+
+@pytest.mark.asyncio
+async def test_in_band_follows_the_band_tag(monkeypatch: Any) -> None:
+    """A thought's response is out of band; the nudge's and his plain reply are in band."""
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    seen: dict[str, bool] = {}
+    for rid, metadata in (
+        ("thought", {"companion": hf_mod.THOUGHT_TAG}),
+        ("nudge", hf_mod.NUDGE_TAG),
+        ("plain", None),
+    ):
+        conns[0].push(
+            _FakeEvent("response.created", response=SimpleNamespace(id=rid, metadata=metadata))
+        )
+        await conns[0].processed()
+        seen[rid] = handler._responses[rid].in_band
+    assert seen == {"thought": False, "nudge": True, "plain": True}
+    await conns[0].close()
+    await asyncio.wait_for(task, timeout=1.0)
