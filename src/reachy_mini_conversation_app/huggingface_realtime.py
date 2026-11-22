@@ -11,6 +11,7 @@ import mimetypes
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Tuple, Callable, Optional, NamedTuple
 from collections import deque
+from dataclasses import field, dataclass
 
 import httpx
 import numpy as np
@@ -324,6 +325,21 @@ class _Thought(NamedTuple):
     create: dict[str, Any]
 
 
+@dataclass
+class _Live:
+    """A response seen created and not yet ended (ConvoAll rule 6, the model's fRT).
+
+    `heard` is the latest heard user item at its created, the reply's turn as the fork knows it.
+    Its deadline runs from that created. `real` says whether its own response.done ended it.
+    """
+
+    heard: str | None
+    deadline: float
+    in_band: bool
+    ended: asyncio.Event = field(default_factory=asyncio.Event)
+    real: bool = False
+
+
 def session_size(session: Any) -> str:
     """What a session.update sends, sized: instructions and tool definitions, with a rough
     token count (the companion's context_size.CHARS_PER_TOKEN, 4 characters a token). The owner,
@@ -529,6 +545,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # The latest response created, and the one the companion's interrupt stopped: its
         # tools get no follow-up and it gets no missed-call nudge (cancel_response).
         self._live_response_id: str | None = None
+        # Every response created and not yet ended, by id, each with its own deadline (ConvoAll
+        # rule 6): a lost done ends only the overdue one. The done event is set when it empties.
+        self._responses: dict[str | None, _Live] = {}
+        self._forced: deque[str | None] = deque(maxlen=32)  # ended by the forced path
         self._interrupted_id: str | None = None
         # From an interrupt that cancelled a live response to the next response.created,
         # every audio delta is the cancelled reply's rest (the websocket keeps order).
@@ -646,8 +666,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Return a valid persisted startup voice, or None."""
         return self._resolve_backend_voice(voice, source="persisted startup voice")
 
-    async def _wait_for_response_done_before_tool_result(self) -> bool:
-        """Return whether the function-call response finished before sending tool output."""
+    async def _wait_for_response_done_before_tool_result(
+        self, response_id: str | None = None
+    ) -> bool:
+        """Return whether the function-call response finished before sending tool output.
+
+        With its response's id, it waits for that response's own done only, until its deadline
+        (ConvoAll rule 6, ToolDrop): a lost done drops this output and no other reply's.
+        """
+        if response_id is not None:
+            return await self._response_ended(response_id, force=False)
         if self._response_done_event.is_set():
             return True
 
@@ -659,6 +687,101 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return True
         except asyncio.TimeoutError:
             return False
+
+    # --- each response by its id (ConvoAll rule 6) ------------------------------------------
+
+    def _track_created(self, response_id: str | None, *, in_band: bool) -> None:
+        """Track a response from its response.created, with its own deadline."""
+        self._responses[response_id] = _Live(
+            self._heard_item, time.monotonic() + _RESPONSE_DONE_TIMEOUT, in_band
+        )
+        self._response_done_event.clear()
+
+    def _end_tracked(self, response_id: str | None, *, real: bool) -> None:
+        """End one response; the done event is set only when none is left."""
+        live = self._responses.pop(response_id, None)
+        if live is not None:
+            live.real = real
+            live.ended.set()
+            if not real:
+                self._forced.append(response_id)
+        if not self._responses:
+            self._response_done_event.set()
+
+    def _clear_tracked(self) -> None:
+        """Forget every response of a session that ended: none of their dones will come."""
+        for live in self._responses.values():
+            live.ended.set()
+        self._responses.clear()
+        self._forced.clear()
+        self._response_done_event.set()
+
+    async def _force(self, response_id: str | None) -> None:
+        """Run the forced path for one overdue response: its done write, then its end alone."""
+        live = self._responses.get(response_id)
+        if live is None:
+            return
+        logger.info(
+            "Response %s overdue (turn %s): its done was not seen; ending it alone",
+            response_id,
+            live.heard,
+        )
+        if live.in_band:
+            await self._writer.at_done()  # rule 2, as at a real done: before the event
+        self._end_tracked(response_id, real=False)
+
+    async def _force_overdue(self) -> bool:
+        """End every response past its deadline, and return whether any was."""
+        now = time.monotonic()
+        overdue = [rid for rid, live in self._responses.items() if live.deadline <= now]
+        for rid in overdue:
+            await self._force(rid)
+        return bool(overdue)
+
+    async def _wait_all_ended(self) -> bool:
+        """Wait until no response is live, forcing each only at its own deadline.
+
+        Return whether the forced path ran. The done event cleared with nothing tracked keeps
+        the old hold: one timeout, then the event is set.
+        """
+        forced = False
+        while not self._response_done_event.is_set():
+            if not self._responses:
+                try:
+                    await asyncio.wait_for(
+                        self._response_done_event.wait(), timeout=_RESPONSE_DONE_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    self._response_done_event.set()
+                    forced = True
+                break
+            first = min(live.deadline for live in self._responses.values())
+            try:
+                await asyncio.wait_for(
+                    self._response_done_event.wait(),
+                    timeout=max(0.0, first - time.monotonic()),
+                )
+            except asyncio.TimeoutError:
+                forced = await self._force_overdue() or forced
+        return forced
+
+    async def _response_ended(self, response_id: str | None, *, force: bool) -> bool:
+        """Wait for one response's end, up to its deadline; return whether its own done came.
+
+        At the deadline the fork's own create is forced (W_ForceOwn); a tool's output is not.
+        """
+        live = self._responses.get(response_id)
+        if live is None:
+            return response_id not in self._forced
+        try:
+            await asyncio.wait_for(
+                live.ended.wait(), timeout=max(0.0, live.deadline - time.monotonic())
+            )
+        except asyncio.TimeoutError:
+            if force:
+                await self._force(response_id)
+            return False
+        return live.real
 
     def _resolve_backend_voice(
         self,
@@ -1953,16 +2076,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.info("Announcement waits for the tool's follow-up reply")
                         self._requeue(bool, front={_ANNOUNCEMENT: announcement})
                         announcement = None
-                try:
-                    await asyncio.wait_for(
-                        self._response_done_event.wait(),
-                        timeout=_RESPONSE_DONE_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
+                # Rule 6: each live response is waited for until its own deadline, and only
+                # the overdue one is ended; another reply still running is still waited for.
+                if await self._wait_all_ended():
                     logger.info(
                         "Timed out waiting for previous response to finish; forcing ahead"
                     )
-                    self._response_done_event.set()
 
                 if not self.connection:
                     break
@@ -1997,6 +2116,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._greeting_live = True
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
+                before = self._live_response_id
                 to_send = self._with_nudge_instructions(kwargs)  # at this attempt, never at the queue
                 if to_send is None:
                     break
@@ -2048,16 +2168,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
                     continue
 
-                try:
-                    await asyncio.wait_for(
-                        self._response_done_event.wait(),
-                        timeout=_RESPONSE_DONE_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
+                # This create's own done, to its own deadline (W_ForceOwn); unseen, every one.
+                own = self._live_response_id
+                if own != before:
+                    ended = await self._response_ended(own, force=True)
+                else:
+                    ended = not await self._wait_all_ended()
+                if not ended:
                     logger.info(
                         "Timed out waiting for response.done; assuming response completed"
                     )
-                    self._response_done_event.set()
                     break
 
                 sent = True
@@ -2132,7 +2252,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._mark_activity("tool_result_ready")
             model_result_submitted = False
             if send_result_to_model and isinstance(completed_tool.id, str):
-                if not await self._wait_for_response_done_before_tool_result():
+                if not await self._wait_for_response_done_before_tool_result(
+                    completed_tool.turn_id
+                ):
                     send_result_to_model = False
                 if not send_result_to_model:
                     logger.warning(
@@ -2329,7 +2451,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # A drop mid-response never brought its response.done, and what was queued or cut
             # belongs to the session that ended. The companion's speaker says an announcement
             # again when it sees the gap, so a kept one would be voiced twice.
-            self._response_done_event.set()
+            self._clear_tracked()
             self._cut_mid_reply = False
             dropped = drop_pending_responses(self._pending_responses)
             if dropped:
@@ -2446,10 +2568,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("response text done: %s", self._out_text)
 
                     if event.type == "response.created":
-                        self._response_done_event.clear()
                         self._dropping_cancelled = False
                         self._live_response_id = getattr(
                             getattr(event, "response", None), "id", None
+                        )
+                        self._track_created(
+                            self._live_response_id, in_band=_band_tag(event) is None
                         )
                         self._response_started_or_rejected_event.set()
                         self._cut_mid_reply = (
@@ -2504,7 +2628,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             # Rule 2: the done write goes before the done event, so the next
                             # create cannot go ahead of it. The nudge's done is a reply's done.
                             await self._writer.at_done()
-                        self._response_done_event.set()
+                        # Rule 6: this response alone ends; the event is set when none is left.
+                        self._end_tracked(
+                            getattr(getattr(event, "response", None), "id", None), real=True
+                        )
                         self._response_started_or_rejected_event.set()
                         if _band_tag(event) is None:
                             self._followup_live = False

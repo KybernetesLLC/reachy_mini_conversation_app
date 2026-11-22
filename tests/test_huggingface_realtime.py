@@ -6640,3 +6640,145 @@ def test_with_the_companion_every_tool_keeps_the_kind_its_name_gave(companion_on
         assert declared.get(name) == kind, name
         assert hf_mod.tool_kind(name, {}) == kind  # and an old companion's tool, by name alone, agrees
     assert all(hf_mod.tool_kind(n, {n: _kind_tool(k)}) == (k or hf_mod.tool_kind(n, {})) for n, k in declared.items())
+
+
+# --- each response by its id (route all, Unit 7: ConvoAll rule 6) ---------------------------
+
+
+def _created_by_id(rid: str) -> _FakeEvent:
+    return _FakeEvent("response.created", response=SimpleNamespace(id=rid, metadata=None))
+
+
+def _done_by_id(rid: str) -> _FakeEvent:
+    return _FakeEvent("response.done", response=SimpleNamespace(id=rid, metadata=None, usage=None))
+
+
+def _overdue(handler: HuggingFaceRealtimeHandler, rid: str) -> None:
+    """Move one response's deadline into the past, as 30 s with its done lost would."""
+    handler._responses[rid].deadline = time.monotonic() - 1.0
+
+
+async def _settle(n: int = 50) -> None:
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_a_lost_done_ends_only_the_overdue_reply(monkeypatch: Any) -> None:
+    """Fforceall, correction 52: turn 1's done is lost while turn 2's reply runs.
+
+    The forced path ends turn 1's reply alone, with its done write. Turn 2's reply is still
+    awaited, so a create waiting behind it does not go until its own done.
+    """
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    at_done = AsyncMock()
+    monkeypatch.setattr(handler._writer, "at_done", at_done)
+    handler._heard_item = "u1"
+    conns[0].push(_created_by_id("r1"))
+    await conns[0].processed()
+    handler._heard_item = "u2"
+    conns[0].push(_created_by_id("r2"))  # turn 2's reply runs; r1's done never comes
+    await conns[0].processed()
+    assert handler._responses["r1"].heard == "u1"
+    _overdue(handler, "r1")
+
+    await handler._safe_response_create()
+    await _settle()
+
+    assert "r1" not in handler._responses and "r2" in handler._responses
+    assert at_done.await_count == 1  # the forced path's done write, for r1
+    assert not handler._response_done_event.is_set()
+    assert conns[0].response.create.await_count == 0  # turn 2's reply still runs
+
+    conns[0].push(_done_by_id("r2"))
+    await conns[0].processed()
+    await _settle()
+    assert handler._response_done_event.is_set()
+    assert conns[0].response.create.await_count == 1
+    await conns[0].close()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_fork_creates_own_overdue_done_ends_it_alone(monkeypatch: Any) -> None:
+    """W_ForceOwn: with no create waiting, the fork's own create's done is overdue.
+
+    The sender ends that response at its deadline, and the next create may go.
+    """
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.05)
+    await handler._safe_response_create()
+    for _ in range(200):
+        if conns[0].response.create.await_count:
+            break
+        await asyncio.sleep(0)
+    conns[0].push(_created_by_id("own"))
+    await conns[0].processed()
+    assert "own" in handler._responses
+    await asyncio.sleep(0.15)
+
+    assert "own" not in handler._responses
+    assert "own" in handler._forced
+    assert handler._response_done_event.is_set()
+    await conns[0].close()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_tool_output_waits_for_its_own_reply_only() -> None:
+    """ToolDrop (fCommit >= fuT): a tool's output follows its own reply's done.
+
+    Another reply still running does not hold it, and another reply's lost done does not drop
+    it; only its own reply's lost done does.
+    """
+    handler = _plain_handler()
+    handler._track_created("r1", in_band=True)
+    handler._track_created("r2", in_band=True)
+    handler._end_tracked("r1", real=True)
+    assert await handler._wait_for_response_done_before_tool_result("r1") is True  # r2 runs
+
+    handler._responses["r2"].deadline = time.monotonic() + 0.01
+    assert await handler._wait_for_response_done_before_tool_result("r2") is False
+    assert "r2" in handler._responses  # the tool's drop does not end its reply
+
+    await handler._force("r2")
+    assert await handler._wait_for_response_done_before_tool_result("r2") is False
+    assert await handler._wait_for_response_done_before_tool_result("r1") is True
+
+
+@pytest.mark.asyncio
+async def test_a_tool_output_whose_reply_ends_while_it_waits_goes() -> None:
+    """The tool finished before its reply's done: it goes once that done comes."""
+    handler = _plain_handler()
+    handler._track_created("r1", in_band=True)
+    waiting = asyncio.create_task(handler._wait_for_response_done_before_tool_result("r1"))
+    await _settle(5)
+    assert not waiting.done()
+    handler._end_tracked("r1", real=True)
+    assert await asyncio.wait_for(waiting, timeout=1.0) is True
+
+
+@pytest.mark.asyncio
+async def test_a_normal_done_writes_then_sets_the_done_event(monkeypatch: Any) -> None:
+    """A real done: the writer's at_done goes before the done event, which is set as before."""
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    order: list[str] = []
+
+    async def _at_done() -> None:
+        order.append("write, event set" if handler._response_done_event.is_set() else "write")
+
+    monkeypatch.setattr(handler._writer, "at_done", _at_done)
+    conns[0].push(_created_by_id("r1"))
+    await conns[0].processed()
+    assert not handler._response_done_event.is_set()
+    conns[0].push(_done_by_id("r1"))
+    await conns[0].processed()
+
+    assert order == ["write"]
+    assert handler._response_done_event.is_set()
+    assert handler._responses == {} and "r1" not in handler._forced
+    await conns[0].close()
+    await asyncio.wait_for(task, timeout=1.0)
