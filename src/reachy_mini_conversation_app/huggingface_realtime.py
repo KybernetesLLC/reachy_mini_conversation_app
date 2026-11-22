@@ -1584,6 +1584,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._writer.report_drop(self._heard_item)
             self._notify_session("context_dropped", item_id=self._heard_item)
 
+    def _maybe_trim(self) -> None:
+        """Trim the chat before the backend compacts it (talk_prune.TRIM_AT, the owner 11-22).
+
+        Rule 9's sequence started on purpose: the companion is told the trim point, bounds the
+        block there and re-sends it; the writer deletes through it only after that write. One at
+        a time: nothing starts while a drop or trim waits for its block.
+        """
+        if self.connection is None or self._writer.drop_pending():
+            return
+        item = self._prune.trim_point()
+        if item is None:
+            return
+        logger.info("Talk prune: %d user items in the chat; trimming to %d",
+                    len([i for i in self._prune.items if i in self._prune.users]),
+                    talk_prune.TRIM_TO)  # fmt: skip
+        self._writer.report_drop(item)
+        self._notify_session("context_dropped", item_id=item, why="trim")
+
     def _count_image(self, b64_jpeg: str) -> None:
         self._session_images += 1
         self._session_image_bytes += b64_size(b64_jpeg)
@@ -2357,6 +2375,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.debug("Realtime event: %s", event.type)
                     if event.type in ("conversation.item.created", "conversation.item.added"):
                         self._prune.seen(getattr(event, "item", None))
+                        self._maybe_trim()
                     if event.type == "input_audio_buffer.speech_started":
                         self._spoke_since_open = True
                         self._new_user_turn()
@@ -2582,6 +2601,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             continue
                         self._cut_mid_reply = False
                         self._heard_item = getattr(event, "item_id", None) or self._heard_item
+                        self._prune.mark_heard(getattr(event, "item_id", None))
 
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None
@@ -2602,6 +2622,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             True,
                             item_id=getattr(event, "item_id", None),
                         )
+                        # after the transcript: the companion holds the turn before the report
+                        self._maybe_trim()
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.delta":

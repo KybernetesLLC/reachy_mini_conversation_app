@@ -72,3 +72,53 @@ def test_a_scrubbed_item_is_never_deleted_again_and_a_reset_forgets_all() -> Non
     assert not prune.items and not prune.calls
     prune.seen(_item("sys", role="system"))
     assert not prune.items  # instructions stay
+
+
+def _chat(prune: tp.TalkPrune, turns: int, *, notes: tuple[int, ...] = (), owed_after: int | None = None) -> list[str]:
+    """`turns` heard user turns, each with his reply; a note before the turns in `notes`."""
+    users = []
+    for n in range(turns):
+        if n in notes:
+            prune.seen(_item(f"note{n}"))
+            users.append(f"note{n}")
+        prune.seen(_item(f"u{n}"))
+        prune.mark_heard(f"u{n}")
+        users.append(f"u{n}")
+        prune.seen(_item(f"a{n}", role="assistant"))
+        if owed_after == n:
+            prune.seen(_item("owed", type_="function_call", call="c9"))
+    return users
+
+
+def test_a_trim_starts_at_trim_at_user_items_and_leaves_at_most_trim_to() -> None:
+    """The owner's trim (11-22): notes count; deleting through the trim point leaves at most
+    TRIM_TO user items in the chat, and never the latest user turn."""
+    prune = tp.TalkPrune()
+    _chat(prune, tp.TRIM_AT - 3, notes=(1,))
+    assert prune.trim_point() is None  # under TRIM_AT
+    prune = tp.TalkPrune()
+    users = _chat(prune, tp.TRIM_AT - 2, notes=(2, 5))  # 8 turns and 2 notes: 10 user items
+    point = prune.trim_point()
+    assert point is not None and point != users[-1] and point in prune.heard
+    conn = Conn()
+    asyncio.run(prune.delete_before(conn, point, through=True))
+    assert len([i for i in prune.items if i in prune.users]) <= tp.TRIM_TO
+    assert users[-1] in prune.items
+    kept = list(prune.items)
+    assert all(i not in kept for i in conn.deleted)
+    # a turn the trim deletes is one at or before its point, which the companion's block holds
+    assert set(conn.deleted) <= set(users[: users.index(point) + 1]) | {f"a{n}" for n in range(10)}
+    assert all(int(i[1:]) < int(point[1:]) for i in conn.deleted if i.startswith("a"))
+
+
+def test_a_trim_never_takes_an_open_tool_pair_or_an_unheard_point() -> None:
+    prune = tp.TalkPrune()
+    _chat(prune, tp.TRIM_AT, owed_after=1)
+    point = prune.trim_point()
+    conn = Conn()
+    asyncio.run(prune.delete_before(conn, point, through=True))
+    assert "owed" not in conn.deleted and "c9" in prune.calls
+    prune = tp.TalkPrune()
+    for n in range(tp.TRIM_AT):
+        prune.seen(_item(f"note{n}"))  # notes only: the companion has no turn to bound at
+    assert prune.trim_point() is None

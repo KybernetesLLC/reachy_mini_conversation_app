@@ -569,11 +569,12 @@ class LocalStream:
         "thought_done": "ready",  # a written reply has no transcript.done (Thought.tla ReadyAtDone)
     }
 
-    def _dispatch_session(self, state: str, item_id: str | None = None) -> None:
+    def _dispatch_session(self, state: str, item_id: str | None = None, why: str | None = None) -> None:
         """Push a conversation.realtime notification: a new realtime session ("started"), with
         when the handler read the companion's block for it, when it says (11-07); or the
         backend's drop of older history in it ("context_dropped", route all rule 9), with that
-        session's mark and the latest heard user item, for the companion to bound the block."""
+        session's mark and the latest heard user item, for the companion to bound the block; or
+        the app's own trim, the same report with `why` "trim" and the trim point's item."""
         params: dict[str, Any] = {"state": state}
         if state == "started":
             self._last_turn_state = None  # the last session's state must not outlive it
@@ -583,6 +584,8 @@ class LocalStream:
                 params["memory_read_at"] = float(read)
         if state == "context_dropped":
             params["item_id"] = item_id
+            if why:
+                params["why"] = why
         if self._rpc is not None:
             self._rpc.broadcast_threadsafe("conversation.realtime", params)
 

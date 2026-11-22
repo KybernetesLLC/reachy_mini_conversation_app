@@ -16,6 +16,13 @@ or none named), the cut falls back to S's time: the items that arrived LAG_S bef
 round-6 review, item 4). A tool call goes only with its output: a call whose output is still
 owed is never deleted, or the backend refuses the output (item 1). Ids and counts only are
 logged.
+
+The trim (the owner's decision, 11-22): the backend compacts a chat on its own once it holds
+chat_size user items, and S then covers turns it has already summarised. So the app trims first.
+When the ledger holds TRIM_AT user items (notes count), the oldest go down to TRIM_TO, by rule
+9's sequence started on purpose: the companion is told the trim point (a heard user turn's item),
+bounds the block there and re-sends it, and the deletes go only after the write that carries it
+(instructions_writer). The latest user turn and a pending tool call are never trimmed.
 """
 
 from __future__ import annotations
@@ -30,6 +37,10 @@ logger = logging.getLogger(__name__)
 
 LEDGER_MAX = 2000
 LAG_S = 60.0  # the time cut: an item arrives before its transcript is stamped
+# The trim: the hosted backend's chat_size is not known (about 14, estimated; its default is 10 at
+# the backend source at SV:370), so the trim starts at 10 user items and leaves 6.
+TRIM_AT = 10
+TRIM_TO = 6
 
 
 class TalkPrune:
@@ -39,6 +50,8 @@ class TalkPrune:
         """Start with an empty ledger."""
         self._order = itertools.count()
         self.items: OrderedDict[str, tuple[int, float]] = OrderedDict()  # (order, wall time)
+        self.users: set[str] = set()  # the user-role items among them (notes count)
+        self.heard: set[str] = set()  # user items whose transcript was heard (the companion has it)
         # a tool call and its output by call_id: [(item id, (order, wall)) of call, of output]
         self.calls: OrderedDict[str, list] = OrderedDict()
 
@@ -59,12 +72,39 @@ class TalkPrune:
             return  # instructions stay
         if item_id and item_id not in self.items:
             self.items[item_id] = stamp
+            if getattr(item, "role", None) == "user":
+                self.users.add(item_id)
             while len(self.items) > LEDGER_MAX:
-                self.items.popitem(last=False)
+                self._drop(self.items.popitem(last=False)[0])
+
+    def _drop(self, item_id: str) -> None:
+        self.items.pop(item_id, None)
+        self.users.discard(item_id)
+        self.heard.discard(item_id)
+
+    def mark_heard(self, item_id: str | None) -> None:
+        """Note a user item whose transcript was heard: the companion holds its turn."""
+        if item_id and item_id in self.items:
+            self.heard.add(item_id)
+
+    def trim_point(self) -> str | None:
+        """Return the heard user item to trim through, once the chat holds TRIM_AT user items.
+
+        The first heard user turn at or after the one that leaves TRIM_TO, never the latest user
+        item; None when the count is under TRIM_AT or no such turn is heard yet.
+        """
+        users = [i for i in self.items if i in self.users]
+        if len(users) < TRIM_AT:
+            return None
+        need = len(users) - TRIM_TO  # this many of the oldest go
+        for i in users[need - 1 : -1]:
+            if i in self.heard:
+                return i
+        return None
 
     def forget(self, item_id: str) -> None:
         """Drop an item deleted elsewhere (a leaked reply's scrub): never deleted again here."""
-        self.items.pop(item_id, None)
+        self._drop(item_id)
 
     def reset(self) -> None:
         """Start again for a new session: nothing of the last one is in its conversation."""
@@ -97,7 +137,7 @@ class TalkPrune:
             return 0
         old = [i for i, stamp in self.items.items() if before(stamp, own=True)]
         for i in old:
-            self.items.pop(i, None)
+            self._drop(i)
             await conn.conversation.item.delete(item_id=i)
         # a call whose output is owed has no output here: it stays (the backend would refuse it)
         pairs = [c for c, (call, out) in self.calls.items()

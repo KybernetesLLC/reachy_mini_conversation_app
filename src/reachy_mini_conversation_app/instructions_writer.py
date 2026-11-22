@@ -243,6 +243,10 @@ class InstructionsWriter:
         """Note a reported drop's item (rule 9): its items go after the block naming it."""
         self._drop = item
 
+    def drop_pending(self) -> bool:
+        """Return whether a reported drop or trim waits for its block."""
+        return self._drop is not None
+
     def want(self, why: str) -> None:
         """Batch a send asked for from outside (a session opened on a live connection)."""
         if self.view is not None:

@@ -4895,6 +4895,34 @@ async def test_a_drop_is_reported_with_the_latest_heard_item_and_sends_nothing_i
     handler.connection.session.update.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_a_trim_reports_its_point_and_deletes_nothing_before_its_block() -> None:
+    """The owner's trim (11-22), rule 9's sequence on purpose: at TRIM_AT user items the
+    companion is told the trim point; nothing is deleted until the block naming it is written;
+    one trim at a time."""
+    from reachy_mini_conversation_app import talk_prune as tp
+
+    handler = _handler()
+    deletes = AsyncMock()
+    handler.connection = SimpleNamespace(
+        session=SimpleNamespace(update=AsyncMock()),
+        conversation=SimpleNamespace(item=SimpleNamespace(delete=deletes)),
+    )
+    reports: list = []
+    handler.set_session_observer(lambda state, **kw: reports.append((state, kw)))
+    for n in range(tp.TRIM_AT):
+        handler._prune.seen(SimpleNamespace(id=f"u{n}", type="message", role="user"))
+        handler._prune.mark_heard(f"u{n}")
+        handler._maybe_trim()
+    point = f"u{tp.TRIM_AT - tp.TRIM_TO - 1}"
+    assert reports == [("context_dropped", {"item_id": point, "why": "trim"})]
+    assert handler._writer._drop == point
+    handler._prune.seen(SimpleNamespace(id="u99", type="message", role="user"))
+    handler._maybe_trim()
+    assert len(reports) == 1  # one at a time
+    deletes.assert_not_awaited()
+
+
 def _handler():
     return HuggingFaceRealtimeHandler(
         ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())

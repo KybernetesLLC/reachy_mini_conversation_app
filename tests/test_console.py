@@ -4557,6 +4557,8 @@ def test_a_context_drop_is_reported_with_its_session_and_the_latest_heard_item()
     assert sent == [
         ("conversation.realtime", {"state": "context_dropped", "memory_read_at": 1234.5, "item_id": "item_9"})
     ]
+    stream._dispatch_session("context_dropped", item_id="item_3", why="trim")
+    assert sent[-1][1] == {"state": "context_dropped", "memory_read_at": 1234.5, "item_id": "item_3", "why": "trim"}
 
 
 def test_a_new_session_forgets_the_last_turn_state() -> None:
