@@ -6469,7 +6469,7 @@ async def test_a_thoughts_reply_is_asked_out_of_band_in_writing_with_the_room_in
 
 @pytest.mark.asyncio
 async def test_a_thoughts_reply_is_reported_noted_and_never_spoken(monkeypatch: Any) -> None:
-    """Reported after the gate, then in the thought record he is told (no system item); lines carry its id."""
+    """Reported after the gate; the app keeps no record of it (the companion's messages part, Unit 6); lines carry its id."""
     handler, sent, replies = _thought_session(monkeypatch, "Yes, a big one!", _thought_response())
     reasons: list[str] = []
     handler.set_activity_observer(lambda reason, **_kw: reasons.append(reason))
@@ -6480,9 +6480,8 @@ async def test_a_thoughts_reply_is_reported_noted_and_never_spoken(monkeypatch: 
 
     assert replies == [("discord:1", "Yes, a big one!", None)]
     assert [payload for kind, payload in sent if kind == "item"] == []  # route all: no system slot
-    assert handler._writer.view.thoughts == (
-        "(a thought from Hadley, answered) did you see the boat? / (your reply) Yes, a big one!",
-    )
+    assert handler._writer.view.messages == ()  # the app builds no record of its own
+    assert not hasattr(handler._writer, "add_thought")
     assert lines == [
         ("user", "(a thought from Hadley) did you see the boat?", True, None, {"thought": "discord:1"}),
         ("assistant", "Yes, a big one!", True, None, {"thought": "discord:1"}),

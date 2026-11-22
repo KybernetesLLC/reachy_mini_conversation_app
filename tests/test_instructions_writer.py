@@ -18,6 +18,7 @@ from reachy_mini_conversation_app import instructions_writer as iw
 SESSION = 5.0
 S1 = {"version": 10.0, "row": 2, "up_to": 1000.0, "text": "Alli asked about ferries.", "cut": "u2"}
 S2 = {"version": 20.0, "row": 4, "up_to": 2000.0, "text": "Then about the bus.", "cut": "u3"}
+HI = "(a thought from Alli, answered) hi / (your reply) hello"
 
 
 class Conn:
@@ -83,7 +84,7 @@ def test_the_composition_is_the_stable_base_then_the_parts() -> None:
     text = iw.compose(view)
     assert text.startswith("BASE\n\n## Your memory\nturns\n\n")
     assert f"{iw.S_HEADING}\nAlli asked about ferries." in text
-    assert text.endswith(f"{iw.THOUGHTS_HEADING}\n(a thought from Alli, answered) hi / (your reply) hello")
+    assert text.endswith(f"{iw.MESSAGES_HEADING}\n(a thought from Alli, answered) hi / (your reply) hello")
 
 
 @pytest.mark.asyncio
@@ -199,7 +200,7 @@ async def test_a_done_write_and_a_batched_write_never_reset_the_drop_measure() -
     catch-up, the S join) starts the measure again, or a drop would never be seen."""
     writer, conn, _, measured = _writer(batch_s=0.01)
     await _open(writer, conn)
-    writer.add_thought("(a thought from Alli, answered) hi / (your reply) hello")
+    writer.parts_changed({"messages": _part("messages", 2, [HI], session=None)})
     await asyncio.sleep(0.05)  # the batch
     writer.parts_changed({"block": _block(2, "## Your memory\nmood changed")})
     await writer.at_done()
@@ -303,3 +304,75 @@ def test_a_reported_drop_with_no_block_is_let_go() -> None:
     assert writer.drop_pending()
     clock["t"] = iw.DROP_WAIT_S + 1
     assert not writer.drop_pending() and writer._drop is None
+
+
+# --- Unit 6: the recent text messages part --------------------------------------------------
+
+
+def _messages(version: int, lines: list[str] | None) -> SimpleNamespace:
+    return _part("messages", version, lines, session=None)
+
+
+@pytest.mark.asyncio
+async def test_the_messages_part_is_in_the_composition_batched_and_never_in_the_slot() -> None:
+    """An answered message is the companion's part, batched, in the instructions, never an item."""
+    writer, conn, _, measured = _writer(batch_s=0.01)
+    await _open(writer, conn)
+    writer.parts_changed({"messages": _messages(2, [HI])})
+    await _settle()
+    assert conn.wire == []  # batched, not at once
+    await asyncio.sleep(0.05)
+    assert [k for k, _ in conn.wire] == ["update"] and measured == []
+    assert conn.wire[0][1].endswith(f"{iw.MESSAGES_HEADING}\n{HI}")
+
+
+@pytest.mark.asyncio
+async def test_the_messages_part_survives_a_reconnects_snapshot_and_a_new_session() -> None:
+    """A snapshot keeps the part, and a new session's composition holds it (the talk's part)."""
+    from reachy_mini_conversation_app import parts as parts_mod
+
+    record = parts_mod.Parts(held={})
+    wire = {"name": "messages", "version": 3, "value": [HI], "session": None, "expires_at": None}
+    record, _, _ = parts_mod.apply(record, {"epoch": "e1", "snapshot": False, "parts": [wire]})
+    record, _, _ = parts_mod.apply(record, {"epoch": "e1", "snapshot": True, "version": 3, "parts": [wire]})
+    assert record.held["messages"].value == [HI]
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn)
+    text = writer.connect(SESSION + 1, "BASE", "## Your memory\nold turns", {"top": 1}, dict(record.held))
+    assert text.endswith(f"{iw.MESSAGES_HEADING}\n{HI}")
+
+
+@pytest.mark.asyncio
+async def test_a_forget_clears_the_messages_at_once() -> None:
+    """A clear (a forget, the talk's end) goes at once, as S's does (ClearedGone)."""
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn, held={"messages": _messages(2, [HI])})
+    assert HI in writer.sent
+    writer.parts_changed({"messages": _messages(3, None)})
+    await _settle()
+    assert [k for k, _ in conn.wire] == ["update"] and HI not in conn.wire[0][1]
+    assert iw.MESSAGES_HEADING not in conn.wire[0][1]
+
+
+def test_an_older_messages_version_is_ignored() -> None:
+    """A late resend of an older version, after the clear, never brings the lines back."""
+    from reachy_mini_conversation_app import parts as parts_mod
+
+    def wire(version: int, value: object) -> dict:
+        return {"name": "messages", "version": version, "value": value, "session": None, "expires_at": None}
+
+    record, _, _ = parts_mod.apply(
+        parts_mod.Parts(held={}), {"epoch": "e1", "snapshot": True, "version": 4, "parts": [wire(4, None)]}
+    )
+    record, _, changes = parts_mod.apply(record, {"epoch": "e1", "snapshot": False, "parts": [wire(3, [HI])]})
+    assert changes == ["messages v3 ignored (older)"]
+    block = iw.Block("", 0, None, None, 0, 0.0)
+    view, urgent = iw.take(iw.View("BASE", SESSION, block, None, 0.0), dict(record.held), 0.0)
+    assert view.messages == () and HI not in iw.compose(view)
+
+
+def test_the_writer_builds_no_record_of_its_own() -> None:
+    """The thought record retired (Unit 6): the writer has no way to add a line itself."""
+    writer, _, _, _ = _writer()
+    assert not hasattr(writer, "add_thought")
+    assert not hasattr(iw, "THOUGHTS_MAX")

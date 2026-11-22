@@ -1824,10 +1824,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._emit_transcript("user", line, True, thought=thought_id)
         if reply:
             self._emit_transcript("assistant", reply, True, thought=thought_id)
-        pictures = f" with {thought.images} picture(s)" if thought.images else ""
-        note = f"(a thought from {thought.sender}{pictures}, answered) {thought.text} / (your reply) {reply or '(none)'}"
-        # A part of his instructions the app builds itself, never a system item (route all, Unit 4).
-        self._writer.add_thought(note)
+        # He is told the thought and his reply by the companion's "messages" part (route all,
+        # Unit 6), built from the reply reported above; the app keeps no record of its own.
 
     def open_settled(self) -> None:
         """Start the greeting's hold: the console has finished this open, its pre-roll sent."""
