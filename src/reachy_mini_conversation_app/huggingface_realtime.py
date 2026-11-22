@@ -33,7 +33,7 @@ from openai.types.realtime.realtime_audio_input_turn_detection_param import Serv
 
 from reachy_mini_conversation_app.tools import camera as camera_tool
 from reachy_mini_conversation_app.tools import core_tools
-from reachy_mini_conversation_app import companion, talk_prune
+from reachy_mini_conversation_app import companion, talk_prune, instructions_writer
 from reachy_mini_conversation_app import wire_log
 from reachy_mini_conversation_app.utils import b64_size
 from reachy_mini_conversation_app.config import (
@@ -47,8 +47,9 @@ from reachy_mini_conversation_app.config import (
 )
 from reachy_mini_conversation_app.prompts import (
     get_session_voice,
-    get_session_instructions,
+    read_session_block,
     get_thought_instructions,
+    get_profile_instructions,
     get_session_greeting_prompt,
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
@@ -264,6 +265,11 @@ GREETING_SETTLE_WAIT_S = 2.0
 # The greeting is its own out-of-band response, tagged, so nothing of it stays in the
 # conversation to be answered late. Re-checked at send; cancelled if the person starts.
 GREETING_TAG = {"companion": "greeting"}
+# The missed-call nudge is its own in-band reply (route all, rule 7): its create carries the
+# session's instructions plus MISSED_CALL_NOTE as response.instructions, built at each send
+# attempt, so no system item is written and no later reply reads the note. Tagged like the
+# greeting so a merge of plain creates (_requeue) never drops it.
+NUDGE_TAG = {"companion": "nudge"}
 
 
 def _out_of_band_request(
@@ -356,7 +362,7 @@ def usage_line(usage: Any, *, images: int, image_bytes: int) -> str | None:
 # for word, so the instructions are sent again; a drop is a fall of more than this from the
 # peak since the instructions went to within it of the least since (the bare session's, an
 # opening glance's image never counted in it).
-CONTEXT_DROP_TOKENS = 1500
+CONTEXT_DROP_TOKENS = 600  # 11-14: the largest fall not a compaction 365, the least compaction 861
 
 
 def context_dropped(base: int | None, peak: int | None, tokens: int) -> bool:
@@ -370,6 +376,17 @@ def _companion_tag(event: Any) -> str | None:
     """Return the companion tag of a response.created/done event's response, if any."""
     metadata = getattr(getattr(event, "response", None), "metadata", None)
     return metadata.get("companion") if isinstance(metadata, dict) else None
+
+
+def _band_tag(event: Any) -> str | None:
+    """Return the tag of an out-of-band response; None for his replies and the nudge's, both in-band."""
+    tag = _companion_tag(event)
+    return None if tag == NUDGE_TAG["companion"] else tag
+
+
+def _is_nudge(create: dict[str, Any]) -> bool:
+    """Return whether a queued response.create's kwargs are the missed-call nudge's."""
+    return (create.get("response") or {}).get("metadata") == NUDGE_TAG
 
 
 # The audio cut (2026-10-16): the output gate (output_gate.py) judges each reply's
@@ -481,7 +498,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._voice_override: str | None = self._normalize_startup_voice(startup_voice)
         self._realtime_connect_query: dict[str, str] = {}
         self._prune = talk_prune.TalkPrune()  # the companion's context budget (11-04)
-        self._prune_task: asyncio.Task | None = None
+        # The writer of his instructions (route all, Unit 4): their only sender. The parts it
+        # composes are the console's record (parts.py), read through `parts_source`.
+        self._writer = instructions_writer.InstructionsWriter(
+            self._prune, connection=lambda: self.connection, on_sent=self._instructions_landed
+        )
+        self.parts_source: Callable[[], Any] | None = None
+        # The latest user item whose transcript was heard: a drop's report names it (rule 9).
+        self._heard_item: str | None = None
 
         # Debouncing for partial transcripts
         self.partial_transcript_task: asyncio.Task[None] | None = None
@@ -566,12 +590,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._session_images = 0
         self._usage_missing_logged = False
         # The in-band input tokens since the instructions were sent: the least and the most
-        # (context_dropped); the instructions sent, and a wish to send them again with why.
+        # (context_dropped).
         self._ctx_base: int | None = None
         self._ctx_peak: int | None = None
-        self._instructions_sent: str | None = None
-        self._instructions_wanted: str | None = None
-        self._instructions_task: asyncio.Task[None] | None = None
+        self._ctx_skip = False  # a reply in flight at a reset read the chat before it
         self._session_image_bytes = 0
         self._session_creates = 0
         self._open_glance_at: float | None = None
@@ -672,9 +694,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     ) -> RealtimeSessionCreateRequestParam:
         """Return the Hugging Face OpenAI-compatible session config."""
         self.memory_read_at = time.monotonic()  # taken before the read: never after it
+        text, header = read_session_block()  # unbounded, naming its S (route all, rule 4)
+        instructions = self._writer.connect(
+            self.memory_read_at, get_profile_instructions(), text, header, self._held_parts()
+        )
         return RealtimeSessionCreateRequestParam(
             type="realtime",
-            instructions=get_session_instructions(self.instance_path),
+            instructions=instructions,
             audio=RealtimeAudioConfigParam(
                 input=RealtimeAudioConfigInputParam(
                     # The OpenAI SDK type only includes 24 kHz PCM, but the HF
@@ -1077,7 +1103,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         Judged from the response's own text, so a reply with no transcript.done is scrubbed too.
         Ids only are logged."""
         conn = self.connection
-        if conn is None or _companion_tag(event) is not None:
+        if conn is None or _band_tag(event) is not None:
             return
         text = self._gate_text or ""
         marked = text and (
@@ -1248,18 +1274,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         logger.warning("missed tool call: %r", text)
         if not self.connection:
             return False
-        try:
-            await self.connection.conversation.item.create(
-                item={
-                    "type": "message",
-                    "role": "system",
-                    "content": [{"type": "input_text", "text": MISSED_CALL_NOTE}],
-                },
-            )
-        except Exception as e:
-            logger.warning("the missed-call note could not be added (%s)", e)
-            return False
-        await self._safe_response_create()
+        # Its own reply; the instructions are built at the send (_response_sender_loop).
+        await self._safe_response_create(response={"metadata": dict(NUDGE_TAG)})
         return True
 
     async def _tool_started(self, tool_name: str, call_id: str) -> None:
@@ -1525,6 +1541,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         tokens = getattr(usage, "input_tokens", None)
         if not isinstance(tokens, int) or tokens <= 0:
             return False
+        if self._ctx_skip:  # created before the write or its deletes: not this chat's size
+            self._ctx_skip = False
+            return False
         if self._ctx_base is None or self._ctx_peak is None:
             self._ctx_base = self._ctx_peak = tokens
             return False
@@ -1540,74 +1559,57 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._ctx_peak = max(self._ctx_peak, tokens)
         return False
 
-    async def _prune_now(self) -> None:
-        """The talk kept small (talk_prune): never a failure of the reply."""
-        try:
-            summary = await asyncio.to_thread(talk_prune.read_summary)
-            if self.connection is not None:
-                await self._prune.apply(self.connection, summary)
-        except Exception:
-            logger.exception("Talk prune: not applied")
+    def _held_parts(self) -> dict[str, Any]:
+        """The companion's parts as the console holds them (parts.py), or none."""
+        source = self.parts_source
+        record = source() if callable(source) else None
+        return dict(getattr(record, "held", None) or {})
+
+    def parts_changed(self, record: Any) -> None:
+        """The console took a conversation.parts message (on the handler's loop)."""
+        self._writer.parts_changed(dict(getattr(record, "held", None) or {}))
 
     def want_instructions(self, why: str) -> None:
-        self._instructions_wanted = why
+        self._writer.want(why)
+
+    def _instructions_landed(self) -> None:
+        """The writer sent his instructions, or deleted items: the measure starts afresh.
+
+        A reply already in flight read the chat as it was before, so its end is not measured
+        (a trim's deletes would otherwise show as a drop at the next reply).
+        """
+        self._ctx_base = self._ctx_peak = None
+        self._ctx_skip = not self._response_done_event.is_set()
 
     def _after_reply(self, usage: Any) -> None:
-        """At an in-band reply's end, on the handler's loop: the instructions go again when
-        wanted (a session opened on this connection, or a drop), one send at a time."""
+        """At an in-band reply's end, on the handler's loop, after the writer's done write: a
+        drop the reply's input shows is reported to the companion with the latest heard user
+        item (rule 9). The companion bounds the block there and re-sends it; the writer sends
+        it at once and then deletes the items through that one."""
         if self._watch_context(usage):
-            self._instructions_wanted = "the conversation was dropped"
             mark = getattr(self.connection, "wire_mark", None)  # the wire log's reader clears here
             if callable(mark):
                 mark("context.dropped", input_tokens=getattr(usage, "input_tokens", None))
-        if (
-            self._prune.due(time.monotonic())
-            and (self._prune_task is None or self._prune_task.done())
-            # never while a response.create waits for its answer: an error there wakes it
-            and self._response_started_or_rejected_event.is_set()
-        ):
-            self._prune_task = asyncio.create_task(self._prune_now())
-        why = self._instructions_wanted
-        if why is None or (
-            self._instructions_task is not None and not self._instructions_task.done()
-        ):
-            return
-        self._instructions_wanted = None
-        self._instructions_task = asyncio.create_task(self.refresh_instructions(why))
+            self._writer.report_drop(self._heard_item)
+            self._notify_session("context_dropped", item_id=self._heard_item)
 
-    async def refresh_instructions(self, why: str) -> None:
-        """Send the session's instructions again, the companion's memory block re-read (off the
-        loop), when they changed since they were last sent (10-29: the second of two
-        back-to-back sessions kept the instructions sent before the first one's words).
+    def _maybe_trim(self) -> None:
+        """Trim the chat before the backend compacts it (talk_prune.TRIM_AT, the owner 11-22).
+
+        Rule 9's sequence started on purpose: the companion is told the trim point, bounds the
+        block there and re-sends it; the writer deletes through it only after that write. One at
+        a time: nothing starts while a drop or trim waits for its block.
         """
-        connection = self.connection
-        if connection is None:
+        if self.connection is None or self._writer.drop_pending():
             return
-        try:
-            instructions = await asyncio.to_thread(
-                get_session_instructions, self.instance_path
-            )
-            if instructions == self._instructions_sent:
-                logger.debug("Instructions unchanged (%s): not sent again", why)
-                return
-            await self._send_instructions(connection, instructions)
-        except Exception as exc:
-            logger.warning("Instructions not sent again (%s): %s", why, exc)
+        item = self._prune.trim_point()
+        if item is None:
             return
-        if connection is self.connection:
-            self._ctx_base = self._ctx_peak = None  # the next reply measures afresh
-        # with tokens at 3.5 chars each: drops have come at 14.4k-22k input tokens (11-03)
-        logger.info("Instructions sent again (%s): %d chars, about %d tokens",
-                    why, len(instructions), round(len(instructions) / 3.5))  # fmt: skip
-
-    async def _send_instructions(self, connection: Any, instructions: str) -> None:
-        """The instructions alone, as a live session.update."""
-        await connection.session.update(
-            session=RealtimeSessionCreateRequestParam(
-                type="realtime", instructions=instructions
-            )
-        )
-        self._instructions_sent = instructions
+        logger.info("Talk prune: %d user items in the chat; trimming to %d",
+                    len([i for i in self._prune.items if i in self._prune.users]),
+                    talk_prune.TRIM_TO)  # fmt: skip
+        self._writer.report_drop(item)
+        self._notify_session("context_dropped", item_id=item, why="trim")
 
     def _count_image(self, b64_jpeg: str) -> None:
         self._session_images += 1
@@ -1824,26 +1826,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._emit_transcript("assistant", reply, True, thought=thought_id)
         pictures = f" with {thought.images} picture(s)" if thought.images else ""
         note = f"(a thought from {thought.sender}{pictures}, answered) {thought.text} / (your reply) {reply or '(none)'}"
-        if self.connection is not None:
-            await self._send_system_note(note, self.connection)
-
-    async def _send_system_note(self, text: str, session: "AsyncRealtimeConnection") -> bool:
-        """Add a system item with no response: an answered thought, which the backend does not act on."""
-        # The companion's probe, 11-12: this form led to no tool call in 3 sessions; the same
-        # text as a user item led to one in 3 of 3 (Thought.tla AppendNote).
-        if self.connection is not session:
-            return self._note_dropped("session changed")
-        try:
-            await session.conversation.item.create(
-                item={
-                    "type": "message",
-                    "role": "system",
-                    "content": [{"type": "input_text", "text": text}],
-                },
-            )
-        except Exception as exc:
-            return self._note_dropped(str(exc))
-        return True
+        # A part of his instructions the app builds itself, never a system item (route all, Unit 4).
+        self._writer.add_thought(note)
 
     def open_settled(self) -> None:
         """Start the greeting's hold: the console has finished this open, its pre-roll sent."""
@@ -1901,6 +1885,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             except Exception as e:
                 logger.debug("could not cancel the greeting's response (%s)", e)
 
+    def _with_nudge_instructions(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the create to send: for the nudge, the instructions last sent plus the note.
+
+        None drops the nudge: with no instructions composed yet, it would replace them with the note alone.
+
+        Built at every send attempt (ConvoAll Ffrozen: a retry sent the copy made at the queue).
+        response.instructions replaces the session's for that reply only, so it carries them all.
+        """
+        if not _is_nudge(kwargs):
+            return kwargs
+        base = self._writer.current()
+        if base is None:
+            logger.warning("missed-call nudge dropped: no instructions sent yet")
+            return None
+        return {**kwargs, "response": {**kwargs["response"], "instructions": f"{base}\n\n{MISSED_CALL_NOTE}"}}
+
     async def _response_sender_loop(self) -> None:
         """Dedicated worker that sends ``response.create()`` calls serially.
 
@@ -1923,12 +1923,17 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             # Parallel tool calls enqueue duplicate empty requests; coalesce to one.
             # An announcement is never merged: it keeps its place in the queue.
             # A thought's reply is never merged either: it is out of band, and dropped it would
-            # never be answered (the companion's model, Thought.tla KeepTagged).
+            # never be answered (the companion's model, Thought.tla KeepTagged). Nor is the nudge's
+            # (ConvoAll NudgeGoes).
             if not kwargs:
                 self._requeue(
                     lambda queued: bool(queued.get(_ANNOUNCEMENT))
                     or _thought_id(queued) is not None
+                    or _is_nudge(queued)
                 )
+            elif _is_nudge(kwargs):
+                # The nudge's reply answers a plain create queued behind it: they merge.
+                self._requeue(bool)
             announcement: str | None = kwargs.pop(_ANNOUNCEMENT, None)
             announcement_added = False
 
@@ -1936,7 +1941,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             max_retries = 5
             attempts = 0
             while not sent and self.connection and attempts < max_retries:
-                if await self._wait_for_owed_outputs(kwargs) and not kwargs:
+                released = await self._wait_for_owed_outputs(kwargs)
+                if released and _is_nudge(kwargs):
+                    # The tool's follow-up, queued while the nudge was held, merges into it.
+                    self._requeue(bool)
+                if released and not kwargs:
                     # Released behind a tool: the tool's plain follow-up, queued just
                     # before the release, merges with a plain create. An announcement
                     # lets that follow-up answer first, then goes as its own reply.
@@ -1988,14 +1997,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     self._greeting_live = True
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
+                to_send = self._with_nudge_instructions(kwargs)  # at this attempt, never at the queue
+                if to_send is None:
+                    break
                 try:
-                    await self.connection.response.create(**kwargs)
+                    await self.connection.response.create(**to_send)
                     self._session_creates += 1
                     # 2026-10-21 16:51: a tool's follow-up after a say was never answered, and
                     # these steps logged only at debug. One line per create sent.
                     if kwargs.get("response", {}).get("conversation") == "none":
                         # out of band: never a follow-up (the review of eea54bb)
                         kind = "thought" if _thought_id(kwargs) else "filler"
+                    elif _is_nudge(kwargs):
+                        kind = "nudge"
                     elif announcement_added:
                         kind = "announcement"
                     else:
@@ -2289,8 +2303,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         ) as conn:
             try:
                 session_config = self._get_session_config(tool_specs)
-                await conn.session.update(session=session_config)
-                self._instructions_sent = session_config.get("instructions")
+                await self._writer.open(conn, session_config)  # its first write
                 logger.info(
                     "Realtime session initialized with profile=%r voice=%r",
                     getattr(config, "REACHY_MINI_CUSTOM_PROFILE", None),
@@ -2338,7 +2351,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 False  # each session says once whether usage comes
             )
             self._ctx_base = self._ctx_peak = None
-            self._instructions_wanted = None  # a new connection sends them fresh
+            self._ctx_skip = False
+            self._heard_item = None
             self._open_glance_at = self._first_reply_at = None
             # A turn left open by the session before is not this session's first turn
             # (the review: its greeting would be judged as the first reply).
@@ -2369,8 +2383,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
-                    if event.type in ("conversation.item.created", "conversation.item.added"):
+                    # his replies and tool calls come only as response.output_item.added (the
+                    # backend at ff4aec3; 11-14: 164 messages, 25 calls, none by item.created)
+                    if event.type in (
+                        "conversation.item.created",
+                        "conversation.item.added",
+                        "response.output_item.added",
+                    ):
                         self._prune.seen(getattr(event, "item", None))
+                        self._maybe_trim()
                     if event.type == "input_audio_buffer.speech_started":
                         self._spoke_since_open = True
                         self._new_user_turn()
@@ -2434,7 +2455,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._cut_mid_reply = (
                             False  # answered: an empty turn asks for no other reply
                         )
-                        if self._followup_pending and _companion_tag(event) is None:
+                        if self._followup_pending and _band_tag(event) is None:
                             self._followup_pending, self._followup_live = False, True
                         self._response_started()
                         self._gate_start()
@@ -2479,9 +2500,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         # Doesn't mean the audio is done playing
                         # Resume tracking for responses that emit no audio (text-only / tool-only).
                         self.deps.movement_manager.set_speaking(False)
+                        if _band_tag(event) is None:
+                            # Rule 2: the done write goes before the done event, so the next
+                            # create cannot go ahead of it. The nudge's done is a reply's done.
+                            await self._writer.at_done()
                         self._response_done_event.set()
                         self._response_started_or_rejected_event.set()
-                        if _companion_tag(event) is None:
+                        if _band_tag(event) is None:
                             self._followup_live = False
                         elif _companion_tag(event) == GREETING_TAG["companion"]:
                             self._greeting_live = False
@@ -2496,7 +2521,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             # A reply with no audio (tool-only): the companion's say waits on
                             # a transcript, so it learns at once that none is coming.
                             self._mark_activity("response_done_silent")
-                        if _companion_tag(event) is None:
+                        if _band_tag(event) is None:
                             self._after_reply(usage)
                         if not self._gate_transcript_done and (
                             self._gate_text or self._gate_had_audio
@@ -2591,6 +2616,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 await self._safe_response_create()
                             continue
                         self._cut_mid_reply = False
+                        self._heard_item = getattr(event, "item_id", None) or self._heard_item
+                        self._prune.mark_heard(getattr(event, "item_id", None))
 
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None
@@ -2611,6 +2638,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             True,
                             item_id=getattr(event, "item_id", None),
                         )
+                        # after the transcript: the companion holds the turn before the report
+                        self._maybe_trim()
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.delta":

@@ -1,8 +1,10 @@
 """Resolve active profile prompts and voice settings."""
 
 import os
+import json
 import random
 import logging
+from typing import Any
 from pathlib import Path
 
 from reachy_mini_conversation_app.config import config, get_default_voice
@@ -71,19 +73,42 @@ def _profile_instructions() -> str:
     return instructions
 
 
-def get_session_instructions(instance_path: str | Path | None = None) -> str:
-    """Return instructions for the active profile with memory context."""
-    instructions = _profile_instructions()
-    memory_prompt = _companion_memory()
-    if memory_prompt:
-        return f"{memory_prompt}\n\n{instructions}"
-    return instructions
+def get_profile_instructions() -> str:
+    """Return the active profile's instructions, the stable base of his instructions.
+
+    Sent first (route all: the prompt cache), the companion's parts after it (instructions_writer).
+    """
+    return _profile_instructions()
+
+
+# The session file's first line (the companion's memory.SESSION_HEADER): the S it is cut at and
+# the highest turn row the write read, as JSON. Only the writer of his instructions reads it.
+SESSION_HEADER = "<!-- block "
+SESSION_HEADER_END = " -->"
+
+
+def read_session_block() -> tuple[str, dict[str, Any]]:
+    """Return the companion's session block as a session's open reads it: (block, header).
+
+    The header's fields are {} with none. Unbounded, with S's text in the header, since a new
+    session has no parts yet (the companion's ConvoAll round 6, rule 4).
+    """
+    raw = _companion_memory()
+    first, _, rest = raw.partition("\n")
+    if not (first.startswith(SESSION_HEADER) and first.endswith(SESSION_HEADER_END)):
+        return raw, {}
+    try:
+        header = json.loads(first[len(SESSION_HEADER) : -len(SESSION_HEADER_END)])
+    except ValueError:
+        logger.warning("The companion's session block header is not JSON: read without it")
+        return rest.strip(), {}
+    return rest.strip(), header if isinstance(header, dict) else {}
 
 
 def get_thought_instructions() -> str:
     """Return the instructions of a written reply to a thought.
 
-    The companion's thought block and the profile, as get_session_instructions joins them. With no
+    The companion's thought block, then the profile. With no
     thought block (unset, missing, unreadable or empty) the profile goes alone, never the session's
     block, which carries words that stay in the room.
     """

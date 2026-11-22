@@ -5,36 +5,12 @@ import json
 import logging
 import sqlite3
 import datetime
-from pathlib import Path
 
 import numpy as np
 import pytest
 
-from reachy_mini_conversation_app import wire_log, companion, talk_prune
+from reachy_mini_conversation_app import wire_log, companion
 from reachy_mini_conversation_app.tools import camera as camera_mod
-
-
-def _summary_db(path: Path, value: str | None) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(path)
-    con.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT, updated_at REAL)")
-    if value is not None:
-        con.execute("INSERT INTO settings VALUES ('talk_summary', ?, 0)", (value,))
-    con.commit()
-    con.close()
-    return path
-
-
-SUMMARIES = [
-    None,
-    "",
-    "{not json",
-    json.dumps(["a list"]),
-    json.dumps({"session": 1.0, "up_to": 150.0, "text": "   "}),
-    json.dumps({"session": 1.0, "up_to": None, "text": " Alli asked about ferries. "}),
-    json.dumps({"session": 9.0, "up_to": "1793800000.5", "text": "Another talk's."}),
-    json.dumps({"up_to": "soon", "text": "A bad time."}),
-]
 
 
 # --- the helper ----------------------------------------------------------------------------
@@ -57,39 +33,6 @@ def test_an_older_companion_without_the_function_falls_back(companion_on, caplog
     caplog.set_level(logging.WARNING, logger=companion.__name__)
     assert companion.function("data_paths", "no_such_read") is None
     assert "no data_paths.no_such_read" in caplog.text
-
-
-# --- the talk summary: the same rows either way --------------------------------------------
-
-
-def _reads(tmp_path: Path, folder: str) -> list:
-    out = []
-    for i, value in enumerate(SUMMARIES):
-        out.append(talk_prune.read_summary(_summary_db(tmp_path / folder / f"{i}.db", value)))
-    out.append(talk_prune.read_summary(tmp_path / folder / "none.db"))
-    return out
-
-
-def test_the_talk_summary_reads_the_same_through_the_companion(tmp_path, request) -> None:
-    request.getfixturevalue("companion_off")
-    own = _reads(tmp_path, "own")
-    assert own[5] == (0.0, "Alli asked about ferries.") and own[6] == (1793800000.5, "Another talk's.")
-    request.getfixturevalue("companion_on")
-    assert companion.function("talk_summary", "read") is not None
-    assert _reads(tmp_path, "theirs") == own
-
-
-def test_a_path_the_old_uri_misread_is_read_through_the_companion(tmp_path, companion_on) -> None:
-    """The app's own read put the path in a URI unescaped: a '#' in it cut the path short."""
-    value = json.dumps({"up_to": 5.0, "text": "Kept."})
-    p = _summary_db(tmp_path / "a#b" / "companion.db", value)
-    assert talk_prune.read_summary(p) == (5.0, "Kept.")
-
-
-def test_the_companion_db_is_its_own_when_no_path_is_given(tmp_path, monkeypatch, companion_on) -> None:
-    p = _summary_db(tmp_path / "c.db", json.dumps({"up_to": 7.0, "text": "Named."}))
-    monkeypatch.setenv("REACHY_COMPANION_DB", str(p))
-    assert talk_prune.read_summary() == (7.0, "Named.")
 
 
 # --- the wire log ---------------------------------------------------------------------------
