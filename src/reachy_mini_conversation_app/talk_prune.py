@@ -42,8 +42,13 @@ LAG_S = 60.0  # the time cut: an item arrives before its transcript is stamped
 # realtime pipeline passes on (s2s_pipeline.py:633); the 10 at api/openai_realtime/service.py:370
 # is only RealtimeService's own default. The lowest evidence for the hosted value: compactions at
 # about 14 user items on 11-14, while notes still counted. So the trim starts at 13, under that,
-# and leaves 6: at 10 down to 3 he kept about 3 exchanges and a fast talk trimmed every ~90 s. An
-# overnight measurement of chat_size will set both.
+# and leaves 6: at 10 down to 3 he kept about 3 exchanges and a fast talk trimmed every ~90 s.
+# The margin: the backend compacts once its user turns exceed chat_size, and every user item
+# counts, images and notes included (LLM/chat.py:374, :475-486). The trim's deletes wait for the
+# companion's block (up to instructions_writer.DROP_WAIT_S), and it needs a heard turn to cut at.
+# So at a hosted 14 the margin is about 2 user items (a turn and a glance), down from 5 at
+# TRIM_AT 10. The overnight measurement of chat_size sets both; if compactions show after the
+# deploy, go to 12.
 TRIM_AT = 13
 TRIM_TO = 6
 
