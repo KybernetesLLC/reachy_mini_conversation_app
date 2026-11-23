@@ -6,20 +6,23 @@ import reachy_mini_conversation_app.prompts as prompts_mod
 from reachy_mini_conversation_app.config import config
 
 
-def test_the_companions_memory_file_is_prepended_to_the_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Ensouled C3: the companion supervisor writes the memory block; the app prepends it."""
-    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", None)
+def test_the_companions_session_file_is_read_with_its_header(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route all, Unit 4: the read at a session's open takes the companion's file whole and its
+    first line apart, the S the block is cut at and its highest turn row (rule 4)."""
     block = tmp_path / "session-memory.md"
-    block.write_text("## Your memory\nThe plant is by my left antenna.\n")
+    header = '<!-- block {"top": 7, "s": {"version": 3.0, "row": 2, "text": "Ferries."}} -->'
+    block.write_text(header + "\n## Your memory\nThe plant is by my left antenna.\n")
     monkeypatch.setenv("REACHY_COMPANION_SESSION_MEMORY", str(block))
+    text, named = prompts_mod.read_session_block()
+    assert text == "## Your memory\nThe plant is by my left antenna."
+    assert named == {"top": 7, "s": {"version": 3.0, "row": 2, "text": "Ferries."}}
 
-    instructions = prompts_mod.get_session_instructions(instance_path=tmp_path)
-
-    assert instructions.startswith("## Your memory\nThe plant is by my left antenna.\n\n")
-    assert "## IDENTITY" in instructions
-
+    block.write_text("## Your memory\nNo header (an older companion).\n")
+    assert prompts_mod.read_session_block() == ("## Your memory\nNo header (an older companion).", {})
+    block.write_text("<!-- block {not json -->\n## Your memory\n")
+    assert prompts_mod.read_session_block() == ("## Your memory", {})
     block.unlink()  # no memories yet: no block
-    assert prompts_mod.get_session_instructions(instance_path=tmp_path) == prompts_mod._profile_instructions()
+    assert prompts_mod.read_session_block() == ("", {})
 
 
 def test_a_thought_with_no_thought_block_gets_the_profile_alone(

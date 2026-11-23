@@ -171,7 +171,7 @@ def _session_handler(
 ) -> HuggingFaceRealtimeHandler:
     """Build a handler wired to a fake realtime client yielding `events`, ready to run a session."""
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -216,7 +216,7 @@ def _report_payload(name: str) -> dict[str, Any]:
 async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> None:
     """Partial transcription snapshots should replace older snapshots for the same item."""
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden"
@@ -253,7 +253,7 @@ async def test_partial_transcription_uses_latest_snapshot(monkeypatch: Any) -> N
 async def test_parallel_tool_calls_trigger_single_response(monkeypatch: Any) -> None:
     """Parallel tool calls in one turn should yield one response, not one per completed tool."""
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden"
@@ -365,7 +365,7 @@ async def test_run_realtime_session_uses_default_voice_for_lb_allocated_sessions
 ) -> None:
     """Use the backend default speaker when no profile voice is selected for the hf LB."""
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -411,7 +411,7 @@ async def test_run_realtime_session_passes_allocated_session_query(
 ) -> None:
     """Hugging Face sessions must forward the allocated session token to the websocket connect call."""
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -435,7 +435,7 @@ async def test_run_realtime_session_passes_allocated_session_query(
 async def test_run_realtime_session_raises_the_receive_limit(monkeypatch: Any) -> None:
     """The server echoes image data URLs back; 1 MiB (the websockets default) closed with 1009."""
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -1479,7 +1479,7 @@ async def test_handler_reopens_a_session_after_shutdown(monkeypatch: Any) -> Non
     _shutdown_active_handler's callers always rebuild. This pins it down.
     """
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -1568,7 +1568,7 @@ async def test_handler_reopens_a_session_after_closing_a_live_connection(
     next event -- the situation Task 3's close verb actually faces.
     """
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -1668,7 +1668,7 @@ def _greeting_handler(
     monkeypatch: Any,
 ) -> tuple[HuggingFaceRealtimeHandler, list[_ScriptedConn]]:
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -1774,11 +1774,11 @@ async def test_speech_between_the_silence_check_and_the_send_drops_the_greeting(
         hf_mod, "GREETING_SETTLE_WAIT_S", 10.0
     )  # the test drives the greeting
     task = await _connect(handler, greet=True)
-    handler._response_done_event.clear()  # something still in flight: the sender holds the create
+    handler._track_created("r0", in_band=True)  # in flight: the sender holds the create
     await handler._send_startup_greeting_prompt()  # silence held until now
     conns[0].push(_FakeEvent("input_audio_buffer.speech_started"))
     await asyncio.sleep(0.05)
-    handler._response_done_event.set()  # the sender may send now
+    handler._end_tracked("r0", real=True)  # the sender may send now
     await asyncio.sleep(0.1)
     assert not conns[0].greeted()
     conns[0].response.create.assert_not_awaited()
@@ -2481,9 +2481,9 @@ async def test_a_spoken_promise_with_no_call_is_caught_once(
     with caplog.at_level(logging.WARNING):
         assert await handler._response_finished(_done()) is True
     assert any("missed tool call" in r.getMessage() for r in caplog.records)
-    item = handler.connection.conversation.item.create.await_args.kwargs["item"]
-    assert item["role"] == "system" and "web_search" in item["content"][0]["text"]
+    handler.connection.conversation.item.create.assert_not_awaited()  # no system item (route all)
     assert create.await_count == 1
+    assert create.await_args.kwargs == {"response": {"metadata": hf_mod.NUDGE_TAG}}
     # The same turn: never again, never a loop.
     handler._response_started()
     handler._response_transcript("Yes, I'm looking it up for you now.")
@@ -2494,6 +2494,217 @@ async def test_a_spoken_promise_with_no_call_is_caught_once(
     handler._response_started()
     handler._response_transcript("Let me find out.")
     assert await handler._response_finished(_done()) is True
+
+
+def _compose_as(handler: HuggingFaceRealtimeHandler, base: str | None) -> None:
+    """Set the writer's composition to `base` alone (None: no session composed yet)."""
+    from reachy_mini_conversation_app import instructions_writer as iw
+
+    if base is None:
+        handler._writer.view = None
+        return
+    block = iw.Block("", 0, None, None, 0, 0.0)
+    handler._writer.view = iw.View(base, None, block, None, 0.0)
+
+
+async def _run_sender(handler: HuggingFaceRealtimeHandler, until: Any) -> None:
+    task = asyncio.create_task(handler._response_sender_loop())
+    for _ in range(200):
+        if until():
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def _sender_handler(monkeypatch: Any) -> tuple[HuggingFaceRealtimeHandler, list[dict[str, Any]]]:
+    """Build a handler whose connection records each response.create and answers it at once."""
+    monkeypatch.setattr(hf_mod, "_RESPONSE_REJECTION_RETRY_DELAY", 0)
+    handler = _plain_handler()
+    handler.connection = MagicMock()
+    handler.connection.conversation.item.create = AsyncMock()
+    handler.connection.session.update = AsyncMock()
+    _compose_as(handler, "BASE")
+    sent: list[dict[str, Any]] = []
+
+    async def _create(**kwargs: Any) -> None:
+        sent.append(kwargs)
+        handler._response_started_or_rejected_event.set()
+        handler._response_done_event.set()
+
+    handler.connection.response.create = AsyncMock(side_effect=_create)
+    return handler, sent
+
+
+@pytest.mark.asyncio
+async def test_the_nudge_writes_no_item_and_no_later_reply_reads_it(monkeypatch: Any) -> None:
+    """The nudge rides on its own create; the next create carries no instructions of its own."""
+    handler, sent = _sender_handler(monkeypatch)
+    handler._start_user_turn()
+    handler._response_started()
+    handler._response_transcript("Let me check.")
+    assert await handler._response_finished(_done()) is True
+    sender = asyncio.create_task(handler._response_sender_loop())
+    for _ in range(200):
+        if sent:
+            break
+        await asyncio.sleep(0.01)
+    await handler._safe_response_create()  # a later plain reply
+    for _ in range(200):
+        if len(sent) == 2:
+            break
+        await asyncio.sleep(0.01)
+    sender.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await sender
+
+    handler.connection.conversation.item.create.assert_not_awaited()
+    handler.connection.session.update.assert_not_awaited()
+    assert hf_mod.MISSED_CALL_NOTE in sent[0]["response"]["instructions"]
+    assert sent[0]["response"]["instructions"].startswith("BASE")
+    assert sent[0]["response"]["metadata"] == hf_mod.NUDGE_TAG
+    assert sent[1] == {}  # nothing of the nudge is in the later reply
+
+
+@pytest.mark.asyncio
+async def test_a_nudge_retry_carries_the_instructions_current_at_that_attempt(monkeypatch: Any) -> None:
+    """Ffrozen: the first attempt is rejected, the instructions change, the retry sends the new ones."""
+    handler, sent = _sender_handler(monkeypatch)
+    attempts: list[str] = []
+
+    async def _create(**kwargs: Any) -> None:
+        attempts.append(kwargs["response"]["instructions"])
+        if len(attempts) == 1:
+            handler._last_response_rejected = True
+            _compose_as(handler, "NEW")  # the composition changed before the retry
+        handler._response_started_or_rejected_event.set()
+        handler._response_done_event.set()
+
+    handler.connection.response.create = AsyncMock(side_effect=_create)
+    await handler._safe_response_create(response={"metadata": dict(hf_mod.NUDGE_TAG)})
+    await _run_sender(handler, lambda: len(attempts) == 2)
+
+    assert attempts == [f"BASE\n\n{hf_mod.MISSED_CALL_NOTE}", f"NEW\n\n{hf_mod.MISSED_CALL_NOTE}"]
+
+
+@pytest.mark.asyncio
+async def test_a_queued_nudge_survives_a_plain_creates_merge(monkeypatch: Any) -> None:
+    """NudgeGoes: the empty-create coalesce drops queued plain creates, never the nudge."""
+    handler, sent = _sender_handler(monkeypatch)
+    await handler._safe_response_create()
+    await handler._safe_response_create(response={"metadata": dict(hf_mod.NUDGE_TAG)})
+    await handler._safe_response_create()
+    await _run_sender(handler, lambda: len(sent) == 2 and handler._pending_responses.empty())
+
+    assert [hf_mod._is_nudge(c) for c in sent] == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_queued_behind_the_nudge_merges_into_it(monkeypatch: Any) -> None:
+    """A tool's plain follow-up queued while the nudge is held is not a second spoken reply."""
+    handler, sent = _sender_handler(monkeypatch)
+    released = iter([True])
+
+    async def _wait(kwargs: Any) -> bool:
+        if not hf_mod._is_nudge(kwargs):
+            return False
+        await handler._safe_response_create()  # F, queued behind N while its output was owed
+        return next(released, False)
+
+    monkeypatch.setattr(handler, "_wait_for_owed_outputs", _wait)
+    await handler._safe_response_create(response={"metadata": dict(hf_mod.NUDGE_TAG)})
+    await _run_sender(handler, lambda: len(sent) >= 1 and handler._pending_responses.empty())
+    await asyncio.sleep(0.1)
+
+    assert [hf_mod._is_nudge(c) for c in sent] == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_nudge_with_no_instructions_sent_is_dropped(monkeypatch: Any) -> None:
+    """With no instructions composed yet the nudge would replace them with the note alone: dropped."""
+    handler, sent = _sender_handler(monkeypatch)
+    _compose_as(handler, None)
+    await handler._safe_response_create(response={"metadata": dict(hf_mod.NUDGE_TAG)})
+    await _run_sender(handler, lambda: handler._pending_responses.empty())
+    await asyncio.sleep(0.05)
+    assert sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tag", "in_band"),
+    [(None, True), (hf_mod.NUDGE_TAG, True), (hf_mod.GREETING_TAG, False)],
+)
+async def test_a_done_of_the_nudge_is_handled_as_his_reply(
+    monkeypatch: Any, tag: Any, in_band: bool
+) -> None:
+    """The nudge's reply is in history: the scrub, the context measure and the follow-up flag run."""
+    text = "<tool_code> express() </tool_code> I'm glad."
+    events = list(_reply_events(text, audio_first=False))
+    events[0] = _FakeEvent("response.created", response=SimpleNamespace(metadata=tag))
+    events[-1] = _scrub_done("it20", tag=tag)
+    handler = _session_handler(monkeypatch, tuple(events))
+    handler._clear_queue = lambda: None
+    conn = _ScrubConnection()
+    after: list[Any] = []
+    real = handler._scrub_at_done
+
+    async def scrub(event: Any) -> None:
+        handler.connection = conn
+        handler._followup_live = True  # set late: the session start resets it
+        await real(event)
+
+    monkeypatch.setattr(handler, "_scrub_at_done", scrub)
+    monkeypatch.setattr(handler, "_after_reply", after.append)
+    await handler._run_realtime_session()
+
+    assert (conn.sent == [("delete", "it20")]) is in_band
+    assert (len(after) == 1) is in_band
+    assert handler._followup_live is (not in_band)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tag", [None, hf_mod.NUDGE_TAG])
+async def test_the_done_write_goes_before_the_done_event(monkeypatch: Any, tag: Any) -> None:
+    """Rule 2: at a reply's done the writer's change goes before _response_done_event is set, so
+    the next create cannot go ahead of it. The nudge's done is a reply's done (Unit 1 review,
+    finding 3, settled in the code's direction)."""
+    events = list(_reply_events("Hello.", audio_first=False))
+    events[0] = _FakeEvent("response.created", response=SimpleNamespace(metadata=tag))
+    events[-1] = _scrub_done("it21", tag=tag)
+    handler = _session_handler(monkeypatch, tuple(events))
+    handler._clear_queue = lambda: None
+    seen: list[bool] = []
+
+    async def at_done() -> None:
+        seen.append(handler._response_done_event.is_set())
+
+    monkeypatch.setattr(handler._writer, "at_done", at_done)
+    await handler._run_realtime_session()
+    assert seen == [False]
+
+
+@pytest.mark.asyncio
+async def test_the_doubling_the_file_is_read_only_at_a_sessions_open(monkeypatch: Any) -> None:
+    """Round 6 (the doubling): a block re-read mid-session holds this connection's turns, which are
+    its chat items too. The file is read at the open only; later blocks are the companion's parts,
+    and the first write is the writer's composition, base first."""
+    events = _reply_events("Hello.", audio_first=False)
+    handler = _session_handler(monkeypatch, events)
+    handler._clear_queue = lambda: None
+    reads: list[int] = []
+
+    def read() -> tuple[str, dict[str, Any]]:
+        reads.append(1)
+        return "## Your memory\nold turns", {"top": 3}
+
+    monkeypatch.setattr(hf_mod, "read_session_block", read)
+    await handler._run_realtime_session()
+    handler.want_instructions("a session opened on a live connection")
+    handler.parts_changed(SimpleNamespace(held={}))
+    assert reads == [1]
+    assert handler._writer.sent == "test\n\n## Your memory\nold turns"
 
 
 @pytest.mark.asyncio
@@ -4346,7 +4557,7 @@ async def test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next(
             return {"status": "done"}
 
     monkeypatch.setattr(
-        hf_mod, "get_session_instructions", lambda _instance_path=None: "test"
+        hf_mod, "get_profile_instructions", lambda: "test"
     )
     monkeypatch.setattr(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
@@ -4653,56 +4864,128 @@ def test_a_dropped_conversation_is_told_from_this_mornings_numbers() -> None:
     assert context_dropped(11401, 14562, 11679)
     assert not context_dropped(11401, 15410, 15000)  # a small dip
     assert not context_dropped(11401, 12100, 11700)  # under the margin from the peak
+    # The round-6 review (11-14): the least compaction fell 861, the largest other fall 365.
+    assert hf_mod.CONTEXT_DROP_TOKENS == 600
+    assert context_dropped(11401, 12400, 12400 - 861)
+    assert not context_dropped(11401, 12400, 12400 - 365)
     assert not context_dropped(None, None, 11601)  # no base yet
 
 
 @pytest.mark.asyncio
-async def test_a_drop_or_a_wish_sends_the_instructions_once_at_a_reply_end(
-    monkeypatch,
-) -> None:
-    """Review of the refresh: on the handler's loop at a reply's end, one send at a time, only
-    when they changed; a drop measures afresh at once; the least since is the base."""
-    from reachy_mini_conversation_app import huggingface_realtime as hr
-
+async def test_a_drop_is_reported_with_the_latest_heard_item_and_sends_nothing_itself() -> None:
+    """Route all, rule 9 (a_noctxblock): a drop at a reply's end is reported to the companion with
+    the latest heard user item; nothing is re-read or sent here (the writer sends the companion's
+    block when it comes). The least since the instructions is the base; a drop measures afresh."""
     handler = _handler()
     marks: list = []
+    reports: list = []
     handler.connection = SimpleNamespace(
         session=SimpleNamespace(update=AsyncMock()),
         wire_mark=lambda kind, **data: marks.append((kind, data)),
     )
-    text = {"now": "memory A"}
-    monkeypatch.setattr(hr, "get_session_instructions", lambda *_: text["now"])
-    handler._instructions_sent = "memory A"
+    handler.set_session_observer(lambda state, **kw: reports.append((state, kw)))
+    handler._heard_item = "item_7"
     u = lambda t: SimpleNamespace(input_tokens=t)  # noqa: E731
-    for t in (
-        12900,
-        11401,
-        15410,
-    ):  # an opening glance's reply first: the least is the base
+    for t in (11900, 11401, 15410):  # an opening glance's reply first: the least is the base
         handler._after_reply(u(t))
-    assert handler._ctx_base == 11401 and handler._instructions_task is None
-    text["now"] = "memory B"
-    assert marks == []
+    assert handler._ctx_base == 11401 and marks == [] and reports == []
     handler._after_reply(u(11601))  # the drop
     assert marks == [("context.dropped", {"input_tokens": 11601})]  # the wire log's mark
-    handler._after_reply(
-        u(11650)
-    )  # the next reply before it lands: measured afresh, no second
-    await handler._instructions_task
-    handler.connection.session.update.assert_awaited_once()
-    assert (
-        handler.connection.session.update.await_args.kwargs["session"]["instructions"]
-        == "memory B"
+    assert reports == [("context_dropped", {"item_id": "item_7"})]
+    assert handler._writer._drop == "item_7"
+    handler._after_reply(u(11650))  # measured afresh: no second report
+    assert len(reports) == 1
+    handler.connection.session.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_trim_reports_its_point_and_deletes_nothing_before_its_block() -> None:
+    """The owner's trim (11-22), rule 9's sequence on purpose: at TRIM_AT user items the
+    companion is told the trim point; nothing is deleted until the block naming it is written;
+    one trim at a time."""
+    from reachy_mini_conversation_app import talk_prune as tp
+
+    handler = _handler()
+    deletes = AsyncMock()
+    handler.connection = SimpleNamespace(
+        session=SimpleNamespace(update=AsyncMock()),
+        conversation=SimpleNamespace(item=SimpleNamespace(delete=deletes)),
     )
-    handler.want_instructions("a session opened on a live connection")
-    handler._after_reply(u(11700))
-    await handler._instructions_task  # unchanged since sent: nothing goes
-    handler.connection.session.update.assert_awaited_once()
-    text["now"] = "memory C"
-    handler.connection.session.update = AsyncMock(side_effect=RuntimeError("closed"))
-    handler.want_instructions("x")
-    handler._after_reply(u(11700))
-    await handler._instructions_task  # a failure is logged, never raised
+    reports: list = []
+    handler.set_session_observer(lambda state, **kw: reports.append((state, kw)))
+    for n in range(tp.TRIM_AT):
+        handler._prune.seen(SimpleNamespace(id=f"u{n}", type="message", role="user"))
+        handler._prune.mark_heard(f"u{n}")
+        handler._maybe_trim()
+    point = f"u{tp.TRIM_AT - tp.TRIM_TO - 1}"
+    assert reports == [("context_dropped", {"item_id": point, "why": "trim"})]
+    assert handler._writer._drop == point
+    handler._prune.seen(SimpleNamespace(id="u99", type="message", role="user"))
+    handler._maybe_trim()
+    assert len(reports) == 1  # one at a time
+    deletes.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_trims_deletes_never_show_as_a_drop() -> None:
+    """The trim and S's join shrink the chat on purpose. A reply in flight at the write read the
+    chat before the deletes; the reply after them reads it smaller. Neither is a drop."""
+    from reachy_mini_conversation_app import talk_prune as tp
+
+    handler = _handler()
+    handler.connection = SimpleNamespace(
+        session=SimpleNamespace(update=AsyncMock()),
+        conversation=SimpleNamespace(item=SimpleNamespace(delete=AsyncMock())),
+    )
+    reports: list = []
+    handler.set_session_observer(lambda state, **kw: reports.append((state, kw)))
+    handler._writer.connect(5.0, "BASE", "## Your memory\nold", {"top": 1}, {})
+    for n in range(tp.TRIM_AT):
+        handler._prune.seen(SimpleNamespace(id=f"u{n}", type="message", role="user"))
+        handler._prune.mark_heard(f"u{n}")
+    handler._after_reply(SimpleNamespace(input_tokens=9000))  # the measure before
+    handler._maybe_trim()
+    point = handler._writer._drop
+    handler._response_done_event.clear()  # this turn's reply is in flight
+    block = {"text": "## Your memory\nthrough the point", "top": 4, "through": point, "s": None,
+             "catch_up": None}  # fmt: skip
+    handler._writer.parts_changed(
+        {"block": SimpleNamespace(name="block", version=2, value=block, session=5.0, expires_at=None)}
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert handler.connection.conversation.item.delete.await_count > 0  # the trim went
+    handler._after_reply(SimpleNamespace(input_tokens=9200))  # in flight: read the chat before
+    handler._response_done_event.set()
+    handler._after_reply(SimpleNamespace(input_tokens=9200 - 1500))  # after the deletes
+    handler._after_reply(SimpleNamespace(input_tokens=7900))
+    assert [kw.get("why") for state, kw in reports if state == "context_dropped"] == ["trim"]
+
+
+@pytest.mark.asyncio
+async def test_his_reply_and_tool_call_reach_the_ledger(monkeypatch: Any) -> None:
+    """The backend (ff4aec3) names his replies and tool calls only by
+    response.output_item.added; conversation.item.created is for user and client items. Both
+    reach TalkPrune's ledger, or trimmed turns' replies and every tool pair stay forever (the
+    Units 3+4 review, finding 1)."""
+    user = SimpleNamespace(id="u1", type="message", role="user")
+    reply = SimpleNamespace(id="a1", type="message", role="assistant")
+    call = SimpleNamespace(id="fc1", type="function_call", call_id="c1")
+    out = SimpleNamespace(id="fco1", type="function_call_output", call_id="c1")
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("conversation.item.created", item=user),
+            _FakeEvent("response.output_item.added", item=call),
+            _FakeEvent("conversation.item.created", item=out),
+            _FakeEvent("response.output_item.added", item=reply),
+        ),
+    )
+    await handler._run_realtime_session()
+    assert "u1" in handler._prune.items
+    assert "a1" in handler._prune.items, "his reply never reaches the ledger"
+    assert handler._prune.calls["c1"][0] is not None, "the call half is never recorded"
+    assert handler._prune.calls["c1"][1] is not None
 
 
 def _handler():
@@ -6189,7 +6472,7 @@ async def test_a_thoughts_reply_is_asked_out_of_band_in_writing_with_the_room_in
 
 @pytest.mark.asyncio
 async def test_a_thoughts_reply_is_reported_noted_and_never_spoken(monkeypatch: Any) -> None:
-    """Reported after the gate, then a system item in the talk; transcript lines carry its id; ready; no head."""
+    """Reported after the gate; the app keeps no record of it (the companion's messages part, Unit 6); lines carry its id."""
     handler, sent, replies = _thought_session(monkeypatch, "Yes, a big one!", _thought_response())
     reasons: list[str] = []
     handler.set_activity_observer(lambda reason, **_kw: reasons.append(reason))
@@ -6199,19 +6482,9 @@ async def test_a_thoughts_reply_is_reported_noted_and_never_spoken(monkeypatch: 
     await handler._run_realtime_session()
 
     assert replies == [("discord:1", "Yes, a big one!", None)]
-    note = [payload for kind, payload in sent if kind == "item"]
-    assert note == [
-        {
-            "type": "message",
-            "role": "system",
-            "content": [
-                {
-                    "type": "input_text",
-                    "text": "(a thought from Hadley, answered) did you see the boat? / (your reply) Yes, a big one!",
-                }
-            ],
-        }
-    ]
+    assert [payload for kind, payload in sent if kind == "item"] == []  # route all: no system slot
+    assert handler._writer.view.messages == ()  # the app builds no record of its own
+    assert not hasattr(handler._writer, "add_thought")
     assert lines == [
         ("user", "(a thought from Hadley) did you see the boat?", True, None, {"thought": "discord:1"}),
         ("assistant", "Yes, a big one!", True, None, {"thought": "discord:1"}),
@@ -6369,3 +6642,324 @@ def test_with_the_companion_every_tool_keeps_the_kind_its_name_gave(companion_on
         assert declared.get(name) == kind, name
         assert hf_mod.tool_kind(name, {}) == kind  # and an old companion's tool, by name alone, agrees
     assert all(hf_mod.tool_kind(n, {n: _kind_tool(k)}) == (k or hf_mod.tool_kind(n, {})) for n, k in declared.items())
+
+
+@pytest.mark.asyncio
+async def test_a_thoughts_done_reaches_his_instructions_by_the_companions_part(monkeypatch: Any) -> None:
+    """Unit 6: a thought's reply, published back by a fake companion as the part, is composed."""
+    from reachy_mini_conversation_app import parts as parts_mod
+
+    handler, _sent, replies = _thought_session(monkeypatch, "Yes, a big one!", _thought_response())
+    record = parts_mod.Parts(held={})
+
+    def companion(thought_id: str, text: str | None, why: str | None) -> None:
+        nonlocal record
+        replies.append((thought_id, text, why))
+        line = f"(a thought from Hadley, answered) did you see the boat? / (your reply) {text or '(none)'}"
+        wire = {"name": "messages", "version": 1, "value": [line], "session": None, "expires_at": None}
+        record, _, _ = parts_mod.apply(record, {"epoch": "e1", "snapshot": True, "version": 1, "parts": [wire]})
+        handler.parts_changed(record)
+
+    handler.on_thought_reply = companion
+
+    await handler._run_realtime_session()
+
+    assert replies == [("discord:1", "Yes, a big one!", None)]
+    assert handler._writer.view.messages == (
+        "(a thought from Hadley, answered) did you see the boat? / (your reply) Yes, a big one!",
+    )
+    assert handler._writer.current().endswith(
+        "### Thoughts you answered in this conversation\n"
+        "(a thought from Hadley, answered) did you see the boat? / (your reply) Yes, a big one!"
+    )
+# --- each response by its id (route all, Unit 7: ConvoAll rule 6) ---------------------------
+
+
+def _created_by_id(rid: str) -> _FakeEvent:
+    return _FakeEvent("response.created", response=SimpleNamespace(id=rid, metadata=None))
+
+
+def _done_by_id(rid: str) -> _FakeEvent:
+    return _FakeEvent("response.done", response=SimpleNamespace(id=rid, metadata=None, usage=None))
+
+
+def _overdue(handler: HuggingFaceRealtimeHandler, rid: str) -> None:
+    """Move one response's deadline into the past, as 30 s with its done lost would."""
+    handler._responses[rid].deadline = time.monotonic() - 1.0
+
+
+async def _settle(n: int = 50) -> None:
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_a_lost_done_ends_at_the_next_created(monkeypatch: Any) -> None:
+    """Correction 52 as this backend runs it: one response at a time (RH:821-826).
+
+    Turn 1's done is lost and turn 2's reply is created, so turn 1's is over. It ends alone, as
+    lost; turn 2's reply is still awaited, and a create waiting behind it goes at its done.
+    """
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    handler._heard_item = "u1"
+    conns[0].push(_created_by_id("r1"))
+    await conns[0].processed()
+    assert handler._responses["r1"].heard == "u1"
+    conns[0].push(_created_by_id("r2"))  # r1's done never came
+    await conns[0].processed()
+    assert list(handler._responses) == ["r2"] and "r1" in handler._forced
+    assert not handler._response_done_event.is_set()
+
+    await handler._safe_response_create()
+    await _settle()
+    assert conns[0].response.create.await_count == 0  # turn 2's reply still runs
+
+    conns[0].push(_done_by_id("r2"))
+    await conns[0].processed()
+    await _settle()
+    assert handler._response_done_event.is_set()
+    assert conns[0].response.create.await_count == 1
+    await conns[0].close()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_newer_reply_done_leaves_nothing_tracked(monkeypatch: Any) -> None:
+    """The review's repro: created r1, created r2, done r2. The backend is idle, so is the fork.
+
+    A reply after a note is asked and goes; no stale r1 holds it until a deadline.
+    """
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    for event in (_created_by_id("r1"), _created_by_id("r2"), _done_by_id("r2")):
+        conns[0].push(event)
+        await conns[0].processed()
+    assert handler._responses == {} and handler._response_done_event.is_set()
+
+    assert await handler.request_reply() is True
+    await _settle()
+    assert conns[0].response.create.await_count == 1
+    await conns[0].close()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_an_overdue_done_is_forced_before_the_next_create(monkeypatch: Any) -> None:
+    """r1's done is lost and nothing newer is created: the sender forces it at its deadline.
+
+    It ends with its done write, and the waiting create goes.
+    """
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    at_done = AsyncMock()
+    monkeypatch.setattr(handler._writer, "at_done", at_done)
+    conns[0].push(_created_by_id("r1"))
+    await conns[0].processed()
+    _overdue(handler, "r1")
+
+    await handler._safe_response_create()
+    await _settle()
+    assert handler._responses == {} and "r1" in handler._forced
+    assert at_done.await_count == 1
+    assert conns[0].response.create.await_count == 1
+    await conns[0].close()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_fork_creates_own_overdue_done_ends_it_alone(monkeypatch: Any) -> None:
+    """W_ForceOwn: with no create waiting, the fork's own create's done is overdue.
+
+    The sender ends that response at its deadline, and the next create may go.
+    """
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    monkeypatch.setattr(hf_mod, "_RESPONSE_DONE_TIMEOUT", 0.05)
+    await handler._safe_response_create()
+    for _ in range(200):
+        if conns[0].response.create.await_count:
+            break
+        await asyncio.sleep(0)
+    conns[0].push(_created_by_id("own"))
+    await conns[0].processed()
+    assert "own" in handler._responses
+    await asyncio.sleep(0.15)
+
+    assert "own" not in handler._responses
+    assert "own" in handler._forced
+    assert handler._response_done_event.is_set()
+    await conns[0].close()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_tool_output_waits_for_its_own_reply_only() -> None:
+    """ToolDrop (fCommit >= fuT), as this backend runs: r1 created, its done lost, r2 created.
+
+    r1's tool output is dropped at once; r2 running does not hold it. r2's own output waits to
+    r2's deadline and is then dropped, without ending r2. After r2's real done it goes.
+    """
+    handler = _plain_handler()
+    handler._track_created("r1", in_band=True)
+    handler._track_created("r2", in_band=True)  # r1's done was lost
+    assert await handler._wait_for_response_done_before_tool_result("r1") is False
+
+    handler._responses["r2"].deadline = time.monotonic() + 0.01
+    assert await handler._wait_for_response_done_before_tool_result("r2") is False
+    assert "r2" in handler._responses  # the tool's drop does not end its reply
+
+    handler._track_created("r3", in_band=True)
+    handler._end_tracked("r3", real=True)
+    assert await handler._wait_for_response_done_before_tool_result("r3") is True
+    assert await handler._wait_for_response_done_before_tool_result("r1") is False
+
+
+@pytest.mark.asyncio
+async def test_a_tool_output_whose_reply_ends_while_it_waits_goes() -> None:
+    """The tool finished before its reply's done: it goes once that done comes."""
+    handler = _plain_handler()
+    handler._track_created("r1", in_band=True)
+    waiting = asyncio.create_task(handler._wait_for_response_done_before_tool_result("r1"))
+    await _settle(5)
+    assert not waiting.done()
+    handler._end_tracked("r1", real=True)
+    assert await asyncio.wait_for(waiting, timeout=1.0) is True
+
+
+@pytest.mark.asyncio
+async def test_a_normal_done_writes_then_sets_the_done_event(monkeypatch: Any) -> None:
+    """A real done: the writer's at_done goes before the done event, which is set as before."""
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    order: list[str] = []
+
+    async def _at_done() -> None:
+        order.append("write, event set" if handler._response_done_event.is_set() else "write")
+
+    monkeypatch.setattr(handler._writer, "at_done", _at_done)
+    conns[0].push(_created_by_id("r1"))
+    await conns[0].processed()
+    assert not handler._response_done_event.is_set()
+    conns[0].push(_done_by_id("r1"))
+    await conns[0].processed()
+
+    assert order == ["write"]
+    assert handler._response_done_event.is_set()
+    assert handler._responses == {} and "r1" not in handler._forced
+    await conns[0].close()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_session_end_releases_a_tool_output_waiting_on_its_reply() -> None:
+    """A session that ends forgets its responses: a tool output waiting on one is dropped."""
+    handler = _plain_handler()
+    handler._track_created("r1", in_band=True)
+    waiting = asyncio.create_task(handler._wait_for_response_done_before_tool_result("r1"))
+    await _settle(5)
+    handler._clear_tracked()
+    assert await asyncio.wait_for(waiting, timeout=1.0) is False
+    assert handler._responses == {} and handler._response_done_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a_tool_result_waits_on_its_own_turn_id(monkeypatch: Any) -> None:
+    """_handle_tool_result passes its call's turn_id to the wait.
+
+    r1's done was lost, so its output is dropped at once, not sent when r2, still running, ends.
+    """
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = _plain_handler()
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(handler, "_safe_response_create", AsyncMock())
+    handler._in_flight_tool_calls = {"call_a"}
+    handler._track_created("r1", in_band=True)
+    handler._track_created("r2", in_band=True)  # r1's done was lost
+    handling = asyncio.create_task(
+        handler._handle_tool_result(
+            ToolNotification(
+                id="call_a",
+                tool_name="test__probe",
+                is_idle_tool_call=False,
+                status=ToolState.COMPLETED,
+                result={"ok": True},
+                turn_id="r1",
+            )
+        )
+    )
+    await _settle()
+    handler._end_tracked("r2", real=True)
+    await asyncio.wait_for(handling, timeout=1.0)
+    outputs = [
+        c
+        for c in handler.connection.conversation.item.create.await_args_list
+        if (c.kwargs.get("item") or {}).get("type") == "function_call_output"
+    ]
+    assert outputs == []
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_forgets_the_last_sessions_responses(monkeypatch: Any) -> None:
+    """The reset at a new session clears every tracked response and wakes its waiters."""
+    handler, conns = _reconnect_handler(monkeypatch)
+    first = await _session(handler)
+    conns[0].push(_created_by_id("r1"))
+    await conns[0].processed()
+    live = handler._responses["r1"]
+    await _dropped(handler, conns[0], first)
+
+    second = await _session(handler)
+    assert handler._responses == {} and live.ended.is_set() and not live.real
+    assert handler._response_done_event.is_set()
+    await conns[1].close()
+    await asyncio.wait_for(second, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_forgets_the_tracked_responses(monkeypatch: Any) -> None:
+    """Shutdown clears the tracked responses, so the sender and a waiting tool output wake."""
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    conns[0].push(_created_by_id("r1"))
+    await conns[0].processed()
+    live = handler._responses["r1"]
+    await handler.shutdown()
+    assert handler._responses == {} and live.ended.is_set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_the_forced_path_writes_only_for_an_in_band_response(monkeypatch: Any) -> None:
+    """An out-of-band response (a thought, a filler) gets no done write when forced; his reply does."""
+    handler = _plain_handler()
+    at_done = AsyncMock()
+    monkeypatch.setattr(handler._writer, "at_done", at_done)
+    handler._track_created("oob", in_band=False)
+    await handler._force("oob")
+    assert at_done.await_count == 0 and handler._responses == {}
+    handler._track_created("reply", in_band=True)
+    await handler._force("reply")
+    assert at_done.await_count == 1 and handler._responses == {}
+
+
+@pytest.mark.asyncio
+async def test_in_band_follows_the_band_tag(monkeypatch: Any) -> None:
+    """A thought's response is out of band; the nudge's and his plain reply are in band."""
+    handler, conns = _reconnect_handler(monkeypatch)
+    task = await _session(handler)
+    seen: dict[str, bool] = {}
+    for rid, metadata in (
+        ("thought", {"companion": hf_mod.THOUGHT_TAG}),
+        ("nudge", hf_mod.NUDGE_TAG),
+        ("plain", None),
+    ):
+        conns[0].push(
+            _FakeEvent("response.created", response=SimpleNamespace(id=rid, metadata=metadata))
+        )
+        await conns[0].processed()
+        seen[rid] = handler._responses[rid].in_band
+    assert seen == {"thought": False, "nudge": True, "plain": True}
+    await conns[0].close()
+    await asyncio.wait_for(task, timeout=1.0)

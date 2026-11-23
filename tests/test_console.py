@@ -2383,6 +2383,7 @@ _DANCE = {
         {"name": "uh_huh_tilt", "beats": 4, "amplitude": 0.7},
     ],
     "bpm": 120.0,
+    "grid": {"at": 1_792_500_000.25, "period_s": 0.5},  # the music's beat grid, a move beat
 }
 
 
@@ -2394,24 +2395,27 @@ def _wait_waiter(stream: LocalStream) -> None:
 
 
 def test_a_dance_over_rpc_queues_its_moves_at_its_tempo() -> None:
-    """conversation.dance queues one move each at the bpm; seconds is the beats at the bpm.
+    """conversation.dance queues one move placed on the grid, its steps at the grid's tempo;
+    seconds is the beats at the bpm and at most one beat's wait for the grid.
 
-    Each move plays its beats, its amplitudes scaled, the antennas still.
+    Each step plays its beats, its amplitudes scaled, the antennas still.
     """
     from reachy_mini_dances_library.collection.dance import AVAILABLE_MOVES
-    from reachy_mini_conversation_app.dance_emotion_moves import DanceQueueMove
+    from reachy_mini_conversation_app.dance_emotion_moves import DanceQueueMove, GridDanceMove
 
     stream, manager, app = _dance_stream()
     library = {n: dict(AVAILABLE_MOVES[n][1]) for n in ("groovy_sway_and_roll", "interwoven_spirals")}
 
     resp = _rpc_call(app, "conversation.dance", _DANCE)
 
-    assert resp["result"] == {"queued": 3, "seconds": 8.0}  # 16 beats at 120 bpm
+    assert resp["result"] == {"queued": 3, "seconds": 8.5}  # 16 beats at 120 bpm, a beat's wait
     stream._robot.disable_wobbling.assert_called_once()
     _drive_manager(manager)
-    moves = [manager.state.current_move, *manager.move_queue]
+    dance = manager.state.current_move
+    assert isinstance(dance, GridDanceMove) and dance.ends_on_release and not manager.move_queue
+    moves = dance.steps
     assert [m.move_name for m in moves] == ["groovy_sway_and_roll", "interwoven_spirals", "uh_huh_tilt"]
-    assert all(isinstance(m, DanceQueueMove) and m.ends_on_release for m in moves)
+    assert all(isinstance(m, DanceQueueMove) for m in moves)
     assert [m.duration for m in moves] == [2.0, 4.0, 2.0]
     first = moves[0].dance_move.move_params
     assert first["y_amplitude_m"] == library["groovy_sway_and_roll"]["y_amplitude_m"] * 0.7
@@ -2430,7 +2434,10 @@ def test_a_dance_over_rpc_queues_its_moves_at_its_tempo() -> None:
         ({**_DANCE, "moves": []}, "invalid_params"),
         ({**_DANCE, "bpm": None}, "invalid_params"),
         ({**_DANCE, "bpm": 400}, "invalid_params"),
-        ({**_DANCE, "bpm": 60, "moves": [{"name": "simple_nod", "beats": 64}]}, "invalid_params"),
+        ({**_DANCE, "bpm": 60, "moves": [{"name": "simple_nod", "beats": 64}], "grid": {"at": 1.0, "period_s": 1.0}}, "invalid_params"),
+        ({k: v for k, v in _DANCE.items() if k != "grid"}, "invalid_params"),
+        ({**_DANCE, "grid": {"at": 1.0, "period_s": 0.6}}, "invalid_params"),  # not the bpm's beat
+        ({**_DANCE, "grid": {"at": None, "period_s": 0.5}}, "invalid_params"),
     ],
 )
 def test_a_bad_dance_is_refused_and_moves_nothing(params: dict[str, Any], reason: str) -> None:
@@ -2446,17 +2453,46 @@ def test_a_bad_dance_is_refused_and_moves_nothing(params: dict[str, Any], reason
 
 
 def test_wobbling_comes_back_once_the_dance_has_played() -> None:
-    """The last move's end turns wobbling back on."""
+    """The dance's end turns wobbling back on: its steps and at most one beat's wait for the grid."""
     stream, manager, app = _dance_stream()
     _rpc_call(app, "conversation.dance", _DANCE)
     t = manager._now()
     _drive_manager(manager, t)
-    for step in (2.0, 6.0, 8.0):  # each move's end
-        _drive_manager(manager, t + step + 0.01)
+    _drive_manager(manager, t + 8.0 - 0.01)  # its steps; the wait is still to come
+    assert getattr(manager.state.current_move, "ends_on_release", False)
+    _drive_manager(manager, t + 8.5 + 0.01)  # 16 beats at 120 bpm and one beat's wait
     assert not getattr(manager.state.current_move, "ends_on_release", False)
     assert len(manager.move_queue) == 0
     _wait_waiter(stream)
     stream._robot.enable_wobbling.assert_called_once()
+
+
+def test_a_dance_is_placed_on_the_grid_by_the_managers_own_sampling() -> None:
+    """Place the dance on the grid's next beat at the manager's first sample (the second review's 5).
+
+    Through the manager's pose path; its length is then that wait and the steps.
+    """
+    import time
+
+    from reachy_mini_conversation_app.dance_emotion_moves import GridDanceMove
+
+    stream, manager, app = _dance_stream()
+    now = time.time()
+    _rpc_call(app, "conversation.dance", {**_DANCE, "grid": {"at": now + 100.3, "period_s": 0.5}})
+    t = manager._now()
+    _drive_manager(manager, t)
+    dance = manager.state.current_move
+    assert isinstance(dance, GridDanceMove) and dance.wait_s is None
+    manager._get_primary_pose(t)
+    assert dance.wait_s is not None and 0.0 <= dance.wait_s < 0.5
+    # the beat it starts on is the grid's: 0.3 s past a whole second, give or take the test's own time
+    began = time.time() - (manager._now() - t)
+    phase = (began + dance.wait_s - (now + 100.3)) % 0.5
+    assert min(phase, 0.5 - phase) < 0.02
+    assert abs(dance.duration - (dance.wait_s + 8.0)) < 1e-9
+    _drive_manager(manager, t + dance.duration + 0.01)
+    assert not getattr(manager.state.current_move, "ends_on_release", False)
+    _wait_waiter(stream)
 
 
 def test_a_hold_ends_the_dance_and_wobbling_comes_back() -> None:
@@ -3204,6 +3240,42 @@ def test_a_now_note_reports_whether_it_was_sent() -> None:
         _stop_loop(loop, thread)
     assert refused.get("result") == {"queued": False, "reason": "response active"}
     assert sent.get("result") == {"queued": True}
+
+
+def test_parts_over_the_rpc_are_kept_on_the_handlers_loop_without_a_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The companion's parts (route all, Unit 2) are kept on the handler's loop.
+
+    Each is acked with the version held, and kept while no session is open.
+    """
+    stream, _manager, app = _pose_stream()
+    stream.handler._is_connected.return_value = False
+    loop, thread = _loop_in_a_thread()
+    stream._asyncio_loop = loop
+    seen: list[asyncio.AbstractEventLoop] = []
+    real_apply = console_mod.parts_record.apply
+
+    def spy(parts: Any, params: Any) -> Any:
+        seen.append(asyncio.get_running_loop())
+        return real_apply(parts, params)
+
+    monkeypatch.setattr(console_mod.parts_record, "apply", spy)
+    part = {"name": "summary", "version": 2, "value": "s"}
+    try:
+        response = _rpc_call(
+            app,
+            "conversation.parts",
+            {"epoch": "e1", "snapshot": True, "version": 2, "parts": [part]},
+        )
+    finally:
+        _stop_loop(loop, thread)
+    assert response.get("result") == {"epoch": "e1", "acks": [{"name": "summary", "version": 2}]}
+    assert seen == [loop]
+    assert stream._parts.held["summary"].value == "s"
+    # route all, Unit 4: the handler's writer is told, and reads the record through parts_source
+    stream.handler.parts_changed.assert_called_once_with(stream._parts)
+    assert stream.handler.parts_source() is stream._parts
 
 
 def test_a_note_needs_text() -> None:
@@ -4507,6 +4579,22 @@ def test_a_session_start_says_when_the_companions_block_was_read() -> None:
     handler.memory_read_at = 1234.5
     stream._dispatch_session("started")
     assert ("conversation.realtime", {"state": "started", "memory_read_at": 1234.5}) in sent
+
+
+def test_a_context_drop_is_reported_with_its_session_and_the_latest_heard_item() -> None:
+    """Route all, rule 9: the companion bounds the block at the item, for that session only."""
+    sent: list[tuple[str, dict]] = []
+    rpc = SimpleNamespace(_clients=set(), broadcast_threadsafe=lambda m, p: sent.append((m, p)))
+    handler = _FakeSessionHandler()
+    stream = LocalStream(handler, SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))
+    stream._rpc = rpc
+    handler.memory_read_at = 1234.5
+    stream._dispatch_session("context_dropped", item_id="item_9")
+    assert sent == [
+        ("conversation.realtime", {"state": "context_dropped", "memory_read_at": 1234.5, "item_id": "item_9"})
+    ]
+    stream._dispatch_session("context_dropped", item_id="item_3", why="trim")
+    assert sent[-1][1] == {"state": "context_dropped", "memory_read_at": 1234.5, "item_id": "item_3", "why": "trim"}
 
 
 def test_a_new_session_forgets_the_last_turn_state() -> None:

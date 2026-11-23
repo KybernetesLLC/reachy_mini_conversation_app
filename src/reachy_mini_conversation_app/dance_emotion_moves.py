@@ -5,8 +5,12 @@ and executed sequentially by the MovementManager.
 """
 
 from __future__ import annotations
+import bisect
 import logging
+import math
+import time
 from typing import Tuple
+from collections.abc import Callable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -95,6 +99,64 @@ class DanceQueueMove(Move):  # type: ignore
 
             neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
             return (neutral_head_pose, np.array([0.0, 0.0], dtype=np.float64), 0.0)
+
+
+class GridDanceMove(Move):  # type: ignore
+    """The companion's dance (conversation.dance) as one move, its steps placed on the music's
+    beat grid in wall time (the companion's design 2026-11-22, dancing on the beat).
+
+    `grid_at` is a move beat's wall time and `period_s` a move beat. At its first evaluation the
+    dance's first step is set on the first grid beat at or after that moment, and every step after
+    it starts on its own beat, so no time is lost at the manager's move boundaries. Until the first
+    beat it holds the first step's opening pose (at most one beat). One move to the manager: a
+    release drops it whole and the wobbler's waiter watches it.
+    """
+
+    relative_to_body = True
+    ends_on_release = True
+
+    def __init__(
+        self,
+        steps: list[DanceQueueMove],
+        *,
+        grid_at: float,
+        period_s: float,
+        clock: Callable[[], float] = time.time,
+    ):
+        """Initialize a GridDanceMove from its steps, each already at the grid's tempo."""
+        self.steps = steps
+        self.grid_at = float(grid_at)
+        self.period_s = float(period_s)
+        self.clock = clock
+        self.moves_s = sum(step.duration for step in steps)
+        self.wait_s: float | None = None  # set at the first evaluation
+        self._starts: list[float] = []
+
+    @property
+    def duration(self) -> float:
+        """The wait for the first beat and the steps: at most one beat of wait before it starts."""
+        return (self.period_s if self.wait_s is None else self.wait_s) + self.moves_s
+
+    def _place(self, t: float) -> None:
+        began = self.clock() - t
+        beats = math.ceil((began - self.grid_at) / self.period_s - 1e-9)
+        first = self.grid_at + beats * self.period_s
+        self.wait_s = first - began
+        start, self._starts = first - began, []
+        for step in self.steps:
+            self._starts.append(start)
+            start += step.duration
+
+    def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
+        """The step playing at `t`, on its own beat; the first step's opening pose before it."""
+        if self.wait_s is None:
+            self._place(t)
+        assert self.wait_s is not None
+        if t < self.wait_s:
+            return self.steps[0].evaluate(0.0)
+        k = max(0, bisect.bisect_right(self._starts, t) - 1)
+        step = self.steps[k]
+        return step.evaluate(min(t - self._starts[k], step.duration))
 
 
 class EmotionQueueMove(Move):  # type: ignore

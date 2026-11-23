@@ -111,3 +111,55 @@ def test_a_still_antenna_dance_move_leaves_the_antennas_to_the_manager() -> None
         _, antennas, body_yaw = move.evaluate(float(t))
         assert antennas is None
         assert body_yaw == 0
+
+
+class _Step:
+    """A step of known length that reports where in it it was asked."""
+
+    def __init__(self, name: str, duration: float) -> None:
+        self.name, self.duration = name, duration
+
+    def evaluate(self, t: float):  # type: ignore[no-untyped-def]
+        return (self.name, t, None)
+
+
+def _grid_dance(now: float, at: float = 100.0, period: float = 0.5):  # type: ignore[no-untyped-def]
+    from reachy_mini_conversation_app.dance_emotion_moves import GridDanceMove
+
+    steps = [_Step("a", 2.0), _Step("b", 4.0), _Step("c", 2.0)]
+    return GridDanceMove(steps, grid_at=at, period_s=period, clock=lambda: now)  # type: ignore[arg-type]
+
+
+def test_a_grid_dance_starts_on_the_next_beat_and_each_step_on_its_own() -> None:
+    """Begun 0.2 s after a beat (100.0 + k * 0.5), the first step waits 0.3 s for the next."""
+    move = _grid_dance(now=1000.2)
+    assert move.duration == 0.5 + 8.0  # unplaced: at most one beat's wait
+    assert move.evaluate(0.0) == ("a", 0.0, None)  # holds the first step's opening pose
+    assert move.wait_s is not None and abs(move.wait_s - 0.3) < 1e-9
+    assert abs(move.duration - 8.3) < 1e-9
+    assert move.evaluate(0.1) == ("a", 0.0, None)
+    name, t, _ = move.evaluate(0.3 + 1.0)
+    assert name == "a" and abs(t - 1.0) < 1e-9
+    name, t, _ = move.evaluate(0.3 + 2.0)
+    assert name == "b" and abs(t) < 1e-9  # the second step on its own beat, nothing lost
+    name, t, _ = move.evaluate(0.3 + 7.5)
+    assert name == "c" and abs(t - 1.5) < 1e-9
+    name, t, _ = move.evaluate(9.0)  # past the end: the last step's last pose
+    assert name == "c" and t == 2.0
+
+
+def test_a_grid_dance_on_a_beat_waits_nothing_and_the_grid_may_be_old() -> None:
+    """A grid's beat long before (or after) now places the same: the period carries it."""
+    on_beat = _grid_dance(now=1000.0)
+    on_beat.evaluate(0.0)
+    assert on_beat.wait_s is not None and abs(on_beat.wait_s) < 1e-9
+    later_grid = _grid_dance(now=1000.2, at=1003.0)  # a beat in the future works too
+    later_grid.evaluate(0.0)
+    assert later_grid.wait_s is not None and abs(later_grid.wait_s - 0.3) < 1e-9
+
+
+def test_a_grid_dance_first_evaluated_late_places_from_its_own_start() -> None:
+    """The manager's first sample may come a tick after the move began: it is placed from then."""
+    move = _grid_dance(now=1000.25)  # began at 1000.2, first sampled 0.05 s in
+    assert move.evaluate(0.05) == ("a", 0.0, None)
+    assert move.wait_s is not None and abs(move.wait_s - 0.3) < 1e-9
