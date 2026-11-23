@@ -848,11 +848,13 @@ async def test_the_in_time_log_at_the_turns_end(caplog) -> None:
         await writer.turn_started("i2", "i1")
         writer.parts_changed({"line": _line(3, "i1")})
         await _settle()
-        writer.turn_ended("i2")
+        writer.turn_ended("i2", text=True)
         await writer.turn_started("i3", "i2")
-        writer.turn_ended("i3")
+        writer.turn_ended("i3", text=True)
+        await writer.turn_started("i4", "i3")
+        await writer.at_empty_end("i4", "an empty end")  # no reply reads a line: no verdict
     assert "Moment line in time: v3, written 0.00 s before the turn's end" in caplog.text
-    assert "Moment line not in time: none for the heard item" in caplog.text
+    assert caplog.text.count("Moment line not in time: none for the heard item") == 1
     assert ACT not in caplog.text and "i1" not in caplog.text
 
 

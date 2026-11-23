@@ -2913,7 +2913,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         # Rule 6: the item ends; no write, so his reply still reads its line
                         # and the reply's done withdraws it (rule 9). The turn stays open for
                         # rule 14 until that done.
-                        self._writer.turn_ended(ended)
+                        self._writer.turn_ended(ended, text=True)
                         self._cut_mid_reply = False
                         self._heard_item = getattr(event, "item_id", None) or self._heard_item
                         self._prune.mark_heard(getattr(event, "item_id", None))

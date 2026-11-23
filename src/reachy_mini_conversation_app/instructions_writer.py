@@ -534,16 +534,18 @@ class InstructionsWriter:
         if self.pending():
             await self.send("speech started")
 
-    def turn_ended(self, item: str | None) -> bool:
+    def turn_ended(self, item: str | None, text: bool = False) -> bool:
         """End the open item at its transcript's end (completed, empty included, or failed).
 
         Return whether it was the open item. Nothing is sent: at a transcript with text the line
-        stays on the server for his reply, and the reply's done withdraws it (rule 9). Logs
-        whether the line for this turn was written before the end, when the reply reads it.
+        stays on the server for his reply, and the reply's done withdraws it (rule 9). Only that
+        end (`text`) logs whether the line for this turn was written before it, when the reply
+        reads it: an empty, failed or forced end has no reply to read it.
         """
         if self.view is None or not item or self.view.open_item != item:
             return False
-        self._log_in_time()
+        if text:
+            self._log_in_time()
         self.view = replace(self.view, open_item=None)
         return True
 
