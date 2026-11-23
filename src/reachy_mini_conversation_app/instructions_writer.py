@@ -2,9 +2,10 @@
 
 The companion's model is ConvoAll, round 6 (docs/formal/conversation-d/model.md on its branch
 arch-d-model), rules 2-5, 7 and 9. His instructions are composed here from the parts, then the
-stable base (the profile) last, nearest the turn, as the fork before route all had it (the owner,
-11-23: after route all put the profile first he stopped calling recall, and the prompt cache it
-was first for never paid off, `cached 0` on all 995 turns from 11-21 to 11-23):
+stable base (the profile), near the turn, as the fork before route all had it (the owner, 11-23:
+after route all put the profile first he stopped calling recall, and the prompt cache it was
+first for never paid off, `cached 0` on all 995 turns from 11-21 to 11-23), then the moment
+thinker's line last of all:
 
 - the session block: at a session's open, the companion's file read unbounded (it names the S it
   is cut at, with its text); after that, the companion's "block" part for this session, bounded
@@ -17,7 +18,16 @@ was first for never paid off, `cached 0` on all 995 turns from 11-21 to 11-23):
   before the base. Its speaker line is shown only when its decision's stamp is not before
   this view's memory_read_at (both on the host's monotonic clock): an older session's speaker is
   never shown. A part past its expiry is not taken. His agenda (Unit 10) is the part's `agenda`
-  lines, after the speaker: what is set, in the companion's words.
+  lines, after the speaker: what is set, in the companion's words;
+- the stable base;
+- this moment (Units 8-9, model.md "The final rule set (F)", rules 6-9): the companion's "line"
+  part, the moment thinker's act for his next reply, after the base (the owner's design: ticket
+  11's gain was measured with it at the end). It is shown only while its item is the open item:
+  the person's turn whose speech_started the writer has seen and whose transcript has not ended
+  (completed, empty included, or failed); a session's open has none. The take has no check of its
+  own, so a resend or a snapshot of a line whose item ended writes nothing. "quiet" is shown as
+  QUIET_LINE. About 20-40 tokens at 3.5 characters a token: the quiet line 19, an act at the
+  companion's 120-character cap 39. The line is not held to its expiry: the open item bounds it.
 
 `take` and `compose` are pure: what the parts record changes, what goes at once and why, and the
 text. The writer sends (rules 3-5, 9):
@@ -33,6 +43,12 @@ text. The writer sends (rules 3-5, 9):
   sooner than BATCHED_GAP_S after the last write (the Units 3+4 review: trims and awareness
   refreshes came to 5-8 writes a minute, 70-117 KB each with the echo);
 - at a reply's done, any change goes before the done event is set (H calls `at_done`);
+- the line goes at once when what is shown of it changes, and never starts the drop measure again
+  (LINE_CHANGED is a J reason, Fu8measure). At speech_started any pending change goes in one write
+  (the withdrawal of an older item's line and whatever else is pending; the companion's ticket 77,
+  item 2), and at an empty or failed end of the open item any pending change goes, before H's
+  re-create; neither starts the measure again. A transcript with text sends nothing: the line
+  stays on the server until his reply's done, so the reply reads it;
 - after the write that carries a newly joined S, the items S covers are deleted; after a drop's
   block, the items through the reported item (talk_prune), in that order, in one coroutine.
 
@@ -64,7 +80,14 @@ SPEAKER_CHANGED = "the speaker changed"
 GUEST_ARRIVED = "a guest arrived"
 AGENDA_GUARDED = "the agenda guarded"  # Unit 10: a guest changed a line of his agenda
 NOW_DROPPED = "just now dropped"
-J_REASONS = frozenset({SPEAKER_CHANGED, GUEST_ARRIVED, AGENDA_GUARDED, NOW_DROPPED})
+# The moment thinker's line (Units 8-9): its own at-once reason, never a measure reset (Fu8measure).
+LINE_PART = "line"
+LINE_HEADING = "### This moment"
+QUIET = "quiet"  # the companion's moment_thinker.QUIET: the words were not said to him
+QUIET_LINE = "These words were not said to you: call stay_quiet."  # the profile's form
+LINE_CHANGED = "the moment's line"
+J_REASONS = frozenset({SPEAKER_CHANGED, GUEST_ARRIVED, AGENDA_GUARDED, NOW_DROPPED, LINE_CHANGED})
+ENDED_KEPT = 16  # the items whose end this session has seen, kept for the line's log
 _NONE = float("-inf")
 
 
@@ -97,6 +120,8 @@ class View:
     s_at: float
     messages: tuple[str, ...] = ()
     now: Optional["Now"] = None
+    line: Optional["Line"] = None
+    open_item: Optional[str] = None  # the person's turn whose transcript has not ended (rule 6)
 
 
 @dataclass(frozen=True)
@@ -106,6 +131,18 @@ class Now:
     value: dict[str, Any]
     version: int
     expires_at: Optional[float]
+
+
+@dataclass(frozen=True)
+class Line:
+    """The companion's "line" part as taken: its item, call, text, version, expiry and arrival."""
+
+    item: str
+    call: int
+    text: str
+    version: int
+    expires_at: Optional[float]
+    at: float
 
 
 def _s(raw: Any) -> Optional[dict[str, Any]]:
@@ -169,6 +206,45 @@ def part_now(part: Any, now: float) -> Optional[Now]:
     if expires is not None and expires <= now:
         return None
     return Now(value, int(getattr(part, "version", 0)), expires)
+
+
+def part_line(part: Any, at: float) -> Optional[Line]:
+    """Return the companion's "line" part, or None for no part, a clear or a value that is not one.
+
+    No other check (rule 8): its session, call and expiry are not read; compose shows it only
+    while its item is open.
+    """
+    value = getattr(part, "value", None)
+    if not isinstance(value, dict):
+        return None
+    item, text, call = value.get("item"), value.get("text"), value.get("call")
+    if not isinstance(item, str) or not item or not isinstance(text, str) or not text.strip():
+        return None
+    return Line(
+        item,
+        call if isinstance(call, int) and not isinstance(call, bool) else 0,
+        text.strip(),
+        int(getattr(part, "version", 0)),
+        getattr(part, "expires_at", None),
+        at,
+    )
+
+
+def shown_line(view: View) -> Optional[Line]:
+    """Return the line shown in this view: only while its item is the open item (rule 7)."""
+    line = view.line
+    if line is None or view.open_item is None or line.item != view.open_item:
+        return None
+    return line
+
+
+def line_text(view: View) -> str:
+    """Return the "### This moment" section, or "" when no line is shown."""
+    line = shown_line(view)
+    if line is None:
+        return ""
+    words = QUIET_LINE if line.text.rstrip(".!").casefold() == QUIET else line.text
+    return f"{LINE_HEADING}\n{words}"
 
 
 def now_speaker(view: View) -> Optional[str]:
@@ -236,7 +312,12 @@ def take(view: View, held: dict[str, Any], now: float) -> tuple[View, list[str]]
     # "Just now" (Unit 5): a speaker change (a naming, a withdrawal, or a re-stamp a new session
     # can show), a guest's arrival, the agenda guarded (Unit 10) and the part dropped go at once;
     # the rest is batched, the agenda's other changes included.
-    new = replace(view, block=block, s=s, s_at=s_at, messages=messages, now=part_now(held.get(NOW_PART), now))
+    line = part_line(held.get(LINE_PART), now)
+    if line is not None and view.line is not None and line.version == view.line.version:
+        line = view.line  # the same version: its arrival stays
+    new = replace(
+        view, block=block, s=s, s_at=s_at, messages=messages, now=part_now(held.get(NOW_PART), now), line=line
+    )
     if view.now is not None and new.now is None:
         urgent.append(NOW_DROPPED)
     elif now_speaker(new) != now_speaker(view):
@@ -245,6 +326,10 @@ def take(view: View, held: dict[str, Any], now: float) -> tuple[View, list[str]]
         urgent.append(GUEST_ARRIVED)
     if _guarded(new.now) and not _guarded(view.now):
         urgent.append(AGENDA_GUARDED)
+    # The line (rule 8): at once whenever what is shown changes; a line for an item not open
+    # changes nothing shown, so it writes nothing.
+    if line_text(new) != line_text(view):
+        urgent.append(LINE_CHANGED)
     return new, urgent
 
 
@@ -269,7 +354,10 @@ def now_text(view: View) -> str:
 
 
 def compose(view: View) -> str:
-    """Return his instructions: the block, S, the messages answered, "just now", then the base."""
+    """Return his instructions, the moment's line last (rule 7, nearest the turn).
+
+    The block, S, the messages answered, "just now", the base, then this moment's line.
+    """
     parts = [view.block.text.strip()]
     if view.s is not None and str(view.s.get("text") or "").strip():
         parts.append(f"{S_HEADING}\n{' '.join(str(view.s['text']).split())}")
@@ -277,6 +365,7 @@ def compose(view: View) -> str:
         parts.append(f"{MESSAGES_HEADING}\n" + "\n".join(view.messages))
     parts.append(now_text(view))
     parts.append(view.base.strip())
+    parts.append(line_text(view))
     return "\n\n".join(p for p in parts if p)
 
 
@@ -311,6 +400,9 @@ class InstructionsWriter:
         self._now: set[asyncio.Task[None]] = set()
         self._held: dict[str, Any] = {}  # the parts record last taken, which the expiry retakes
         self._expiry: asyncio.TimerHandle | None = None  # the one timer at "now"'s expiry
+        self._ended: deque[str] = deque(maxlen=ENDED_KEPT)  # items whose end this session saw
+        self._line_sent: Line | None = None  # the line the last write showed, and when it went
+        self._line_sent_at = 0.0
 
     # --- a session's open ---------------------------------------------------------------------
 
@@ -331,6 +423,9 @@ class InstructionsWriter:
         block = file_block(text, header, now)
         view, _ = take(View(base, session, block, block.s, now), held, now)
         self.view, self.sent, self._drop = view, None, None
+        self._ended.clear()
+        self._line_sent = None
+        self._line_arrived(None)
         self._joined = s_version(view.s)
         if self._batch is not None:
             self._batch.cancel()
@@ -361,9 +456,10 @@ class InstructionsWriter:
         if self.view is None:
             return
         self._held = held
-        before = self.view.messages
+        before, line = self.view.messages, self.view.line
         view, urgent = take(self.view, held, self.clock())
         self.view = view
+        self._line_arrived(line)
         self._arm_expiry()
         if urgent:
             # J's reasons alone never start the drop measure again; with a block or S reason,
@@ -403,6 +499,46 @@ class InstructionsWriter:
         """Send any change at a reply's done, before the done event is set (rule 2)."""
         if self.pending():
             await self.send("a reply's done")
+
+    # --- the person's turn: the open item (Units 8-9, rules 6 and 9) ----------------------------
+
+    async def turn_started(self, item: str | None) -> None:
+        """Take speech_started's item as the open item, and send any pending change in one write.
+
+        The write withdraws an older item's line and carries whatever else waits (rule 9; the
+        companion's ticket 77, item 2). It never starts the drop measure again (Fu8measureclr).
+        """
+        if self.view is None:
+            return
+        self.view = replace(self.view, open_item=item or None)
+        if self.pending():
+            await self.send("speech started")
+
+    def turn_ended(self, item: str | None) -> bool:
+        """End the open item at its transcript's end (completed, empty included, or failed).
+
+        Return whether it was the open item. Nothing is sent: at a transcript with text the line
+        stays on the server for his reply, and the reply's done withdraws it (rule 9).
+        """
+        if item:
+            self._ended.append(item)
+        if self.view is None or not item or self.view.open_item != item:
+            return False
+        self.view = replace(self.view, open_item=None)
+        return True
+
+    async def at_empty_end(self, item: str | None, why: str) -> bool:
+        """At an empty or failed end of the open item, send any pending change now (rule 9).
+
+        H awaits it before the empty turn's re-create, so the re-create never reads the line.
+        It never starts the drop measure again (Fu8measureclr). Return whether it was the open
+        item.
+        """
+        if not self.turn_ended(item):
+            return False
+        if self.pending():
+            await self.send(why)
+        return True
 
     def _arm_expiry(self) -> None:
         """Set the one timer at the held "now" part's expiry (ConvoAll rule 10, JExpire).
@@ -488,6 +624,7 @@ class InstructionsWriter:
                 while self._writes and self._writes[0] < now - 60.0:
                     self._writes.popleft()
                 self._log(why, target)
+                self._log_line(why, shown_line(view), now)
                 if measure and self.on_sent is not None:
                     self.on_sent()
             try:
@@ -513,6 +650,54 @@ class InstructionsWriter:
             deleted += await self.prune.delete_before(conn, item, through=True)
         return deleted
 
+    def _line_arrived(self, before: Line | None) -> None:
+        """Log a newly taken line version: counts and timings only, never its text or item."""
+        view = self.view
+        line = view.line if view is not None else None
+        if line is None or (before is not None and before.version == line.version):
+            return
+        if view is not None and line.item == view.open_item:
+            where = "its item open"
+        elif line.item in self._ended:
+            where = "after its item ended"
+        else:
+            where = "not the open item"
+        logger.info(
+            "Moment line taken: call %d, v%d, %s, %s; %s",
+            line.call,
+            line.version,
+            "quiet" if line.text.rstrip(".!").casefold() == QUIET else "an act",
+            where,
+            self._expiry_left(line, line.at),
+        )
+
+    def _log_line(self, why: str, shown: Line | None, now: float) -> None:
+        """Log a write that showed a new line or withdrew one: counts and timings only."""
+        sent, self._line_sent = self._line_sent, shown
+        if shown is not None and (sent is None or sent.version != shown.version):
+            self._line_sent_at = now
+            logger.info(
+                "Moment line written (%s): call %d, v%d, %.2f s after it was taken; %s",
+                why,
+                shown.call,
+                shown.version,
+                now - shown.at,
+                self._expiry_left(shown, now),
+            )
+        elif shown is None and sent is not None:
+            logger.info(
+                "Moment line withdrawn (%s): call %d, v%d, shown %.1f s",
+                why,
+                sent.call,
+                sent.version,
+                now - self._line_sent_at,
+            )
+
+    @staticmethod
+    def _expiry_left(line: Line, now: float) -> str:
+        expires = line.expires_at
+        return "no expiry" if expires is None else f"{expires - now:.1f} s to its expiry"
+
     def _log(self, why: str, text: str) -> None:
         view, now = self.view, self.clock()
         if view is None:
@@ -537,7 +722,7 @@ class InstructionsWriter:
         # with tokens at 3.5 chars each: drops have come at 14.4k-22k input tokens (11-03)
         logger.info(
             "Instructions sent (%s): %d chars, about %d tokens; block v%d to row %d, %.1f s old; "
-            "%s; %d message(s); %s; %d write(s) in the last minute",
+            "%s; %d message(s); %s; %s; %d write(s) in the last minute",
             why,
             len(text),
             round(len(text) / 3.5),
@@ -547,5 +732,6 @@ class InstructionsWriter:
             s_part,
             len(view.messages),
             j_part,
+            "a line shown" if shown_line(view) is not None else "no line",
             len(self._writes),
         )

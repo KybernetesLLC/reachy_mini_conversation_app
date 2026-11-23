@@ -584,6 +584,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # not cancel it.
         self._followup_pending = False
         self._followup_live = False
+        # Rule 14 (ConvoAll FuAfter): the newest person's turn whose end the fork has not seen
+        # (the model's fTurn > fEnd), set at speech_started and ended at an empty or failed end,
+        # or at the done (or forced path) of the reply whose turn it is (_Live.heard). A tool's
+        # follow-up waits while it is open (_wait_for_newer_turn).
+        self._open_turn: str | None = None
+        self._open_turn_ended: asyncio.Event = asyncio.Event()
+        self._open_turn_ended.set()
         self._turn_began_owing = False
         self._cut_mid_reply = False
         # Set by shutdown(), cleared when start_up begins: a close during the client's build
@@ -705,6 +712,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """
         for older in [rid for rid in self._responses if rid != response_id]:
             logger.info("Response %s ended at a newer response.created: its done was lost", older)
+            if self._responses[older].in_band:
+                self._turn_ended(self._responses[older].heard)  # rule 14, as the forced path
             self._end_tracked(older, real=False)
         self._responses[response_id] = _Live(
             self._heard_item, time.monotonic() + _RESPONSE_DONE_TIMEOUT, in_band
@@ -742,6 +751,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         )
         if live.in_band:
             await self._writer.at_done()  # rule 2, as at a real done: before the event
+            self._turn_ended(live.heard)  # rule 14: the forced path ends its turn
         self._end_tracked(response_id, real=False)
 
     async def _force_overdue(self) -> bool:
@@ -1032,6 +1042,55 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
     def _reset_owed_outputs(self) -> None:
         self._owed_outputs.clear()
         self._no_outputs_owed.set()
+
+    def _turn_opened(self, item: str | None) -> None:
+        """Rule 14: a person's turn opened at speech_started (no item id: none is held)."""
+        self._open_turn = item or None
+        if self._open_turn is None:
+            self._open_turn_ended.set()
+        else:
+            self._open_turn_ended.clear()
+
+    def _turn_ended(self, item: str | None) -> None:
+        """Rule 14: the open turn's end was seen (an empty or failed end, or its reply's done)."""
+        if item and item == self._open_turn:
+            self._open_turn = None
+            self._open_turn_ended.set()
+
+    async def _wait_for_newer_turn(self, kwargs: dict[str, Any]) -> bool | None:
+        """Hold a tool's follow-up while a newer person's turn is open (rule 14).
+
+        Every follow-up's own turn has ended, so an open turn is a newer one: created now, the
+        follow-up would read that turn's line (ConvoAll Fu8leannofu, NoFuNewer). It waits, as
+        `_wait_for_owed_outputs` does and to the same bound, `_OWED_OUTPUT_TIMEOUT`, for the
+        turn's end: an empty or failed end, or the done or forced path of its reply. At the bound
+        the turn is ended as by the forced path: its line is withdrawn (no measure reset).
+
+        Return False when nothing was held, True when it was and the follow-up still goes, and
+        None when the newer turn's reply took the follow-up (its response.created clears
+        `_followup_pending`): that reply carried the tool's answer, so the follow-up is dropped,
+        the model's skip (ConvoAll FollowUp, fFu' = "none"). An empty or failed newer turn makes
+        no reply, so its follow-up still goes.
+        """
+        item = self._open_turn
+        if kwargs or not self._followup_pending or item is None:
+            return False
+        logger.info("tool follow-up held: a newer turn is open")
+        try:
+            await asyncio.wait_for(self._open_turn_ended.wait(), timeout=_OWED_OUTPUT_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "tool follow-up: the newer turn's end not seen in %.0f s; ending it as forced",
+                _OWED_OUTPUT_TIMEOUT,
+            )
+            self._writer.turn_ended(item)
+            self._turn_ended(item)
+            await self._writer.at_done()  # the forced path's write: the line withdrawn
+        if not self._followup_pending:
+            logger.info("tool follow-up dropped: the newer turn's reply carried the tool's answer")
+            return None
+        logger.info("tool follow-up released: the newer turn ended")
+        return True
 
     async def _wait_for_owed_outputs(self, kwargs: dict[str, Any]) -> bool:
         """Hold an in-band response.create until every function call has its output; True if held.
@@ -1577,6 +1636,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         come, so _user_speaking stayed set and the listening pose stayed held.
         """
         self._user_speaking = False
+        # No transcript event will come for the open item: its line is withdrawn and rule 14's
+        # turn ends here (Units 8-9), as at an empty end.
+        item = self._open_turn
+        if await self._writer.at_empty_end(item, "the microphone stopped"):
+            self._turn_ended(item)
         try:
             self.deps.movement_manager.set_listening(False)
         except Exception:
@@ -2142,6 +2206,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         )
                         break
                     self._greeting_live = True
+                held = False if announcement else await self._wait_for_newer_turn(kwargs)
+                if held is None:
+                    break  # the newer turn's reply answered for the tool
+                if held:
+                    continue  # the turn's end may bring its reply: wait for that again first
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
                 conn = self.connection
@@ -2492,6 +2561,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 logger.info("%d thought(s) of the last session not answered", len(self._thoughts))
                 self._thoughts.clear()
             self._followup_pending = self._followup_live = False
+            self._turn_opened(None)  # rule 14: no turn of the last session is open
             # Session-state hygiene: the last session's batch is over. Its cancelled tools'
             # results are dropped by the tool manager, never handled here.
             self._in_flight_tool_calls.clear()
@@ -2573,6 +2643,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if self._greeting_live:
                             await self._cancel_greeting()
                         self.deps.movement_manager.set_listening(True)
+                        # Units 8-9, rules 6 and 9: the open item, and one write of anything
+                        # pending (an older item's line withdrawn); rule 14's turn opens.
+                        started = getattr(event, "item_id", None)
+                        self._turn_opened(started)
+                        await self._writer.turn_started(started)
                         logger.debug("User speech started")
 
                     if event.type == "input_audio_buffer.speech_stopped":
@@ -2660,6 +2735,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             # Rule 2: the done write goes before the done event, so the next
                             # create cannot go ahead of it. The nudge's done is a reply's done.
                             await self._writer.at_done()
+                            done_live = self._responses.get(
+                                getattr(getattr(event, "response", None), "id", None)
+                            )
+                            if done_live is not None:  # rule 14: its reply's done ends a turn
+                                self._turn_ended(done_live.heard)
                         # Rule 6: this response alone ends; the event is set when none is left.
                         self._end_tracked(
                             getattr(getattr(event, "response", None), "id", None), real=True
@@ -2744,6 +2824,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             "user_transcription_failed", getattr(event, "item_id", None)
                         )
                         self._end_partial(getattr(event, "item_id", None))
+                        # rule 9: the failed end withdraws the open item's line; rule 14: it ends
+                        failed = getattr(event, "item_id", None)
+                        await self._writer.at_empty_end(failed, "a failed end")
+                        self._turn_ended(failed)
                         logger.warning(
                             "User transcription failed for item %s",
                             getattr(event, "item_id", None),
@@ -2766,8 +2850,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         await self._cancel_partial_transcript_task()
 
+                        ended = getattr(event, "item_id", None)
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
+                            # Rule 9: the empty end withdraws the open item's line before the
+                            # re-create below, which would read it; rule 14: the turn ends.
+                            await self._writer.at_empty_end(ended, "an empty end")
+                            self._turn_ended(ended)
                             if getattr(self, "_cut_mid_reply", False):
                                 # 11-03 19:39-19:42: VAD fired on no speech 1-3 s into his reply,
                                 # the reply was dropped, and 11-36 s of silence followed
@@ -2777,6 +2866,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 )
                                 await self._safe_response_create()
                             continue
+                        # Rule 6: the item ends; no write, so his reply still reads its line
+                        # and the reply's done withdraws it (rule 9). The turn stays open for
+                        # rule 14 until that done.
+                        self._writer.turn_ended(ended)
                         self._cut_mid_reply = False
                         self._heard_item = getattr(event, "item_id", None) or self._heard_item
                         self._prune.mark_heard(getattr(event, "item_id", None))

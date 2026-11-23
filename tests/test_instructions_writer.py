@@ -628,3 +628,175 @@ async def test_the_agenda_guarded_goes_at_once_and_never_measures() -> None:
         await _settle()
         assert len(conn.wire) == 1 and writer.pending()  # batched: nothing at once
     assert iw.AGENDA_GUARDED in iw.J_REASONS
+
+
+# --- the moment thinker's line (Units 8-9, model.md "The final rule set (F)", rules 6-9) ---------
+
+ACT = "Answer the question about the weekend."
+
+
+def _line(version: int, item: str, text: str = ACT, call: int = 1, expires_at=None) -> SimpleNamespace:
+    value = {"item": item, "call": call, "text": text}
+    return SimpleNamespace(name="line", version=version, value=value, session=None, expires_at=expires_at)
+
+
+def _updates(conn: Conn) -> list[str]:
+    return [text for kind, text in conn.wire if kind == "update"]
+
+
+@pytest.mark.asyncio
+async def test_the_line_is_placed_last_after_the_base_while_its_item_is_open() -> None:
+    """Rule 7: the line goes at once, under its heading, after the stable base (the owner's design)."""
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn)
+    await writer.turn_started("i1")
+    writer.parts_changed({"line": _line(1, "i1")})
+    await _settle()
+    assert _updates(conn) == [writer.current()]
+    assert writer.current().endswith(f"BASE\n\n{iw.LINE_HEADING}\n{ACT}")
+
+
+def test_quiet_is_rendered_as_one_plain_line() -> None:
+    """The companion's "quiet": the words were not said to him, in the profile's own form."""
+    block = iw.Block("", 0, None, None, 0, 0.0)
+    line = iw.Line("i1", 1, "quiet", 1, None, 0.0)
+    text = iw.compose(iw.View("BASE", SESSION, block, None, 0.0, line=line, open_item="i1"))
+    assert text == f"BASE\n\n{iw.LINE_HEADING}\n{iw.QUIET_LINE}"
+    assert "quiet" not in iw.QUIET_LINE.replace("stay_quiet", "")
+    assert round(len(f"{iw.LINE_HEADING}\n{iw.QUIET_LINE}") / 3.5) <= 25
+
+
+@pytest.mark.asyncio
+async def test_a_line_part_with_no_open_item_writes_nothing_new() -> None:
+    """Rule 8: the take has no checks, and compose shows nothing for an item that is not open."""
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn)
+    writer.parts_changed({"line": _line(1, "i1")})
+    await _settle()
+    assert conn.wire == [] and not writer.pending()
+    assert writer.view.line is not None  # taken, not shown
+
+
+@pytest.mark.asyncio
+async def test_a_line_for_an_item_cut_by_a_reconnect_is_not_shown() -> None:
+    """Fu8leannoopen (NoCrossSession): a session's open has no open item.
+
+    The record's line for the item the reconnect cut is in neither the new session's first
+    write nor its next turn.
+    """
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn)
+    await writer.turn_started("i1")
+    writer.parts_changed({"line": _line(1, "i1")})
+    await _settle()
+    assert iw.LINE_HEADING in writer.sent
+    held = {"line": _line(1, "i1")}  # the reconnect's snapshot still holds it
+    text = writer.connect(SESSION + 1, "BASE", "## Your memory\nold turns", {"top": 1}, held)
+    assert iw.LINE_HEADING not in text and writer.view.open_item is None
+    await writer.open(conn, {"type": "realtime", "instructions": text})
+    conn.wire.clear()
+    await writer.turn_started("i2")
+    writer.parts_changed(held)
+    await _settle()
+    assert conn.wire == [] and iw.LINE_HEADING not in writer.current()
+
+
+@pytest.mark.asyncio
+async def test_a_line_after_its_items_end_is_not_shown(caplog) -> None:
+    """Fnodrop (LineGoneAtEnd): a line that comes after its item's end is not written.
+
+    Its log says so, with counts and timings only.
+    """
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn)
+    await writer.turn_started("i1")
+    assert writer.turn_ended("i1") is True
+    with caplog.at_level("INFO", logger=iw.__name__):
+        writer.parts_changed({"line": _line(1, "i1", expires_at=writer.clock() + 29.0)})
+        await _settle()
+    assert conn.wire == [] and iw.LINE_HEADING not in writer.current()
+    assert "Moment line taken: call 1, v1, an act, after its item ended; 29.0 s to its expiry" in caplog.text
+    assert ACT not in caplog.text and "i1" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_snapshot_after_the_done_does_not_bring_the_line_back() -> None:
+    """Fnodrop (NoStaleLine): a line offered again after the done writes nothing.
+
+    The transcript with text sends nothing, so his reply reads the line; the done withdraws it,
+    and the record's line offered again (a snapshot, a newer call) writes nothing.
+    """
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn)
+    await writer.turn_started("i1")
+    writer.parts_changed({"line": _line(1, "i1")})
+    await _settle()
+    writer.turn_ended("i1")  # the completed transcript: no write
+    await _settle()
+    assert len(_updates(conn)) == 1 and iw.LINE_HEADING in writer.sent
+    await writer.at_done()
+    assert len(_updates(conn)) == 2 and iw.LINE_HEADING not in writer.sent
+    writer.parts_changed({"line": _line(1, "i1")})
+    writer.parts_changed({"line": _line(2, "i1", call=2)})
+    await _settle()
+    assert len(_updates(conn)) == 2 and not writer.pending()
+
+
+@pytest.mark.asyncio
+async def test_every_line_write_leaves_the_drop_measure(caplog) -> None:
+    """Fu8measure and Fu8measureclr (NoGapHis): no line write starts the drop measure again.
+
+    The take's write, the withdrawal at speech_started and the withdrawal at an empty end each
+    go, and none starts the drop measure again.
+    """
+    writer, conn, _, measured = _writer()
+    await _open(writer, conn)
+    with caplog.at_level("INFO", logger=iw.__name__):
+        await writer.turn_started("i1")
+        writer.parts_changed({"line": _line(1, "i1")})  # the take
+        await _settle()
+        await writer.turn_started("i2")  # the clear at speech_started
+        writer.parts_changed({"line": _line(2, "i2")})
+        await _settle()
+        await writer.at_empty_end("i2", "an empty end")  # the empty end
+    updates = _updates(conn)
+    assert len(updates) == 4
+    assert [iw.LINE_HEADING in u for u in updates] == [True, False, True, False]
+    assert measured == []
+    assert caplog.text.count("Moment line written") == 2
+    assert caplog.text.count("Moment line withdrawn") == 2
+    assert "Moment line withdrawn (speech started)" in caplog.text
+    assert "Moment line withdrawn (an empty end)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_speech_started_sends_whatever_is_pending_in_one_write() -> None:
+    """Rule 9 and the companion's ticket 77, item 2: speech_started sends what is pending.
+
+    A batched change waiting at speech_started goes with the withdrawal in one write, with no
+    measure reset; nothing pending sends nothing.
+    """
+    writer, conn, _, measured = _writer()
+    await _open(writer, conn)
+    await writer.turn_started("i1")
+    assert conn.wire == []
+    writer.parts_changed({"line": _line(1, "i1")})
+    await _settle()
+    conn.wire.clear()
+    writer.view = writer.view.__class__(**{**writer.view.__dict__, "base": "NEW"})  # batched
+    await writer.turn_started("i2")
+    assert _updates(conn) == [writer.current()]
+    assert writer.current().endswith("NEW") and measured == []
+
+
+@pytest.mark.asyncio
+async def test_an_end_of_another_item_neither_clears_the_open_item_nor_sends() -> None:
+    """A failed or empty end of an older item leaves the open item's line shown."""
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn)
+    await writer.turn_started("i2")
+    writer.parts_changed({"line": _line(1, "i2")})
+    await _settle()
+    conn.wire.clear()
+    await writer.at_empty_end("i1", "a failed end")
+    assert conn.wire == [] and writer.view.open_item == "i2"
