@@ -387,13 +387,18 @@ def test_the_writer_builds_no_record_of_its_own() -> None:
 # --- the "just now" part (route all, Unit 5; ConvoAll rule 10) --------------------------------
 
 
-def _now(version: int, *, speaker=None, guest=False, here=(), lines=(), time="It's noon.", expires=None):
+def _now(
+    version: int, *, speaker=None, guest=False, here=(), lines=(), time="It's noon.", expires=None,
+    agenda=None, guarded=False,
+):  # fmt: skip
     value = {
         "time": time,
         "here": list(here),
         "guest": guest,
         "speaker": speaker,
         "lines": list(lines),
+        "agenda": None if agenda is None else list(agenda),
+        "guarded": guarded,
         "at_wall": 1_800_000_000.0,
         "at_mono": 4.0,
     }
@@ -568,3 +573,56 @@ async def test_a_part_that_arrives_after_a_connect_without_one_arms_the_expiry()
     await _settle()
     assert writer.view.now is None and iw.NOW_HEADING not in (writer.sent or "")
     assert measured == []
+
+
+# --- his agenda in "just now" (route all, Unit 10; ConvoAll Unit 10) ----------------------------
+# The companion's half (the rows, the forms, the claim's rebuild) is tested in the companion's
+# tests/test_reminder_words.py and tests/test_now_part.py.
+
+
+def test_the_agenda_is_composed_after_the_speaker_and_before_the_lines() -> None:
+    """The agenda's lines go after the speaker and before the sense lines; unread, nothing."""
+    block = iw.Block("## Your memory\nturns", 3, None, None, 1, 0.0)
+    j = iw.Now(
+        _now(1, speaker={"text": "Ada is speaking to you.", "at": SESSION}, here=["Ada is here."],
+             agenda=["A timer, due today 16:05.", "A reminder for Ada, due today 17:00."],
+             lines=["You're bright."]).value,
+        1,
+        None,
+    )  # fmt: skip
+    text = iw.compose(iw.View("BASE", SESSION, block, None, 0.0, (), j))
+    assert text.endswith(
+        f"{iw.NOW_HEADING}\nIt's noon.\nAda is here.\nAda is speaking to you.\n"
+        "A timer, due today 16:05.\nA reminder for Ada, due today 17:00.\nYou're bright."
+    )
+    unread = iw.Now(_now(2, agenda=None).value, 2, None)  # the store unread: no agenda line
+    assert _just_now(iw.compose(iw.View("BASE", SESSION, block, None, 0.0, (), unread))) == "It's noon."
+
+
+@pytest.mark.asyncio
+async def test_the_agenda_guarded_goes_at_once_and_never_measures() -> None:
+    """ConvoAll Unit 10, GuardInTime (Fjgbatched) and NoGapHis (Fjgmeasure): the guard goes at once.
+
+    `guarded` turning True goes at once with no drop-measure reset, as a guest's arrival does.
+    Every other agenda change, the guard turning False included, is batched.
+    """
+    writer, conn, _, measured = _writer()
+    full = ["A calendar reminder for Ada, due today 15:00."]
+    hidden = ["A reminder for Ada, due today 15:00."]
+    await _open(writer, conn, held={"now": _now(1, agenda=full)})
+    assert "A calendar reminder for Ada" in writer.sent
+    writer.parts_changed({"now": _now(2, agenda=hidden, guarded=True)})
+    await _settle()
+    assert [k for k, _ in conn.wire] == ["update"] and "A reminder for Ada" in conn.wire[0][1]
+    assert "calendar" not in _just_now(conn.wire[0][1]) and measured == []
+    for version, change in enumerate(
+        [{"agenda": hidden + ["A timer, due today 15:30."], "guarded": True},  # a row set
+         {"agenda": full, "guarded": False},  # the guest left
+         {"agenda": []},  # the row claimed or cancelled
+         {"agenda": ["A timer, due today 15:30.", "1 more set for later."]}],
+        start=3,
+    ):  # fmt: skip
+        writer.parts_changed({"now": _now(version, **change)})
+        await _settle()
+        assert len(conn.wire) == 1 and writer.pending()  # batched: nothing at once
+    assert iw.AGENDA_GUARDED in iw.J_REASONS

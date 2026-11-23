@@ -14,7 +14,8 @@ profile, first, for the prompt cache) and then the parts:
 - what is true just now: the companion's "now" part (Unit 5, ConvoAll rule 10), last, so a change
   rewrites only the tail. Its speaker line is shown only when its decision's stamp is not before
   this view's memory_read_at (both on the host's monotonic clock): an older session's speaker is
-  never shown. A part past its expiry is not taken.
+  never shown. A part past its expiry is not taken. His agenda (Unit 10) is the part's `agenda`
+  lines, after the speaker: what is set, in the companion's words.
 
 `take` and `compose` are pure: what the parts record changes, what goes at once and why, and the
 text. The writer sends (rules 3-5, 9):
@@ -23,8 +24,8 @@ text. The writer sends (rules 3-5, 9):
   held less than the bound) and a drop's block go at once, on the handler's loop;
 - an answered message goes at once too, but does not start the drop measure again (Unit 6
   review: S's join goes at once, and the record is S-shaped);
-- a speaker change, a guest's arrival and "just now" dropped (its expiry, or a snapshot that lacks
-  it) go at once and do not start the drop measure again either, unless a block or S reason goes
+- a speaker change, a guest's arrival, the agenda guarded (Unit 10: a guest changed a line) and
+  "just now" dropped (its expiry, or a snapshot that lacks it) go at once and do not start the drop measure again either, unless a block or S reason goes
   in the same send; one timer at the held part's expiry drops it and sends at once;
 - any other change is batched, BATCH_S, and goes in a tool's window too (no hold), and never
   sooner than BATCHED_GAP_S after the last write (the Units 3+4 review: trims and awareness
@@ -59,8 +60,9 @@ NOW_PART = "now"
 # The "just now" reasons: at once, and never a drop-measure reset of their own (ConvoAll rule 10).
 SPEAKER_CHANGED = "the speaker changed"
 GUEST_ARRIVED = "a guest arrived"
+AGENDA_GUARDED = "the agenda guarded"  # Unit 10: a guest changed a line of his agenda
 NOW_DROPPED = "just now dropped"
-J_REASONS = frozenset({SPEAKER_CHANGED, GUEST_ARRIVED, NOW_DROPPED})
+J_REASONS = frozenset({SPEAKER_CHANGED, GUEST_ARRIVED, AGENDA_GUARDED, NOW_DROPPED})
 _NONE = float("-inf")
 
 
@@ -189,6 +191,10 @@ def _guest(j: Optional[Now]) -> bool:
     return j is not None and j.value.get("guest") is True
 
 
+def _guarded(j: Optional[Now]) -> bool:
+    return j is not None and j.value.get("guarded") is True
+
+
 def _lines(raw: Any) -> list[str]:
     return [x.strip() for x in raw if isinstance(x, str) and x.strip()] if isinstance(raw, list) else []
 
@@ -226,7 +232,8 @@ def take(view: View, held: dict[str, Any], now: float) -> tuple[View, list[str]]
     if view.messages and not messages:
         urgent.append("messages cleared")
     # "Just now" (Unit 5): a speaker change (a naming, a withdrawal, or a re-stamp a new session
-    # can show), a guest's arrival and the part dropped go at once; the rest is batched.
+    # can show), a guest's arrival, the agenda guarded (Unit 10) and the part dropped go at once;
+    # the rest is batched, the agenda's other changes included.
     new = replace(view, block=block, s=s, s_at=s_at, messages=messages, now=part_now(held.get(NOW_PART), now))
     if view.now is not None and new.now is None:
         urgent.append(NOW_DROPPED)
@@ -234,13 +241,16 @@ def take(view: View, held: dict[str, Any], now: float) -> tuple[View, list[str]]
         urgent.append(SPEAKER_CHANGED)
     if _guest(new.now) and not _guest(view.now):
         urgent.append(GUEST_ARRIVED)
+    if _guarded(new.now) and not _guarded(view.now):
+        urgent.append(AGENDA_GUARDED)
     return new, urgent
 
 
 def now_text(view: View) -> str:
     """Return the "### Just now" section, or "" when it has nothing to say.
 
-    The time, who is here, the speaker shown, then the lines: the companion's order and text.
+    The time, who is here, the speaker shown, his agenda, then the lines: the companion's order
+    and text.
     """
     j = view.now
     if j is None:
@@ -251,6 +261,7 @@ def now_text(view: View) -> str:
     speaker = now_speaker(view)
     if speaker:
         lines.append(speaker)
+    lines += _lines(j.value.get("agenda"))
     lines += _lines(j.value.get("lines"))
     return f"{NOW_HEADING}\n" + "\n".join(lines) if lines else ""
 
