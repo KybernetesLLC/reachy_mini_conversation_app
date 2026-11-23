@@ -549,3 +549,22 @@ async def test_the_send_log_names_the_parts_version_and_age_never_its_text(caplo
         await _settle()
     assert "just now v2, " in caplog.text and " s old, its speaker shown" in caplog.text
     assert "Ada" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_part_that_arrives_after_a_connect_without_one_arms_the_expiry() -> None:
+    """The expiry timer is armed at each take, not only at the connect.
+
+    A session opened with no "now" part held, then a part arrives: its expiry still drops it.
+    """
+    import time
+
+    writer, conn, _, measured = _writer()
+    await _open(writer, conn, held={})
+    assert writer._expiry is None
+    writer.parts_changed({"now": _now(1, expires=time.monotonic() + 0.05)})
+    assert writer._expiry is not None
+    await asyncio.sleep(0.15)
+    await _settle()
+    assert writer.view.now is None and iw.NOW_HEADING not in (writer.sent or "")
+    assert measured == []
