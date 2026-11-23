@@ -7037,3 +7037,143 @@ async def test_fragment_deltas_reach_the_companion_whole_and_the_ui_partial_is_u
         ("user", "Hey how are you?", False, "item-1"),
     ]
     assert handler.input_transcript_chunks_by_item.deltas == [" how are you?"]
+
+
+# --- route all, Units 8-9: the moment thinker's line and rule 14 -------------------------------
+
+_ACT = "Answer the question about the weekend."
+
+
+def _line_record(item: str, version: int = 1) -> Any:
+    part = SimpleNamespace(
+        name="line", version=version, value={"item": item, "call": 1, "text": _ACT},
+        session=None, expires_at=None,
+    )  # fmt: skip
+    return SimpleNamespace(held={"line": part})
+
+
+async def _let_tasks_run() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_transcript_withdraws_the_line_before_the_recreate(monkeypatch: Any) -> None:
+    """Fu8leannoempty (OneOwnerLine): an empty end withdraws the line before the re-create.
+
+    The empty turn's re-create (his reply was cut mid-way) is queued only after that write.
+    """
+    from reachy_mini_conversation_app import instructions_writer as iw
+
+    wire: list[tuple[str, bool]] = []
+    handler = _session_handler(monkeypatch, ())
+    handler._clear_queue = lambda: (5.0, 3.0)  # a barge-in 3 s before his reply's end
+
+    def _patch() -> None:
+        async def update(**kwargs: Any) -> None:
+            wire.append(("update", iw.LINE_HEADING in (kwargs["session"].get("instructions") or "")))
+
+        async def create(**_kwargs: Any) -> None:
+            wire.append(("create", False))
+
+        handler.connection.session.update = update
+        handler._safe_response_create = create
+
+    async def _line_comes() -> None:
+        handler.parts_changed(_line_record("i1"))
+        await _let_tasks_run()
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _patch,
+            _FakeEvent("input_audio_buffer.speech_started", item_id="i1"),
+            _line_comes,
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed", item_id="i1", transcript=" "
+            ),
+        )
+    )
+    await handler._run_realtime_session()
+
+    assert wire == [("update", True), ("update", False), ("create", False)]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_transcription_withdraws_the_open_items_line(monkeypatch: Any) -> None:
+    """Rule 9: a failed end of the open item withdraws its line at once."""
+    from reachy_mini_conversation_app import instructions_writer as iw
+
+    handler = _session_handler(monkeypatch, ())
+    seen: list[bool] = []
+
+    async def _line_comes() -> None:
+        handler.parts_changed(_line_record("i1"))
+        await _let_tasks_run()
+        seen.append(iw.LINE_HEADING in (handler._writer.sent or ""))
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("input_audio_buffer.speech_started", item_id="i1"),
+            _line_comes,
+            _FakeEvent("conversation.item.input_audio_transcription.failed", item_id="i1"),
+            lambda: seen.append(iw.LINE_HEADING in (handler._writer.sent or "")),
+        )
+    )
+    await handler._run_realtime_session()
+
+    assert seen == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_the_open_item_survives_connect_before_the_tracker_reset(monkeypatch: Any) -> None:
+    """The build hazard (model.md, F's build rule 5): connect runs before the tracker's reset.
+
+    The writer's connect runs inside _get_session_config, before the transcript tracker's
+    reset. The open item lives in the writer's View, so the open has none while the old tracker
+    still names the cut item, and the new session's item is held after that reset.
+    """
+    from dataclasses import replace
+
+    from reachy_mini_conversation_app import instructions_writer as iw
+
+    handler = _session_handler(monkeypatch, ())
+    handler.parts_source = lambda: _line_record("old")
+    handler._writer.connect(1.0, "test", "", {}, {})
+    handler._writer.view = replace(handler._writer.view, open_item="old")  # the last session's
+    handler.input_transcript_chunks_by_item = hf_mod.InputTranscriptChunksByItem(
+        item_id="old", deltas=["words"]
+    )
+    at_open: list[tuple[str | None, str | None, bool]] = []
+    real_open = handler._writer.open
+
+    async def _open(conn: Any, session_config: dict[str, Any]) -> None:
+        at_open.append(
+            (
+                handler.input_transcript_chunks_by_item.item_id,  # not reset yet
+                handler._writer.view.open_item,
+                iw.LINE_HEADING in session_config["instructions"],
+            )
+        )
+        await real_open(conn, session_config)
+
+    monkeypatch.setattr(handler._writer, "open", _open)
+    after: list[tuple[str | None, str | None, bool]] = []
+
+    async def _line_comes() -> None:
+        handler.parts_changed(_line_record("new", version=2))
+        await _let_tasks_run()
+        after.append(
+            (
+                handler.input_transcript_chunks_by_item.item_id,
+                handler._writer.view.open_item,
+                iw.LINE_HEADING in (handler._writer.sent or ""),
+            )
+        )
+
+    handler.client = _make_fake_realtime_client(
+        events=(_FakeEvent("input_audio_buffer.speech_started", item_id="new"), _line_comes)
+    )
+    await handler._run_realtime_session()
+
+    assert at_open == [("old", None, False)]
+    assert after == [(None, "new", True)]

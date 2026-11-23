@@ -2573,6 +2573,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         if self._greeting_live:
                             await self._cancel_greeting()
                         self.deps.movement_manager.set_listening(True)
+                        # Units 8-9, rules 6 and 9: the open item, and one write of anything
+                        # pending (an older item's line withdrawn).
+                        await self._writer.turn_started(getattr(event, "item_id", None))
                         logger.debug("User speech started")
 
                     if event.type == "input_audio_buffer.speech_stopped":
@@ -2744,6 +2747,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             "user_transcription_failed", getattr(event, "item_id", None)
                         )
                         self._end_partial(getattr(event, "item_id", None))
+                        # rule 9: the failed end withdraws the open item's line
+                        await self._writer.at_empty_end(
+                            getattr(event, "item_id", None), "a failed end"
+                        )
                         logger.warning(
                             "User transcription failed for item %s",
                             getattr(event, "item_id", None),
@@ -2766,8 +2773,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         await self._cancel_partial_transcript_task()
 
+                        ended = getattr(event, "item_id", None)
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
+                            # Rule 9: the empty end withdraws the open item's line before the
+                            # re-create below, which would read it.
+                            await self._writer.at_empty_end(ended, "an empty end")
                             if getattr(self, "_cut_mid_reply", False):
                                 # 11-03 19:39-19:42: VAD fired on no speech 1-3 s into his reply,
                                 # the reply was dropped, and 11-36 s of silence followed
@@ -2777,6 +2788,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 )
                                 await self._safe_response_create()
                             continue
+                        # Rule 6: the item ends; no write, so his reply still reads its line
+                        # and the reply's done withdraws it (rule 9).
+                        self._writer.turn_ended(ended)
                         self._cut_mid_reply = False
                         self._heard_item = getattr(event, "item_id", None) or self._heard_item
                         self._prune.mark_heard(getattr(event, "item_id", None))

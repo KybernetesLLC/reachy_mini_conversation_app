@@ -11,8 +11,9 @@ part named that is held is acknowledged with the version held, taken or not, and
 names the epoch held, so a companion the record is not from sends a snapshot.
 
 The writer of his instructions composes from them (instructions_writer, Unit 4). `expires_at` is
-stored here; the writer acts on it (Unit 5): it takes no part past its expiry, and its one timer at
-the "now" part's expiry drops that part and writes at once.
+stored here; the writer acts on it (Unit 5): it takes no "now" part past its expiry, and its one
+timer at that part's expiry drops it and writes at once. The "line" part (Units 8-9) is taken with
+no check of its expiry: the writer shows it only while its item is open (model.md, rule 8).
 """
 
 from __future__ import annotations
