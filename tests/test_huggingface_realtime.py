@@ -2689,7 +2689,7 @@ async def test_the_done_write_goes_before_the_done_event(monkeypatch: Any, tag: 
 async def test_the_doubling_the_file_is_read_only_at_a_sessions_open(monkeypatch: Any) -> None:
     """Round 6 (the doubling): a block re-read mid-session holds this connection's turns, which are
     its chat items too. The file is read at the open only; later blocks are the companion's parts,
-    and the first write is the writer's composition, base first."""
+    and the first write is the writer's composition, base last."""
     events = _reply_events("Hello.", audio_first=False)
     handler = _session_handler(monkeypatch, events)
     handler._clear_queue = lambda: None
@@ -2704,7 +2704,7 @@ async def test_the_doubling_the_file_is_read_only_at_a_sessions_open(monkeypatch
     handler.want_instructions("a session opened on a live connection")
     handler.parts_changed(SimpleNamespace(held={}))
     assert reads == [1]
-    assert handler._writer.sent == "test\n\n## Your memory\nold turns"
+    assert handler._writer.sent == "## Your memory\nold turns\n\ntest"
 
 
 @pytest.mark.asyncio
@@ -6670,7 +6670,7 @@ async def test_a_thoughts_done_reaches_his_instructions_by_the_companions_part(m
     )
     assert handler._writer.current().endswith(
         "### Thoughts you answered in this conversation\n"
-        "(a thought from Hadley, answered) did you see the boat? / (your reply) Yes, a big one!"
+        "(a thought from Hadley, answered) did you see the boat? / (your reply) Yes, a big one!\n\ntest"
     )
 # --- each response by its id (route all, Unit 7: ConvoAll rule 6) ---------------------------
 

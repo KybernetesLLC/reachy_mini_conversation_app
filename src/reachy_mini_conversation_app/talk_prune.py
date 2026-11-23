@@ -37,11 +37,15 @@ logger = logging.getLogger(__name__)
 
 LEDGER_MAX = 2000
 LAG_S = 60.0  # the time cut: an item arrives before its transcript is stamped
-# The trim: the hosted backend's chat_size is not known (about 14, estimated; its default is 10 at
-# the backend source at SV:370), so the trim starts at 10 user items. It leaves 3 (the Units 3+4
-# review: notes are half the user items, and leaving 6 trimmed every 2.4 turns).
-TRIM_AT = 10
-TRIM_TO = 3
+# The trim (the owner, 11-23): the hosted backend's chat_size is not known. At speech-to-speech
+# ff4aec3 it defaults to 30 (arguments_classes/language_model_base_arguments.py:22), which the
+# realtime pipeline passes on (s2s_pipeline.py:633); the 10 at api/openai_realtime/service.py:370
+# is only RealtimeService's own default. The lowest evidence for the hosted value: compactions at
+# about 14 user items on 11-14, while notes still counted. So the trim starts at 13, under that,
+# and leaves 6: at 10 down to 3 he kept about 3 exchanges and a fast talk trimmed every ~90 s. An
+# overnight measurement of chat_size will set both.
+TRIM_AT = 13
+TRIM_TO = 6
 
 
 class TalkPrune:

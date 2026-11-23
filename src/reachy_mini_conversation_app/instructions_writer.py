@@ -1,8 +1,10 @@
 """The writer of his instructions (route all, Unit 4): the only sender of session instructions.
 
 The companion's model is ConvoAll, round 6 (docs/formal/conversation-d/model.md on its branch
-arch-d-model), rules 2-5, 7 and 9. His instructions are composed here from the stable base (the
-profile, first, for the prompt cache) and then the parts:
+arch-d-model), rules 2-5, 7 and 9. His instructions are composed here from the parts, then the
+stable base (the profile) last, nearest the turn, as the fork before route all had it (the owner,
+11-23: after route all put the profile first he stopped calling recall, and the prompt cache it
+was first for never paid off, `cached 0` on all 995 turns from 11-21 to 11-23):
 
 - the session block: at a session's open, the companion's file read unbounded (it names the S it
   is cut at, with its text); after that, the companion's "block" part for this session, bounded
@@ -11,8 +13,8 @@ profile, first, for the prompt cache) and then the parts:
   and the companion's "summary" part (rule 8: S arrives by both; a clear is a newer version);
 - the recent text messages he answered in this talk: the companion's "messages" part (Unit 6,
   ConvoAll rule 4 as S), its lines composed as they come. The app keeps no record of its own;
-- what is true just now: the companion's "now" part (Unit 5, ConvoAll rule 10), last, so a change
-  rewrites only the tail. Its speaker line is shown only when its decision's stamp is not before
+- what is true just now: the companion's "now" part (Unit 5, ConvoAll rule 10), the last part,
+  before the base. Its speaker line is shown only when its decision's stamp is not before
   this view's memory_read_at (both on the host's monotonic clock): an older session's speaker is
   never shown. A part past its expiry is not taken. His agenda (Unit 10) is the part's `agenda`
   lines, after the speaker: what is set, in the companion's words.
@@ -267,15 +269,14 @@ def now_text(view: View) -> str:
 
 
 def compose(view: View) -> str:
-    """Return his instructions: the base, the block, S, the messages answered, then "just now"."""
-    parts = [view.base.strip()]
-    if view.block.text.strip():
-        parts.append(view.block.text.strip())
+    """Return his instructions: the block, S, the messages answered, "just now", then the base."""
+    parts = [view.block.text.strip()]
     if view.s is not None and str(view.s.get("text") or "").strip():
         parts.append(f"{S_HEADING}\n{' '.join(str(view.s['text']).split())}")
     if view.messages:
         parts.append(f"{MESSAGES_HEADING}\n" + "\n".join(view.messages))
     parts.append(now_text(view))
+    parts.append(view.base.strip())
     return "\n\n".join(p for p in parts if p)
 
 

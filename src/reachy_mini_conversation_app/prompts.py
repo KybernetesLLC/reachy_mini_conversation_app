@@ -76,7 +76,7 @@ def _profile_instructions() -> str:
 def get_profile_instructions() -> str:
     """Return the active profile's instructions, the stable base of his instructions.
 
-    Sent first (route all: the prompt cache), the companion's parts after it (instructions_writer).
+    Sent last, after the companion's parts (instructions_writer.compose).
     """
     return _profile_instructions()
 

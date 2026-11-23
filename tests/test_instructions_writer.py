@@ -78,13 +78,14 @@ async def _settle() -> None:
         await asyncio.sleep(0)
 
 
-def test_the_composition_is_the_stable_base_then_the_parts() -> None:
+def test_the_composition_is_the_parts_then_the_stable_base() -> None:
     block = iw.Block("## Your memory\nturns", 3, None, None, 1, 0.0)
     view = iw.View("BASE", SESSION, block, S1, 0.0, ("(a thought from Alli, answered) hi / (your reply) hello",))
     text = iw.compose(view)
-    assert text.startswith("BASE\n\n## Your memory\nturns\n\n")
+    assert text.startswith("## Your memory\nturns\n\n")
+    assert text.index(iw.S_HEADING) < text.index(iw.MESSAGES_HEADING)
     assert f"{iw.S_HEADING}\nAlli asked about ferries." in text
-    assert text.endswith(f"{iw.MESSAGES_HEADING}\n(a thought from Alli, answered) hi / (your reply) hello")
+    assert text.endswith(f"{iw.MESSAGES_HEADING}\n(a thought from Alli, answered) hi / (your reply) hello\n\nBASE")
 
 
 @pytest.mark.asyncio
@@ -322,7 +323,7 @@ async def test_the_messages_part_is_in_the_composition_at_once_and_never_in_the_
     await _settle()
     assert [k for k, _ in conn.wire] == ["update"]
     assert measured == []  # the drop measure is not started again
-    assert conn.wire[0][1].endswith(f"{iw.MESSAGES_HEADING}\n{HI}")
+    assert conn.wire[0][1].endswith(f"{iw.MESSAGES_HEADING}\n{HI}\n\nBASE")
 
 
 def test_only_lines_of_text_are_taken_from_the_part() -> None:
@@ -345,7 +346,7 @@ async def test_the_messages_part_survives_a_reconnects_snapshot_and_a_new_sessio
     writer, conn, _, _ = _writer()
     await _open(writer, conn)
     text = writer.connect(SESSION + 1, "BASE", "## Your memory\nold turns", {"top": 1}, dict(record.held))
-    assert text.endswith(f"{iw.MESSAGES_HEADING}\n{HI}")
+    assert text.endswith(f"{iw.MESSAGES_HEADING}\n{HI}\n\nBASE")
 
 
 @pytest.mark.asyncio
@@ -406,11 +407,12 @@ def _now(
 
 
 def _just_now(text: str) -> str:
-    return text.split(f"{iw.NOW_HEADING}\n", 1)[1] if iw.NOW_HEADING in text else ""
+    """Return the "just now" section's lines, without the base that follows it."""
+    return text.split(f"{iw.NOW_HEADING}\n", 1)[1].removesuffix("\n\nBASE") if iw.NOW_HEADING in text else ""
 
 
 def test_just_now_is_composed_last_in_its_order() -> None:
-    """The section goes last, after the messages: the time, who, the speaker, the lines."""
+    """The section is the last part, before the base: the time, who, the speaker, the lines."""
     block = iw.Block("## Your memory\nturns", 3, None, None, 1, 0.0)
     j = iw.Now(
         _now(1, speaker={"text": "Ada is speaking to you.", "at": SESSION}, here=["Ada is here."],
@@ -422,7 +424,7 @@ def test_just_now_is_composed_last_in_its_order() -> None:
     text = iw.compose(iw.View("BASE", SESSION, block, None, 0.0, (hi,), j))
     assert text.endswith(
         f"{iw.MESSAGES_HEADING}\n{hi}\n\n{iw.NOW_HEADING}\nIt's noon.\nAda is here.\n"
-        "Ada is speaking to you.\nYour hearing is off right now.\nYou're bright."
+        "Ada is speaking to you.\nYour hearing is off right now.\nYou're bright.\n\nBASE"
     )
     empty = iw.Now(_now(2, time=None).value, 2, None)
     assert iw.NOW_HEADING not in iw.compose(iw.View("BASE", SESSION, block, None, 0.0, (), empty))
@@ -593,7 +595,7 @@ def test_the_agenda_is_composed_after_the_speaker_and_before_the_lines() -> None
     text = iw.compose(iw.View("BASE", SESSION, block, None, 0.0, (), j))
     assert text.endswith(
         f"{iw.NOW_HEADING}\nIt's noon.\nAda is here.\nAda is speaking to you.\n"
-        "A timer, due today 16:05.\nA reminder for Ada, due today 17:00.\nYou're bright."
+        "A timer, due today 16:05.\nA reminder for Ada, due today 17:00.\nYou're bright.\n\nBASE"
     )
     unread = iw.Now(_now(2, agenda=None).value, 2, None)  # the store unread: no agenda line
     assert _just_now(iw.compose(iw.View("BASE", SESSION, block, None, 0.0, (), unread))) == "It's noon."
