@@ -382,3 +382,189 @@ def test_the_writer_builds_no_record_of_its_own() -> None:
     writer, _, _, _ = _writer()
     assert not hasattr(writer, "add_thought")
     assert not hasattr(iw, "THOUGHTS_MAX")
+
+
+# --- the "just now" part (route all, Unit 5; ConvoAll rule 10) --------------------------------
+
+
+def _now(version: int, *, speaker=None, guest=False, here=(), lines=(), time="It's noon.", expires=None):
+    value = {
+        "time": time,
+        "here": list(here),
+        "guest": guest,
+        "speaker": speaker,
+        "lines": list(lines),
+        "at_wall": 1_800_000_000.0,
+        "at_mono": 4.0,
+    }
+    return SimpleNamespace(name="now", version=version, value=value, session=None, expires_at=expires)
+
+
+def _just_now(text: str) -> str:
+    return text.split(f"{iw.NOW_HEADING}\n", 1)[1] if iw.NOW_HEADING in text else ""
+
+
+def test_just_now_is_composed_last_in_its_order() -> None:
+    """The section goes last, after the messages: the time, who, the speaker, the lines."""
+    block = iw.Block("## Your memory\nturns", 3, None, None, 1, 0.0)
+    j = iw.Now(
+        _now(1, speaker={"text": "Ada is speaking to you.", "at": SESSION}, here=["Ada is here."],
+             lines=["Your hearing is off right now.", "You're bright."]).value,
+        1,
+        None,
+    )  # fmt: skip
+    hi = "(a thought from Ada, answered) hi / (your reply) hello"
+    text = iw.compose(iw.View("BASE", SESSION, block, None, 0.0, (hi,), j))
+    assert text.endswith(
+        f"{iw.MESSAGES_HEADING}\n{hi}\n\n{iw.NOW_HEADING}\nIt's noon.\nAda is here.\n"
+        "Ada is speaking to you.\nYour hearing is off right now.\nYou're bright."
+    )
+    empty = iw.Now(_now(2, time=None).value, 2, None)
+    assert iw.NOW_HEADING not in iw.compose(iw.View("BASE", SESSION, block, None, 0.0, (), empty))
+
+
+@pytest.mark.asyncio
+async def test_a_speaker_stamped_after_memory_read_at_is_shown() -> None:
+    """ConvoAll JInTime: a speaker decided at or after this view's memory_read_at is shown.
+
+    It goes at once, before the reply it is for, and is not a drop-measure reset.
+    """
+    writer, conn, _, measured = _writer()
+    await _open(writer, conn, held={"now": _now(1)})
+    writer.parts_changed({"now": _now(2, speaker={"text": "Ada is speaking to you.", "at": SESSION + 1})})
+    await _settle()
+    assert [k for k, _ in conn.wire] == ["update"]
+    assert _just_now(conn.wire[0][1]) == "It's noon.\nAda is speaking to you."
+    assert measured == []
+    writer.parts_changed({"now": _now(3, speaker={"text": "Ada is speaking to you.", "at": SESSION})})
+    await _settle()
+    assert len(conn.wire) == 1  # a stamp equal to the read is shown too: no change, no write
+    writer.parts_changed({"now": _now(4, speaker=None)})  # a withdrawal (answer (a)) goes at once too
+    await _settle()
+    assert len(conn.wire) == 2 and "Ada is speaking" not in conn.wire[1][1] and measured == []
+
+
+@pytest.mark.asyncio
+async def test_an_old_sessions_speaker_is_not_in_the_startup_write() -> None:
+    """ConvoAll NoStaleSpeaker: the startup write leaves out an older session's speaker.
+
+    The record at a reconnect's connect still holds the last session's speaker, stamped before
+    this view's memory_read_at. The companion's re-stamp at the next clear verdict shows it at once.
+    """
+    writer, conn, _, _ = _writer()
+    held = {"now": _now(1, speaker={"text": "Ada is speaking to you.", "at": SESSION - 0.5})}
+    text = writer.connect(SESSION, "BASE", "## Your memory\nold turns", {"top": 1}, held)
+    assert _just_now(text) == "It's noon." and "Ada" not in text
+    await writer.open(conn, {"type": "realtime", "instructions": text})
+    conn.wire.clear()
+    writer.parts_changed({"now": _now(2, speaker={"text": "Ada is speaking to you.", "at": SESSION + 2})})
+    await _settle()
+    assert [k for k, _ in conn.wire] == ["update"] and "Ada is speaking to you." in conn.wire[0][1]
+
+
+@pytest.mark.asyncio
+async def test_a_just_now_write_during_a_reply_leaves_the_drop_measure() -> None:
+    """ConvoAll NoGapHis (Fjmeasure): a just-now write never starts the drop measure again.
+
+    The speaker and a guest's arrival go at once with no measure reset, or the drop detector
+    would start again at every turn; taken with S's join, the one send measures by S's reason.
+    Any other change (the time, who is here, the lines, a guest leaving) is batched.
+    """
+    writer, conn, _, measured = _writer()
+    await _open(writer, conn, held={"now": _now(1)})
+    writer.parts_changed({"now": _now(2, guest=True, here=["A guest is here."])})
+    await _settle()
+    assert [k for k, _ in conn.wire] == ["update"] and "A guest is here." in conn.wire[0][1]
+    assert measured == []
+    for version, change in enumerate(
+        [{"time": "It's five past noon.", "guest": True, "here": ["A guest is here."]},
+         {"guest": True, "here": ["A guest is here.", "Ben is here."]},
+         {"guest": True, "here": ["A guest is here."], "lines": ["Your hearing is off right now."]},
+         {"guest": False, "here": []}],
+        start=3,
+    ):  # fmt: skip
+        writer.parts_changed({"now": _now(version, **change)})
+        await _settle()
+        assert len(conn.wire) == 1 and writer.pending()  # batched: nothing at once
+    writer.parts_changed(
+        {
+            "now": _now(8, speaker={"text": "Ben is speaking to you.", "at": SESSION + 3}),
+            "summary": _part("summary", 9, {**S1, "text": "Ada asked about the weather."}, session=None),
+        }
+    )
+    await _settle()
+    assert conn.wire[1][0] == "update" and "Ben is speaking to you." in conn.wire[1][1]
+    assert measured[0] == "reset"  # S's join measures; the speaker rode with it
+
+
+@pytest.mark.asyncio
+async def test_a_silent_companions_part_is_dropped_at_its_expiry(caplog) -> None:
+    """ConvoAll NoExpiredJ (Fnojwake): a silent companion's part is dropped at its expiry.
+
+    With no newer version (a silent companion, a dead link), the writer's one timer at the held
+    part's expiry drops it and writes at once, so he has no "just now" rather than a stale one.
+    A part already past its expiry is never taken, and a snapshot that lacks the part drops it
+    at once too. None of it resets the drop measure.
+    """
+    import time
+
+    writer, conn, _, measured = _writer()
+    await _open(writer, conn, held={"now": _now(1, expires=time.monotonic() + 0.05)})
+    assert iw.NOW_HEADING in writer.sent
+    with caplog.at_level("INFO", logger=iw.__name__):
+        await asyncio.sleep(0.15)
+        await _settle()
+    assert [k for k, _ in conn.wire] == ["update"] and iw.NOW_HEADING not in conn.wire[0][1]
+    assert "(just now dropped)" in caplog.text and "no just now" in caplog.text
+    writer.parts_changed({"now": _now(2, expires=time.monotonic() - 1.0)})  # already past it
+    await _settle()
+    assert writer.view.now is None and len(conn.wire) == 1
+    writer.parts_changed({"now": _now(3, expires=time.monotonic() + 60.0)})
+    writer.parts_changed({})  # a snapshot without it
+    await _settle()
+    assert iw.NOW_HEADING not in conn.wire[-1][1] and writer.view.now is None
+    assert measured == []
+    assert writer._expiry is None  # nothing held, no timer
+
+
+@pytest.mark.asyncio
+async def test_a_newer_version_moves_the_expiry_timer_later() -> None:
+    """The heartbeat: each version's expiry is later, so its timer replaces the last one's."""
+    import time
+
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn, held={"now": _now(1, expires=time.monotonic() + 0.05)})
+    writer.parts_changed({"now": _now(2, expires=time.monotonic() + 60.0)})
+    await asyncio.sleep(0.15)
+    assert conn.wire == [] and writer.view.now is not None and writer._expiry is not None
+
+
+@pytest.mark.asyncio
+async def test_the_send_log_names_the_parts_version_and_age_never_its_text(caplog) -> None:
+    """The send log carries the part's version and age, never household text."""
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn, held={"now": _now(1)})
+    with caplog.at_level("INFO", logger=iw.__name__):
+        writer.parts_changed({"now": _now(2, speaker={"text": "Ada is speaking to you.", "at": SESSION + 1})})
+        await _settle()
+    assert "just now v2, " in caplog.text and " s old, its speaker shown" in caplog.text
+    assert "Ada" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_part_that_arrives_after_a_connect_without_one_arms_the_expiry() -> None:
+    """The expiry timer is armed at each take, not only at the connect.
+
+    A session opened with no "now" part held, then a part arrives: its expiry still drops it.
+    """
+    import time
+
+    writer, conn, _, measured = _writer()
+    await _open(writer, conn, held={})
+    assert writer._expiry is None
+    writer.parts_changed({"now": _now(1, expires=time.monotonic() + 0.05)})
+    assert writer._expiry is not None
+    await asyncio.sleep(0.15)
+    await _settle()
+    assert writer.view.now is None and iw.NOW_HEADING not in (writer.sent or "")
+    assert measured == []

@@ -11,7 +11,8 @@ part named that is held is acknowledged with the version held, taken or not, and
 names the epoch held, so a companion the record is not from sends a snapshot.
 
 The writer of his instructions composes from them (instructions_writer, Unit 4). `expires_at` is
-stored, not acted on (Unit 5).
+stored here; the writer acts on it (Unit 5): it takes no part past its expiry, and its one timer at
+the "now" part's expiry drops that part and writes at once.
 """
 
 from __future__ import annotations
