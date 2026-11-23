@@ -6963,3 +6963,77 @@ async def test_in_band_follows_the_band_tag(monkeypatch: Any) -> None:
     assert seen == {"thought": False, "nudge": True, "plain": True}
     await conns[0].close()
     await asyncio.wait_for(task, timeout=1.0)
+
+
+def test_the_companions_partial_is_throttled_per_item() -> None:
+    """Send the item's words so far to the companion, throttled per item (Unit 8, rule 5).
+
+    The backend's deltas carry only the newly stable words (speech_to_speech ff4aec3,
+    openai_realtime/handlers/conversation.py:378-379), so the text sent is the item's deltas
+    appended: at most one per 0.5 s per item, the first at once; a new item starts again, and
+    the item's end forgets its text.
+    """
+    handler = _plain_handler()
+    sent: list[tuple[Any, ...]] = []
+    handler.set_transcript_observer(
+        lambda role, text, final, artifact, item_id=None: sent.append((role, text, final, item_id))
+    )
+    now = [100.0]
+    handler._partial_clock = lambda: now[0]
+    handler._send_partial("item-1", "Hey")
+    now[0] = 100.3
+    handler._send_partial("item-1", " how")
+    now[0] = 100.5
+    handler._send_partial("item-1", " are")
+    now[0] = 100.6
+    handler._send_partial("item-2", "So")
+    handler._send_partial("item-2", " then")
+    handler._end_partial("item-2")
+    now[0] = 101.0
+    handler._send_partial("item-2", "Later")
+    assert sent == [
+        ("user", "Hey", False, "item-1"),
+        ("user", "Hey how are", False, "item-1"),
+        ("user", "So", False, "item-2"),
+        ("user", "Later", False, "item-2"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fragment_deltas_reach_the_companion_whole_and_the_ui_partial_is_unchanged(
+    monkeypatch: Any,
+) -> None:
+    """Send the companion the whole text so far from fragment deltas.
+
+    The deltas of one item come as the backend sends them, each only its new words, with no
+    pause: the companion gets the first at once and, after 0.5 s, the words appended (the UI's
+    debounce would send it nothing). The UI's own partial is unchanged (it shows only the last
+    fragment, as before).
+    """
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.delta",
+                item_id="item-1",
+                delta="Hey",
+            ),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.delta",
+                item_id="item-1",
+                delta=" how are you?",
+            ),
+        ),
+    )
+    sent: list[tuple[Any, ...]] = []
+    handler.set_transcript_observer(
+        lambda role, text, final, artifact, item_id=None: sent.append((role, text, final, item_id))
+    )
+    clock = iter([100.0, 100.6])
+    handler._partial_clock = lambda: next(clock)
+    await handler._run_realtime_session()
+    assert sent[:2] == [
+        ("user", "Hey", False, "item-1"),
+        ("user", "Hey how are you?", False, "item-1"),
+    ]
+    assert handler.input_transcript_chunks_by_item.deltas == [" how are you?"]

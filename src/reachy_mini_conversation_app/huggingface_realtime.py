@@ -100,6 +100,7 @@ UNKNOWN_MARKUP = re.compile(
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 MID_REPLY_LEFT_S = 0.5  # a barge-in this far from his reply's end cut it mid-way
+PARTIAL_SEND_S = 0.5  # the companion's user partials: one per item this often (Unit 8)
 _OWED_OUTPUT_TIMEOUT: float = (
     _RESPONSE_DONE_TIMEOUT  # longest hold of an in-band create
 )
@@ -526,6 +527,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # Debouncing for partial transcripts
         self.partial_transcript_task: asyncio.Task[None] | None = None
         self.partial_debounce_delay = 0.5  # seconds
+        # The companion's partial (route all, Unit 8; ConvoAll "Units 8-9", rule 5): the item's
+        # text so far, at most one per PARTIAL_SEND_S per item, the first at once. The debounce
+        # above fires only after a quiet half second, so in continuous speech it sends nothing.
+        # Kept apart from InputTranscriptChunksByItem: (item, its text so far, when last sent).
+        self._partial: tuple[str | None, str, float] = (None, "", float("-inf"))
+        self._partial_clock = time.monotonic
         self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
 
         # Internal lifecycle flags
@@ -911,6 +918,34 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except asyncio.CancelledError:
             logger.debug("Debounced partial cancelled")
             raise
+
+    def _send_partial(self, item_id: str | None, delta: str) -> None:
+        """Send the person's words so far to the companion (route all, Unit 8).
+
+        A delta carries only the newly stable words: the backend keeps `transcript_prefix` and
+        sends `" " + new_words` (speech_to_speech ff4aec3, openai_realtime/handlers/
+        conversation.py:378-379), and its demo client appends them (s2s-realtime-client.js:
+        144-145). So the item's deltas are appended here, the server's own form, and the whole
+        text so far goes as role user, final False, with its item id: at most one per
+        PARTIAL_SEND_S per item, the first at once. The UI's debounced partial is unchanged.
+        """
+        if not item_id:
+            return
+        item, text, at = self._partial
+        if item != item_id:
+            text, at = "", float("-inf")
+        text += delta or ""
+        now = self._partial_clock()
+        if not text.strip() or now - at < PARTIAL_SEND_S:
+            self._partial = (item_id, text, at)
+            return
+        self._partial = (item_id, text, now)
+        self._emit_transcript("user", text.strip(), False, item_id=item_id)
+
+    def _end_partial(self, item_id: str | None = None) -> None:
+        """Forget the companion partial's text: at its item's end (None: at a new session)."""
+        if item_id is None or self._partial[0] == item_id:
+            self._partial = (None, "", float("-inf"))
 
     def _record_partial_transcript_delta(
         self,
@@ -2436,6 +2471,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             # Reset the partial-transcript accumulator for each new session
             self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
+            self._end_partial()  # the companion partial's text too
 
             # Manage events received from the realtime server. The greeting's hold is
             # this open's: reset before the console can see the connection.
@@ -2687,6 +2723,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         current_partial = "".join(input_transcript.deltas)
                         sequence_counter = len(input_transcript.deltas) - 1
+                        self._send_partial(item_id, delta)
 
                         await self._cancel_partial_transcript_task()
 
@@ -2706,6 +2743,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._mark_activity(
                             "user_transcription_failed", getattr(event, "item_id", None)
                         )
+                        self._end_partial(getattr(event, "item_id", None))
                         logger.warning(
                             "User transcription failed for item %s",
                             getattr(event, "item_id", None),
@@ -2720,6 +2758,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             "user_transcription_completed",
                             getattr(event, "item_id", None),
                         )
+                        self._end_partial(getattr(event, "item_id", None))
                         raw_transcript = event.transcript or ""
                         transcript = raw_transcript.strip()
                         logger.debug("User transcript: %s", raw_transcript)
