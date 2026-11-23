@@ -100,6 +100,7 @@ UNKNOWN_MARKUP = re.compile(
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 MID_REPLY_LEFT_S = 0.5  # a barge-in this far from his reply's end cut it mid-way
+PARTIAL_SEND_S = 0.5  # the companion's user partials: one per item this often (Unit 8)
 _OWED_OUTPUT_TIMEOUT: float = (
     _RESPONSE_DONE_TIMEOUT  # longest hold of an in-band create
 )
@@ -526,6 +527,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # Debouncing for partial transcripts
         self.partial_transcript_task: asyncio.Task[None] | None = None
         self.partial_debounce_delay = 0.5  # seconds
+        # The companion's partial (route all, Unit 8; ConvoAll "Units 8-9", rule 5): at most one
+        # per PARTIAL_SEND_S per item, the first at once. The debounce above fires only after a
+        # quiet half second (each delta replaces `deltas`), so in continuous speech it sends
+        # nothing. Kept apart from InputTranscriptChunksByItem. (item, when sent; monotonic)
+        self._partial_sent: tuple[str | None, float] = (None, float("-inf"))
+        self._partial_clock = time.monotonic
         self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
 
         # Internal lifecycle flags
@@ -911,6 +918,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except asyncio.CancelledError:
             logger.debug("Debounced partial cancelled")
             raise
+
+    def _send_partial(self, item_id: str | None, text: str) -> None:
+        """Send the person's partial transcript to the companion (route all, Unit 8).
+
+        Role user, final False, with its item id: at most one per PARTIAL_SEND_S per item, the
+        first at once. The UI's debounced partial is separate and unchanged.
+        """
+        if not item_id or not text.strip():
+            return
+        now = self._partial_clock()
+        item, at = self._partial_sent
+        if item == item_id and now - at < PARTIAL_SEND_S:
+            return
+        self._partial_sent = (item_id, now)
+        self._emit_transcript("user", text, False, item_id=item_id)
 
     def _record_partial_transcript_delta(
         self,
@@ -2687,6 +2709,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         current_partial = "".join(input_transcript.deltas)
                         sequence_counter = len(input_transcript.deltas) - 1
+                        self._send_partial(item_id, current_partial)
 
                         await self._cancel_partial_transcript_task()
 

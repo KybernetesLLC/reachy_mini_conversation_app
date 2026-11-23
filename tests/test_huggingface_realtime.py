@@ -6963,3 +6963,65 @@ async def test_in_band_follows_the_band_tag(monkeypatch: Any) -> None:
     assert seen == {"thought": False, "nudge": True, "plain": True}
     await conns[0].close()
     await asyncio.wait_for(task, timeout=1.0)
+
+
+def test_the_companions_partial_is_throttled_per_item() -> None:
+    """Throttle the companion's partial per item (route all, Unit 8; ConvoAll rule 5).
+
+    A user partial goes to the companion as a non-final transcript with its item id, at most one
+    per 0.5 s per item, the first at once; a new item's first goes at once too.
+    """
+    handler = _plain_handler()
+    sent: list[tuple[Any, ...]] = []
+    handler.set_transcript_observer(
+        lambda role, text, final, artifact, item_id=None: sent.append((role, text, final, item_id))
+    )
+    now = [100.0]
+    handler._partial_clock = lambda: now[0]
+    handler._send_partial("item-1", "Hey")
+    now[0] = 100.3
+    handler._send_partial("item-1", "Hey, how")
+    now[0] = 100.5
+    handler._send_partial("item-1", "Hey, how are")
+    now[0] = 100.6
+    handler._send_partial("item-2", "So")
+    handler._send_partial("item-2", "So then")
+    assert sent == [
+        ("user", "Hey", False, "item-1"),
+        ("user", "Hey, how are", False, "item-1"),
+        ("user", "So", False, "item-2"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_continuous_speech_sends_partials_and_the_ui_partial_is_unchanged(
+    monkeypatch: Any,
+) -> None:
+    """Send the companion a partial during continuous speech.
+
+    The deltas of one item, with no pause: the companion gets the first at once (the UI's
+    debounce would send it nothing), and the UI still gets only its debounced partial.
+    """
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.delta",
+                item_id="item-1",
+                delta="Hey",
+            ),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.delta",
+                item_id="item-1",
+                delta="Hey, how are you?",
+            ),
+        ),
+    )
+    sent: list[tuple[Any, ...]] = []
+    handler.set_transcript_observer(
+        lambda role, text, final, artifact, item_id=None: sent.append((role, text, final, item_id))
+    )
+    await handler._run_realtime_session()
+    assert sent[0] == ("user", "Hey", False, "item-1")
+    assert all(not final for _, _, final, _ in sent)
+    assert not any(m.get("role") == "user" for m in _messages(_drain(handler)))
