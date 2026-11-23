@@ -7177,3 +7177,135 @@ async def test_the_open_item_survives_connect_before_the_tracker_reset(monkeypat
 
     assert at_open == [("old", None, False)]
     assert after == [(None, "new", True)]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_follow_up_waits_for_the_newer_turns_end(monkeypatch: Any) -> None:
+    """Fu8leannofu (NoFuNewer): a stale follow-up waits for the newer turn's end.
+
+    A tool's follow-up queued for an older turn is not created while a newer person's turn is
+    open, nor at its transcript's end; it goes at that turn's reply's done.
+    """
+    handler, sent = _sender_handler(monkeypatch)
+    handler._followup_pending = True
+    handler._turn_opened("i2")  # speech_started of a newer turn
+    await handler._safe_response_create()  # the follow-up for turn 1
+    task = asyncio.create_task(handler._response_sender_loop())
+    try:
+        await asyncio.sleep(0.05)
+        assert sent == []
+        handler._writer.turn_ended("i2")  # the completed transcript: the turn is not over
+        await asyncio.sleep(0.05)
+        assert sent == []
+        handler._track_created("r2", in_band=True)  # its reply, with i2 heard
+        handler._responses["r2"].heard = "i2"
+        handler._turn_ended(handler._responses["r2"].heard)  # that reply's done
+        handler._end_tracked("r2", real=True)
+        for _ in range(50):
+            if sent:
+                break
+            await asyncio.sleep(0.01)
+        assert sent == [{}]
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_a_stale_follow_up_at_its_deadline_withdraws_the_line_then_goes(monkeypatch: Any) -> None:
+    """Rule 14's deadline, NEWER_TURN_WAIT_S: the newer turn is ended as by the forced path.
+
+    Its line is withdrawn (no measure reset) before the follow-up is created.
+    """
+    from dataclasses import replace
+
+    from reachy_mini_conversation_app import instructions_writer as iw
+
+    monkeypatch.setattr(hf_mod, "NEWER_TURN_WAIT_S", 0.05)
+    handler, sent = _sender_handler(monkeypatch)
+    order: list[str] = []
+
+    async def _update(**kwargs: Any) -> None:
+        text = kwargs["session"]["instructions"]
+        order.append("withdrawn" if iw.LINE_HEADING not in text else "shown")
+
+    async def _create(**kwargs: Any) -> None:
+        order.append("create")
+        sent.append(kwargs)
+        handler._response_started_or_rejected_event.set()
+        handler._response_done_event.set()
+
+    handler.connection.session.update = AsyncMock(side_effect=_update)
+    handler.connection.response.create = AsyncMock(side_effect=_create)
+    line = iw.Line("i2", 1, _ACT, 1, None, 0.0)
+    handler._writer.view = replace(handler._writer.view, line=line, open_item="i2")
+    handler._writer.sent = handler._writer.current()  # the line is on the server
+    measured: list[bool] = []
+    handler._writer.on_sent = lambda: measured.append(True)
+    handler._followup_pending = True
+    handler._turn_opened("i2")
+    await handler._safe_response_create()
+    await _run_sender(handler, lambda: bool(sent))
+
+    assert order == ["withdrawn", "create"]
+    assert measured == [] and handler._open_turn is None
+
+
+@pytest.mark.asyncio
+async def test_a_plain_create_or_a_quiet_turn_is_not_held(monkeypatch: Any) -> None:
+    """Rule 14 holds only a follow-up, and only while a turn is open.
+
+    A plain create with no follow-up pending goes while a turn is open, and a follow-up with no
+    open turn goes at once.
+    """
+    handler, sent = _sender_handler(monkeypatch)
+    handler._turn_opened("i2")
+    await handler._safe_response_create()
+    await _run_sender(handler, lambda: bool(sent))
+    assert sent == [{}]
+    handler._turn_opened(None)
+    handler._followup_pending = True
+    await handler._safe_response_create()
+    await _run_sender(handler, lambda: len(sent) == 2)
+    assert sent == [{}, {}]
+
+
+@pytest.mark.asyncio
+async def test_the_reply_done_and_the_forced_path_end_the_newer_turn(monkeypatch: Any) -> None:
+    """Rule 14's ends: the reply's done and the forced path end the turn; an older done does not.
+
+    The in-band done of the reply whose turn it is (_Live.heard) ends the open turn; a done of an
+    older reply (a barge-in's cancel) does not; the forced path does.
+    """
+    handler = _session_handler(monkeypatch, ())
+    seen: list[str | None] = []
+
+    def _heard(item: str) -> Callable[[], None]:
+        def set_() -> None:
+            handler._heard_item = item
+
+        return set_
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _heard("i1"),
+            _FakeEvent("response.created", response=SimpleNamespace(id="r1")),
+            _FakeEvent("input_audio_buffer.speech_started", item_id="i2"),
+            _FakeEvent("response.done", response=SimpleNamespace(id="r1", usage=None)),
+            lambda: seen.append(handler._open_turn),
+            _heard("i2"),
+            _FakeEvent("response.created", response=SimpleNamespace(id="r2")),
+            lambda: seen.append(handler._open_turn),
+            _FakeEvent("response.done", response=SimpleNamespace(id="r2", usage=None)),
+            lambda: seen.append(handler._open_turn),
+        )
+    )
+    await handler._run_realtime_session()
+    assert seen == ["i2", "i2", None]
+
+    handler._turn_opened("i3")
+    handler._heard_item = "i3"
+    handler._track_created("r3", in_band=True)
+    await handler._force("r3")
+    assert handler._open_turn is None
