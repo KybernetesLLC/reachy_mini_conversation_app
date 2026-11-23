@@ -10,7 +10,11 @@ profile, first, for the prompt cache) and then the parts:
 - S, the talk's earlier part in short: the newer, by S's own version, of the S the block names
   and the companion's "summary" part (rule 8: S arrives by both; a clear is a newer version);
 - the recent text messages he answered in this talk: the companion's "messages" part (Unit 6,
-  ConvoAll rule 4 as S), its lines composed as they come. The app keeps no record of its own.
+  ConvoAll rule 4 as S), its lines composed as they come. The app keeps no record of its own;
+- what is true just now: the companion's "now" part (Unit 5, ConvoAll rule 10), last, so a change
+  rewrites only the tail. Its speaker line is shown only when its decision's stamp is not before
+  this view's memory_read_at (both on the host's monotonic clock): an older session's speaker is
+  never shown. A part past its expiry is not taken.
 
 `take` and `compose` are pure: what the parts record changes, what goes at once and why, and the
 text. The writer sends (rules 3-5, 9):
@@ -19,6 +23,9 @@ text. The writer sends (rules 3-5, 9):
   held less than the bound) and a drop's block go at once, on the handler's loop;
 - an answered message goes at once too, but does not start the drop measure again (Unit 6
   review: S's join goes at once, and the record is S-shaped);
+- a speaker change, a guest's arrival and "just now" dropped (its expiry, or a snapshot that lacks
+  it) go at once and do not start the drop measure again either, unless a block or S reason goes
+  in the same send; one timer at the held part's expiry drops it and sends at once;
 - any other change is batched, BATCH_S, and goes in a tool's window too (no hold), and never
   sooner than BATCHED_GAP_S after the last write (the Units 3+4 review: trims and awareness
   refreshes came to 5-8 writes a minute, 70-117 KB each with the echo);
@@ -47,6 +54,13 @@ BATCHED_GAP_S = 5.0  # a batched write goes at most this often; the at-once ones
 DROP_WAIT_S = 30.0  # a drop's or trim's block not come by then is let go
 S_HEADING = "### Earlier in this talk, in short"
 MESSAGES_HEADING = "### Thoughts you answered in this conversation"
+NOW_HEADING = "### Just now"
+NOW_PART = "now"
+# The "just now" reasons: at once, and never a drop-measure reset of their own (ConvoAll rule 10).
+SPEAKER_CHANGED = "the speaker changed"
+GUEST_ARRIVED = "a guest arrived"
+NOW_DROPPED = "just now dropped"
+J_REASONS = frozenset({SPEAKER_CHANGED, GUEST_ARRIVED, NOW_DROPPED})
 _NONE = float("-inf")
 
 
@@ -78,6 +92,16 @@ class View:
     s: Optional[dict[str, Any]]
     s_at: float
     messages: tuple[str, ...] = ()
+    now: Optional["Now"] = None
+
+
+@dataclass(frozen=True)
+class Now:
+    """The companion's "now" part as taken: its value, its version and its expiry (monotonic)."""
+
+    value: dict[str, Any]
+    version: int
+    expires_at: Optional[float]
 
 
 def _s(raw: Any) -> Optional[dict[str, Any]]:
@@ -129,6 +153,46 @@ def part_messages(part: Any) -> tuple[str, ...]:
     return tuple(line for line in value if isinstance(line, str) and line.strip())
 
 
+def part_now(part: Any, now: float) -> Optional[Now]:
+    """Return the companion's "now" part, or None.
+
+    None is no part, a clear, a value that is not one, or a part past its expiry.
+    """
+    value = getattr(part, "value", None)
+    if not isinstance(value, dict):
+        return None
+    expires = getattr(part, "expires_at", None)
+    if expires is not None and expires <= now:
+        return None
+    return Now(value, int(getattr(part, "version", 0)), expires)
+
+
+def now_speaker(view: View) -> Optional[str]:
+    """Return the speaker line shown in this view: the stamp filter (ConvoAll rule 10).
+
+    Its decision's stamp must not be before the view's memory_read_at, so a speaker decided for
+    an earlier realtime session is not shown (NoStaleSpeaker).
+    """
+    j = view.now
+    speaker = j.value.get("speaker") if j is not None else None
+    if not isinstance(speaker, dict) or view.session is None:
+        return None
+    text, at = speaker.get("text"), speaker.get("at")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or at < view.session:
+        return None
+    return text.strip()
+
+
+def _guest(j: Optional[Now]) -> bool:
+    return j is not None and j.value.get("guest") is True
+
+
+def _lines(raw: Any) -> list[str]:
+    return [x.strip() for x in raw if isinstance(x, str) and x.strip()] if isinstance(raw, list) else []
+
+
 def take(view: View, held: dict[str, Any], now: float) -> tuple[View, list[str]]:
     """Return the view after the parts record `held` changed, and why it goes at once.
 
@@ -161,11 +225,38 @@ def take(view: View, held: dict[str, Any], now: float) -> tuple[View, list[str]]
     messages = part_messages(held.get("messages"))
     if view.messages and not messages:
         urgent.append("messages cleared")
-    return replace(view, block=block, s=s, s_at=s_at, messages=messages), urgent
+    # "Just now" (Unit 5): a speaker change (a naming, a withdrawal, or a re-stamp a new session
+    # can show), a guest's arrival and the part dropped go at once; the rest is batched.
+    new = replace(view, block=block, s=s, s_at=s_at, messages=messages, now=part_now(held.get(NOW_PART), now))
+    if view.now is not None and new.now is None:
+        urgent.append(NOW_DROPPED)
+    elif now_speaker(new) != now_speaker(view):
+        urgent.append(SPEAKER_CHANGED)
+    if _guest(new.now) and not _guest(view.now):
+        urgent.append(GUEST_ARRIVED)
+    return new, urgent
+
+
+def now_text(view: View) -> str:
+    """Return the "### Just now" section, or "" when it has nothing to say.
+
+    The time, who is here, the speaker shown, then the lines: the companion's order and text.
+    """
+    j = view.now
+    if j is None:
+        return ""
+    time_line = j.value.get("time")
+    lines = [time_line.strip()] if isinstance(time_line, str) and time_line.strip() else []
+    lines += _lines(j.value.get("here"))
+    speaker = now_speaker(view)
+    if speaker:
+        lines.append(speaker)
+    lines += _lines(j.value.get("lines"))
+    return f"{NOW_HEADING}\n" + "\n".join(lines) if lines else ""
 
 
 def compose(view: View) -> str:
-    """Return his instructions: the stable base first, then the block, S and the messages answered."""
+    """Return his instructions: the base, the block, S, the messages answered, then "just now"."""
     parts = [view.base.strip()]
     if view.block.text.strip():
         parts.append(view.block.text.strip())
@@ -173,6 +264,7 @@ def compose(view: View) -> str:
         parts.append(f"{S_HEADING}\n{' '.join(str(view.s['text']).split())}")
     if view.messages:
         parts.append(f"{MESSAGES_HEADING}\n" + "\n".join(view.messages))
+    parts.append(now_text(view))
     return "\n\n".join(p for p in parts if p)
 
 
@@ -205,6 +297,8 @@ class InstructionsWriter:
         self._lock: asyncio.Lock | None = None
         self._batch: asyncio.Task[None] | None = None
         self._now: set[asyncio.Task[None]] = set()
+        self._held: dict[str, Any] = {}  # the parts record last taken, which the expiry retakes
+        self._expiry: asyncio.TimerHandle | None = None  # the one timer at "now"'s expiry
 
     # --- a session's open ---------------------------------------------------------------------
 
@@ -229,6 +323,8 @@ class InstructionsWriter:
         if self._batch is not None:
             self._batch.cancel()
             self._batch = None
+        self._held = held
+        self._arm_expiry()
         return compose(view)
 
     async def open(self, conn: Any, session_config: dict[str, Any]) -> None:
@@ -252,11 +348,15 @@ class InstructionsWriter:
         """Take the companion's changed parts record (on the handler's loop)."""
         if self.view is None:
             return
+        self._held = held
         before = self.view.messages
         view, urgent = take(self.view, held, self.clock())
         self.view = view
+        self._arm_expiry()
         if urgent:
-            self._send_now(", ".join(urgent))
+            # J's reasons alone never start the drop measure again; with a block or S reason,
+            # that reason's write measures as it does today (ConvoAll rule 10, Fjmeasure).
+            self._send_now(", ".join(urgent), measure=any(r not in J_REASONS for r in urgent))
         elif view.messages and view.messages != before:
             self._send_now("a message answered", measure=False)
         elif compose(view) != self.sent:
@@ -291,6 +391,34 @@ class InstructionsWriter:
         """Send any change at a reply's done, before the done event is set (rule 2)."""
         if self.pending():
             await self.send("a reply's done")
+
+    def _arm_expiry(self) -> None:
+        """Set the one timer at the held "now" part's expiry (ConvoAll rule 10, JExpire).
+
+        A silent companion or a dead link leaves him no "just now" rather than a stale one.
+        """
+        if self._expiry is not None:
+            self._expiry.cancel()
+            self._expiry = None
+        j = self.view.now if self.view is not None else None
+        if j is None or j.expires_at is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # no loop: the next take drops it
+            return
+        self._expiry = loop.call_later(max(0.0, j.expires_at - self.clock()), self._expired)
+
+    def _expired(self) -> None:
+        self._expiry = None
+        if self.view is None:
+            return
+        view, urgent = take(self.view, self._held, self.clock())
+        self.view = view
+        if urgent:
+            self._send_now(", ".join(urgent), measure=any(r not in J_REASONS for r in urgent))
+        else:
+            self._arm_expiry()  # the clock read early: wait again
 
     # --- sending --------------------------------------------------------------------------------
 
@@ -385,10 +513,19 @@ class InstructionsWriter:
             else f"S v{s_version(s):.3f} {'cleared' if not s.get('text') else 'held'}, "
             f"{now - view.s_at:.1f} s old"
         )
+        j = view.now
+        at = j.value.get("at_mono") if j is not None else None
+        j_part = (
+            "no just now"
+            if j is None
+            else f"just now v{j.version}"
+            + (f", {now - at:.1f} s old" if isinstance(at, (int, float)) and not isinstance(at, bool) else "")
+            + (", its speaker shown" if now_speaker(view) else "")
+        )
         # with tokens at 3.5 chars each: drops have come at 14.4k-22k input tokens (11-03)
         logger.info(
             "Instructions sent (%s): %d chars, about %d tokens; block v%d to row %d, %.1f s old; "
-            "%s; %d message(s); %d write(s) in the last minute",
+            "%s; %d message(s); %s; %d write(s) in the last minute",
             why,
             len(text),
             round(len(text) / 3.5),
@@ -397,5 +534,6 @@ class InstructionsWriter:
             now - block.at,
             s_part,
             len(view.messages),
+            j_part,
             len(self._writes),
         )
