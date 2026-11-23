@@ -13,7 +13,9 @@ names the epoch held, so a companion the record is not from sends a snapshot.
 The writer of his instructions composes from them (instructions_writer, Unit 4). `expires_at` is
 stored here; the writer acts on it (Unit 5): it takes no "now" part past its expiry, and its one
 timer at that part's expiry drops it and writes at once. The "line" part (Units 8-9) is taken with
-no check of its expiry: the writer shows it only while its item is open (model.md, rule 8).
+no check of its expiry: the writer shows it only while its item is open (model.md, rule 8). The
+residual: a turn the server's VAD discards after speech_started brings no transcript event, so
+its item stays open and its line stays shown until the next speech_started.
 """
 
 from __future__ import annotations

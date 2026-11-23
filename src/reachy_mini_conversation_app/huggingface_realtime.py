@@ -101,11 +101,6 @@ _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
 MID_REPLY_LEFT_S = 0.5  # a barge-in this far from his reply's end cut it mid-way
 PARTIAL_SEND_S = 0.5  # the companion's user partials: one per item this often (Unit 8)
-# Rule 14 (ConvoAll, model.md "Units 8-9"): a tool's follow-up waits at most this long for a newer
-# person's turn to end. At it, the turn is ended as by the forced path: the writer withdraws its
-# line (no measure reset) and the follow-up goes, so the tool's answer is never lost. The line's
-# own life is 30 s from its call (the companion's moment_thinker.LIFE_S).
-NEWER_TURN_WAIT_S = 30.0
 _OWED_OUTPUT_TIMEOUT: float = (
     _RESPONSE_DONE_TIMEOUT  # longest hold of an in-band create
 )
@@ -1062,30 +1057,38 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._open_turn = None
             self._open_turn_ended.set()
 
-    async def _wait_for_newer_turn(self, kwargs: dict[str, Any]) -> bool:
-        """Hold a tool's follow-up while a newer person's turn is open; True if held (rule 14).
+    async def _wait_for_newer_turn(self, kwargs: dict[str, Any]) -> bool | None:
+        """Hold a tool's follow-up while a newer person's turn is open (rule 14).
 
         Every follow-up's own turn has ended, so an open turn is a newer one: created now, the
         follow-up would read that turn's line (ConvoAll Fu8leannofu, NoFuNewer). It waits, as
-        `_wait_for_owed_outputs` does, for the turn's end: an empty or failed end, or the done or
-        forced path of its reply. At NEWER_TURN_WAIT_S the turn is ended as by the forced path:
-        its line is withdrawn (no measure reset), then the follow-up goes.
+        `_wait_for_owed_outputs` does and to the same bound, `_OWED_OUTPUT_TIMEOUT`, for the
+        turn's end: an empty or failed end, or the done or forced path of its reply. At the bound
+        the turn is ended as by the forced path: its line is withdrawn (no measure reset).
+
+        Return False when nothing was held, True when it was and the follow-up still goes, and
+        None when the newer turn's reply took the follow-up (its response.created clears
+        `_followup_pending`): that reply carried the tool's answer, so the follow-up is dropped,
+        the model's skip (ConvoAll FollowUp, fFu' = "none"). An empty or failed newer turn makes
+        no reply, so its follow-up still goes.
         """
         item = self._open_turn
         if kwargs or not self._followup_pending or item is None:
             return False
         logger.info("tool follow-up held: a newer turn is open")
         try:
-            await asyncio.wait_for(self._open_turn_ended.wait(), timeout=NEWER_TURN_WAIT_S)
+            await asyncio.wait_for(self._open_turn_ended.wait(), timeout=_OWED_OUTPUT_TIMEOUT)
         except asyncio.TimeoutError:
             logger.warning(
                 "tool follow-up: the newer turn's end not seen in %.0f s; ending it as forced",
-                NEWER_TURN_WAIT_S,
+                _OWED_OUTPUT_TIMEOUT,
             )
             self._writer.turn_ended(item)
             self._turn_ended(item)
             await self._writer.at_done()  # the forced path's write: the line withdrawn
-            return True
+        if not self._followup_pending:
+            logger.info("tool follow-up dropped: the newer turn's reply carried the tool's answer")
+            return None
         logger.info("tool follow-up released: the newer turn ended")
         return True
 
@@ -1633,6 +1636,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         come, so _user_speaking stayed set and the listening pose stayed held.
         """
         self._user_speaking = False
+        # No transcript event will come for the open item: its line is withdrawn and rule 14's
+        # turn ends here (Units 8-9), as at an empty end.
+        item = self._open_turn
+        if await self._writer.at_empty_end(item, "the microphone stopped"):
+            self._turn_ended(item)
         try:
             self.deps.movement_manager.set_listening(False)
         except Exception:
@@ -2198,7 +2206,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         )
                         break
                     self._greeting_live = True
-                if not announcement and await self._wait_for_newer_turn(kwargs):
+                held = False if announcement else await self._wait_for_newer_turn(kwargs)
+                if held is None:
+                    break  # the newer turn's reply answered for the tool
+                if held:
                     continue  # the turn's end may bring its reply: wait for that again first
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()

@@ -527,14 +527,18 @@ class InstructionsWriter:
         self.view = replace(self.view, open_item=None)
         return True
 
-    async def at_empty_end(self, item: str | None, why: str) -> None:
+    async def at_empty_end(self, item: str | None, why: str) -> bool:
         """At an empty or failed end of the open item, send any pending change now (rule 9).
 
         H awaits it before the empty turn's re-create, so the re-create never reads the line.
-        It never starts the drop measure again (Fu8measureclr).
+        It never starts the drop measure again (Fu8measureclr). Return whether it was the open
+        item.
         """
-        if self.turn_ended(item) and self.pending():
+        if not self.turn_ended(item):
+            return False
+        if self.pending():
             await self.send(why)
+        return True
 
     def _arm_expiry(self) -> None:
         """Set the one timer at the held "now" part's expiry (ConvoAll rule 10, JExpire).

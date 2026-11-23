@@ -7179,42 +7179,170 @@ async def test_the_open_item_survives_connect_before_the_tracker_reset(monkeypat
     assert after == [(None, "new", True)]
 
 
+def _follow_up_session(
+    monkeypatch: Any, newer_turn: tuple[Any, ...]
+) -> tuple[HuggingFaceRealtimeHandler, list[str]]:
+    """Build a session where a tool's follow-up for turn 1 is queued while turn 2 is open.
+
+    `newer_turn` is turn 2's events after its speech_started. Each create is recorded with the
+    turn still open at that moment, and each check point as "check".
+    """
+    handler = _session_handler(monkeypatch, ())
+    record: list[str] = []
+
+    async def _create(**_kwargs: Any) -> None:
+        record.append(f"create while {handler._open_turn}")
+
+    async def _queue_follow_up() -> None:
+        handler.connection.response.create = _create
+        handler._followup_pending = True  # as _handle_tool_result sets it
+        await handler._safe_response_create()
+        await asyncio.sleep(0.05)
+        record.append("check")
+
+    async def _check() -> None:
+        await asyncio.sleep(0.05)
+        record.append("check")
+
+    events: list[Any] = [_FakeEvent("input_audio_buffer.speech_started", item_id="i2"), _queue_follow_up]
+    for event in newer_turn:
+        events += [event, _check]
+    handler.client = _make_fake_realtime_client(events=tuple(events))
+    return handler, record
+
+
 @pytest.mark.asyncio
-async def test_a_stale_follow_up_waits_for_the_newer_turns_end(monkeypatch: Any) -> None:
+async def test_a_stale_follow_up_waits_for_the_newer_turns_end(monkeypatch: Any, caplog: Any) -> None:
     """Fu8leannofu (NoFuNewer): a stale follow-up waits for the newer turn's end.
 
-    A tool's follow-up queued for an older turn is not created while a newer person's turn is
-    open, nor at its transcript's end; it goes at that turn's reply's done.
+    The follow-up for turn 1 is not created while turn 2 is open, nor at its transcript's end.
+    Turn 2's reply's response.created takes the pending follow-up, so that reply carries the
+    tool's answer: after its done no create follows (the model's skip, fFu' = "none"; 11-14, a
+    second full reply after 2 of 25 tool calls).
     """
-    handler, sent = _sender_handler(monkeypatch)
-    handler._followup_pending = True
-    handler._turn_opened("i2")  # speech_started of a newer turn
-    await handler._safe_response_create()  # the follow-up for turn 1
-    task = asyncio.create_task(handler._response_sender_loop())
-    try:
-        await asyncio.sleep(0.05)
-        assert sent == []
-        handler._writer.turn_ended("i2")  # the completed transcript: the turn is not over
-        await asyncio.sleep(0.05)
-        assert sent == []
-        handler._track_created("r2", in_band=True)  # its reply, with i2 heard
-        handler._responses["r2"].heard = "i2"
-        handler._turn_ended(handler._responses["r2"].heard)  # that reply's done
-        handler._end_tracked("r2", real=True)
-        for _ in range(50):
-            if sent:
-                break
-            await asyncio.sleep(0.01)
-        assert sent == [{}]
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+    handler, record = _follow_up_session(
+        monkeypatch,
+        (
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed", item_id="i2", transcript="Hello"
+            ),
+            _FakeEvent("response.created", response=SimpleNamespace(id="r2")),
+            _FakeEvent("response.done", response=SimpleNamespace(id="r2", usage=None)),
+        ),
+    )
+    with caplog.at_level(logging.INFO):
+        await handler._run_realtime_session()
+
+    assert record == ["check"] * 4
+    assert "tool follow-up dropped: the newer turn's reply carried the tool's answer" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_stale_follow_up_goes_after_an_empty_newer_turn(monkeypatch: Any) -> None:
+    """An empty newer turn makes no reply, so the held follow-up goes once that turn has ended."""
+    handler, record = _follow_up_session(
+        monkeypatch,
+        (
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed", item_id="i2", transcript=" "
+            ),
+        ),
+    )
+    await handler._run_realtime_session()
+
+    assert record == ["check", "create while None", "check"]
+
+
+@pytest.mark.asyncio
+async def test_a_newer_response_created_ends_the_older_replys_turn() -> None:
+    """Rule 14, as the forced path: a newer created ends the older reply's turn.
+
+    A reply whose done was lost ends at a newer created, and so does its turn; an out-of-band
+    response's end ends no turn.
+    """
+    handler = _plain_handler()
+    handler._turn_opened("i2")
+    handler._heard_item = "i2"
+    handler._track_created("oob", in_band=False)
+    handler._track_created("r2", in_band=True)
+    assert handler._open_turn == "i2"
+    handler._track_created("r3", in_band=True)
+    assert handler._open_turn is None
+
+
+@pytest.mark.asyncio
+async def test_a_transcript_with_text_sends_no_write(monkeypatch: Any) -> None:
+    """Rule 9: at the open item's transcript with text nothing is written.
+
+    His reply still reads the line; the change waits for the reply's done.
+    """
+    from reachy_mini_conversation_app import instructions_writer as iw
+
+    handler = _session_handler(monkeypatch, ())
+    updates: list[bool] = []
+    seen: list[tuple[int, bool]] = []
+
+    def _patch() -> None:
+        async def update(**kwargs: Any) -> None:
+            updates.append(iw.LINE_HEADING in (kwargs["session"].get("instructions") or ""))
+
+        handler.connection.session.update = update
+
+    async def _line_comes() -> None:
+        handler.parts_changed(_line_record("i1"))
+        await _let_tasks_run()
+
+    async def _after() -> None:
+        await _let_tasks_run()
+        seen.append((len(updates), handler._writer.pending()))
+
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _patch,
+            _FakeEvent("input_audio_buffer.speech_started", item_id="i1"),
+            _line_comes,
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed", item_id="i1", transcript="Hello"
+            ),
+            _after,
+        )
+    )
+    await handler._run_realtime_session()
+
+    assert updates == [True]
+    assert seen == [(1, True)]
+
+
+@pytest.mark.asyncio
+async def test_a_microphone_stopped_mid_turn_withdraws_the_line_and_ends_the_turn(monkeypatch: Any) -> None:
+    """end_user_turn withdraws the open item's line and ends rule 14's turn.
+
+    No transcript event will come after the microphone stops.
+    """
+    from dataclasses import replace
+
+    from reachy_mini_conversation_app import instructions_writer as iw
+
+    handler, _ = _sender_handler(monkeypatch)
+    texts: list[str] = []
+
+    async def _update(**kwargs: Any) -> None:
+        texts.append(kwargs["session"]["instructions"])
+
+    handler.connection.session.update = AsyncMock(side_effect=_update)
+    line = iw.Line("i2", 1, _ACT, 1, None, 0.0)
+    handler._writer.view = replace(handler._writer.view, line=line, open_item="i2")
+    handler._writer.sent = handler._writer.current()
+    handler._turn_opened("i2")
+    await handler.end_user_turn()
+
+    assert len(texts) == 1 and iw.LINE_HEADING not in texts[0]
+    assert handler._open_turn is None and handler._writer.view.open_item is None
 
 
 @pytest.mark.asyncio
 async def test_a_stale_follow_up_at_its_deadline_withdraws_the_line_then_goes(monkeypatch: Any) -> None:
-    """Rule 14's deadline, NEWER_TURN_WAIT_S: the newer turn is ended as by the forced path.
+    """Rule 14's deadline, _OWED_OUTPUT_TIMEOUT: the newer turn is ended as by the forced path.
 
     Its line is withdrawn (no measure reset) before the follow-up is created.
     """
@@ -7222,7 +7350,7 @@ async def test_a_stale_follow_up_at_its_deadline_withdraws_the_line_then_goes(mo
 
     from reachy_mini_conversation_app import instructions_writer as iw
 
-    monkeypatch.setattr(hf_mod, "NEWER_TURN_WAIT_S", 0.05)
+    monkeypatch.setattr(hf_mod, "_OWED_OUTPUT_TIMEOUT", 0.05)
     handler, sent = _sender_handler(monkeypatch)
     order: list[str] = []
 
