@@ -7294,7 +7294,10 @@ async def test_the_reply_done_and_the_forced_path_end_the_newer_turn(monkeypatch
             _FakeEvent("input_audio_buffer.speech_started", item_id="i2"),
             _FakeEvent("response.done", response=SimpleNamespace(id="r1", usage=None)),
             lambda: seen.append(handler._open_turn),
-            _heard("i2"),
+            _FakeEvent(
+                "conversation.item.input_audio_transcription.completed", item_id="i2", transcript="Hello"
+            ),
+            lambda: seen.append(handler._open_turn),  # its transcript does not end it (fCommit)
             _FakeEvent("response.created", response=SimpleNamespace(id="r2")),
             lambda: seen.append(handler._open_turn),
             _FakeEvent("response.done", response=SimpleNamespace(id="r2", usage=None)),
@@ -7302,7 +7305,7 @@ async def test_the_reply_done_and_the_forced_path_end_the_newer_turn(monkeypatch
         )
     )
     await handler._run_realtime_session()
-    assert seen == ["i2", "i2", None]
+    assert seen == ["i2", "i2", "i2", None]
 
     handler._turn_opened("i3")
     handler._heard_item = "i3"
