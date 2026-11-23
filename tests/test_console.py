@@ -4581,6 +4581,22 @@ def test_a_session_start_says_when_the_companions_block_was_read() -> None:
     assert ("conversation.realtime", {"state": "started", "memory_read_at": 1234.5}) in sent
 
 
+def test_his_final_carries_the_item_it_answered_under_its_own_key() -> None:
+    """His final carries the item it answered under its own key.
+
+    The next-exchange line's rule 5: his final carries "answers", never "item_id" (which names a
+    user turn's own item for the supervisor and the speaker).
+    """
+    sent: list[tuple[str, dict]] = []
+    rpc = SimpleNamespace(_clients=set(), broadcast_threadsafe=lambda m, p: sent.append((m, p)))
+    stream = LocalStream(_FakeSessionHandler(), SimpleNamespace(media=SimpleNamespace(audio=None, backend=None)))
+    stream._rpc = rpc
+    stream._dispatch_transcript("assistant", "hi", True, answers="item_7")
+    assert sent == [
+        ("conversation.transcript", {"role": "assistant", "text": "hi", "final": True, "answers": "item_7"})
+    ]
+
+
 def test_a_context_drop_is_reported_with_its_session_and_the_latest_heard_item() -> None:
     """Route all, rule 9: the companion bounds the block at the item, for that session only."""
     sent: list[tuple[str, dict]] = []

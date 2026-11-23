@@ -630,9 +630,9 @@ async def test_the_agenda_guarded_goes_at_once_and_never_measures() -> None:
     assert iw.AGENDA_GUARDED in iw.J_REASONS
 
 
-# --- the moment thinker's line (Units 8-9, model.md "The final rule set (F)", rules 6-9) ---------
+# --- the moment thinker's line (model.md "Next-exchange line (after 11-23)", rules 6-10) --------
 
-ACT = "Answer the question about the weekend."
+ACT = "If she answers, react to it first."
 
 
 def _line(version: int, item: str, text: str = ACT, call: int = 1, expires_at=None) -> SimpleNamespace:
@@ -645,158 +645,233 @@ def _updates(conn: Conn) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_the_line_is_placed_last_after_the_base_while_its_item_is_open() -> None:
+async def test_the_line_is_placed_last_after_the_base_while_its_turn_is_open() -> None:
     """Rule 7: the line goes at once, under its heading, after the stable base (the owner's design)."""
     writer, conn, _, _ = _writer()
     await _open(writer, conn)
-    await writer.turn_started("i1")
+    await writer.turn_started("i2", "i1")
     writer.parts_changed({"line": _line(1, "i1")})
     await _settle()
     assert _updates(conn) == [writer.current()]
     assert writer.current().endswith(f"BASE\n\n{iw.LINE_HEADING}\n{ACT}")
 
 
-def test_quiet_is_rendered_as_one_plain_line() -> None:
-    """The companion's "quiet": the words were not said to him, in the profile's own form."""
-    block = iw.Block("", 0, None, None, 0, 0.0)
-    line = iw.Line("i1", 1, "quiet", 1, None, 0.0)
-    text = iw.compose(iw.View("BASE", SESSION, block, None, 0.0, line=line, open_item="i1"))
-    assert text == f"BASE\n\n{iw.LINE_HEADING}\n{iw.QUIET_LINE}"
-    assert "quiet" not in iw.QUIET_LINE.replace("stay_quiet", "")
-    assert round(len(f"{iw.LINE_HEADING}\n{iw.QUIET_LINE}") / 3.5) <= 25
-
-
 @pytest.mark.asyncio
-async def test_a_line_part_with_no_open_item_writes_nothing_new() -> None:
-    """Rule 8: the take has no checks, and compose shows nothing for an item that is not open."""
-    writer, conn, _, _ = _writer()
-    await _open(writer, conn)
-    writer.parts_changed({"line": _line(1, "i1")})
-    await _settle()
-    assert conn.wire == [] and not writer.pending()
-    assert writer.view.line is not None  # taken, not shown
+async def test_the_line_shows_only_while_a_newer_turn_is_open_and_keyed_by_the_heard_item() -> None:
+    """Fnxfromtake (NxGone, NxOthersNoLine): the line shows only while the next turn is open.
 
-
-@pytest.mark.asyncio
-async def test_a_line_for_an_item_cut_by_a_reconnect_is_not_shown() -> None:
-    """Fu8leannoopen (NoCrossSession): a session's open has no open item.
-
-    The record's line for the item the reconnect cut is in neither the new session's first
-    write nor its next turn.
+    Fnxfromtake (NxGone, NxOthersNoLine): taken after his reply, the line writes nothing until the
+    person's next speech_started, which shows it in its one write; the transcript with text sends
+    nothing, so his reply reads it, and the done withdraws it.
     """
     writer, conn, _, _ = _writer()
     await _open(writer, conn)
-    await writer.turn_started("i1")
-    writer.parts_changed({"line": _line(1, "i1")})
+    writer.parts_changed({"line": _line(1, "i1")})  # after his reply to i1: no turn open
     await _settle()
-    assert iw.LINE_HEADING in writer.sent
-    held = {"line": _line(1, "i1")}  # the reconnect's snapshot still holds it
-    text = writer.connect(SESSION + 1, "BASE", "## Your memory\nold turns", {"top": 1}, held)
-    assert iw.LINE_HEADING not in text and writer.view.open_item is None
-    await writer.open(conn, {"type": "realtime", "instructions": text})
-    conn.wire.clear()
-    await writer.turn_started("i2")
-    writer.parts_changed(held)
-    await _settle()
-    assert conn.wire == [] and iw.LINE_HEADING not in writer.current()
-
-
-@pytest.mark.asyncio
-async def test_a_line_after_its_items_end_is_not_shown(caplog) -> None:
-    """Fnodrop (LineGoneAtEnd): a line that comes after its item's end is not written.
-
-    Its log says so, with counts and timings only.
-    """
-    writer, conn, _, _ = _writer()
-    await _open(writer, conn)
-    await writer.turn_started("i1")
-    assert writer.turn_ended("i1") is True
-    with caplog.at_level("INFO", logger=iw.__name__):
-        writer.parts_changed({"line": _line(1, "i1", expires_at=writer.clock() + 29.0)})
-        await _settle()
-    assert conn.wire == [] and iw.LINE_HEADING not in writer.current()
-    assert "Moment line taken: call 1, v1, an act, after its item ended; 29.0 s to its expiry" in caplog.text
-    assert ACT not in caplog.text and "i1" not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_a_snapshot_after_the_done_does_not_bring_the_line_back() -> None:
-    """Fnodrop (NoStaleLine): a line offered again after the done writes nothing.
-
-    The transcript with text sends nothing, so his reply reads the line; the done withdraws it,
-    and the record's line offered again (a snapshot, a newer call) writes nothing.
-    """
-    writer, conn, _, _ = _writer()
-    await _open(writer, conn)
-    await writer.turn_started("i1")
-    writer.parts_changed({"line": _line(1, "i1")})
-    await _settle()
-    writer.turn_ended("i1")  # the completed transcript: no write
+    assert conn.wire == [] and not writer.pending() and writer.view.line is not None
+    await writer.turn_started("i2", "i1")
+    assert len(_updates(conn)) == 1 and iw.LINE_HEADING in writer.sent
+    assert writer.turn_ended("i2") is True  # the completed transcript: no write
     await _settle()
     assert len(_updates(conn)) == 1 and iw.LINE_HEADING in writer.sent
     await writer.at_done()
     assert len(_updates(conn)) == 2 and iw.LINE_HEADING not in writer.sent
-    writer.parts_changed({"line": _line(1, "i1")})
-    writer.parts_changed({"line": _line(2, "i1", call=2)})
+    writer.parts_changed({"line": _line(2, "i1", call=2)})  # a newer call, after the done
     await _settle()
     assert len(_updates(conn)) == 2 and not writer.pending()
 
 
 @pytest.mark.asyncio
-async def test_every_line_write_leaves_the_drop_measure(caplog) -> None:
-    """Fu8measure and Fu8measureclr (NoGapHis): no line write starts the drop measure again.
+async def test_a_line_of_an_older_exchange_is_not_shown() -> None:
+    """Fnxnoheard (NoStaleLine): a line of an older exchange is not shown.
 
-    The take's write, the withdrawal at speech_started and the withdrawal at an empty end each
-    go, and none starts the drop measure again.
+    Fnxnoheard (NoStaleLine): with the newest exchange's call lost or late, the turn after shows no
+    line rather than an older exchange's.
+    """
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn)
+    writer.parts_changed({"line": _line(1, "i1")})
+    await writer.turn_started("i3", "i2")  # his reply to i2 brought no line
+    await _settle()
+    assert conn.wire == [] and iw.LINE_HEADING not in writer.current()
+
+
+@pytest.mark.asyncio
+async def test_a_line_after_the_next_commit_is_never_shown(caplog) -> None:
+    """W_NxLate: a line that comes after its turn has ended is never shown.
+
+    W_NxLate: a line that comes after the turn it was for has ended is not written, nor shown at the
+    turn after (its key is older then). Its log says so, with counts and timings only.
+    """
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn)
+    await writer.turn_started("i2", "i1")
+    writer.turn_ended("i2")
+    with caplog.at_level("INFO", logger=iw.__name__):
+        writer.parts_changed({"line": _line(1, "i1", expires_at=writer.clock() + 59.0)})
+        await _settle()
+    assert conn.wire == [] and iw.LINE_HEADING not in writer.current()
+    assert "Moment line taken: call 1, v1, late, its turn ended; 59.0 s to its expiry" in caplog.text
+    assert ACT not in caplog.text and "i1" not in caplog.text
+    await writer.turn_started("i3", "i2")
+    assert conn.wire == [] and iw.LINE_HEADING not in writer.current()
+
+
+@pytest.mark.asyncio
+async def test_an_empty_end_withdraws_the_line_and_the_next_start_shows_it_again() -> None:
+    """Fnxnoemptyclr and W_NxReshow: an empty end withdraws the line; the next start shows it.
+
+    Fnxnoemptyclr and W_NxReshow: an empty end withdraws the line before H's re-create; the empty
+    turn leaves H's heard item as it was, so the next speech_started shows it again.
+    """
+    writer, conn, _, measured = _writer()
+    await _open(writer, conn)
+    writer.parts_changed({"line": _line(1, "i1")})
+    await writer.turn_started("i2", "i1")
+    assert await writer.at_empty_end("i2", "an empty end") is True
+    await writer.turn_started("i3", "i1")
+    assert [iw.LINE_HEADING in u for u in _updates(conn)] == [True, False, True]
+    assert measured == []
+
+
+@pytest.mark.asyncio
+async def test_a_line_for_an_item_cut_by_a_reconnect_is_not_shown() -> None:
+    """NoCrossSession: a line for an item a reconnect cut is not shown.
+
+    NoCrossSession: a session's open has no heard item, and H's is reset at connect, so the record's
+    line for the item the reconnect cut is in neither the new session's first write nor its next
+    turn.
+    """
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn)
+    await writer.turn_started("i2", "i1")
+    writer.parts_changed({"line": _line(1, "i1")})
+    await _settle()
+    assert iw.LINE_HEADING in writer.sent
+    held = {"line": _line(1, "i1")}  # the reconnect's snapshot still holds it
+    text = writer.connect(SESSION + 1, "BASE", "## Your memory\nold turns", {"top": 1}, held)
+    assert iw.LINE_HEADING not in text and writer.view.heard is None
+    await writer.open(conn, {"type": "realtime", "instructions": text})
+    conn.wire.clear()
+    await writer.turn_started("i3", None)
+    await _settle()
+    assert conn.wire == [] and iw.LINE_HEADING not in writer.current()
+
+
+@pytest.mark.asyncio
+async def test_an_expired_line_is_not_shown_at_speech_started() -> None:
+    """Rule 7: an expired line is not shown.
+
+    Rule 7: speech_started takes the record's line again, so a line past its expiry is not shown,
+    and a take refuses one already past it.
+    """
+    writer, conn, _, _ = _writer()
+    now = {"t": 1000.0}
+    writer.clock = lambda: now["t"]
+    await _open(writer, conn)
+    writer.parts_changed({"line": _line(1, "i1", expires_at=1060.0)})
+    now["t"] = 1061.0
+    await writer.turn_started("i2", "i1")
+    assert conn.wire == [] and writer.view.line is None
+    writer.parts_changed({"line": _line(1, "i1", expires_at=1060.0)})
+    await _settle()
+    assert writer.view.line is None and conn.wire == []
+
+
+@pytest.mark.asyncio
+async def test_every_line_write_leaves_the_drop_measure(caplog) -> None:
+    """Fnxmeasure (NoGapHis): no line write starts the drop measure again.
+
+    The take's write, the withdrawal at an empty end and the write at speech_started each go,
+    and none starts the drop measure again.
     """
     writer, conn, _, measured = _writer()
     await _open(writer, conn)
     with caplog.at_level("INFO", logger=iw.__name__):
-        await writer.turn_started("i1")
-        writer.parts_changed({"line": _line(1, "i1")})  # the take
-        await _settle()
-        await writer.turn_started("i2")  # the clear at speech_started
-        writer.parts_changed({"line": _line(2, "i2")})
+        await writer.turn_started("i2", "i1")
+        writer.parts_changed({"line": _line(1, "i1")})  # the take, its turn open
         await _settle()
         await writer.at_empty_end("i2", "an empty end")  # the empty end
+        await writer.turn_started("i3", "i1")  # shown again at speech_started
     updates = _updates(conn)
-    assert len(updates) == 4
-    assert [iw.LINE_HEADING in u for u in updates] == [True, False, True, False]
+    assert [iw.LINE_HEADING in u for u in updates] == [True, False, True]
     assert measured == []
     assert caplog.text.count("Moment line written") == 2
-    assert caplog.text.count("Moment line withdrawn") == 2
-    assert "Moment line withdrawn (speech started)" in caplog.text
+    assert "Moment line written (speech started)" in caplog.text
     assert "Moment line withdrawn (an empty end)" in caplog.text
 
 
 @pytest.mark.asyncio
 async def test_speech_started_sends_whatever_is_pending_in_one_write() -> None:
-    """Rule 9 and the companion's ticket 77, item 2: speech_started sends what is pending.
+    """Speech_started sends what is pending in one write.
 
-    A batched change waiting at speech_started goes with the withdrawal in one write, with no
-    measure reset; nothing pending sends nothing.
+    Speech_started sends what is pending: a batched change waiting goes with the line in one write,
+    with no measure reset; nothing pending sends nothing.
     """
     writer, conn, _, measured = _writer()
     await _open(writer, conn)
-    await writer.turn_started("i1")
+    await writer.turn_started("i1", None)
     assert conn.wire == []
     writer.parts_changed({"line": _line(1, "i1")})
+    writer.turn_ended("i1")
     await _settle()
-    conn.wire.clear()
+    assert conn.wire == []
     writer.view = writer.view.__class__(**{**writer.view.__dict__, "base": "NEW"})  # batched
-    await writer.turn_started("i2")
+    await writer.turn_started("i2", "i1")
     assert _updates(conn) == [writer.current()]
-    assert writer.current().endswith("NEW") and measured == []
+    assert writer.current().endswith(ACT) and "NEW" in writer.current() and measured == []
 
 
 @pytest.mark.asyncio
 async def test_an_end_of_another_item_neither_clears_the_open_item_nor_sends() -> None:
-    """A failed or empty end of an older item leaves the open item's line shown."""
+    """A failed or empty end of an older item leaves the open turn's line shown."""
     writer, conn, _, _ = _writer()
     await _open(writer, conn)
-    await writer.turn_started("i2")
-    writer.parts_changed({"line": _line(1, "i2")})
+    await writer.turn_started("i2", "i1")
+    writer.parts_changed({"line": _line(1, "i1")})
     await _settle()
     conn.wire.clear()
     await writer.at_empty_end("i1", "a failed end")
     assert conn.wire == [] and writer.view.open_item == "i2"
+
+
+@pytest.mark.asyncio
+async def test_the_in_time_log_at_the_turns_end(caplog) -> None:
+    """At the turn's end the writer logs whether the line was in time.
+
+    At the turn's end the writer logs whether the line was written in time, with its version (the
+    companion logs its kind with the same version): counts and timings only.
+    """
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn)
+    with caplog.at_level("INFO", logger=iw.__name__):
+        await writer.turn_started("i2", "i1")
+        writer.parts_changed({"line": _line(3, "i1")})
+        await _settle()
+        writer.turn_ended("i2")
+        await writer.turn_started("i3", "i2")
+        writer.turn_ended("i3")
+    assert "Moment line in time: v3, written 0.00 s before the turn's end" in caplog.text
+    assert "Moment line not in time: none for the heard item" in caplog.text
+    assert ACT not in caplog.text and "i1" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_create_other_than_the_reply_is_composed_without_the_line() -> None:
+    """Rule 10: a create other than his reply is composed without the line.
+
+    Rule 10: `current(line=False)` is the composition without the line, and `line_held` is true
+    while a line is shown or is in what the session last got.
+    """
+    writer, conn, _, _ = _writer()
+    await _open(writer, conn)
+    assert not writer.line_held()
+    await writer.turn_started("i2", "i1")
+    writer.parts_changed({"line": _line(1, "i1")})
+    await _settle()
+    assert writer.line_held() and iw.LINE_HEADING in writer.current()
+    assert writer.current(line=False) == writer.current().rsplit("\n\n", 1)[0]
+    writer.turn_ended("i2")
+    assert writer.line_held()  # the session still holds it until the done's write
+    await writer.at_done()
+    assert not writer.line_held()
