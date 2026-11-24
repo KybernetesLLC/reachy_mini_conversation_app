@@ -470,11 +470,13 @@ class LocalStream:
         artifact: str | None = None,
         item_id: str | None = None,
         thought: str | None = None,
+        answers: str | None = None,
     ) -> None:
         """Push a conversation.transcript notification to JSON-RPC clients. A reply the
         output gate cut carries its kind as "artifact": the supervisor never keeps it. A user
         transcript carries its realtime "item_id" when it has one, and a thought's lines its id
-        as "thought"."""
+        as "thought". His final that answered a person's item carries that item as "answers"
+        (its own key, never "item_id", which names a user turn's own item)."""
         if self._rpc is not None:
             params: dict[str, Any] = {"role": role, "text": text, "final": final}
             if artifact:
@@ -483,6 +485,8 @@ class LocalStream:
                 params["item_id"] = item_id
             if thought:
                 params["thought"] = thought
+            if answers:
+                params["answers"] = answers
             self._rpc.broadcast_threadsafe("conversation.transcript", params)
 
     def _dispatch_thought_reply(self, thought_id: str, text: str | None, why: str | None) -> None:

@@ -7039,9 +7039,18 @@ async def test_fragment_deltas_reach_the_companion_whole_and_the_ui_partial_is_u
     assert handler.input_transcript_chunks_by_item.deltas == [" how are you?"]
 
 
-# --- route all, Units 8-9: the moment thinker's line and rule 14 -------------------------------
+# --- the moment thinker's line (the next-exchange line, rules 5-10) and rule 14 -----------------
 
-_ACT = "Answer the question about the weekend."
+_ACT = "If she answers, react to it first."
+
+
+def _heard_was(handler: Any, item: str) -> Callable[[], None]:
+    """Return an event step that sets H's heard item, as a transcript with text would."""
+
+    def set_() -> None:
+        handler._heard_item = item
+
+    return set_
 
 
 def _line_record(item: str, version: int = 1) -> Any:
@@ -7080,12 +7089,13 @@ async def test_an_empty_transcript_withdraws_the_line_before_the_recreate(monkey
         handler._safe_response_create = create
 
     async def _line_comes() -> None:
-        handler.parts_changed(_line_record("i1"))
+        handler.parts_changed(_line_record("i0"))
         await _let_tasks_run()
 
     handler.client = _make_fake_realtime_client(
         events=(
             _patch,
+            _heard_was(handler, "i0"),
             _FakeEvent("input_audio_buffer.speech_started", item_id="i1"),
             _line_comes,
             _FakeEvent(
@@ -7107,12 +7117,13 @@ async def test_a_failed_transcription_withdraws_the_open_items_line(monkeypatch:
     seen: list[bool] = []
 
     async def _line_comes() -> None:
-        handler.parts_changed(_line_record("i1"))
+        handler.parts_changed(_line_record("i0"))
         await _let_tasks_run()
         seen.append(iw.LINE_HEADING in (handler._writer.sent or ""))
 
     handler.client = _make_fake_realtime_client(
         events=(
+            _heard_was(handler, "i0"),
             _FakeEvent("input_audio_buffer.speech_started", item_id="i1"),
             _line_comes,
             _FakeEvent("conversation.item.input_audio_transcription.failed", item_id="i1"),
@@ -7160,7 +7171,7 @@ async def test_the_open_item_survives_connect_before_the_tracker_reset(monkeypat
     after: list[tuple[str | None, str | None, bool]] = []
 
     async def _line_comes() -> None:
-        handler.parts_changed(_line_record("new", version=2))
+        handler.parts_changed(_line_record("heard", version=2))
         await _let_tasks_run()
         after.append(
             (
@@ -7171,7 +7182,11 @@ async def test_the_open_item_survives_connect_before_the_tracker_reset(monkeypat
         )
 
     handler.client = _make_fake_realtime_client(
-        events=(_FakeEvent("input_audio_buffer.speech_started", item_id="new"), _line_comes)
+        events=(
+            _heard_was(handler, "heard"),  # the new session's first transcript with text
+            _FakeEvent("input_audio_buffer.speech_started", item_id="new"),
+            _line_comes,
+        )
     )
     await handler._run_realtime_session()
 
@@ -7289,7 +7304,7 @@ async def test_a_transcript_with_text_sends_no_write(monkeypatch: Any) -> None:
         handler.connection.session.update = update
 
     async def _line_comes() -> None:
-        handler.parts_changed(_line_record("i1"))
+        handler.parts_changed(_line_record("i0"))
         await _let_tasks_run()
 
     async def _after() -> None:
@@ -7299,6 +7314,7 @@ async def test_a_transcript_with_text_sends_no_write(monkeypatch: Any) -> None:
     handler.client = _make_fake_realtime_client(
         events=(
             _patch,
+            _heard_was(handler, "i0"),
             _FakeEvent("input_audio_buffer.speech_started", item_id="i1"),
             _line_comes,
             _FakeEvent(
@@ -7330,8 +7346,8 @@ async def test_a_microphone_stopped_mid_turn_withdraws_the_line_and_ends_the_tur
         texts.append(kwargs["session"]["instructions"])
 
     handler.connection.session.update = AsyncMock(side_effect=_update)
-    line = iw.Line("i2", 1, _ACT, 1, None, 0.0)
-    handler._writer.view = replace(handler._writer.view, line=line, open_item="i2")
+    line = iw.Line("i1", 1, _ACT, 1, None, 0.0)
+    handler._writer.view = replace(handler._writer.view, line=line, open_item="i2", heard="i1")
     handler._writer.sent = handler._writer.current()
     handler._turn_opened("i2")
     await handler.end_user_turn()
@@ -7366,8 +7382,8 @@ async def test_a_stale_follow_up_at_its_deadline_withdraws_the_line_then_goes(mo
 
     handler.connection.session.update = AsyncMock(side_effect=_update)
     handler.connection.response.create = AsyncMock(side_effect=_create)
-    line = iw.Line("i2", 1, _ACT, 1, None, 0.0)
-    handler._writer.view = replace(handler._writer.view, line=line, open_item="i2")
+    line = iw.Line("i1", 1, _ACT, 1, None, 0.0)
+    handler._writer.view = replace(handler._writer.view, line=line, open_item="i2", heard="i1")
     handler._writer.sent = handler._writer.current()  # the line is on the server
     measured: list[bool] = []
     handler._writer.on_sent = lambda: measured.append(True)
@@ -7440,3 +7456,163 @@ async def test_the_reply_done_and_the_forced_path_end_the_newer_turn(monkeypatch
     handler._track_created("r3", in_band=True)
     await handler._force("r3")
     assert handler._open_turn is None
+
+
+def _answers_session(monkeypatch: Any, steps: tuple[Any, ...]) -> tuple[Any, list[tuple[str, str | None]]]:
+    """Build a session whose assistant finals are recorded as (text, answers)."""
+    handler = _session_handler(monkeypatch, ())
+    got: list[tuple[str, str | None]] = []
+
+    def observer(role, text, final, artifact, item_id=None, thought=None, answers=None) -> None:
+        if role == "assistant":
+            got.append((text, answers))
+
+    handler.set_transcript_observer(observer)
+    handler.client = _make_fake_realtime_client(events=steps)
+    return handler, got
+
+
+def _turn_and_reply(item: str, rid: str, said: str) -> tuple[Any, ...]:
+    return (
+        _FakeEvent("input_audio_buffer.speech_started", item_id=item),
+        _FakeEvent("conversation.item.input_audio_transcription.completed", item_id=item, transcript="Hi"),
+        _FakeEvent("response.created", response=SimpleNamespace(id=rid)),
+        _FakeEvent("response.output_audio_transcript.done", transcript=said, response_id=rid),
+        _FakeEvent("response.done", response=SimpleNamespace(id=rid, usage=None)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_his_transcript_carries_the_item_it_answered(monkeypatch: Any) -> None:
+    """Rule 5: his reply carries the item it answered.
+
+    Rule 5: his reply to a person's turn carries that turn's item as `answers`, looked up by the
+    transcript's own response id; a barge-in's cut reply too (its transcript.done comes before its
+    done).
+    """
+    handler, got = _answers_session(
+        monkeypatch,
+        _turn_and_reply("i1", "r1", "Hello.")
+        + (
+            _FakeEvent("input_audio_buffer.speech_started", item_id="i2"),
+            _FakeEvent("conversation.item.input_audio_transcription.completed", item_id="i2", transcript="So"),
+            _FakeEvent("response.created", response=SimpleNamespace(id="r2")),
+            _FakeEvent("response.output_audio_transcript.done", transcript="Well, I", response_id="r2"),
+            _FakeEvent("response.done", response=SimpleNamespace(id="r2", status="cancelled", usage=None)),
+        ),
+    )
+    await handler._run_realtime_session()
+    assert got == [("Hello.", "i1"), ("Well, I", "i2")]
+
+
+@pytest.mark.asyncio
+async def test_a_say_or_request_reply_after_the_reply_carries_no_item(monkeypatch: Any) -> None:
+    """Rule 5: a plain create's response answers no item.
+
+    Rule 5: a plain create's response after his reply (say(), request_reply) answers no item; nor
+    does one created during a person's open turn, before its transcript.
+    """
+    handler, got = _answers_session(
+        monkeypatch,
+        _turn_and_reply("i1", "r1", "Hello.")
+        + (
+            _FakeEvent("response.created", response=SimpleNamespace(id="r2")),
+            _FakeEvent("response.output_audio_transcript.done", transcript="A reminder.", response_id="r2"),
+            _FakeEvent("response.done", response=SimpleNamespace(id="r2", usage=None)),
+            _FakeEvent("input_audio_buffer.speech_started", item_id="i2"),
+            _FakeEvent("response.created", response=SimpleNamespace(id="r3")),
+            _FakeEvent("response.output_audio_transcript.done", transcript="Another.", response_id="r3"),
+            _FakeEvent("response.done", response=SimpleNamespace(id="r3", usage=None)),
+        ),
+    )
+    await handler._run_realtime_session()
+    assert got == [("Hello.", "i1"), ("A reminder.", None), ("Another.", None)]
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_and_the_nudge_carry_the_same_item(monkeypatch: Any) -> None:
+    """Rule 5: the follow-up and the nudge answer the reply's item.
+
+    Rule 5: the tool's follow-up and the missed-call nudge answer the same item as the reply, so
+    their calls supersede its line (at most max_calls an item).
+    """
+    handler, got = _answers_session(monkeypatch, ())
+
+    def _follow_up_owed() -> None:
+        handler._followup_pending = True
+
+    handler.client = _make_fake_realtime_client(
+        events=_turn_and_reply("i1", "r1", "Let me check.")
+        + (
+            _follow_up_owed,
+            _FakeEvent("response.created", response=SimpleNamespace(id="r2")),
+            _FakeEvent("response.output_audio_transcript.done", transcript="It is sunny.", response_id="r2"),
+            _FakeEvent("response.done", response=SimpleNamespace(id="r2", usage=None)),
+            _FakeEvent("response.created", response=SimpleNamespace(id="r3", metadata=dict(hf_mod.NUDGE_TAG))),
+            _FakeEvent("response.output_audio_transcript.done", transcript="Here it is.", response_id="r3"),
+            _FakeEvent("response.done", response=SimpleNamespace(id="r3", usage=None)),
+        )
+    )
+    await handler._run_realtime_session()
+    assert got == [("Let me check.", "i1"), ("It is sunny.", "i1"), ("Here it is.", "i1")]
+
+
+def _line_shown(handler: Any) -> None:
+    """His writer with the moment's line shown: turn i2 open, keyed by the heard item i1."""
+    from dataclasses import replace
+
+    from reachy_mini_conversation_app import instructions_writer as iw
+
+    line = iw.Line("i1", 1, _ACT, 1, None, 0.0)
+    handler._writer.view = replace(handler._writer.view, line=line, open_item="i2", heard="i1")
+
+
+@pytest.mark.asyncio
+async def test_the_nudge_create_carries_no_line(monkeypatch: Any) -> None:
+    """Fnxownline (NxOthersNoLine): the nudge's create carries no line.
+
+    Fnxownline (NxOthersNoLine): the nudge's create carries the composition without the moment's
+    line, plus the note.
+    """
+    from reachy_mini_conversation_app import instructions_writer as iw
+
+    handler, _ = _sender_handler(monkeypatch)
+    _line_shown(handler)
+    assert iw.LINE_HEADING in handler._writer.current()
+    sent = handler._with_nudge_instructions({"response": {"metadata": dict(hf_mod.NUDGE_TAG)}})
+    assert sent["response"]["instructions"] == f"BASE\n\n{hf_mod.MISSED_CALL_NOTE}"
+
+
+@pytest.mark.asyncio
+async def test_a_plain_create_while_a_line_is_shown_is_sent_without_it(monkeypatch: Any) -> None:
+    """Fnxannline (NoSpent, NxOthersNoLine): other creates go without the line.
+
+    Fnxannline (NoSpent, NxOthersNoLine): say(), request_reply, a follow-up or a re-create sent
+    while a line is shown or held carries the composition without it; with no line it is sent as it
+    was, and a create with instructions of its own (out of band) is never changed.
+    """
+    handler, _ = _sender_handler(monkeypatch)
+    assert handler._with_nudge_instructions({}) == {}
+    _line_shown(handler)
+    assert handler._with_nudge_instructions({}) == {"response": {"instructions": "BASE"}}
+    own = {"response": {"conversation": "none", "instructions": "Say this."}}
+    assert handler._with_nudge_instructions(own) == own
+
+
+@pytest.mark.asyncio
+async def test_a_plain_create_during_an_open_turn_reaches_the_server_without_the_line(
+    monkeypatch: Any,
+) -> None:
+    """A plain create during an open turn reaches the server without the line.
+
+    The sender's own path: a plain create queued while a line is shown goes with
+    response.instructions, so it never reads the session's line (the robot: 4 plain creates during
+    an open turn, 11-21 to 11-23).
+    """
+    from reachy_mini_conversation_app import instructions_writer as iw
+
+    handler, sent = _sender_handler(monkeypatch)
+    _line_shown(handler)
+    await handler._safe_response_create()
+    await _run_sender(handler, lambda: bool(sent))
+    assert iw.LINE_HEADING not in sent[0]["response"]["instructions"]

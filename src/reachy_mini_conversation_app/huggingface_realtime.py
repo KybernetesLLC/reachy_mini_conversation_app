@@ -332,6 +332,8 @@ class _Live:
 
     `heard` is the latest heard user item at its created, the reply's turn as the fork knows it.
     Its deadline runs from that created. `real` says whether its own response.done ended it.
+    `answers` says whether it answers `heard` (the next-exchange line's rule 5): his reply, its
+    tool follow-up or the missed-call nudge; his transcript then carries `heard` as `answers`.
     """
 
     heard: str | None
@@ -339,6 +341,7 @@ class _Live:
     in_band: bool
     ended: asyncio.Event = field(default_factory=asyncio.Event)
     real: bool = False
+    answers: bool = False
 
 
 def session_size(session: Any) -> str:
@@ -719,6 +722,33 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._heard_item, time.monotonic() + _RESPONSE_DONE_TIMEOUT, in_band
         )
         self._response_done_event.clear()
+
+    def _mark_answers(self, event: Any) -> None:
+        """Mark whether an in-band response answers the heard item (rule 5).
+
+        Rule 5, at an in-band response.created: it answers the heard item when it is the tool's
+        follow-up, the missed-call nudge, or the first response since that item's transcript. That
+        last is the turn-latency marker's own condition (not a thought, the person's transcript
+        seen, no response created since), read before the marker is set.
+        """
+        live = self._responses.get(getattr(getattr(event, "response", None), "id", None))
+        if live is None or not live.in_band or live.heard is None:
+            return
+        tag = _companion_tag(event)
+        live.answers = (
+            self._followup_live
+            or tag == NUDGE_TAG["companion"]
+            or (
+                tag != THOUGHT_TAG
+                and self._turn_user_done_at is not None
+                and self._turn_response_created_at is None
+            )
+        )
+
+    def _answered(self, response_id: str | None) -> str | None:
+        """Return the item a response answered (rule 5), by its own id; None for one that answers none."""
+        live = self._responses.get(response_id)
+        return live.heard if live is not None and live.answers else None
 
     def _end_tracked(self, response_id: str | None, *, real: bool) -> None:
         """End one response; the done event is set only when none is left."""
@@ -2101,20 +2131,33 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 logger.debug("could not cancel the greeting's response (%s)", e)
 
     def _with_nudge_instructions(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
-        """Return the create to send: for the nudge, the instructions last sent plus the note.
+        """Return the create to send, without the moment's line unless it is his reply.
 
-        None drops the nudge: with no instructions composed yet, it would replace them with the note alone.
+        Return the create to send: for the nudge, the instructions composed now, without the
+        moment's line, plus the note; for any other create with no instructions of its own while a
+        line is shown or held, the composition without the line (rule 10: only his reply to the
+        person's turn reads the line; a follow-up, say(), request_reply or a re-create does not).
+
+        None drops the nudge: with no instructions composed yet, it would replace them with the note
+        alone.
 
         Built at every send attempt (ConvoAll Ffrozen: a retry sent the copy made at the queue).
         response.instructions replaces the session's for that reply only, so it carries them all.
         """
-        if not _is_nudge(kwargs):
+        if _is_nudge(kwargs):
+            base = self._writer.current(line=False)
+            if base is None:
+                logger.warning("missed-call nudge dropped: no instructions sent yet")
+                return None
+            return {**kwargs, "response": {**kwargs["response"], "instructions": f"{base}\n\n{MISSED_CALL_NOTE}"}}
+        response = kwargs.get("response") or {}
+        if "instructions" in response or not self._writer.line_held():
             return kwargs
-        base = self._writer.current()
+        base = self._writer.current(line=False)
         if base is None:
-            logger.warning("missed-call nudge dropped: no instructions sent yet")
-            return None
-        return {**kwargs, "response": {**kwargs["response"], "instructions": f"{base}\n\n{MISSED_CALL_NOTE}"}}
+            return kwargs
+        logger.info("A create while the moment's line is shown: sent without it")
+        return {**kwargs, "response": {**response, "instructions": base}}
 
     async def _response_sender_loop(self) -> None:
         """Dedicated worker that sends ``response.create()`` calls serially.
@@ -2647,7 +2690,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         # pending (an older item's line withdrawn); rule 14's turn opens.
                         started = getattr(event, "item_id", None)
                         self._turn_opened(started)
-                        await self._writer.turn_started(started)
+                        await self._writer.turn_started(started, self._heard_item)
                         logger.debug("User speech started")
 
                     if event.type == "input_audio_buffer.speech_stopped":
@@ -2688,6 +2731,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         )
                         if self._followup_pending and _band_tag(event) is None:
                             self._followup_pending, self._followup_live = False, True
+                        self._mark_answers(event)  # before the latency marker below is set
                         self._response_started()
                         self._gate_start()
                         self._out_text = ""
@@ -2869,7 +2913,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         # Rule 6: the item ends; no write, so his reply still reads its line
                         # and the reply's done withdraws it (rule 9). The turn stays open for
                         # rule 14 until that done.
-                        self._writer.turn_ended(ended)
+                        self._writer.turn_ended(ended, text=True)
                         self._cut_mid_reply = False
                         self._heard_item = getattr(event, "item_id", None) or self._heard_item
                         self._prune.mark_heard(getattr(event, "item_id", None))
@@ -2922,8 +2966,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             else without_calls(said, self._gate_tools)
                         )  # 2026-10-20
                         if kept or not said:
+                            # rule 5: the item it answered, by this response's own id; after a
+                            # barge-in the text is what was generated, not all of it played
                             self._emit_transcript(
-                                "assistant", kept, True, artifact=self._gate_cut_kind
+                                "assistant",
+                                kept,
+                                True,
+                                artifact=self._gate_cut_kind,
+                                answers=self._answered(getattr(event, "response_id", None)),
                             )
                         else:  # played, but only markup: logged by the supervisor, never kept (the review)
                             self._emit_transcript(
