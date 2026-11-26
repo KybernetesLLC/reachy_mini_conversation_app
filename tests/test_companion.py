@@ -65,15 +65,28 @@ def test_the_wire_log_path_is_the_companions(tmp_path, monkeypatch, companion_on
     assert wire_log.from_env() is None
 
 
-@pytest.mark.parametrize("raw", ["x", "0", "4000"])
+def _kept_days(monkeypatch, tmp_path, days) -> None:
+    """Set the companion's turn_retention from a file of this test's own: it reads no environment variable now."""
+    monkeypatch.syspath_prepend(str(companion.src_dir()))
+    from reachy_companion import settings, turn_retention
+
+    monkeypatch.setattr(settings, "MACHINE_PATH", tmp_path / "machine.toml")
+    monkeypatch.setattr(settings, "owner_path", lambda: tmp_path / "owner.toml")
+    path = tmp_path / "turn_retention.toml"
+    path.write_text(f"days = {json.dumps(days)}\n")
+    monkeypatch.setattr(turn_retention.RETENTION, "path", path)
+    monkeypatch.setattr(turn_retention.RETENTION, "_state", {})
+
+
+@pytest.mark.parametrize("raw", ["x", 0, 4000])
 def test_a_retention_the_supervisor_refuses_keeps_the_log_off(tmp_path, monkeypatch, companion_on, raw, caplog) -> None:
     monkeypatch.setattr(wire_log, "_LOG", None)
     monkeypatch.setenv(wire_log.ENV, str(tmp_path / "wire.db"))
-    monkeypatch.setenv(wire_log.RETENTION_ENV, raw)
+    _kept_days(monkeypatch, tmp_path, raw)
     with caplog.at_level(logging.ERROR, logger=wire_log.__name__):
         assert wire_log.from_env() is None
     assert "wire log: off" in caplog.text and not (tmp_path / "wire.db").exists()
-    monkeypatch.setenv(wire_log.RETENTION_ENV, "30")
+    _kept_days(monkeypatch, tmp_path, 30)
     assert wire_log.retention_days() == 30
 
 

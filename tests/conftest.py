@@ -43,6 +43,9 @@ def companion_on(monkeypatch: pytest.MonkeyPatch):
     checkout = os.environ.get(COMPANION_ENV, "").strip()
     if not checkout or not (Path(checkout) / "src" / "reachy_companion" / "luma.py").exists():
         pytest.skip(f"{COMPANION_ENV} names no companion checkout with ticket 33's reads")
+    # The companion's own dependencies are this venv's dev dependencies (pyproject.toml): a missing one
+    # fails here, loudly, not as the app's defaults under a read that caches None (companion ticket 218).
+    import msgspec  # noqa: F401  (the settings module's)
     monkeypatch.setattr(sys, "path", list(sys.path))
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     monkeypatch.setattr(companion, "_found", {})

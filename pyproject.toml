@@ -31,6 +31,8 @@ dev = [
   "pytest",
   "pytest-asyncio",
   "pytest-cov==7.1.0",
+  "pytest-xdist>=3",  # the suite runs -n 6 under tools/suite_compare.py (companion ticket 218)
+  "msgspec>=0.22",  # the companion's settings module imports it; the companion tests need it (ticket 218)
   "ruff==0.15.20",
   "mypy==2.2.0",
   "pre-commit",
