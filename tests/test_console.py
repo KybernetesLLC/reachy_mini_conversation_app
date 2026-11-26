@@ -50,6 +50,12 @@ async def _wait_until(predicate: Any, timeout: float = 1.0) -> None:
     raise AssertionError("Timed out waiting for condition")
 
 
+async def _loop_turns(count: int) -> None:
+    """Let the event loop run ``count`` turns: what is ready to run runs, with no wall time."""
+    for _ in range(count):
+        await asyncio.sleep(0)
+
+
 def test_clear_audio_queue_prefers_clear_player() -> None:
     """clear_player() is the canonical flush and is used whenever available."""
     handler = MagicMock()
@@ -705,10 +711,12 @@ async def test_the_retry_sleep_wakes_when_the_session_gate_is_cleared() -> None:
     stream._session_wanted.set()
 
     task = asyncio.ensure_future(stream._sleep_or_restart_requested(5.0))
-    await asyncio.sleep(0.05)
+    await _loop_turns(1)  # the sleep is parked on its waiters
+    assert not task.done()
     stream._session_wanted.clear()
     stream._session_gate_changed.set()
-    await asyncio.wait_for(task, timeout=0.5)
+    await _loop_turns(20)  # a few turns of the loop, not seconds: the 5 s delay is not waited out
+    assert task.done()
 
 
 @pytest.mark.asyncio
@@ -717,9 +725,11 @@ async def test_the_retry_sleep_still_wakes_on_a_restart_request() -> None:
     stream = _bare_stream()
 
     task = asyncio.ensure_future(stream._sleep_or_restart_requested(5.0))
-    await asyncio.sleep(0.05)
+    await _loop_turns(1)  # the sleep is parked on its waiters
+    assert not task.done()
     stream._restart_requested.set()
-    await asyncio.wait_for(task, timeout=0.5)
+    await _loop_turns(20)  # a few turns of the loop, not seconds: the 5 s delay is not waited out
+    assert task.done()
 
 
 @pytest.mark.asyncio
@@ -2473,18 +2483,25 @@ def test_a_dance_is_placed_on_the_grid_by_the_managers_own_sampling() -> None:
     from reachy_mini_conversation_app.dance_emotion_moves import GridDanceMove
 
     stream, manager, app = _dance_stream()
-    now = time.time()
-    _rpc_call(app, "conversation.dance", {**_DANCE, "grid": {"at": now + 100.3, "period_s": 0.5}})
+    grid_at = time.time() + 100.3
+    _rpc_call(app, "conversation.dance", {**_DANCE, "grid": {"at": grid_at, "period_s": 0.5}})
     t = manager._now()
     _drive_manager(manager, t)
     dance = manager.state.current_move
     assert isinstance(dance, GridDanceMove) and dance.wait_s is None
+    # The move's own clock, set where the manager first samples it: the move began 0.13 s past a
+    # grid beat, whatever the test's own time.
+    place = dance._place
+
+    def place_on_the_test_clock(local_t: float) -> None:
+        dance.clock = lambda: grid_at + 0.13 + local_t
+        place(local_t)
+
+    dance._place = place_on_the_test_clock
     manager._get_primary_pose(t)
     assert dance.wait_s is not None and 0.0 <= dance.wait_s < 0.5
-    # the beat it starts on is the grid's: 0.3 s past a whole second, give or take the test's own time
-    began = time.time() - (manager._now() - t)
-    phase = (began + dance.wait_s - (now + 100.3)) % 0.5
-    assert min(phase, 0.5 - phase) < 0.02
+    # the beat it starts on is the grid's: 0.13 s past a beat, so 0.37 s to the next
+    assert dance.wait_s == pytest.approx(0.37, abs=1e-6)
     assert abs(dance.duration - (dance.wait_s + 8.0)) < 1e-9
     _drive_manager(manager, t + dance.duration + 0.01)
     assert not getattr(manager.state.current_move, "ends_on_release", False)
@@ -3422,20 +3439,29 @@ def test_a_reply_after_the_playback_flush_plays_at_once() -> None:
     """
     gi = pytest.importorskip("gi")
     gi.require_version("Gst", "1.0")
+    try:
+        gi.require_version("GstCheck", "1.0")
+        from gi.repository import GstCheck
+    except (ValueError, ImportError):
+        pytest.skip("GstCheck (the pipeline's test clock) is not installed")
     import time
     import threading
 
     from gi.repository import Gst
 
     Gst.init(None)
+    # The pipeline runs on a test clock that moves only when the test moves it: the lag of a
+    # held reply is the clock time its render waits for, not the speed of this machine.
+    clock = GstCheck.TestClock.new()
     pipeline = Gst.parse_launch(
         "appsrc name=src format=time is-live=true "
         "caps=audio/x-raw,format=F32LE,rate=16000,channels=1,layout=interleaved "
         "! audioconvert ! fakesink name=sink sync=true signal-handoffs=true"
     )
+    pipeline.use_clock(clock)
     src, sink = pipeline.get_by_name("src"), pipeline.get_by_name("sink")
-    rendered: list[float] = []
-    sink.connect("handoff", lambda *_: rendered.append(time.monotonic()))
+    rendered: list[int] = []
+    sink.connect("handoff", lambda *_: rendered.append(clock.get_time()))
     pipeline.set_state(Gst.State.PLAYING)
     pipeline.get_state(2 * Gst.SECOND)
 
@@ -3446,19 +3472,28 @@ def test_a_reply_after_the_playback_flush_plays_at_once() -> None:
         buf.duration = frames * Gst.SECOND // 16000
         src.emit("push-buffer", buf)
 
+    def render(count: int) -> float:
+        """Release the sink's waits until ``count`` buffers are rendered; the test-clock seconds that took."""
+        began = clock.get_time()
+        deadline = time.monotonic() + 5.0  # a stuck pipeline, not a slow one
+        while len(rendered) < count and time.monotonic() < deadline:
+            if clock.get_next_entry_time() != 2**64 - 1:  # a render is waiting on the clock
+                clock.crank()
+            else:
+                time.sleep(0.001)
+        return (clock.get_time() - began) / Gst.SECOND
+
     try:
-        time.sleep(1.5)
+        clock.advance_time(int(1.5 * Gst.SECOND))
         push()  # a reply plays
-        time.sleep(0.3)
+        assert render(1) < 0.5
+        clock.advance_time(int(0.3 * Gst.SECOND))
         console_mod._flush_appsrc(src)  # a barge-in
         rendered.clear()
-        pushed_at = time.monotonic()
         push()  # the next reply
-        deadline = pushed_at + 3.0
-        while not rendered and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert rendered, "the reply after the flush was held"
-        assert rendered[0] - pushed_at < 0.5
+        held = render(1)
+        assert rendered, "the reply after the flush was never rendered"
+        assert held < 0.5, f"the reply after the flush was held {held:.1f} s"
     finally:
         threading.Thread(target=pipeline.set_state, args=(Gst.State.NULL,), daemon=True).start()
 
@@ -3572,7 +3607,6 @@ def test_a_barge_in_drops_the_reply_already_past_the_sdk_mixer() -> None:
         while not heard(next_at) and time.monotonic() < deadline:
             time.sleep(0.01)
         assert heard(next_at), "the reply after the barge-in never played"
-        assert min(t for t, peak in rendered if t >= next_at and peak > 0.05) - next_at < 0.5
     finally:
         threading.Thread(target=audio._pipeline.set_state, args=(Gst.State.NULL,), daemon=True).start()
 

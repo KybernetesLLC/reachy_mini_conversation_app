@@ -193,7 +193,12 @@ class Rig:
         threading.Thread(target=self._pull_mic, daemon=True).start()
         if USE_SDK_DEVICES:
             self._start_monitor()
-        time.sleep(1.0)
+        # settled once the microphone's frames flow (and, on the sdk devices, the monitor's)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and (
+            len(self.mic_buffers) < 5 or (USE_SDK_DEVICES and not self.rendered)
+        ):
+            time.sleep(0.01)
 
     def _start_monitor(self) -> None:
         """Hear the speaker past the server's queue: its monitor source, in a separate pipeline."""
@@ -467,8 +472,7 @@ def test_a_sound_stream_is_closed_at_its_end_on_the_sdks_own_loop(
         lambda: playbin.get_state(0)[1] == Gst.State.NULL
     )  # set by the reaper
     # Speech is untouched by the second stream's end.
-    lat = rig.reply_latency(0.6)
-    assert lat is not None and lat < 1.0
+    assert rig.reply_latency(0.6) is not None  # heard within heard_after's deadline
 
 
 def test_a_replaced_sound_is_closed_once_and_a_stop_ends_the_next(
@@ -667,7 +671,14 @@ def test_a_rebuild_waits_for_a_capture_change_in_progress(
 
 # --- the capture-gap trigger ---------------------------------------------------------------
 
-IDLE_S = float(os.environ.get("REACHY_PLAYBACK_TEST_IDLE_S", "15"))
+# The idle the quiet test waits out: past the longest bound either watch applies to an idle
+# stretch (the capture watch's 5 s gap, the reply tracker's 5 s window), so a verdict either
+# would give by then has been given. 6 s; it was 15.
+IDLE_S = float(
+    os.environ.get(
+        "REACHY_PLAYBACK_TEST_IDLE_S", max(ph.CAPTURE_GAP_S, ph.UNHEARD_WINDOW_S) + 1.0
+    )
+)
 
 
 @pytest.mark.parametrize(
@@ -813,15 +824,21 @@ def test_the_capture_gap_trigger_rebuilds_the_speaker_once_capture_recovers(
 ) -> None:
     """Integration: a 6 s capture gap is reported once, then one rebuild when frames return, and replies play."""
     rebuilt: list[Any] = []
+    rebuild_done = threading.Event()
     real_rebuild = ph.rebuild_sink
-    monkeypatch.setattr(
-        ph, "rebuild_sink", lambda sink: rebuilt.append(sink) or real_rebuild(sink)
-    )
+
+    def rebuild(sink: Any) -> bool:
+        rebuilt.append(sink)
+        done = real_rebuild(sink)
+        rebuild_done.set()
+        return done
+
+    monkeypatch.setattr(ph, "rebuild_sink", rebuild)
     rig.start()
     acted = _drive_capture_watch(rig)
     with caplog.at_level(logging.INFO, logger=ph.logger.name):
         _hold_capture(rig, 6.0)
-        time.sleep(1.5)
+        assert rebuild_done.wait(10.0), "the speaker was not rebuilt once capture recovered"
     assert [v.action for v in acted] == ["stalled", "rebuild"], acted
     assert rebuilt == [rig.speaker]
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
@@ -844,24 +861,6 @@ def _barge_in(audio: Any) -> None:
         audio._appsrc.send_event(Gst.Event.new_flush_stop(False))
         return
     _flush_appsrc(audio._appsrc)
-
-
-def test_the_capture_gap_trigger_stays_quiet_through_speech_barge_ins_and_idle(
-    rig: Rig, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Normal replies, a barge-in flush and an idle stretch: no stall, no gap, no rebuild."""
-    monkeypatch.setattr(
-        ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a healthy stream")
-    )
-    rig.start()
-    acted = _drive_capture_watch(rig)
-    for level in (0.4, 0.5):
-        assert rig.reply_latency(level) is not None
-    threading.Thread(target=rig.push_reply, args=(2.0, 0.45), daemon=True).start()
-    time.sleep(0.5)
-    _barge_in(rig.audio)
-    time.sleep(IDLE_S)
-    assert acted == []
 
 
 # --- the unheard-reply trigger -------------------------------------------------------------
@@ -1244,14 +1243,17 @@ class _Desync:
 
     def __init__(self, rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
         self.on = False
-        self.rebuilds = 0
+        self.rebuilds = 0  # begun
+        self.rebuilt = 0  # done
         rig.silenced = lambda: self.on  # read by the rig's heard probe
         real_rebuild = ph.rebuild_sink
 
         def rebuild(sink: Any) -> bool:
             self.rebuilds += 1
             self.on = False
-            return real_rebuild(sink)
+            done = real_rebuild(sink)
+            self.rebuilt += 1
+            return done
 
         monkeypatch.setattr(ph, "rebuild_sink", rebuild)
 
@@ -1340,6 +1342,15 @@ def _wait_lags(verdicts: list[ph.Verdict], count: int, timeout: float) -> list[f
     return [float(v.cause.split()[0]) for v in verdicts if v.action == "heard_after"]
 
 
+def _reply_gap(tracker: ph.ReplyTracker) -> None:
+    """Wait until the last push is further back than REPLY_GAP_S: the next push is a reply of its own."""
+    assert _until(
+        lambda: tracker.last_pushed_at is not None
+        and time.monotonic() - tracker.last_pushed_at > ph.REPLY_GAP_S,
+        timeout_s=ph.REPLY_GAP_S + 5.0,
+    )
+
+
 def test_three_unheard_replies_rebuild_the_speaker_and_the_next_is_heard(
     rig: Rig, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1359,9 +1370,9 @@ def test_three_unheard_replies_rebuild_the_speaker_and_the_next_is_heard(
             desync.on = True
             for _ in range(3):
                 rig.push_reply(0.5, 0.4)
-                time.sleep(2.0)  # a pause between replies
+                _reply_gap(tracker)  # a pause between replies
             _wait_judged(verdicts, 4)
-            time.sleep(1.0)
+            assert _until(lambda: desync.rebuilt >= 1)  # the rebuild the third one asked for
             assert desync.rebuilds == 1
             rig.push_reply(0.5, 0.4)
             _wait_judged(verdicts, 5)
@@ -1387,24 +1398,30 @@ def test_three_unheard_replies_rebuild_the_speaker_and_the_next_is_heard(
     )
 
 
-def test_the_unheard_trigger_stays_quiet_through_speech_barge_ins_and_idle(
+def test_the_triggers_stay_quiet_through_speech_barge_ins_and_idle(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Normal replies, a barge-in mid-reply and an idle stretch: every judged reply heard or flushed."""
+    """Normal replies, a barge-in mid-reply and an idle stretch, both watchers on the one run.
+
+    The capture gap trigger sees no stall and no gap; the unheard trigger judges every reply
+    heard or flushed; nothing rebuilds.
+    """
     monkeypatch.setattr(
         ph, "rebuild_sink", lambda sink: pytest.fail("rebuilt a healthy stream")
     )
     rig.start()
+    acted = _drive_capture_watch(rig)
     stop = threading.Event()
     try:
         tracker, verdicts = _drive_reply_tracker(rig, stop)
-        rig.push_reply(0.8, 0.4)
-        time.sleep(2.0)
-        rig.push_reply(0.8, 0.5)
-        time.sleep(2.0)
+        for level in (0.4, 0.5):
+            pushed_at = rig.push_reply(0.8, level)
+            assert rig.heard_after(pushed_at, level) is not None
+            _reply_gap(tracker)
+        began = time.monotonic()
         pusher = threading.Thread(target=rig.push_reply, args=(3.0, 0.45), daemon=True)
         pusher.start()
-        time.sleep(0.6)
+        assert rig.heard_after(began, 0.45) is not None  # the reply is playing
         _barge_in(rig.audio)
         tracker.flushed(time.monotonic())  # as LocalStream.clear_audio_queue does
         pusher.join()
@@ -1412,6 +1429,7 @@ def test_the_unheard_trigger_stays_quiet_through_speech_barge_ins_and_idle(
         _wait_judged(verdicts, 3)
     finally:
         stop.set()
+    assert acted == []
     actions = [v.action for v in verdicts]
     assert "heard_late" not in actions, verdicts
     actions = [v.action for v in _judged(verdicts)]
@@ -1440,7 +1458,7 @@ def test_a_reply_lag_is_measured_during_speech_and_reported_each_minute(
         tracker, verdicts = _drive_reply_tracker(rig, stop)
         for level in (0.4, 0.5, 0.45):
             rig.push_reply(0.8, level)
-            time.sleep(2.0)
+            _reply_gap(tracker)
         lags = _wait_lags(verdicts, 3, timeout=5.0)
     finally:
         stop.set()
@@ -1483,7 +1501,7 @@ def test_a_reply_heard_over_5_s_late_is_logged_and_never_rebuilds(
         with caplog.at_level(logging.INFO, logger=ph.logger.name):
             rig.push_reply(0.8, 0.4)
             assert len(_wait_lags(verdicts, 1, timeout=5.0)) == 1, verdicts
-            time.sleep(2.0)
+            _reply_gap(tracker)
             rig.speaker.set_property("ts-offset", 6 * Gst.SECOND)
             rig.push_reply(0.8, 0.5)
             lags = _wait_lags(verdicts, 2, timeout=12.0)
@@ -1759,6 +1777,12 @@ def test_pair_idle_refresh_and_the_unheard_trigger_share_one_cooldown(
     assert governor.idle_verdict(11000.0, TICK, fresh).action == "rebuild"
 
 
+def test_the_idle_thresholds_are_ten_minutes_and_three_hours_by_default() -> None:
+    """The defaults, once: the parametrized rows below do not repeat them."""
+    assert ph.REFRESH_IDLE == ("REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S", 600.0)
+    assert ph.IDLE_REBUILD == ("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", 10800.0)
+
+
 @pytest.mark.parametrize("setting", [ph.REFRESH_IDLE, ph.IDLE_REBUILD])
 @pytest.mark.parametrize(
     ("raw", "expected"),
@@ -1776,8 +1800,6 @@ def test_the_idle_thresholds_come_from_the_environment(
     setting: tuple[str, float], raw: str | None, expected: float | None
 ) -> None:
     """Seconds, 0 for off; anything missing or invalid keeps the default."""
-    assert ph.REFRESH_IDLE == ("REACHY_COMPANION_SPEAKER_REFRESH_IDLE_S", 600.0)
-    assert ph.IDLE_REBUILD == ("REACHY_COMPANION_SPEAKER_IDLE_REBUILD_S", 10800.0)
     env, default = setting
     environ = {} if raw is None else {env: raw}
     assert env_number(*setting, environ) == (

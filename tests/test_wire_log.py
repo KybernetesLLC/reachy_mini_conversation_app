@@ -150,16 +150,24 @@ def test_every_send_and_receive_is_recorded_with_audio_counted(tmp_path: Path) -
 
 def test_a_full_queue_drops_and_counts_never_blocks() -> None:
     """The tap never waits on the writer: past the bound an event is dropped and counted."""
+    release = threading.Event()
 
     class Stalled(WireLog):
-        def _run(self) -> None:  # a writer that never drains
-            threading.Event().wait(0.5)
+        def _run(self) -> None:  # a writer that never drains, until the test lets it go
+            release.wait(30)
 
     log = Stalled("/nonexistent/wire.db", queue_max=2)
-    t0 = time.monotonic()
-    for _ in range(10):
-        log.received(1, _ev("response.created"))
-    assert time.monotonic() - t0 < 0.1
+
+    def enqueue() -> None:
+        for _ in range(10):
+            log.received(1, _ev("response.created"))
+
+    tap = threading.Thread(target=enqueue, daemon=True)
+    tap.start()
+    tap.join(30)  # a tap that waited on the stalled writer would still be here
+    stuck = tap.is_alive()
+    release.set()
+    assert not stuck
     assert log.dropped == 8
 
 
