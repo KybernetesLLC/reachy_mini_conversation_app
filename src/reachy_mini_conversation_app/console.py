@@ -437,8 +437,6 @@ class LocalStream:
         """Set the active handler and wire LocalStream-owned helpers into it."""
         self.handler = handler
         self.handler._clear_queue = self.clear_audio_queue
-        # A rebuilt handler is never armed to greet (the companion's audio audit, A7;
-        # the review, 2026-10-24): losing a greeting is the safe side.
         self._attach_observers_to_handler()
 
     def _attach_observers_to_handler(self) -> None:
@@ -853,7 +851,6 @@ class LocalStream:
         preroll: bool = False,
         anchor_ago: float | None = None,
         glance: bool = False,
-        greet: bool = False,
     ) -> None:
         """Let the startup loop open a realtime session, and wake it now.
 
@@ -888,9 +885,6 @@ class LocalStream:
                 want("a session opened on a live connection")
             return
         self._glance_on_connect = glance
-        # The greeting only when this open asks for it (the companion's setting, the
-        # review, 2026-10-24); the handler plays it only into silence, once.
-        self.handler.greet_at_open = greet
         if preroll:
             self._preroll_flush_pending = True
             if anchor_ago is not None:
@@ -1715,7 +1709,6 @@ class LocalStream:
                             preroll=bool(params.get("preroll", False)),
                             anchor_ago=_anchor_ago(params.get("preroll_anchor_ago")),
                             glance=params.get("glance") is True,
-                            greet=params.get("greet") is True,
                         )
                     )
                 else:
@@ -2140,12 +2133,6 @@ class LocalStream:
                     break
         finally:
             self._reset_preroll()
-            if self._backend_connected():
-                # The open is settled, its pre-roll (if any) sent: the greeting's hold
-                # for the person's first words starts now (2026-10-24).
-                settled = getattr(self.handler, "open_settled", None)
-                if callable(settled):
-                    settled()
 
     async def _glance_at_open(self) -> None:
         """Glance at a wake's open, beside the pre-roll flush.

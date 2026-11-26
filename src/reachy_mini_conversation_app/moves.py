@@ -71,19 +71,19 @@ TURN_SPEED = float(companion.value("facing", "TURN_SPEED", math.radians(20.0)))
 
 
 def _body_limit(name: str, default: float) -> float:
-    """A commanded body limit in degrees, from the setting the supervisor reads (facing.py), with
-    the same range; outside it, the default (with one warning)."""
-    value = env_number(name, default)
+    """A commanded body limit in degrees, from the companion's facing.py (its settings, ``[facing]``) or
+    the default when the companion is not there; outside the range, the default (with one warning)."""
+    value = float(companion.value("facing", name, default))
     if not TURN_RANGE_DEG[0] <= value <= TURN_RANGE_DEG[1]:
-        logger.warning("%s=%s is not %.0f to %.0f degrees; using %s", name, value, *TURN_RANGE_DEG, default)
+        logger.warning("facing.%s=%s is not %.0f to %.0f degrees; using %s", name, value, *TURN_RANGE_DEG, default)
         return default
     return value
 
 
 def _body_limits() -> Tuple[float, float]:
     """The commanded body limits (lowest, highest, radians); positive yaw is his left."""
-    left = _body_limit("REACHY_COMPANION_BODY_TURN_LEFT_DEG", TURN_LEFT_DEFAULT_DEG)
-    right = _body_limit("REACHY_COMPANION_BODY_TURN_RIGHT_DEG", TURN_RIGHT_DEFAULT_DEG)
+    left = _body_limit("TURN_LEFT_DEG", TURN_LEFT_DEFAULT_DEG)
+    right = _body_limit("TURN_RIGHT_DEG", TURN_RIGHT_DEFAULT_DEG)
     return math.radians(-right), math.radians(left)
 
 

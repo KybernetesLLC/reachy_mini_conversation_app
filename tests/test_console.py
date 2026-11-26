@@ -1422,10 +1422,6 @@ class _FakeSessionHandler:
         self.last_activity_time = time.monotonic()
         self.started = asyncio.Event()
         self.stopped = asyncio.Event()
-        self.settled_after: list[int] = []  # frames received when each open settled
-
-    def open_settled(self) -> None:
-        self.settled_after.append(len(self.received))
 
     async def start_up(self) -> None:
         self.connection = object()
@@ -2620,24 +2616,6 @@ async def test_a_request_said_before_the_name_arrives_whole(monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
-async def test_the_open_settles_once_the_pre_roll_is_flushed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Start the greeting's hold only after the pre-roll flush (2026-10-24).
-
-    The person's buffered words reach the server first, so its VAD can skip the greeting.
-    """
-    settled: list[list[int]] = []
-    real_init = _FakeSessionHandler.__init__
-
-    def init(self: _FakeSessionHandler) -> None:
-        real_init(self)
-        settled.append(self.settled_after)
-
-    monkeypatch.setattr(_FakeSessionHandler, "__init__", init)
-    await _name_last_flush(monkeypatch, anchor_ago=0.7)
-    assert settled == [[50]]
-
-
-@pytest.mark.asyncio
 async def test_without_an_anchor_the_preroll_counts_back_from_the_connect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2651,7 +2629,7 @@ def test_the_session_verb_passes_the_anchor() -> None:
     seen = {}
 
     async def open_session(
-        *, preroll: bool = False, anchor_ago: float | None = None, glance: bool = False, greet: bool = False
+        *, preroll: bool = False, anchor_ago: float | None = None, glance: bool = False
     ) -> None:
         seen.update(preroll=preroll, anchor_ago=anchor_ago)
 
@@ -3018,7 +2996,7 @@ def test_a_session_close_over_the_rpc_runs_on_the_handlers_loop() -> None:
 
 
 def test_a_session_open_over_the_rpc_runs_on_the_handlers_loop() -> None:
-    """The open's gate set and greeting flag are handler state: set on the handler's loop."""
+    """The open's gate set is handler state: set on the handler's loop."""
     stream, _manager, app = _pose_stream()
     seen: list[asyncio.AbstractEventLoop | None] = []
     stream._refresh_speaker_if_idle = lambda: seen.append(_loop_of_this_call())
@@ -3317,32 +3295,19 @@ def test_a_note_whose_session_closes_mid_hop_is_a_graceful_result() -> None:
     assert response.get("result") == {"queued": False, "reason": "no session"}
 
 
-@pytest.mark.asyncio
-async def test_an_open_arms_the_greeting_only_when_asked() -> None:
-    """The review, I1 (2026-10-24): the handler greets only for an open that asks."""
-    stream = _gate_stream()
-    stream._session_wanted.clear()  # closed, as the companion parks it
-    await stream.open_session()
-    assert stream.handler.greet_at_open is False
-    stream._session_wanted.clear()  # closed again
-    await stream.open_session(greet=True)
-    assert stream.handler.greet_at_open is True
-
-
-def test_the_session_verb_greets_only_on_an_explicit_true() -> None:
-    """The review, M2 (2026-10-24): an open that leaves greet out never greets."""
+def test_the_session_verb_ignores_a_greet_key_from_an_older_companion() -> None:
+    """Ticket 217: the opener is gone; a `greet` still sent is ignored, not refused."""
     stream, _manager, app = _pose_stream()
-    seen: list[bool] = []
+    seen: list[dict[str, Any]] = []
 
     async def open_session(**kw: Any) -> None:
-        seen.append(kw.get("greet", False))
+        seen.append(kw)
 
     stream.open_session = open_session
-    _rpc_call(app, "conversation.session", {"open": True, "greet": False})
-    _rpc_call(app, "conversation.session", {"open": True})
-    _rpc_call(app, "conversation.session", {"open": True, "greet": "yes"})
-    _rpc_call(app, "conversation.session", {"open": True, "greet": True})
-    assert seen == [False, False, False, True]
+    for greet in (False, True, "yes"):
+        response = _rpc_call(app, "conversation.session", {"open": True, "greet": greet})
+        assert "error" not in response
+    assert all("greet" not in kw for kw in seen) and len(seen) == 3
 
 
 # --- the companion's audio audit, 2026-10-09 -------------------------------------------------
@@ -3418,21 +3383,6 @@ def test_audio_health_reports_frames_and_level() -> None:
     assert health["frames_5s"] == 2 and health["last_frame_age_s"] < 1.0
     assert 0.1 < health["rms_5s"] < 0.25
     assert "current_source" in health and "capture" in health and "muted" in health
-
-
-def test_a_rebuilt_handler_is_not_armed() -> None:
-    """The companion's audio audit, A7, and the review, M2: a handler rebuilt before
-    connect or mid-conversation does not greet; losing a greeting is the safe side."""
-    robot = SimpleNamespace(media=SimpleNamespace(audio=None, backend=None))
-    first, second = MagicMock(), MagicMock()
-    second.greet_at_open = False
-    stream = LocalStream(first, robot)
-    stream._handler_factory = lambda voice: second
-    stream._session_wanted.clear()  # closed, as the companion keeps it between sessions
-    asyncio.run(stream.open_session(greet=True))
-    assert first.greet_at_open is True
-    stream._build_handler_for_current_backend()
-    assert stream.handler is second and second.greet_at_open is False
 
 
 @pytest.mark.asyncio

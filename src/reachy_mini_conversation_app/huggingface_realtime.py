@@ -6,7 +6,6 @@ import base64
 import random
 import asyncio
 import logging
-import contextlib
 import mimetypes
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Tuple, Callable, Optional, NamedTuple
@@ -51,7 +50,6 @@ from reachy_mini_conversation_app.prompts import (
     read_session_block,
     get_thought_instructions,
     get_profile_instructions,
-    get_session_greeting_prompt,
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
 from reachy_mini_conversation_app.output_gate import (  # noqa: F401  (spoken_artifact: tests)
@@ -259,18 +257,10 @@ def note_item_text(text: str) -> str:
     return NOTE_TEXT.format(text=text.replace("[", "(").replace("]", ")"))
 
 
-# The startup greeting (the companion, 2026-10-24): only when an open asks for it, and only
-# into silence. It waits for the console to finish the open (the pre-roll flush), at most
-# GREETING_SETTLE_WAIT_S, then GREETING_HOLD_S more; speech or a reply by then skips it.
-GREETING_HOLD_S = 0.8
-GREETING_SETTLE_WAIT_S = 2.0
-# The greeting is its own out-of-band response, tagged, so nothing of it stays in the
-# conversation to be answered late. Re-checked at send; cancelled if the person starts.
-GREETING_TAG = {"companion": "greeting"}
 # The missed-call nudge is its own in-band reply (route all, rule 7): its create carries the
 # session's instructions plus MISSED_CALL_NOTE as response.instructions, built at each send
-# attempt, so no system item is written and no later reply reads the note. Tagged like the
-# greeting so a merge of plain creates (_requeue) never drops it.
+# attempt, so no system item is written and no later reply reads the note. Tagged so a
+# merge of plain creates (_requeue) never drops it.
 NUDGE_TAG = {"companion": "nudge"}
 
 
@@ -567,12 +557,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
         self._turn_first_audio_at: float | None = None
-        # Set by LocalStream.open_session for an open that asked for the greeting; spent
-        # when the greeting is sent or skipped, so a reconnect within it stays quiet.
-        self.greet_at_open = False
-        self._spoke_since_open = False
-        self._greeting_live = False  # its create is sent and its response not yet done
-        self._open_settled: asyncio.Event = asyncio.Event()
         self._in_flight_tool_calls: set[str] = set()
         # Function calls whose function_call_output is not yet sent. The server rejects an
         # in-band response.create while any is owed ("Cannot create a response while function
@@ -2074,62 +2058,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # He is told the thought and his reply by the companion's "messages" part (route all,
         # Unit 6), built from the reply reported above; the app keeps no record of its own.
 
-    def open_settled(self) -> None:
-        """Start the greeting's hold: the console has finished this open, its pre-roll sent."""
-        self._open_settled.set()
-
-    async def _greet_into_silence(self) -> None:
-        """Greet once the open has settled and the person has stayed quiet.
-
-        A wake's pre-roll carries the name and often the request; the server hears it
-        and answers, so a greeting then would talk over the person or queue a second
-        reply. Skipped silently: his body already shows he is listening.
-        """
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self._open_settled.wait(), GREETING_SETTLE_WAIT_S)
-        await asyncio.sleep(GREETING_HOLD_S)
-        if self._spoke_since_open or not self._response_done_event.is_set():
-            self.greet_at_open = False
-            logger.info("Startup greeting skipped: the person has started speaking")
-            return
-        await self._send_startup_greeting_prompt()
-
-    async def _send_startup_greeting_prompt(self) -> None:
-        """Prompt the model to open the conversation, once, for an open that asked."""
-        if not self.greet_at_open or not self.connection:
-            return
-        self.greet_at_open = False
-        greeting_prompt = get_session_greeting_prompt().strip()
-        if not greeting_prompt:
-            return
-
-        self._mark_activity("startup_greeting_prompt")
-        await self._safe_response_create(
-            response=_out_of_band_request(
-                GREETING_TAG,
-                ["audio"],
-                greeting_prompt,
-                [{"type": "input_text", "text": "(Say the line now.)"}],
-            )
-        )
-        logger.info("Queued startup greeting prompt")
-
-    async def _cancel_greeting(self) -> None:
-        """Stop the greeting's response at once: the person has started speaking.
-
-        As a barge-in does: drop its held and queued audio, and cancel it on the server.
-        """
-        self._greeting_live = False
-        logger.info("Startup greeting cancelled: the person started speaking")
-        self._gate_drop_held()
-        if self._clear_queue:
-            self._clear_queue()
-        if self.connection:
-            try:
-                await self.connection.response.cancel()
-            except Exception as e:
-                logger.debug("could not cancel the greeting's response (%s)", e)
-
     def _with_nudge_instructions(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
         """Return the create to send, without the moment's line unless it is his reply.
 
@@ -2239,16 +2167,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         break
                     announcement_added = True
 
-                greeting = (kwargs.get("response") or {}).get(
-                    "metadata"
-                ) == GREETING_TAG
-                if greeting:
-                    if self._spoke_since_open:
-                        logger.info(
-                            "Startup greeting dropped at send: the person has started speaking"
-                        )
-                        break
-                    self._greeting_live = True
                 held = False if announcement else await self._wait_for_newer_turn(kwargs)
                 if held is None:
                     break  # the newer turn's reply answered for the tool
@@ -2325,8 +2243,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 # Given up, or its done never came: the companion gives it again (Thought.tla
                 # ReportLoss), and with nothing in flight it is answered then.
                 logger.info("thought %s not answered: its create was not sent", thought_id)
-            if (kwargs.get("response") or {}).get("metadata") == GREETING_TAG:
-                self._greeting_live = False  # done, cancelled, rejected or never sent
 
     async def _handle_tool_result(self, completed_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
@@ -2585,10 +2501,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
             self._end_partial()  # the companion partial's text too
 
-            # Manage events received from the realtime server. The greeting's hold is
-            # this open's: reset before the console can see the connection.
-            self._spoke_since_open = self._greeting_live = False
-            self._open_settled.clear()
+            # Manage events received from the realtime server.
             self.connection = conn
             self._prune.reset()  # the companion's context budget: this session's items
             self._reset_owed_outputs()
@@ -2631,7 +2544,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._notify_session("started")  # the companion's turn pairing starts again
 
             response_sender_task: asyncio.Task[None] | None = None
-            greeting_task: asyncio.Task[None] | None = None
             try:
                 # Start the background tool manager
                 self.tool_manager.start_up(
@@ -2643,10 +2555,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 response_sender_task = asyncio.create_task(
                     self._response_sender_loop(), name="response-sender"
                 )
-                if self.greet_at_open:
-                    greeting_task = asyncio.create_task(
-                        self._greet_into_silence(), name="startup-greeting"
-                    )
 
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
@@ -2660,7 +2568,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._prune.seen(getattr(event, "item", None))
                         self._maybe_trim()
                     if event.type == "input_audio_buffer.speech_started":
-                        self._spoke_since_open = True
                         self._new_user_turn()
                         self._user_speaking = True
                         self._last_speech_at = time.monotonic()
@@ -2683,8 +2590,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             )
                         # his reply cut mid-way: if the turn proves empty, he goes on (11-03)
                         self._cut_mid_reply = left > MID_REPLY_LEFT_S
-                        if self._greeting_live:
-                            await self._cancel_greeting()
                         self.deps.movement_manager.set_listening(True)
                         # Units 8-9, rules 6 and 9: the open item, and one write of anything
                         # pending (an older item's line withdrawn); rule 14's turn opens.
@@ -2736,11 +2641,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._gate_start()
                         self._out_text = ""
                         thought = _companion_tag(event) == THOUGHT_TAG
-                        if (
-                            _companion_tag(event) == GREETING_TAG["companion"]
-                            and self._spoke_since_open
-                        ):
-                            await self._cancel_greeting()  # speech came between its create and now
                         self._mark_activity("response_created")
                         if not thought:  # written, never spoken: the head stays still
                             self.deps.movement_manager.set_speaking(True)
@@ -2791,8 +2691,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._response_started_or_rejected_event.set()
                         if _band_tag(event) is None:
                             self._followup_live = False
-                        elif _companion_tag(event) == GREETING_TAG["companion"]:
-                            self._greeting_live = False
                         # Checked against the function call's response_id on the robot (2026-10-23).
                         logger.debug(
                             "Response done: id=%s",
@@ -3144,11 +3042,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 # Audio still held belongs to a response this session will not finish.
                 self._gate_drop_held()
                 self._gate = "pass"
-
-                if greeting_task is not None:
-                    greeting_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await greeting_task
 
                 # Stop the response sender worker.
                 if response_sender_task is not None:
