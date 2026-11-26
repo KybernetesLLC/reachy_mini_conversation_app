@@ -1256,6 +1256,9 @@ def test_the_body_limits_follow_the_companions_facing_settings(tmp_path: Path) -
 
     def limits(left: float | None, right: float | None) -> tuple[float, float]:
         env = {k: v for k, v in os.environ.items() if k != companion.TOOLS_ENV} | {"PYTHONDONTWRITEBYTECODE": "1"}
+        # The child imports the same moves.py as this process, not the one a venv's editable path names.
+        src = str(Path(companion.__file__).resolve().parents[1])
+        env["PYTHONPATH"] = os.pathsep.join([src, *([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])])
         if left is not None:
             (package / "facing.py").write_text(f"TURN_LEFT_DEG = {left!r}\nTURN_RIGHT_DEG = {right!r}\n")
             env[companion.TOOLS_ENV] = str(tmp_path / "app_tools")

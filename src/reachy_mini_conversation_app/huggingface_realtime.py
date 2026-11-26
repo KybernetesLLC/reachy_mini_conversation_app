@@ -259,8 +259,8 @@ def note_item_text(text: str) -> str:
 
 # The missed-call nudge is its own in-band reply (route all, rule 7): its create carries the
 # session's instructions plus MISSED_CALL_NOTE as response.instructions, built at each send
-# attempt, so no system item is written and no later reply reads the note. Tagged like the
-# greeting so a merge of plain creates (_requeue) never drops it.
+# attempt, so no system item is written and no later reply reads the note. Tagged so a
+# merge of plain creates (_requeue) never drops it.
 NUDGE_TAG = {"companion": "nudge"}
 
 

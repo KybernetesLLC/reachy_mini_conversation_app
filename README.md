@@ -240,7 +240,7 @@ Every profile directory contains one strict schema-version-1 `profile.md`. TOML 
 +++
 schema_version = 1
 voice = "Aiden"
-greeting = "Greet me warmly in one sentence, in character, and vary the wording each time."
+greeting = "Ignored: the app no longer greets at open; the key is still accepted."
 hidden = false
 default_tools = [
   "dance",
@@ -254,7 +254,7 @@ default_tools = [
 You are a concise, friendly robot guide.
 ```
 
-`schema_version`, `default_tools`, and a non-empty Markdown body are required. `voice`, `greeting`, and `hidden` are optional. An empty `default_tools` list is valid and inherits nothing.
+`schema_version`, `default_tools`, and a non-empty Markdown body are required. `voice` and `hidden` are optional; `greeting` is accepted and ignored (the app no longer greets at open). An empty `default_tools` list is valid and inherits nothing.
 
 Profile directories are data-only. Python tool implementations belong in `src/reachy_mini_conversation_app/tools/`, or in `REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY` for external tools. Each enabled tool ID must resolve to a shared tool, an external tool, or a tool from an installed Hugging Face Space.
 

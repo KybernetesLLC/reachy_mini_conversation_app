@@ -1422,10 +1422,6 @@ class _FakeSessionHandler:
         self.last_activity_time = time.monotonic()
         self.started = asyncio.Event()
         self.stopped = asyncio.Event()
-        self.settled_after: list[int] = []  # frames received when each open settled
-
-    def open_settled(self) -> None:
-        self.settled_after.append(len(self.received))
 
     async def start_up(self) -> None:
         self.connection = object()
@@ -3000,7 +2996,7 @@ def test_a_session_close_over_the_rpc_runs_on_the_handlers_loop() -> None:
 
 
 def test_a_session_open_over_the_rpc_runs_on_the_handlers_loop() -> None:
-    """The open's gate set and greeting flag are handler state: set on the handler's loop."""
+    """The open's gate set is handler state: set on the handler's loop."""
     stream, _manager, app = _pose_stream()
     seen: list[asyncio.AbstractEventLoop | None] = []
     stream._refresh_speaker_if_idle = lambda: seen.append(_loop_of_this_call())
