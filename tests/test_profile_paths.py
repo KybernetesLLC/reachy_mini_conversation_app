@@ -147,53 +147,6 @@ def test_session_voice_defaults_to_hf_voice(monkeypatch: pytest.MonkeyPatch) -> 
     assert prompts_mod.get_session_voice() == "Aiden"
 
 
-def test_session_greeting_prompt_loads_from_selected_profile(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Profile metadata should steer the startup greeting prompt."""
-    profile_dir = tmp_path / "friendly"
-    write_profile(
-        "friendly",
-        profile_dir,
-        "test instructions",
-        [],
-        greeting="Greet me like a tiny stage host.",
-    )
-
-    monkeypatch.setattr(config, "PROFILES_DIRECTORY", tmp_path)
-    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "friendly")
-
-    assert prompts_mod.get_session_greeting_prompt() == "Greet me like a tiny stage host."
-
-
-def test_session_greeting_prompt_says_a_listed_line_never_twice_running(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A startup_greetings.txt beside profile.md wins over the greeting prompt."""
-    profile_dir = tmp_path / "friendly"
-    write_profile("friendly", profile_dir, "test instructions", [], greeting="Greet me.")
-    (profile_dir / prompts_mod.STARTUP_GREETINGS_FILENAME).write_text("# a comment\n\nHello.\nHi there.\n")
-    monkeypatch.setattr(config, "PROFILES_DIRECTORY", tmp_path)
-    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", "friendly")
-
-    said = [prompts_mod.get_session_greeting_prompt() for _ in range(6)]
-
-    assert all(p.startswith("Start the conversation by saying exactly this") for p in said)
-    assert {p.split('"')[1] for p in said} == {"Hello.", "Hi there."}
-    assert all(a != b for a, b in zip(said, said[1:]))
-
-
-def test_session_greeting_prompt_uses_builtin_default_without_profile(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The no-profile greeting should come from the built-in constant only."""
-    monkeypatch.setattr(config, "REACHY_MINI_CUSTOM_PROFILE", None)
-
-    assert prompts_mod.get_session_greeting_prompt() == prompts_mod.DEFAULT_GREETING_PROMPT
-
-
 def test_packaged_profiles_win_outside_source_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Installed builds should use packaged profiles, not an unrelated sibling folder."""
     unrelated_profiles = tmp_path / "profiles"

@@ -177,7 +177,6 @@ def _session_handler(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
     )
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
-    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
     handler = _plain_handler()
     handler.client = _make_fake_realtime_client(events=events)
     monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
@@ -1615,13 +1614,6 @@ async def test_handler_reopens_a_session_after_closing_a_live_connection(
     assert handler.tool_manager._lifecycle_tasks == []
 
 
-# --- the startup greeting: only when an open asks, and only into silence (2026-10-24) ---
-
-GREETING_PROMPT = (
-    'Start the conversation by saying exactly this, and nothing else: "Mm?"'
-)
-
-
 class _ScriptedConn(_LiveFakeConn):
     """A live connection whose events the test pushes while it is open."""
 
@@ -1646,210 +1638,6 @@ class _ScriptedConn(_LiveFakeConn):
         if event is None:
             raise StopAsyncIteration
         return event
-
-    def greeted(self) -> bool:
-        """Whether the greeting went out: its own tagged response, or its prompt plus a create."""
-        tagged = [
-            c
-            for c in self.response.create.await_args_list
-            if (c.kwargs.get("response") or {}).get("metadata")
-            == {"companion": "greeting"}
-        ]
-        sent = [
-            c.kwargs["item"]["content"][0]["text"]
-            for c in self.conversation.item.create.await_args_list
-        ]
-        return bool(tagged) or (
-            GREETING_PROMPT in sent and self.response.create.await_count > 0
-        )
-
-
-def _greeting_handler(
-    monkeypatch: Any,
-) -> tuple[HuggingFaceRealtimeHandler, list[_ScriptedConn]]:
-    monkeypatch.setattr(
-        hf_mod, "get_profile_instructions", lambda: "test"
-    )
-    monkeypatch.setattr(
-        hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
-    )
-    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
-    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: GREETING_PROMPT)
-    monkeypatch.setattr(hf_mod, "GREETING_HOLD_S", 0.1, raising=False)
-    monkeypatch.setattr(hf_mod, "GREETING_SETTLE_WAIT_S", 0.1, raising=False)
-    handler = _plain_handler()
-    conns: list[_ScriptedConn] = []
-
-    async def _build(self: Any) -> Any:
-        conn = _ScriptedConn()
-        conns.append(conn)
-        return SimpleNamespace(realtime=SimpleNamespace(connect=lambda **_kw: conn))
-
-    monkeypatch.setattr(type(handler), "_build_realtime_client", _build)
-    return handler, conns
-
-
-async def _connect(
-    handler: HuggingFaceRealtimeHandler, greet: bool | None
-) -> asyncio.Task[None]:
-    """One connect; `greet` is what LocalStream.open_session sets (None: a reconnect, no open)."""
-    if greet is not None:
-        handler.greet_at_open = greet
-    task = asyncio.create_task(handler.start_up())
-    await asyncio.wait_for(handler._connected_event.wait(), timeout=1.0)
-    return task
-
-
-async def _disconnect(
-    handler: HuggingFaceRealtimeHandler, task: asyncio.Task[None]
-) -> None:
-    await asyncio.wait_for(handler.shutdown(), timeout=1.0)
-    await asyncio.wait_for(task, timeout=1.0)
-
-
-@pytest.mark.asyncio
-async def test_an_open_that_asks_greets_after_a_quiet_hold(monkeypatch: Any) -> None:
-    """The greeting waits out the hold for the person's first words, then plays."""
-    handler, conns = _greeting_handler(monkeypatch)
-    task = await _connect(handler, greet=True)
-    await asyncio.sleep(0.05)
-    assert not conns[0].greeted()  # not at connect: the hold comes first
-    await asyncio.sleep(0.4)
-    assert conns[0].greeted()
-    await _disconnect(handler, task)
-
-
-@pytest.mark.asyncio
-async def test_an_open_that_does_not_ask_never_greets(monkeypatch: Any) -> None:
-    """Never greet unless an open asked (the review, I1, 2026-10-24).
-
-    An open that leaves greet out, the app's own start and a say's session never greet,
-    whatever the companion's setting.
-    """
-    handler, conns = _greeting_handler(monkeypatch)
-    task = await _connect(handler, greet=None)  # a fresh handler, nobody asked
-    await asyncio.sleep(0.4)
-    assert not conns[0].greeted()
-    conns[0].conversation.item.create.assert_not_awaited()
-    await _disconnect(handler, task)
-
-
-@pytest.mark.asyncio
-async def test_a_person_already_speaking_gets_no_greeting(monkeypatch: Any) -> None:
-    """The review, I2: speech within the hold skips the greeting; his body shows he listens."""
-    handler, conns = _greeting_handler(monkeypatch)
-    task = await _connect(handler, greet=True)
-    conns[0].push(_FakeEvent("input_audio_buffer.speech_started"))
-    await asyncio.sleep(0.4)
-    assert not conns[0].greeted()
-    await _disconnect(handler, task)
-
-
-@pytest.mark.asyncio
-async def test_speech_in_the_pre_roll_gets_no_greeting(monkeypatch: Any) -> None:
-    """Skip the greeting when the pre-roll carries speech (the review, I2).
-
-    A wake's flush carries the person's words and the name; the server hears speech in it
-    and answers, so no greeting goes before that answer.
-    """
-    handler, conns = _greeting_handler(monkeypatch)
-    monkeypatch.setattr(hf_mod, "GREETING_SETTLE_WAIT_S", 1.0)
-    task = await _connect(handler, greet=True)
-    await asyncio.sleep(0.2)  # the flush is still draining: the hold has not begun
-    conns[0].push(_FakeEvent("input_audio_buffer.speech_started"))
-    await asyncio.sleep(0.05)
-    handler.open_settled()  # the console: the pre-roll is flushed
-    await asyncio.sleep(0.3)
-    assert not conns[0].greeted()
-    await _disconnect(handler, task)
-
-
-@pytest.mark.asyncio
-async def test_speech_between_the_silence_check_and_the_send_drops_the_greeting(
-    monkeypatch: Any,
-) -> None:
-    """Re-check at send (re-review 1): the create can wait in the sender's queue."""
-    handler, conns = _greeting_handler(monkeypatch)
-    monkeypatch.setattr(
-        hf_mod, "GREETING_SETTLE_WAIT_S", 10.0
-    )  # the test drives the greeting
-    task = await _connect(handler, greet=True)
-    handler._track_created("r0", in_band=True)  # in flight: the sender holds the create
-    await handler._send_startup_greeting_prompt()  # silence held until now
-    conns[0].push(_FakeEvent("input_audio_buffer.speech_started"))
-    await asyncio.sleep(0.05)
-    handler._end_tracked("r0", real=True)  # the sender may send now
-    await asyncio.sleep(0.1)
-    assert not conns[0].greeted()
-    conns[0].response.create.assert_not_awaited()
-    await _disconnect(handler, task)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("speech_before_created", [True, False])
-async def test_speech_after_the_send_cancels_the_greeting(
-    monkeypatch: Any, speech_before_created: bool
-) -> None:
-    """Cancel the greeting at once when speech follows its create (re-review 1).
-
-    Before or after the server reports it created, as a barge-in does.
-    """
-    handler, conns = _greeting_handler(monkeypatch)
-    monkeypatch.setattr(hf_mod, "GREETING_SETTLE_WAIT_S", 10.0)
-    task = await _connect(handler, greet=True)
-    await handler._send_startup_greeting_prompt()
-    await asyncio.sleep(0.05)
-    assert conns[0].greeted()  # sent
-    created = _FakeEvent(
-        "response.created",
-        response=SimpleNamespace(
-            id="r1", metadata={"companion": "greeting"}, conversation_id=None
-        ),
-    )
-    speech = _FakeEvent("input_audio_buffer.speech_started")
-    for event in (speech, created) if speech_before_created else (created, speech):
-        conns[0].push(event)
-    await asyncio.sleep(0.1)
-    conns[0].response.cancel.assert_awaited()
-    await _disconnect(handler, task)
-
-
-@pytest.mark.asyncio
-async def test_a_greeting_nobody_spoke_over_is_not_cancelled(monkeypatch: Any) -> None:
-    """Leave a finished greeting alone: speech after it is an ordinary turn."""
-    handler, conns = _greeting_handler(monkeypatch)
-    monkeypatch.setattr(hf_mod, "GREETING_SETTLE_WAIT_S", 10.0)
-    task = await _connect(handler, greet=True)
-    await handler._send_startup_greeting_prompt()
-    await asyncio.sleep(0.05)
-    response = SimpleNamespace(
-        id="r1", metadata={"companion": "greeting"}, conversation_id=None
-    )
-    conns[0].push(_FakeEvent("response.created", response=response))
-    conns[0].push(_FakeEvent("response.done", response=response))
-    await asyncio.sleep(0.05)
-    conns[0].push(
-        _FakeEvent("input_audio_buffer.speech_started")
-    )  # the person, after it played
-    await asyncio.sleep(0.1)
-    conns[0].response.cancel.assert_not_awaited()
-    await _disconnect(handler, task)
-
-
-@pytest.mark.asyncio
-async def test_each_asking_open_greets_once_and_a_reconnect_does_not(
-    monkeypatch: Any,
-) -> None:
-    """Greet exactly where an open asked for it (the review, M3).
-
-    Across open, close and open on one handler, and a reconnect within the conversation.
-    """
-    handler, conns = _greeting_handler(monkeypatch)
-    for greet in (True, False, True, None):  # None: the same conversation reconnects
-        task = await _connect(handler, greet=greet)
-        await asyncio.sleep(0.4)
-        await _disconnect(handler, task)
-    assert [c.greeted() for c in conns] == [True, False, True, False]
 
 
 # --- the inner monologue: sight notes, written by the companion since 2026-10-17 -----
@@ -2634,7 +2422,7 @@ async def test_a_nudge_with_no_instructions_sent_is_dropped(monkeypatch: Any) ->
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tag", "in_band"),
-    [(None, True), (hf_mod.NUDGE_TAG, True), (hf_mod.GREETING_TAG, False)],
+    [(None, True), (hf_mod.NUDGE_TAG, True)],
 )
 async def test_a_done_of_the_nudge_is_handled_as_his_reply(
     monkeypatch: Any, tag: Any, in_band: bool
@@ -4563,7 +4351,6 @@ async def test_a_tool_cancelled_with_its_session_sends_nothing_into_the_next(
         hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: default
     )
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
-    monkeypatch.setattr(hf_mod, "get_session_greeting_prompt", lambda: "")
     monkeypatch.setattr(
         hf_mod.core_tools, "get_tools", lambda: {"express": _SlowExpress()}
     )

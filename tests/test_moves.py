@@ -1,6 +1,8 @@
+import os
 import math
 import time
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, call
 from collections.abc import Callable
 
@@ -9,6 +11,7 @@ import pytest
 
 from reachy_mini.utils import create_head_pose
 from reachy_mini.utils.interpolation import compose_world_offset
+from reachy_mini_conversation_app import companion
 from reachy_mini_conversation_app.moves import (
     HoldPoseMove,
     BreathingMove,
@@ -1239,23 +1242,32 @@ def test_a_body_yaw_past_the_limits_is_held_there_and_the_head_turns_back_with_i
     assert inside == 1.0 and same is head
 
 
-def test_the_body_limits_read_the_supervisors_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """One number on the robot: the names and the range are the supervisor's (facing.py). A value
-    outside the range, or not a number, gives the default."""
-    import math
+def test_the_body_limits_follow_the_companions_facing_settings(tmp_path: Path) -> None:
+    """One number on the robot: BODY_YAW_LOW and BODY_YAW_HIGH are the companion's facing.TURN_RIGHT_DEG
+    and TURN_LEFT_DEG (ticket 217), read once at import. A fresh interpreter sees each case: a companion
+    with other limits, one with a limit outside the range, and none to import (the app's defaults)."""
+    import sys
+    import subprocess
 
-    from reachy_mini_conversation_app.moves import _body_limits
+    (tmp_path / "app_tools").mkdir()
+    package = tmp_path / "src" / "reachy_companion"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
 
-    monkeypatch.delenv("REACHY_COMPANION_BODY_TURN_LEFT_DEG", raising=False)
-    monkeypatch.delenv("REACHY_COMPANION_BODY_TURN_RIGHT_DEG", raising=False)
-    assert _body_limits() == pytest.approx((math.radians(-115), math.radians(106)))
-    monkeypatch.setenv("REACHY_COMPANION_BODY_TURN_LEFT_DEG", "90")
-    monkeypatch.setenv("REACHY_COMPANION_BODY_TURN_RIGHT_DEG", "80")
-    assert _body_limits() == pytest.approx((math.radians(-80), math.radians(90)))
-    for bad in ("170", "5", "nan", "much", ""):
-        monkeypatch.setenv("REACHY_COMPANION_BODY_TURN_LEFT_DEG", bad)
-        monkeypatch.setenv("REACHY_COMPANION_BODY_TURN_RIGHT_DEG", bad)
-        assert _body_limits() == pytest.approx((math.radians(-115), math.radians(106)))
+    def limits(left: float | None, right: float | None) -> tuple[float, float]:
+        env = {k: v for k, v in os.environ.items() if k != companion.TOOLS_ENV} | {"PYTHONDONTWRITEBYTECODE": "1"}
+        if left is not None:
+            (package / "facing.py").write_text(f"TURN_LEFT_DEG = {left!r}\nTURN_RIGHT_DEG = {right!r}\n")
+            env[companion.TOOLS_ENV] = str(tmp_path / "app_tools")
+        code = "from reachy_mini_conversation_app import moves; print(moves.BODY_YAW_LOW, moves.BODY_YAW_HIGH)"
+        out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True)
+        low, high = out.stdout.split()
+        return float(low), float(high)
+
+    defaults = (math.radians(-115), math.radians(106))
+    assert limits(90.0, 80.0) == pytest.approx((math.radians(-80), math.radians(90)))
+    assert limits(170.0, 5.0) == pytest.approx(defaults)
+    assert limits(None, None) == pytest.approx(defaults)
 
 
 @pytest.mark.parametrize("start, limit", [(140.0, 106.0), (-150.0, -115.0)])
