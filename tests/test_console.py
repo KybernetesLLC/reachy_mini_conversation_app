@@ -2489,16 +2489,10 @@ def test_a_dance_is_placed_on_the_grid_by_the_managers_own_sampling() -> None:
     _drive_manager(manager, t)
     dance = manager.state.current_move
     assert isinstance(dance, GridDanceMove) and dance.wait_s is None
-    # The move's own clock, set where the manager first samples it: the move began 0.13 s past a
-    # grid beat, whatever the test's own time.
-    place = dance._place
-
-    def place_on_the_test_clock(local_t: float) -> None:
-        dance.clock = lambda: grid_at + 0.13 + local_t
-        place(local_t)
-
-    dance._place = place_on_the_test_clock
-    manager._get_primary_pose(t)
+    # The move's own clock reads 0.13 s past a grid beat at the manager's sample, and the manager passes
+    # its own t (+0.07) to the move: a wrong t from the manager moves the wait.
+    dance.clock = lambda: grid_at + 0.13 + 0.07
+    manager._get_primary_pose(t + 0.07)
     assert dance.wait_s is not None and 0.0 <= dance.wait_s < 0.5
     # the beat it starts on is the grid's: 0.13 s past a beat, so 0.37 s to the next
     assert dance.wait_s == pytest.approx(0.37, abs=1e-6)

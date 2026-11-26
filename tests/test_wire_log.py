@@ -157,17 +157,20 @@ def test_a_full_queue_drops_and_counts_never_blocks() -> None:
             release.wait(30)
 
     log = Stalled("/nonexistent/wire.db", queue_max=2)
+    puts: list[bool] = []
+    real_put = log._q.put
 
-    def enqueue() -> None:
+    def spy_put(item, block=True, timeout=None):
+        puts.append(block is False)
+        return real_put(item, block=block, timeout=timeout)
+
+    log._q.put = spy_put  # type: ignore[method-assign]
+    try:
         for _ in range(10):
             log.received(1, _ev("response.created"))
-
-    tap = threading.Thread(target=enqueue, daemon=True)
-    tap.start()
-    tap.join(30)  # a tap that waited on the stalled writer would still be here
-    stuck = tap.is_alive()
-    release.set()
-    assert not stuck
+    finally:
+        release.set()
+    assert puts and all(puts), "a put was allowed to block"
     assert log.dropped == 8
 
 
