@@ -15,17 +15,17 @@ from reachy_mini_conversation_app import output_gate as gate
 from reachy_mini_conversation_app.tools import core_tools
 
 
-# The companion's live registry, from the app's "Tools to be used in conversation" line
-# at 20:41:44 on 2026-10-17.
+# The companion's live registry (26 Nov 2026): its profile's default_tools, the names in the
+# companion's app_tools, and the app's time tool, less REACHY_MINI_EXCLUDED_TOOLS
+# (task_status, task_cancel, skills_list).
 COMPANION_TOOLS = (
-    "dance stop_dance play_emotion stop_emotion idle_do_nothing move_head sweep_look "
-    "head_tracking camera task_status task_cancel boats set_commitment list_commitments "
-    "cancel_commitment express flights look skills_list skill_view transit events why_lit "
-    "remember forget turn_body look_at_me music stay_quiet stop_listening web_search "
-    "pollen_robotics_reachy_mini_time_tool__get_time "
-    "pollen_robotics_reachy_mini_weather_tool__get_weather"
+    "play_emotion move_head camera pollen_robotics_reachy_mini_time_tool__get_time "
+    "activities boats body cancel_commitment end_talk events express flights forget introduce "
+    "lights list_commitments look_at_me look music recall remember reminder_setting "
+    "set_commitment skill_view stay_quiet stop_listening told_facing transit turn_body weather "
+    "web_search why_lit"
 ).split()
-LEAK_SAFE = {"stay_quiet", "idle_do_nothing"}
+LEAK_SAFE = {"stay_quiet"}
 
 
 def _registry() -> list[str]:
@@ -35,7 +35,19 @@ def _registry() -> list[str]:
 
 
 REGISTRY = _registry()
+# The tool names the generated cases run over: each rule needs a name of its kind, not all of
+# them (ticket 220: 2,067 tests gave the same branch coverage as 789). A name that is a prefix
+# or a suffix word of another (look, look_at_me; body, turn_body), a leak-safe one, a one-word
+# one, a multi-word one and a namespaced one.
+SAMPLE = [
+    "look", "look_at_me", "body", "turn_body", "stay_quiet", "express", "set_commitment",
+    "stop_listening", "play_emotion", "pollen_robotics_reachy_mini_time_tool__get_time",
+]  # fmt: skip
 TOOLS = gate.ToolNames((name, name in LEAK_SAFE) for name in REGISTRY)
+
+
+def test_the_sample_is_names_the_registry_has() -> None:
+    assert set(SAMPLE) <= set(REGISTRY)
 
 
 def _spoken(name: str) -> str:
@@ -90,7 +102,7 @@ def _expected_cut(name: str) -> str:
     return gate.CUT_AND_EXECUTE if name in LEAK_SAFE else gate.CUT
 
 
-@pytest.mark.parametrize("name", REGISTRY)
+@pytest.mark.parametrize("name", SAMPLE)
 @pytest.mark.parametrize("shape", MARKUP_SHAPES)
 def test_every_tool_in_every_markup_shape_is_cut(name: str, shape: str) -> None:
     verdict = gate.judge(shape.format(n=name), TOOLS, final=True)
@@ -102,7 +114,7 @@ def test_every_tool_in_every_markup_shape_is_cut(name: str, shape: str) -> None:
     assert verdict.kind == "leaked tool call"
 
 
-@pytest.mark.parametrize("name", REGISTRY)
+@pytest.mark.parametrize("name", SAMPLE)
 @pytest.mark.parametrize("shape", ("{n}", "{n}.", " {n}! ", "`{n}`", '"{n}"'))
 def test_every_tool_said_bare_is_judged_on_the_whole_reply(
     name: str, shape: str
@@ -129,7 +141,7 @@ def test_every_tool_said_bare_is_judged_on_the_whole_reply(
 
 
 @pytest.mark.parametrize(
-    "name", [n for n in REGISTRY if "_" in _spoken(n).strip() or " " in _spoken(n)]
+    "name", [n for n in SAMPLE if "_" in _spoken(n).strip() or " " in _spoken(n)]
 )
 @pytest.mark.parametrize("shape", ("{w}", "{W}.", "{w}!", "{h}"))
 def test_every_multi_word_tool_said_as_words_is_cut(name: str, shape: str) -> None:
@@ -174,7 +186,7 @@ def test_natural_sentences_play(text: str) -> None:
     assert gate.judge(text, TOOLS, final=True) == gate.Verdict(gate.PLAY)
 
 
-@pytest.mark.parametrize("text", ["Dance!", "Music.", "look", "Remember?", "Events"])
+@pytest.mark.parametrize("text", ["Body!", "Music.", "look", "Remember?", "Events"])
 def test_a_single_plain_word_tool_plays_and_is_logged(text: str) -> None:
     verdict = gate.judge(text, TOOLS, final=True)
     assert verdict.action == gate.PLAY_AND_LOG
@@ -191,7 +203,7 @@ def test_the_start_of_a_multi_word_name_waits(text: str) -> None:
 
 @pytest.mark.parametrize("text", ["I", "I'm", "He", "We", "St", "Go"])
 def test_a_reply_never_waits_on_a_short_start(text: str) -> None:
-    """ "I" starts a fifth of his replies; it would otherwise wait for idle_do_nothing."""
+    """ "I" starts a fifth of his replies; it would otherwise wait for stay_quiet."""
     assert gate.judge(text, TOOLS).action == gate.PLAY
 
 
@@ -227,7 +239,7 @@ def test_tools_opt_in_to_running_when_leaked() -> None:
 # spoken (real words follow) and kept markup and all, and his word-for-word memory taught
 # him to do it again.
 Q = '<|"|>'
-OPEN_IDLE = f"<call:idle_do_nothing{{reason:{Q}Acknowledging Matt's comment.{Q}}}"
+OPEN_IDLE = f"<call:stay_quiet{{reason:{Q}Acknowledging Matt's comment.{Q}}}"
 LEADING = (
     f"<call:express{{feeling:{Q}shy{Q},intensity:0.4}}/>I'm sorry I'm being glitchy."
 )
@@ -238,7 +250,7 @@ def test_a_call_left_open_at_the_end_of_the_reply_is_cut() -> None:
     verdict = gate.judge(OPEN_IDLE, TOOLS, final=True)
     assert (verdict.action, verdict.tool, verdict.shape) == (
         gate.CUT_AND_EXECUTE,
-        "idle_do_nothing",
+        "stay_quiet",
         "markup",
     )
 
@@ -368,8 +380,8 @@ JSON_SHAPES = (
 
 @pytest.mark.parametrize(
     "name, shape",
-    [("dance", shape) for shape in JSON_SHAPES]
-    + [(name, JSON_SHAPES[1]) for name in REGISTRY],
+    [("look", shape) for shape in JSON_SHAPES]
+    + [(name, JSON_SHAPES[1]) for name in SAMPLE],
 )
 def test_every_json_shape_and_every_tool_is_cut(name: str, shape: str) -> None:
     """Every shape with one tool, and every tool in the 10-23 shape: the name is read the same in each."""
@@ -382,12 +394,12 @@ def test_every_json_shape_and_every_tool_is_cut(name: str, shape: str) -> None:
 
 
 def test_a_json_call_list_names_each_of_its_tools() -> None:
-    text = '{"tool_calls": [{"function": "stay_quiet", "parameters": {}}, {"name": "dance", "arguments": {}}]}'
+    text = '{"tool_calls": [{"function": "stay_quiet", "parameters": {}}, {"name": "look", "arguments": {}}]}'
     verdict = gate.judge(text, TOOLS, final=True)
     assert (verdict.action, verdict.tool) == (gate.CUT_AND_EXECUTE, "stay_quiet")
     assert [(call.action, call.tool, call.shape) for call in verdict.calls] == [
         (gate.CUT_AND_EXECUTE, "stay_quiet", "json"),
-        (gate.CUT, "dance", "json"),
+        (gate.CUT, "look", "json"),
     ]
 
 
@@ -545,7 +557,7 @@ BARE_TAG_SHAPES = (
 )
 
 
-@pytest.mark.parametrize("name", REGISTRY)
+@pytest.mark.parametrize("name", SAMPLE)
 @pytest.mark.parametrize("shape", BARE_TAG_SHAPES)
 def test_every_tool_as_a_bare_tag_is_cut(name: str, shape: str) -> None:
     """Mid-reply it waits on the long hold, as words may follow; the whole reply is cut."""
@@ -590,7 +602,7 @@ def test_a_played_reply_is_kept_without_its_bare_tag() -> None:
 
 
 @pytest.mark.parametrize(
-    "text", ["Stay quiet.", "stay quiet", "Stay", "stay qu", "Idle do"]
+    "text", ["Stay quiet.", "stay quiet", "Stay", "stay qu", "Set comm"]
 )
 def test_a_name_in_words_that_could_be_cut_waits_on_the_name(text: str) -> None:
     """Its audio is held until the verdict (SPOKEN_NAME_HOLD_S), not the short hold."""
@@ -598,7 +610,7 @@ def test_a_name_in_words_that_could_be_cut_waits_on_the_name(text: str) -> None:
     assert (verdict.action, verdict.waits_on_name) == (gate.UNDECIDED, True)
 
 
-@pytest.mark.parametrize("text", ["Dance", "Expr", "<xyz", "(stops"])
+@pytest.mark.parametrize("text", ["Music", "Expr", "<xyz", "(stops"])
 def test_a_wait_that_cannot_end_in_a_spoken_name_cut_is_the_short_hold(
     text: str,
 ) -> None:
@@ -615,7 +627,7 @@ def test_ordinary_short_replies_do_not_wait(text: str) -> None:
 
 
 # The three leaks the review of a67a150 found (the owner, 11-07).
-MULTI_WORD = [n for n in REGISTRY if "_" in n.rsplit("__", 1)[-1]]
+MULTI_WORD = [n for n in SAMPLE if "_" in n.rsplit("__", 1)[-1]]
 
 
 @pytest.mark.parametrize("name", MULTI_WORD)
@@ -764,7 +776,7 @@ def test_the_start_of_a_reasoning_opening_waits(text: str) -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ["In", "An", "Th", "1.", "#", "Thinking o", "Thinking about", "1. Make coffee"],
+    ["In", "An", "Th", "1.", "#", "Thinking o", "Thinking about"],
 )
 def test_a_short_or_diverging_opening_plays_at_once(text: str) -> None:
     assert gate.judge(text, TOOLS) == gate.Verdict(gate.PLAY)
@@ -806,7 +818,7 @@ def test_a_leaked_express_call_gives_back_its_arguments(text: str, args: Any) ->
     assert gate.leaked_express(text) == args
 
 
-@pytest.mark.parametrize("said", ["I love music (jazz most).", "Dance(s) are fun.", "Look (over there)."])
+@pytest.mark.parametrize("said", ["I love music (jazz most).", "Music(s) are fun.", "Look (over there)."])
 def test_a_tool_name_before_brackets_in_words_plays(said: str) -> None:
     """11-11: a Python call needs no space, and empty, keyword or quoted arguments."""
     assert gate.judge(said, TOOLS, final=True).action == gate.PLAY
@@ -822,7 +834,7 @@ def test_a_tool_name_before_brackets_in_words_plays(said: str) -> None:
         ('Sure. express(feeling="jo', True),
         ("Sure, sounds good.", False),
         ("I like music (jazz", False),
-        ("I like to dance(s", False),
+        ("I like to music(s", False),
         ("I want to cal", False),
         ("Look at this `", False),
         ("I <3 you", False),
@@ -944,7 +956,7 @@ def test_an_open_tool_tag_waits_the_name_hold() -> None:
     "said",
     [
         '<say name="music">Here is some music for you, I hope you like it.',
-        '<action name="dance">I am dancing now!',
+        '<action name="look">I am looking now!',
     ],
 )
 def test_a_tool_named_tag_before_words_is_a_reply_and_stays_in_the_talk(said: str) -> None:

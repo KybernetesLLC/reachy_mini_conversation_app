@@ -31,7 +31,7 @@ def test_external_profile_can_use_builtin_tools(tmp_path: Path, monkeypatch: pyt
     profile_name = "ext_profile_test"
     external_profiles_root = tmp_path / "external_profiles"
     profile_dir = external_profiles_root / profile_name
-    write_profile(profile_name, profile_dir, "hello", ["dance"])
+    write_profile(profile_name, profile_dir, "hello", ["move_head"])
 
     monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", profile_name)
     monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", external_profiles_root)
@@ -40,8 +40,8 @@ def test_external_profile_can_use_builtin_tools(tmp_path: Path, monkeypatch: pyt
 
     core_tools_mod = _reload_core_tools()
 
-    assert "dance" in core_tools_mod.ALL_TOOLS
-    assert "dance" not in sys.modules
+    assert "move_head" in core_tools_mod.ALL_TOOLS
+    assert "move_head" not in sys.modules
 
 
 def test_packaged_default_tools_load_with_external_profiles_root(

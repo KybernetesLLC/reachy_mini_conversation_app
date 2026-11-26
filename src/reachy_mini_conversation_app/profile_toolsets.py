@@ -144,27 +144,6 @@ def write_profile_tool_override(
         return write_profile_toolsets(instance_path, ProfileToolsets(profiles=profiles))
 
 
-def clear_profile_tool_override(
-    profile: str | None,
-    instance_path: str | Path | None,
-) -> bool:
-    """Clear one profile override and restore its on-disk defaults."""
-    with _STORE_LOCK:
-        toolsets = read_profile_toolsets(instance_path)
-        profile_name = canonical_profile_name(profile)
-        if profile_name not in toolsets.profiles:
-            return False
-
-        profiles = dict(toolsets.profiles)
-        del profiles[profile_name]
-        settings_path = get_profile_toolsets_path(instance_path)
-        if profiles:
-            write_profile_toolsets(instance_path, ProfileToolsets(profiles=profiles))
-        elif settings_path.exists():
-            settings_path.unlink()
-        return True
-
-
 def enable_profile_tools(
     profile: str | None,
     tool_names: Iterable[str],

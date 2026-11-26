@@ -15,7 +15,6 @@ from reachy_mini_conversation_app.profile_toolsets import (
     read_profile_tool_names,
     get_profile_toolsets_path,
     read_profile_tool_override,
-    clear_profile_tool_override,
     write_profile_tool_override,
     disable_profile_tools_by_prefix,
 )
@@ -43,8 +42,8 @@ def configured_profiles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     return instance_path
 
 
-def test_profile_tool_override_round_trip_and_reset(configured_profiles: Path) -> None:
-    """An explicit override should replace authored defaults until it is reset."""
+def test_profile_tool_override_round_trip(configured_profiles: Path) -> None:
+    """An explicit override should replace authored defaults."""
     instance_path = configured_profiles
     assert read_profile_tool_names("guide", instance_path) == ["camera", TOOL_NAME, "other_space__lookup"]
     assert read_profile_tool_override("guide", instance_path) is None
@@ -63,11 +62,6 @@ def test_profile_tool_override_round_trip_and_reset(configured_profiles: Path) -
 
     assert read_profile_tool_override("guide", instance_path) == []
     assert read_profile_tool_names("guide", instance_path) == []
-    assert clear_profile_tool_override("guide", instance_path) is True
-    assert read_profile_tool_override("guide", instance_path) is None
-    assert read_profile_tool_names("guide", instance_path) == ["camera", TOOL_NAME, "other_space__lookup"]
-    assert not settings_path.exists()
-    assert clear_profile_tool_override("guide", instance_path) is False
 
 
 def test_default_profile_uses_canonical_storage_key(configured_profiles: Path) -> None:

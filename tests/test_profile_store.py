@@ -2,7 +2,6 @@ from pathlib import Path
 
 import pytest
 
-from reachy_mini_conversation_app.config import DEFAULT_PROFILES_DIRECTORY
 from reachy_mini_conversation_app.profile_store import (
     ProfileFormatError,
     write_profile,
@@ -63,10 +62,3 @@ def test_profile_listing_requires_profile_document(tmp_path: Path) -> None:
 
     assert list_profile_names(tmp_path) == ["visible"]
 
-
-def test_bundled_profiles_enable_head_tracking_by_default() -> None:
-    """Every bundled personality should start with head tracking available."""
-    for profile_name in list_profile_names(DEFAULT_PROFILES_DIRECTORY):
-        profile = read_profile_from_directory(profile_name, DEFAULT_PROFILES_DIRECTORY / profile_name)
-
-        assert "head_tracking" in profile.default_tools, profile_name

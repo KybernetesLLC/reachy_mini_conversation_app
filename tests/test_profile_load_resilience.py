@@ -95,7 +95,7 @@ def test_readable_profile_is_left_alone(
     """The fallback must not disturb a profile that reads correctly."""
     profiles_root = tmp_path / "profiles"
     good_profile = profiles_root / "good_profile"
-    write_profile("good_profile", good_profile, "sois utile", ["dance"])
+    write_profile("good_profile", good_profile, "sois utile", ["move_head"])
 
     _use_profile(monkeypatch, profiles_root, "good_profile")
 
@@ -105,7 +105,7 @@ def test_readable_profile_is_left_alone(
     assert config_mod.config.REACHY_MINI_CUSTOM_PROFILE == "good_profile"
     from reachy_mini_conversation_app.tools import core_tools
 
-    assert "dance" in core_tools.ALL_TOOLS
+    assert "move_head" in core_tools.ALL_TOOLS
 
 
 def test_failure_propagates_when_the_fallback_also_fails(

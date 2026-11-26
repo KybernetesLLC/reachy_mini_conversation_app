@@ -702,17 +702,6 @@ class MovementManager:
         """
         self._command_queue.put(("set_moving_state", duration))
 
-    def is_idle(self) -> bool:
-        """Return True when the robot has been inactive longer than the idle delay."""
-        with self._shared_state_lock:
-            last_activity = self._shared_last_activity_time
-            listening = self._shared_is_listening
-
-        if listening:
-            return False
-
-        return self._now() - last_activity >= self.idle_inactivity_delay
-
     def set_listening(self, listening: bool) -> None:
         """Enable or disable listening mode without touching shared state directly.
 
@@ -726,10 +715,6 @@ class MovementManager:
         companion's review, 2026-10-19).
         """
         self._command_queue.put(("set_listening", listening))
-
-    def set_head_tracking(self, enabled: bool) -> None:
-        """Start or stop following the user's face; thread-safe via the command queue."""
-        self._command_queue.put(("set_head_tracking", enabled))
 
     def set_speaking(self, speaking: bool) -> None:
         """Pause head tracking while the assistant speaks, resume it afterwards.
@@ -922,21 +907,6 @@ class MovementManager:
                 return
             self._pending_listening = None
             self._apply_listening(desired_state, now)
-        elif command == "set_head_tracking":
-            enabled = bool(payload)
-            if self._head_tracking == enabled:
-                return
-            self._head_tracking = enabled
-            self._track_anchor = None
-            # set_speaking is gated off while disabled, so its state would go stale across a toggle.
-            self._is_speaking = False
-            try:
-                if enabled:
-                    self.current_robot.start_head_tracking(weight=1.0)
-                else:
-                    self.current_robot.stop_head_tracking()
-            except Exception as e:
-                logger.warning("Head-tracking toggle failed: %s", e)
         elif command == "set_speaking":
             if not self._head_tracking:
                 return
