@@ -18,7 +18,6 @@ from reachy_mini_conversation_app.mcp_client import McpToolTimeoutError, McpTool
 from reachy_mini_conversation_app.tool_spaces import build_remote_client, read_installed_tool_spaces
 from reachy_mini_conversation_app.profile_store import DEFAULT_PROFILE_NAME
 from reachy_mini_conversation_app.profile_toolsets import read_profile_tool_names
-from reachy_mini_conversation_app.tools.tool_constants import SystemTool
 
 
 if TYPE_CHECKING:
@@ -312,8 +311,6 @@ def _read_profile_tool_names(instance_path: str | Path | None) -> list[str]:
     except (OSError, RuntimeError, ValueError) as exc:
         logger.error("Failed to read tools for profile %r: %s", profile, exc)
         raise RuntimeError(f"Failed to read tools for profile {profile!r}") from exc
-
-    tool_names.extend(tool.value for tool in SystemTool if tool.value not in tool_names)
 
     if config.AUTOLOAD_EXTERNAL_TOOLS:
         discovered_external_tools = list_tool_module_names(config.TOOLS_DIRECTORY)

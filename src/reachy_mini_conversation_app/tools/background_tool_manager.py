@@ -14,7 +14,6 @@ from typing import Any, Dict, Callable, Optional, Coroutine
 
 from pydantic import Field, BaseModel, PrivateAttr
 
-from reachy_mini_conversation_app.utils import clamp
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolDependencies,
     dispatch_tool_call,
@@ -282,35 +281,6 @@ class BackgroundToolManager(BaseModel):
         await self._notification_queue.put(background_tool.get_notification())
         logger.debug(f"Queued notification for tool: {background_tool.tool_name} (id={background_tool.id})")
 
-    async def update_progress(
-        self,
-        tool_id: str,
-        progress: float,
-        message: Optional[str] = None,
-    ) -> bool:
-        """Update progress for a tool (for tools with with_progress=True).
-
-        Args:
-            tool_id: The tool ID
-            progress: Progress value between 0.0 and 1.0
-            message: Optional progress message (e.g., "50% downloaded")
-
-        Returns:
-            True if updated successfully, False if tool not found or not tracking progress
-
-        """
-        tool = self._tools.get(tool_id)
-        if tool is None:
-            return False
-
-        if tool.progress is None:
-            # Tool not tracking progress
-            return False
-
-        tool.progress = ToolProgress(progress=clamp(progress, 0.0, 1.0), message=message)
-        logger.debug(f"Tool {tool_id} progress: {progress:.1%} - {message or ''}")
-        return True
-
     async def cancel_tool(self, tool_id: str, log: bool = True) -> bool:
         """Cancel a running tool by ID.
 
@@ -471,22 +441,3 @@ class BackgroundToolManager(BaseModel):
     def get_running_tools(self) -> list[BackgroundTool]:
         """Get all currently running tools."""
         return [t for t in self._tools.values() if t.status == ToolState.RUNNING]
-
-    def get_all_tools(self, limit: Optional[int] = None) -> list[BackgroundTool]:
-        """Get recent tools (most recent first).
-
-        Args:
-            limit: Maximum number of tools to return (None means all)
-
-        Returns:
-            List of tools sorted by start time (most recent first)
-
-        """
-        sorted_tools = sorted(
-            self._tools.values(),
-            key=lambda t: t.started_at,
-            reverse=True,
-        )
-        if limit is not None:
-            return sorted_tools[:limit]
-        return sorted_tools

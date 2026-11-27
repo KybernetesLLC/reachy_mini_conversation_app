@@ -1820,7 +1820,7 @@ def test_a_first_reply_before_the_glance_is_a_warning(caplog: Any) -> None:
 async def test_only_the_first_reply_to_a_person_is_judged_and_each_session_starts_fresh(
     monkeypatch: Any,
 ) -> None:
-    """Not the startup greeting, not a later turn; nothing carried over from a session before."""
+    """Not a reply that arrives before any turn, not a later turn; nothing carried over from a session before."""
     from types import SimpleNamespace
 
     spoken = SimpleNamespace(metadata=None, conversation_id="conv_1")
@@ -1833,11 +1833,11 @@ async def test_only_the_first_reply_to_a_person_is_judged_and_each_session_start
         _FakeEvent("response.created", response=spoken),
         _FakeEvent("response.done", response=spoken),
     )
-    greeting = (
+    before_any_turn = (
         _FakeEvent("response.created", response=spoken),
         _FakeEvent("response.done", response=spoken),
     )
-    handler = _session_handler(monkeypatch, events=greeting + turn + turn)
+    handler = _session_handler(monkeypatch, events=before_any_turn + turn + turn)
     calls: list[float | None] = []
     real = handler._first_reply_created
 
@@ -1852,15 +1852,15 @@ async def test_only_the_first_reply_to_a_person_is_judged_and_each_session_start
     await handler._run_realtime_session()
     assert calls == [
         None
-    ]  # once, for the person's turn, not the greeting; the old glance cleared
+    ]  # once, for the person's turn, not the reply before any turn; the old glance cleared
 
 
 @pytest.mark.asyncio
-async def test_a_turn_left_open_by_the_session_before_does_not_make_the_greeting_first(
+async def test_a_turn_left_open_by_the_session_before_does_not_make_a_reply_before_any_turn_first(
     monkeypatch: Any,
 ) -> None:
     """The review (2026-10-17): a transcript with no reply before a close; the next
-    session's greeting would have been judged as its first reply (a false rollback warning).
+    session's reply before any turn would have been judged as its first reply (a false rollback warning).
     """
     from types import SimpleNamespace
 

@@ -132,8 +132,6 @@ def test_the_fallback_literals_equal_the_companions_constants(companion_on) -> N
     """The fork keeps its own figure for each constant it reads; a pin that the two agree today."""
     from reachy_mini_conversation_app import moves, console
 
-    if companion.function("idle", "BREATHING_SCALE_RANGE") is None:
-        pytest.skip("the companion has no idle.BREATHING_SCALE_RANGE (older than ticket 38)")
     assert companion.value("facing", "TURN_LEFT_DEFAULT_DEG", None) == moves.TURN_LEFT_DEFAULT_DEG == 106.0
     assert companion.value("facing", "TURN_RIGHT_DEFAULT_DEG", None) == moves.TURN_RIGHT_DEFAULT_DEG == 115.0
     assert tuple(companion.value("facing", "TURN_RANGE_DEG", None)) == moves.TURN_RANGE_DEG == (10.0, 160.0)
@@ -159,8 +157,6 @@ def test_the_model_image_is_sized_as_the_companions_glance(companion_on) -> None
 
     pytest.importorskip("gi")
     glance_size = companion.function("people", "glance_size")
-    if glance_size is None:
-        pytest.skip("the companion has no people.glance_size")
     long_side = model_image.MODEL_IMAGE.long_side
     assert long_side == companion.value("people", "GLANCE_LONG_SIDE", None)
     for width, height in [(1920, 1080), (1080, 1920), (1056, 1056), (640, 480), (3, 1), (4000, 3001), (1057, 33)]:

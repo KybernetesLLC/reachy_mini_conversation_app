@@ -59,41 +59,6 @@ def start_import_warmup() -> threading.Thread:
     return _import_warmup_thread
 
 
-def _start_inactivity_timeout_thread(
-    timeout_minutes: float,
-    stream_manager: LocalStream,
-    logger: logging.Logger,
-    app_stop_event: threading.Event | None,
-    go_to_sleep: Callable[[], dict[str, Any]] | None = None,
-) -> threading.Thread:
-    """Start a daemon that puts the app to sleep after inactivity."""
-    timeout_seconds = timeout_minutes * 60.0
-
-    def poll_inactivity_timeout() -> None:
-        logger.info("App inactivity timeout enabled: %.1f minutes.", timeout_minutes)
-        while app_stop_event is None or not app_stop_event.is_set():
-            elapsed = stream_manager.seconds_since_activity()
-            if elapsed >= timeout_seconds:
-                logger.info("No activity for %.1f minutes; going to sleep.", elapsed / 60.0)
-                try:
-                    if go_to_sleep is not None:
-                        go_to_sleep()
-                    else:
-                        stream_manager.close()
-                except Exception as e:
-                    logger.error("Error while going to sleep after inactivity timeout: %s", e)
-                    try:
-                        stream_manager.close()
-                    except Exception as close_error:
-                        logger.error("Error while closing stream manager after inactivity timeout: %s", close_error)
-                return
-            time.sleep(1.0)
-
-    thread = threading.Thread(target=poll_inactivity_timeout, daemon=True)
-    thread.start()
-    return thread
-
-
 def main() -> None:
     """Entrypoint for the Reachy Mini conversation app."""
     args, _ = parse_args()
@@ -124,7 +89,6 @@ def run(
         HF_LOCAL_CONNECTION_MODE,
         set_instance_path,
         get_hf_connection_selection,
-        resolve_app_timeout_minutes,
         refresh_runtime_config_from_env,
     )
     from reachy_mini_conversation_app.startup_settings import (
@@ -196,8 +160,6 @@ def run(
     # The companion (R-36): an app the supervisor starts on its own moves nothing
     # until the supervisor says so -- no wake-up from the fold, no breathing.
     still = not startup.motion_on_start()
-    if not still:
-        app_lifecycle.wake_up_if_sleeping(robot, logger)
 
     movement_manager = MovementManager(current_robot=robot)
 
@@ -309,9 +271,6 @@ def run(
 
     deps.go_to_sleep = go_to_sleep_and_stop_app
 
-    def run_go_to_sleep_tool() -> dict[str, Any]:
-        return app_lifecycle.run_go_to_sleep_tool(deps, logger)
-
     if args.ui and settings_app is None and effective_settings_app is not None:
         import uvicorn
 
@@ -333,10 +292,6 @@ def run(
     # taps the media pipeline at push_audio_sample. The console stream pushes
     # assistant audio through that pipeline directly.
     robot.enable_wobbling()
-
-    timeout_minutes = resolve_app_timeout_minutes()
-    if timeout_minutes is not None:
-        _start_inactivity_timeout_thread(timeout_minutes, stream_manager, logger, app_stop_event, run_go_to_sleep_tool)
 
     def poll_stop_event() -> None:
         """Poll the stop event to allow graceful shutdown.

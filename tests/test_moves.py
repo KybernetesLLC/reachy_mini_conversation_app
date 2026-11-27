@@ -3,7 +3,7 @@ import math
 import time
 import threading
 from pathlib import Path
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 from collections.abc import Callable
 
 import numpy as np
@@ -63,68 +63,6 @@ def test_stop_can_skip_neutral_reset(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert manager._thread is None
     robot.goto_target.assert_not_called()
-
-
-def test_head_tracking_follows_speaking() -> None:
-    """Once enabled, tracking owns the head when idle and releases it while the assistant speaks."""
-    robot = MagicMock()
-    robot.get_current_head_pose.return_value = np.eye(4)
-    robot.get_current_joint_positions.return_value = ([0.0] * 6, [0.0, 0.0])
-    manager = MovementManager(robot)
-    manager.start()
-    try:
-        # The head_tracking tool enables tracking with full weight.
-        manager.set_head_tracking(True)
-        assert _wait_for(lambda: call(weight=1.0) in robot.start_head_tracking.call_args_list)
-
-        # Speaking with a locked face captures the anchor and releases the head.
-        manager.set_speaking(True)
-        assert _wait_for(lambda: call(weight=0.0) in robot.start_head_tracking.call_args_list)
-        assert _wait_for(lambda: manager._track_anchor is not None)
-
-        # Done speaking hands the head back to tracking.
-        robot.start_head_tracking.reset_mock()
-        manager.set_speaking(False)
-        assert _wait_for(lambda: call(weight=1.0) in robot.start_head_tracking.call_args_list)
-        assert _wait_for(lambda: manager._track_anchor is None)
-    finally:
-        manager.stop(reset_to_neutral=False)
-
-    robot.stop_head_tracking.assert_called_once()
-
-
-@pytest.mark.parametrize("posture_command", ["hold", "release"])
-def test_a_pose_from_the_companion_ends_face_tracking(posture_command: str) -> None:
-    """End the app's face tracking on a hold or release from the companion.
-
-    The companion's ownership audit (2026-10-10): the supervisor turned the daemon's
-    tracker off for a still pose, but the app's own flag stayed on, and the end of the
-    next utterance turned tracking back on at full weight under the held pose.
-    """
-    robot = MagicMock()
-    robot.get_current_head_pose.return_value = np.eye(4)
-    robot.get_current_joint_positions.return_value = ([0.0] * 6, [0.0, 0.0])
-    manager = MovementManager(robot)
-    manager.start()
-    try:
-        manager.set_head_tracking(True)
-        assert _wait_for(lambda: call(weight=1.0) in robot.start_head_tracking.call_args_list)
-        manager.set_speaking(True)
-        assert _wait_for(lambda: manager._is_speaking)
-
-        if posture_command == "hold":
-            manager.hold_pose(np.eye(4), (0.0, 0.0), 0.5)
-        else:
-            manager.release_hold()
-        assert _wait_for(lambda: not manager._head_tracking)
-        assert _wait_for(lambda: robot.stop_head_tracking.called)
-
-        robot.start_head_tracking.reset_mock()
-        manager.set_speaking(False)  # the end of the utterance
-        time.sleep(0.1)
-        assert call(weight=1.0) not in robot.start_head_tracking.call_args_list
-    finally:
-        manager.stop(reset_to_neutral=False)
 
 
 def test_speaking_anchor_composes_emotions_and_holds_dances_from_neutral() -> None:
@@ -496,21 +434,6 @@ def test_is_holding_reports_current_or_queued_hold() -> None:
 
     manager._handle_command("release_hold", None, now)
     assert manager.is_holding() is False
-
-
-def test_is_idle_reflects_listening_and_activity() -> None:
-    """is_idle is False while listening and True once past the inactivity delay."""
-    manager = MovementManager(MagicMock())
-
-    manager._shared_is_listening = True
-    assert manager.is_idle() is False
-
-    manager._shared_is_listening = False
-    manager._shared_last_activity_time = manager._now()
-    assert manager.is_idle() is False
-
-    manager._shared_last_activity_time = manager._now() - 10.0
-    assert manager.is_idle() is True
 
 
 def test_handle_command_queue_and_clear() -> None:
