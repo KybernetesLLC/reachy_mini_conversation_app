@@ -41,7 +41,7 @@ def test_config_raises_on_external_tool_name_collision(tmp_path: Path, monkeypat
     """Config should fail fast when external/built-in tool names collide."""
     external_tools = tmp_path / "external_tools"
     external_tools.mkdir(parents=True)
-    (external_tools / "dance.py").write_text("# collision with built-in dance tool\n", encoding="utf-8")
+    (external_tools / "move_head.py").write_text("# collision with built-in move_head tool\n", encoding="utf-8")
 
     monkeypatch.setattr(config_mod.Config, "PROFILES_DIRECTORY", config_mod.DEFAULT_PROFILES_DIRECTORY)
     monkeypatch.setattr(config_mod.Config, "TOOLS_DIRECTORY", external_tools)

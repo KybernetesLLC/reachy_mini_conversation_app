@@ -46,7 +46,8 @@ SAMPLE = [
 TOOLS = gate.ToolNames((name, name in LEAK_SAFE) for name in REGISTRY)
 
 
-def test_the_sample_is_names_the_registry_has() -> None:
+def test_the_sample_names_are_in_the_registry() -> None:
+    """Every sampled name is one the registry has."""
     assert set(SAMPLE) <= set(REGISTRY)
 
 
